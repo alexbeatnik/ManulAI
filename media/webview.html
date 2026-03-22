@@ -1176,8 +1176,31 @@
         .filter(line => line && !line.startsWith('#'));
     }
 
+    function parseJsonStringArray(value) {
+      if (!value) {
+        return [];
+      }
+
+      try {
+        const parsed = JSON.parse(value);
+        return Array.isArray(parsed) ? parsed.filter(item => typeof item === 'string') : [];
+      } catch {
+        return [];
+      }
+    }
+
     function collectUriPaths(dt) {
       const collected = [];
+
+      const resourceUrls = dt.getData('ResourceURLs');
+      if (resourceUrls) {
+        collected.push(...parseJsonStringArray(resourceUrls));
+      }
+
+      const codeFiles = dt.getData('CodeFiles');
+      if (codeFiles) {
+        collected.push(...parseJsonStringArray(codeFiles));
+      }
 
       const vscodeUri = dt.getData('application/vnd.code.uri-list');
       if (vscodeUri) {
@@ -1232,7 +1255,14 @@
         return;
       }
 
-      // Path 1: System file drops (OS file manager) — read content via FileReader
+      // Path 1: VS Code internal drops from Explorer/editors/tree views.
+      const uriPaths = collectUriPaths(dt);
+      if (uriPaths.length > 0) {
+        vscode.postMessage({ command: 'addFilePathContext', paths: uriPaths });
+        return;
+      }
+
+      // Path 2: System file drops (desktop/file manager) — read content via FileReader.
       let fileItemsFound = false;
       if (dt.items && dt.items.length > 0) {
         for (const item of Array.from(dt.items)) {
@@ -1246,13 +1276,6 @@
         }
       }
       if (fileItemsFound) {
-        return;
-      }
-
-      // Path 2: VS Code internal drops — send URI paths to backend for vscode.fs read
-      const uriPaths = collectUriPaths(dt);
-      if (uriPaths.length > 0) {
-        vscode.postMessage({ command: 'addFilePathContext', paths: uriPaths });
         return;
       }
 
