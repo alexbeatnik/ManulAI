@@ -113,6 +113,11 @@
           "default": true,
           "description": "When enabled, ManulAI exposes local tools to Ollama and runs the native agent loop automatically. When disabled, requests run as plain chat without tool calling."
         },
+        "manulai.autoApprove": {
+          "type": "boolean",
+          "default": false,
+          "description": "When enabled, tool calls are executed automatically without asking for user confirmation. When disabled, each tool call requires explicit approval."
+        },
         "manulai.systemPrompt": {
           "type": "string",
           "default": "You are ManulAI, a privacy-first local coding agent running inside VS Code. Work across any programming language. Use tools when needed to inspect files, edit files, and run commands. Prefer precise, minimal changes and explain results clearly.",

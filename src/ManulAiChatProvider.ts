@@ -29,6 +29,11 @@ interface OllamaResponse {
   done_reason?: string;
 }
 
+interface ParsedToolCall {
+  name: string;
+  arguments?: Record<string, unknown> | string;
+}
+
 interface AttachedFileContext {
   uri: vscode.Uri;
   name: string;
@@ -80,11 +85,13 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   private readonly attachedFiles = new Map<string, AttachedFileContext>();
   private availableModels: string[] = [];
   private agentMode = true;
+  private autoApprove = false;
   private requestInFlight = false;
 
   public constructor(private readonly extensionContext: vscode.ExtensionContext) {
     const config = vscode.workspace.getConfiguration('manulai');
     this.agentMode = Boolean(config.get('agentMode', true));
+    this.autoApprove = Boolean(config.get('autoApprove', false));
   }
 
   public resolveWebviewView(
@@ -171,6 +178,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   public async handleConfigurationChange(): Promise<void> {
     const config = vscode.workspace.getConfiguration('manulai');
     this.agentMode = Boolean(config.get('agentMode', true));
+    this.autoApprove = Boolean(config.get('autoApprove', false));
     await this.refreshModelCatalog(false);
     this.postStateToWebview();
   }
@@ -246,8 +254,10 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         await this.browseAndAttachFiles();
         return;
       case 'toggleAgentMode':
-      case 'toggleAutoApprove':
         await this.setAgentMode(message.value);
+        return;
+      case 'toggleAutoApprove':
+        await this.setAutoApprove(message.value);
         return;
       default:
         return;
@@ -271,44 +281,8 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     this.postBusyState(true);
 
     try {
-      while (true) {
-        const response = await this.callOllama(this.messages);
-        const assistantMessage = response.message;
-
-        if (!assistantMessage) {
-          throw new Error('Ollama returned no message payload.');
-        }
-
-        if (this.agentMode && assistantMessage.tool_calls?.length) {
-          this.messages.push({
-            role: 'assistant',
-            content: assistantMessage.content ?? '',
-            tool_calls: assistantMessage.tool_calls,
-            hiddenFromTranscript: true
-          });
-
-          for (const toolCall of assistantMessage.tool_calls) {
-            const toolName = toolCall.function?.name || 'unknown_tool';
-            this.postStatus(`Running tool: ${toolName}`);
-            const toolResult = await this.executeToolCall(toolCall);
-            this.messages.push({
-              role: 'tool',
-              content: toolResult,
-              tool_name: toolName
-            });
-          }
-
-          this.postStateToWebview();
-          continue;
-        }
-
-        this.messages.push({
-          role: 'assistant',
-          content: assistantMessage.content ?? ''
-        });
-        this.postStateToWebview();
-        break;
-      }
+      await this.processOllamaResponse(this.messages);
+      this.postStateToWebview();
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Unknown error';
       this.postStatus(`Request failed: ${message}`);
@@ -317,6 +291,63 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       this.postBusyState(false);
       this.postStateToWebview();
     }
+  }
+
+  private async processOllamaResponse(messages: OllamaMessage[]): Promise<void> {
+    const responseData = await this.callOllama(messages);
+    const assistantMessage = responseData.message;
+
+    if (!assistantMessage) {
+      throw new Error('Ollama returned no message payload.');
+    }
+
+    const resolvedToolCalls = this.agentMode ? this.extractToolCalls(assistantMessage) : [];
+
+    if (resolvedToolCalls.length > 0) {
+      if (!this.autoApprove) {
+        const toolNames = resolvedToolCalls.map(tc => tc.function?.name || 'unknown').join(', ');
+        this.postStatus(`Tool call requested: ${toolNames}. Waiting for approval...`);
+        const choice = await vscode.window.showInformationMessage(
+          `ManulAI wants to call: ${toolNames}`,
+          { modal: false },
+          'Allow',
+          'Deny'
+        );
+        if (choice !== 'Allow') {
+          messages.push({
+            role: 'assistant',
+            content: assistantMessage.content || `[Tool call denied by user: ${toolNames}]`
+          });
+          return;
+        }
+      }
+
+      messages.push({
+        role: 'assistant',
+        content: assistantMessage.content ?? '',
+        tool_calls: resolvedToolCalls,
+        hiddenFromTranscript: true
+      });
+
+      for (const toolCall of resolvedToolCalls) {
+        const toolName = toolCall.function?.name || 'unknown_tool';
+        const toolResult = await this.executeToolCall(toolCall);
+        messages.push({
+          role: 'tool',
+          content: toolResult,
+          tool_name: toolName,
+          hiddenFromTranscript: true
+        });
+      }
+
+      await this.processOllamaResponse(messages);
+      return;
+    }
+
+    messages.push({
+      role: 'assistant',
+      content: assistantMessage.content ?? ''
+    });
   }
 
   private async callOllama(messages: OllamaMessage[]): Promise<OllamaResponse> {
@@ -361,6 +392,143 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     }
 
     return (await response.json()) as OllamaResponse;
+  }
+
+  private extractToolCalls(message: OllamaMessage): ToolFunctionCall[] {
+    if (message.tool_calls?.length) {
+      return message.tool_calls;
+    }
+
+    return this.parseToolCallsFromContent(message.content);
+  }
+
+  private parseToolCallsFromContent(content: string): ToolFunctionCall[] {
+    const trimmed = content.trim();
+    if (!trimmed) {
+      return [];
+    }
+
+    // Direct JSON parse when the whole content looks like JSON
+    if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+      try {
+        const parsed = JSON.parse(trimmed) as unknown;
+        const calls = this.normalizeParsedToolCalls(parsed);
+        if (calls.length > 0) {
+          return calls;
+        }
+      } catch {
+        // Fall through to regex extraction
+      }
+    }
+
+    // Regex fallback: extract JSON from markdown code blocks or <tool_call> tags.
+    // Local LLMs (e.g. Qwen) often wrap tool-call JSON in ```json ... ``` blocks.
+    const knownToolNames = new Set(this.getToolDefinitions().map(t => t.function.name));
+    const candidates: string[] = [];
+
+    const codeBlockPattern = /```(?:json|tool_call|tool)?\s*\n?([\s\S]*?)```/g;
+    const tagPattern = /<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/g;
+
+    let match: RegExpExecArray | null;
+    while ((match = codeBlockPattern.exec(trimmed)) !== null) {
+      const inner = match[1].trim();
+      if (inner.startsWith('{') || inner.startsWith('[')) {
+        candidates.push(inner);
+      }
+    }
+    while ((match = tagPattern.exec(trimmed)) !== null) {
+      const inner = match[1].trim();
+      if (inner.startsWith('{') || inner.startsWith('[')) {
+        candidates.push(inner);
+      }
+    }
+
+    for (const candidate of candidates) {
+      try {
+        const parsed = JSON.parse(candidate) as unknown;
+        const calls = this.normalizeParsedToolCalls(parsed);
+        // Only accept if every parsed name matches a known tool definition
+        if (calls.length > 0 && calls.every(c => knownToolNames.has(c.function.name))) {
+          return calls;
+        }
+      } catch {
+        // Try next candidate
+      }
+    }
+
+    return [];
+  }
+
+  private normalizeParsedToolCalls(rawValue: unknown): ToolFunctionCall[] {
+    if (!rawValue || typeof rawValue !== 'object') {
+      return [];
+    }
+
+    if (Array.isArray(rawValue)) {
+      return rawValue
+        .map(item => this.normalizeSingleParsedToolCall(item))
+        .filter((toolCall): toolCall is ToolFunctionCall => toolCall !== undefined);
+    }
+
+    const record = rawValue as Record<string, unknown>;
+
+    if (Array.isArray(record.tool_calls)) {
+      return record.tool_calls
+        .map(item => this.normalizeSingleParsedToolCall(item))
+        .filter((toolCall): toolCall is ToolFunctionCall => toolCall !== undefined);
+    }
+
+    const singleToolCall = this.normalizeSingleParsedToolCall(record);
+    return singleToolCall ? [singleToolCall] : [];
+  }
+
+  private normalizeSingleParsedToolCall(rawValue: unknown): ToolFunctionCall | undefined {
+    if (!rawValue || typeof rawValue !== 'object') {
+      return undefined;
+    }
+
+    const record = rawValue as Record<string, unknown>;
+    const directName = typeof record.name === 'string' ? record.name.trim() : '';
+    const directArguments = record.arguments;
+    const functionRecord = this.toObjectRecord(record.function);
+    const normalizedArguments = this.normalizeParsedToolArguments(functionRecord?.arguments ?? directArguments);
+
+    const parsedToolCall: ParsedToolCall = {
+      name: typeof functionRecord?.name === 'string' ? functionRecord.name.trim() : directName,
+      arguments: normalizedArguments
+    };
+
+    if (!parsedToolCall.name) {
+      return undefined;
+    }
+
+    return {
+      type: 'function',
+      function: {
+        name: parsedToolCall.name,
+        arguments: parsedToolCall.arguments
+      }
+    };
+  }
+
+  private toObjectRecord(value: unknown): Record<string, unknown> | undefined {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      return undefined;
+    }
+
+    return value as Record<string, unknown>;
+  }
+
+  private normalizeParsedToolArguments(value: unknown): Record<string, unknown> | string | undefined {
+    if (typeof value === 'string') {
+      return value;
+    }
+
+    if (value && typeof value === 'object' && !Array.isArray(value)) {
+      return value as Record<string, unknown>;
+    }
+
+    return undefined;
   }
 
   private getToolDefinitions(): ToolDefinition[] {
@@ -682,6 +850,22 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     );
   }
 
+  private async setAutoApprove(value: boolean | undefined): Promise<void> {
+    this.autoApprove = value !== undefined ? value : !this.autoApprove;
+
+    const target = vscode.workspace.workspaceFolders?.length
+      ? vscode.ConfigurationTarget.Workspace
+      : vscode.ConfigurationTarget.Global;
+
+    await vscode.workspace.getConfiguration('manulai').update('autoApprove', this.autoApprove, target);
+    this.postStateToWebview();
+    this.postStatus(
+      this.autoApprove
+        ? 'Auto-Approve enabled. Tools will execute without asking.'
+        : 'Auto-Approve disabled. You will be asked before each tool execution.'
+    );
+  }
+
   private synchronizeAttachmentContextMessage(): void {
     this.removeAttachmentContextMessages();
 
@@ -778,15 +962,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     }
 
     const renderableMessages: WebviewRenderableMessage[] = this.messages.reduce<WebviewRenderableMessage[]>((result, message) => {
-      if (message.role === 'system' || message.hiddenFromTranscript) {
-        return result;
-      }
-
-      if (message.role === 'tool') {
-        result.push({
-          role: 'tool',
-          content: `${message.tool_name ?? 'tool'}\n${message.content}`
-        });
+      if (message.role === 'system' || message.role === 'tool' || message.hiddenFromTranscript) {
         return result;
       }
 
@@ -803,6 +979,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       currentModel: this.getSelectedModel(),
       availableModels: this.availableModels,
       agentMode: this.agentMode,
+      autoApprove: this.autoApprove,
       attachments: Array.from(this.attachedFiles.values()).map(file => ({
         path: file.uri.fsPath,
         name: file.name

@@ -130,7 +130,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
   context.subscriptions.push(
     vscode.workspace.onDidChangeConfiguration(async event => {
-      if (event.affectsConfiguration('manulai.ollamaBaseUrl') || event.affectsConfiguration('manulai.ollamaModel') || event.affectsConfiguration('manulai.agentMode')) {
+      if (event.affectsConfiguration('manulai.ollamaBaseUrl') || event.affectsConfiguration('manulai.ollamaModel') || event.affectsConfiguration('manulai.agentMode') || event.affectsConfiguration('manulai.autoApprove')) {
         await provider.handleConfigurationChange();
       }
     })

@@ -915,6 +915,11 @@
           <span class="toggle-slider"></span>
           <span id="agentModeLabel" class="toggle-label">Agent Mode</span>
         </label>
+        <label class="toggle-switch" title="Auto-approve tool execution without asking for confirmation">
+          <input type="checkbox" id="autoApproveToggle" />
+          <span class="toggle-slider"></span>
+          <span id="autoApproveLabel" class="toggle-label">Auto-Approve</span>
+        </label>
         <select id="modelSelect" class="model-select" aria-label="Ollama model"></select>
         <button id="refreshModels" class="ghost-button" type="button">Refresh</button>
       </div>
@@ -978,6 +983,8 @@
     const refreshModelsEl = document.getElementById('refreshModels');
     const agentModeToggle = document.getElementById('agentModeToggle');
     const agentModeLabel = document.getElementById('agentModeLabel');
+    const autoApproveToggle = document.getElementById('autoApproveToggle');
+    const autoApproveLabel = document.getElementById('autoApproveLabel');
     const statusPillEl = document.getElementById('statusPill');
 
     let busy = false;
@@ -987,6 +994,7 @@
     let currentModel = '';
     let dragDepth = 0;
     let agentMode = true;
+    let autoApprove = false;
     const seenMessageKeys = new Set();
 
     function roleLabel(role) {
@@ -1159,6 +1167,8 @@
       sendEl.setAttribute('aria-busy', String(busy));
       agentModeToggle.checked = agentMode;
       agentModeLabel.textContent = 'Agent Mode';
+      autoApproveToggle.checked = autoApprove;
+      autoApproveLabel.textContent = 'Auto-Approve';
       updateHeaderState();
       autoResizeTextarea();
       historyEl.scrollTop = historyEl.scrollHeight;
@@ -1317,6 +1327,10 @@
       vscode.postMessage({ command: 'toggleAgentMode', value: agentModeToggle.checked });
     });
 
+    autoApproveToggle.addEventListener('change', () => {
+      vscode.postMessage({ command: 'toggleAutoApprove', value: autoApproveToggle.checked });
+    });
+
     inputEl.addEventListener('keydown', event => {
       if (event.key === 'Enter' && !event.shiftKey) {
         event.preventDefault();
@@ -1380,6 +1394,7 @@
         availableModels = payload.availableModels || [];
         currentModel = payload.currentModel || '';
         agentMode = payload.agentMode !== undefined ? payload.agentMode : agentMode;
+        autoApprove = payload.autoApprove !== undefined ? payload.autoApprove : autoApprove;
         render();
         return;
       }
