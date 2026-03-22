@@ -306,7 +306,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  private async processOllamaResponse(messages: OllamaMessage[]): Promise<void> {
+  private async processOllamaResponse(messages: OllamaMessage[], retryCount = 0): Promise<void> {
     const responseData = await this.callOllama(messages);
     const assistantMessage = responseData.message;
 
@@ -358,14 +358,72 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         });
       }
 
-      await this.processOllamaResponse(messages);
+      await this.processOllamaResponse(messages, 0);
       return;
     }
 
     let finalContent = assistantMessage.content ?? '';
+
     if (this.agentMode) {
-      finalContent = await this.applyInlineFileBlocks(finalContent);
+      // Fallback: detect code blocks with filepath hints and apply them as file writes
+      const codeBlockWrites = this.extractCodeBlockFileWrites(finalContent);
+      if (codeBlockWrites.length > 0) {
+        if (!this.autoApprove) {
+          const fileNames = codeBlockWrites.map(w => w.filepath).join(', ');
+          this.postStatus(`Detected file write in response: ${fileNames}. Waiting for approval...`);
+          const choice = await vscode.window.showInformationMessage(
+            `ManulAI wants to write: ${fileNames}`,
+            { modal: false },
+            'Allow',
+            'Deny'
+          );
+          if (choice !== 'Allow') {
+            messages.push({ role: 'assistant', content: `[File write denied by user: ${fileNames}]` });
+            return;
+          }
+        }
+
+        const appliedSummaries: string[] = [];
+        for (const block of codeBlockWrites) {
+          const result = await this.createOrEditFile(block.filepath, block.fileContent);
+          const parsed = JSON.parse(result) as Record<string, unknown>;
+          if (parsed.error) {
+            appliedSummaries.push(`Failed to write ${block.filepath}: ${String(parsed.error)}`);
+          } else {
+            appliedSummaries.push(`Wrote ${block.filepath} (${String(parsed.bytesWritten)} bytes)`);
+          }
+          finalContent = finalContent.replace(block.fullMatch, '');
+        }
+        finalContent = appliedSummaries.join('\n') + (finalContent.trim() ? '\n\n' + finalContent.trim() : '');
+      } else {
+        // Apply legacy [FILE:] blocks
+        finalContent = await this.applyInlineFileBlocks(finalContent);
+      }
+
+      // If model pasted code but didn't use tools, nudge it once to use tools
+      const hasLargeCodeBlocks = /```[\w]*\n[\s\S]{500,}?```/.test(finalContent);
+      if (hasLargeCodeBlocks && codeBlockWrites.length === 0 && retryCount < 1) {
+        messages.push({
+          role: 'assistant',
+          content: finalContent,
+          hiddenFromTranscript: true
+        });
+        messages.push({
+          role: 'user',
+          content: 'You pasted code in chat instead of using a tool. Do NOT paste code. ' +
+            'Call `replace_in_file` to edit an existing file or `write_to_file` to create/overwrite a file. ' +
+            'Try again now — use a tool call.',
+          hiddenFromTranscript: true
+        });
+        this.postStatus('Model did not use tools — retrying with nudge...');
+        await this.processOllamaResponse(messages, retryCount + 1);
+        return;
+      }
+
+      // Truncate any remaining large code blocks so we don't flood the chat
+      finalContent = this.truncateLargeCodeBlocks(finalContent);
     }
+
     messages.push({
       role: 'assistant',
       content: finalContent
@@ -384,14 +442,15 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       const workspaceInstructions = await this.getWorkspaceInstructions();
 
       let agentMandate = 'You are an autonomous VS Code Agent with direct file-system access through tools.\n' +
-        'CRITICAL RULES — follow strictly:\n' +
-        '1. To EDIT an existing file — call `replace_in_file` with the exact old text and the new text. ' +
-        'This is preferred for any change that touches only part of a file.\n' +
-        '2. To CREATE a new file or fully rewrite one — call `write_to_file` with complete content.\n' +
-        '3. NEVER paste file content into your chat response. NEVER use [FILE:] blocks. Only tool calls write to disk.\n' +
-        '4. NEVER print an entire file in chat. After a tool call, confirm ONLY what you changed in 1-3 short sentences. ' +
-        'Show at most the changed lines, not the whole file.\n' +
-        '5. You may use chat text for explanations, questions, or reasoning — but keep it concise.';
+        'ABSOLUTE RULES — you MUST follow these without exception:\n' +
+        '1. To EDIT an existing file — ALWAYS call the `replace_in_file` tool with `old_text` (the exact existing text) and `new_text` (the replacement). ' +
+        'Include 2-3 lines of surrounding context in `old_text` so it matches uniquely. This is the PREFERRED tool for any partial change.\n' +
+        '2. To CREATE a new file or fully rewrite one — call the `write_to_file` tool.\n' +
+        '3. NEVER output code in your chat message. NEVER paste file content in chat. NEVER use markdown code blocks to show file content. ' +
+        'ONLY tool calls can modify files. If you want to change a file, you MUST use a tool call.\n' +
+        '4. After a tool call, respond with a 1-3 sentence summary of what you changed. Do NOT show the file or the changed code in chat.\n' +
+        '5. If you need to read a file first, call `read_specific_file` or `read_active_file`.\n' +
+        '6. IMPORTANT: Do NOT explain what code you would write. Just call the tool and write it directly.';
 
       if (workspaceInstructions) {
         agentMandate += '\n\n<workspace_instructions>\n' + workspaceInstructions + '\n</workspace_instructions>';
@@ -706,6 +765,46 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         }
       }
     ];
+  }
+
+  private extractCodeBlockFileWrites(content: string): Array<{ fullMatch: string; filepath: string; fileContent: string }> {
+    const blocks: Array<{ fullMatch: string; filepath: string; fileContent: string }> = [];
+    // Match: ```lang:filepath or ```lang filepath
+    // Also: ```lang\n// filepath  or ```lang\n# filepath
+    const pattern = /```(\w+)[:\s]+([^\n`]+)\n([\s\S]*?)```/g;
+    let match: RegExpExecArray | null;
+    while ((match = pattern.exec(content)) !== null) {
+      const filepath = match[2].trim();
+      const fileContent = match[3];
+      if (filepath && fileContent && !filepath.includes(' ') && (filepath.includes('/') || filepath.includes('.'))) {
+        blocks.push({ fullMatch: match[0], filepath, fileContent });
+      }
+    }
+
+    // Match: ```lang\n// filepath: path/to/file\n...
+    const commentPathPattern = /```(\w+)\s*\n\s*(?:\/\/|#|--|\/\*)\s*(?:filepath|file|path):\s*([^\n]+)\n([\s\S]*?)```/gi;
+    while ((match = commentPathPattern.exec(content)) !== null) {
+      const filepath = match[2].trim();
+      const fileContent = match[3];
+      if (filepath && fileContent && !blocks.some(b => b.filepath === filepath)) {
+        blocks.push({ fullMatch: match[0], filepath, fileContent });
+      }
+    }
+
+    return blocks;
+  }
+
+  private truncateLargeCodeBlocks(content: string): string {
+    return content.replace(/```(\w*)\n([\s\S]*?)```/g, (_fullMatch, lang: string, code: string) => {
+      const lines = code.split('\n');
+      if (lines.length <= 15) {
+        return _fullMatch;
+      }
+      const head = lines.slice(0, 6).join('\n');
+      const tail = lines.slice(-4).join('\n');
+      const omitted = lines.length - 10;
+      return '```' + lang + '\n' + head + '\n// ... ' + String(omitted) + ' lines omitted ...\n' + tail + '\n```';
+    });
   }
 
   private extractInlineFileBlocks(content: string): Array<{ fullMatch: string; filepath: string; fileContent: string }> {
