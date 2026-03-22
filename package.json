@@ -1,0 +1,88 @@
+{
+  "name": "manulai-local-agent",
+  "displayName": "ManulAI Local Agent",
+  "description": "Privacy-first local AI coding agent for VS Code powered entirely by Ollama.",
+  "version": "0.0.0.1",
+  "publisher": "manulai",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://example.com/manulai-local-agent.git"
+  },
+  "engines": {
+    "vscode": "^1.112.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onView:manulai.chatView",
+    "onCommand:manulai.openChat"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "manulai.openChat",
+        "title": "ManulAI: Focus Chat",
+        "category": "ManulAI",
+        "icon": "$(comment-discussion)"
+      }
+    ],
+    "viewsContainers": {
+      "secondarySidebar": [
+        {
+          "id": "manulai",
+          "title": "ManulAI",
+          "icon": "media/manulai-icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "manulai": [
+        {
+          "type": "webview",
+          "id": "manulai.chatView",
+          "name": "ManulAI Chat",
+          "contextualTitle": "ManulAI Chat",
+          "icon": "media/manulai-icon.svg"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "ManulAI",
+      "properties": {
+        "manulai.ollamaModel": {
+          "type": "string",
+          "default": "llama3.2",
+          "description": "Local Ollama model used for chat and tool calling."
+        },
+        "manulai.ollamaBaseUrl": {
+          "type": "string",
+          "default": "http://localhost:11434",
+          "description": "Base URL for the local Ollama server."
+        },
+        "manulai.systemPrompt": {
+          "type": "string",
+          "default": "You are ManulAI, a privacy-first local coding agent running inside VS Code. Work across any programming language. Use tools when needed to inspect files, edit files, and run commands. Prefer precise, minimal changes and explain results clearly.",
+          "description": "System prompt prepended to every Ollama chat request.",
+          "editPresentation": "multilineText"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "lint": "eslint src --ext ts"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.10",
+    "@types/vscode": "^1.110.0",
+    "@typescript-eslint/eslint-plugin": "^8.27.0",
+    "@typescript-eslint/parser": "^8.27.0",
+    "eslint": "^9.22.0",
+    "typescript": "^5.8.2"
+  }
+}

@@ -1,0 +1,388 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta
+    http-equiv="Content-Security-Policy"
+    content="default-src 'none'; img-src {{cspSource}} https: data:; style-src 'unsafe-inline'; script-src 'nonce-{{nonce}}';"
+  />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ManulAI Chat</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: var(--vscode-sideBar-background);
+      --panel: color-mix(in srgb, var(--vscode-editor-background) 88%, transparent);
+      --panel-strong: color-mix(in srgb, var(--vscode-input-background) 90%, transparent);
+      --border: var(--vscode-panel-border);
+      --text: var(--vscode-foreground);
+      --muted: var(--vscode-descriptionForeground);
+      --accent: var(--vscode-focusBorder);
+      --user: color-mix(in srgb, var(--vscode-textLink-foreground) 18%, var(--vscode-editor-background));
+      --assistant: color-mix(in srgb, var(--vscode-button-background) 10%, var(--vscode-editor-background));
+      --tool: color-mix(in srgb, var(--vscode-terminal-ansiGreen) 10%, var(--vscode-editor-background));
+      --status: color-mix(in srgb, var(--vscode-terminal-ansiYellow) 14%, var(--vscode-editor-background));
+      --danger: var(--vscode-errorForeground);
+      font-family: var(--vscode-font-family);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      grid-template-rows: auto auto 1fr auto;
+      background:
+        radial-gradient(circle at top right, color-mix(in srgb, var(--accent) 18%, transparent), transparent 32%),
+        linear-gradient(180deg, color-mix(in srgb, var(--bg) 92%, black 8%), var(--bg));
+      color: var(--text);
+    }
+
+    .header {
+      padding: 14px 14px 10px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .title {
+      font-size: 13px;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      margin: 0 0 4px;
+    }
+
+    .subtitle {
+      margin: 0;
+      font-size: 12px;
+      color: var(--muted);
+    }
+
+    .dropzone {
+      margin: 12px 14px 0;
+      padding: 12px;
+      border: 1px dashed color-mix(in srgb, var(--accent) 55%, var(--border));
+      border-radius: 12px;
+      background: color-mix(in srgb, var(--panel) 78%, transparent);
+      color: var(--muted);
+      font-size: 12px;
+      transition: border-color 120ms ease, background 120ms ease, transform 120ms ease;
+    }
+
+    .dropzone.active {
+      border-color: var(--accent);
+      background: color-mix(in srgb, var(--accent) 10%, var(--panel));
+      color: var(--text);
+      transform: translateY(-1px);
+    }
+
+    .chips {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      padding: 10px 14px 0;
+    }
+
+    .chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 10px;
+      border-radius: 999px;
+      background: var(--panel-strong);
+      border: 1px solid var(--border);
+      font-size: 12px;
+    }
+
+    .chip button {
+      border: 0;
+      background: transparent;
+      color: var(--muted);
+      cursor: pointer;
+      padding: 0;
+      line-height: 1;
+      font-size: 14px;
+    }
+
+    .history {
+      overflow-y: auto;
+      padding: 12px 14px 18px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+
+    .empty {
+      margin: auto 0;
+      padding: 18px;
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      background: color-mix(in srgb, var(--panel) 88%, transparent);
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.5;
+    }
+
+    .message {
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 10px 12px;
+      line-height: 1.5;
+      font-size: 12px;
+      white-space: pre-wrap;
+      word-break: break-word;
+      box-shadow: 0 12px 24px rgba(0, 0, 0, 0.08);
+    }
+
+    .message.user {
+      background: var(--user);
+      align-self: flex-end;
+      max-width: 92%;
+    }
+
+    .message.assistant {
+      background: var(--assistant);
+    }
+
+    .message.tool {
+      background: var(--tool);
+      font-family: var(--vscode-editor-font-family);
+      font-size: 11px;
+    }
+
+    .message.status {
+      background: var(--status);
+      color: var(--muted);
+      border-style: dashed;
+    }
+
+    .composer {
+      border-top: 1px solid var(--border);
+      padding: 12px 14px 14px;
+      background: color-mix(in srgb, var(--bg) 86%, transparent);
+    }
+
+    .composer-row {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 10px;
+    }
+
+    textarea {
+      width: 100%;
+      resize: vertical;
+      min-height: 76px;
+      max-height: 220px;
+      border-radius: 12px;
+      border: 1px solid var(--border);
+      background: var(--panel-strong);
+      color: var(--text);
+      padding: 10px 12px;
+      outline: none;
+      font: inherit;
+    }
+
+    textarea:focus {
+      border-color: var(--accent);
+    }
+
+    button.send {
+      align-self: end;
+      border: 0;
+      border-radius: 12px;
+      padding: 10px 14px;
+      background: var(--vscode-button-background);
+      color: var(--vscode-button-foreground);
+      cursor: pointer;
+      font: inherit;
+      min-width: 74px;
+    }
+
+    button.send[disabled] {
+      opacity: 0.5;
+      cursor: default;
+    }
+  </style>
+</head>
+<body>
+  <header class="header">
+    <p class="title">ManulAI Chat</p>
+    <p class="subtitle">Local-first coding agent in the right sidebar. Drop files to attach context.</p>
+  </header>
+
+  <section id="dropzone" class="dropzone">
+    Drop files from Explorer or your desktop here to attach them as chat context.
+  </section>
+
+  <section id="chips" class="chips"></section>
+
+  <main id="history" class="history">
+    <div class="empty">Ask a coding question, drop files for context, or let the model call tools to inspect and modify the workspace.</div>
+  </main>
+
+  <footer class="composer">
+    <div class="composer-row">
+      <textarea id="input" placeholder="Ask ManulAI to inspect, change, or explain code..."></textarea>
+      <button id="send" class="send">Send</button>
+    </div>
+  </footer>
+
+  <script nonce="{{nonce}}">
+    const vscode = acquireVsCodeApi();
+    const historyEl = document.getElementById('history');
+    const chipsEl = document.getElementById('chips');
+    const inputEl = document.getElementById('input');
+    const sendEl = document.getElementById('send');
+    const dropzoneEl = document.getElementById('dropzone');
+
+    let busy = false;
+    let messages = [];
+    let attachments = [];
+
+    function render() {
+      historyEl.innerHTML = '';
+
+      if (messages.length === 0) {
+        const empty = document.createElement('div');
+        empty.className = 'empty';
+        empty.textContent = 'Ask a coding question, drop files for context, or let the model call tools to inspect and modify the workspace.';
+        historyEl.appendChild(empty);
+      } else {
+        for (const message of messages) {
+          const element = document.createElement('div');
+          element.className = `message ${message.role}`;
+          element.textContent = message.content;
+          historyEl.appendChild(element);
+        }
+      }
+
+      chipsEl.innerHTML = '';
+      for (const attachment of attachments) {
+        const chip = document.createElement('div');
+        chip.className = 'chip';
+        chip.title = attachment.path;
+
+        const label = document.createElement('span');
+        label.textContent = attachment.name;
+
+        const remove = document.createElement('button');
+        remove.type = 'button';
+        remove.textContent = '×';
+        remove.addEventListener('click', () => {
+          vscode.postMessage({ command: 'removeFileContext', path: attachment.path });
+        });
+
+        chip.append(label, remove);
+        chipsEl.appendChild(chip);
+      }
+
+      sendEl.disabled = busy;
+      historyEl.scrollTop = historyEl.scrollHeight;
+    }
+
+    function appendStatus(text) {
+      messages = [...messages, { role: 'status', content: text }];
+      render();
+    }
+
+    function extractDroppedPath(event) {
+      const transfer = event.dataTransfer;
+      if (!transfer) {
+        return '';
+      }
+
+      const uriList = transfer.getData('text/uri-list');
+      if (uriList) {
+        return uriList.split(/\r?\n/).find(line => line && !line.startsWith('#')) || '';
+      }
+
+      const vscodeUri = transfer.getData('application/vnd.code.uri-list');
+      if (vscodeUri) {
+        return vscodeUri.split(/\r?\n/).find(line => line && !line.startsWith('#')) || '';
+      }
+
+      const plain = transfer.getData('text/plain');
+      if (plain.startsWith('file:') || plain.startsWith('/')) {
+        return plain;
+      }
+
+      return '';
+    }
+
+    function submitMessage() {
+      const text = inputEl.value.trim();
+      if (!text || busy) {
+        return;
+      }
+
+      inputEl.value = '';
+      vscode.postMessage({ command: 'sendMessage', text });
+    }
+
+    sendEl.addEventListener('click', submitMessage);
+
+    inputEl.addEventListener('keydown', event => {
+      if (event.key === 'Enter' && !event.shiftKey) {
+        event.preventDefault();
+        submitMessage();
+      }
+    });
+
+    ['dragenter', 'dragover'].forEach(type => {
+      dropzoneEl.addEventListener(type, event => {
+        event.preventDefault();
+        dropzoneEl.classList.add('active');
+      });
+    });
+
+    ['dragleave', 'dragend'].forEach(type => {
+      dropzoneEl.addEventListener(type, () => {
+        dropzoneEl.classList.remove('active');
+      });
+    });
+
+    dropzoneEl.addEventListener('drop', event => {
+      event.preventDefault();
+      dropzoneEl.classList.remove('active');
+      const droppedPath = extractDroppedPath(event);
+      if (!droppedPath) {
+        appendStatus('Drop did not contain a readable file URI.');
+        return;
+      }
+
+      vscode.postMessage({ command: 'addFileContext', path: droppedPath });
+    });
+
+    window.addEventListener('message', event => {
+      const payload = event.data;
+
+      if (payload.command === 'state') {
+        messages = payload.messages;
+        attachments = payload.attachments;
+        render();
+        return;
+      }
+
+      if (payload.command === 'status') {
+        appendStatus(payload.message);
+        return;
+      }
+
+      if (payload.command === 'toolResult') {
+        messages = [...messages, { role: 'tool', content: `${payload.toolName}\n${payload.result}` }];
+        render();
+        return;
+      }
+
+      if (payload.command === 'busy') {
+        busy = Boolean(payload.busy);
+        render();
+      }
+    });
+
+    vscode.postMessage({ command: 'ready' });
+  </script>
+</body>
+</html>
