@@ -412,9 +412,12 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
 
       // --- Fallback layer 3: detect described replacements (old → new code blocks) ---
       const describedReplacements = this.extractDescribedReplacements(finalContent);
-      if (describedReplacements.length > 0 && this.attachedFiles.size > 0) {
-        // Resolve filepath from attached files
-        const targetFile = this.findAttachedFileForReplacements(describedReplacements);
+      if (describedReplacements.length > 0) {
+        // Resolve filepath: first from attached files, then from file name mentioned in response
+        let targetFile = this.findAttachedFileForReplacements(describedReplacements);
+        if (!targetFile) {
+          targetFile = await this.findMentionedFileForReplacements(finalContent, describedReplacements);
+        }
         if (targetFile) {
           const names = [path.basename(targetFile)];
           const writeApproved = await this.approveFileWrite([targetFile]);
@@ -591,13 +594,17 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   private extractDescribedReplacements(content: string): Array<{ oldText: string; newText: string }> {
     const replacements: Array<{ oldText: string; newText: string }> = [];
 
+    // Normalize all quote variants to straight ASCII quotes for reliable matching
+    const normalized = content
+      .replace(/[\u201C\u201D\u201E\u201F\u2033\u2036]/g, '"')  // smart double quotes → "
+      .replace(/[\u2018\u2019\u201A\u201B\u2032\u2035]/g, "'")  // smart single quotes → '
+      .replace(/[«»]/g, '"');                                     // guillemets → "
+
     // Pattern 1: markdown code blocks with old → new separated by "На:" / "To:" / "→"
-    // Matches:
-    //   ```\nCopyright 2026 Jane\n```\n На:\n ```\nCopyright 2026 John\n```
     const codeBlockPairPattern =
       /```[^\n]*\n([\s\S]*?)```\s*(?:\n\s*)?(?:На|на|To|to|→|->|replaced with|замінено на|changed to)[:\s]*\s*```[^\n]*\n([\s\S]*?)```/gi;
     let match: RegExpExecArray | null;
-    while ((match = codeBlockPairPattern.exec(content)) !== null) {
+    while ((match = codeBlockPairPattern.exec(normalized)) !== null) {
       const oldText = match[1].trim();
       const newText = match[2].trim();
       if (oldText && newText && oldText !== newText) {
@@ -609,11 +616,40 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       return replacements;
     }
 
-    // Pattern 2: numbered list with "Змінено ... На:" pairs (inline)
-    //   Змінено ім'я: `old_value` → `new_value`  OR  `old_value` На: `new_value`
+    // Pattern 2: inline quoted pairs — "old_value" на "new_value"
     const inlinePattern =
-      /[`"«]([^`"»\n]+)[`"»]\s*(?:→|->|на|to|replaced with|changed to)[:\s]*\s*[`"«]([^`"»\n]+)[`"»]/gi;
-    while ((match = inlinePattern.exec(content)) !== null) {
+      /["'`]([^"'`\n]+)["'`]\s*(?:→|->|на|to|replaced with|changed to|замінено на)[:\s]*\s*["'`]([^"'`\n]+)["'`]/gi;
+    while ((match = inlinePattern.exec(normalized)) !== null) {
+      const oldText = match[1].trim();
+      const newText = match[2].trim();
+      if (oldText && newText && oldText !== newText) {
+        replacements.push({ oldText, newText });
+      }
+    }
+
+    if (replacements.length > 0) {
+      return replacements;
+    }
+
+    // Pattern 3: "з X на Y" pattern common in Ukrainian — з "old" на "new"
+    const zNaPattern =
+      /(?:з|from)\s+["'`]([^"'`\n]+)["'`]\s+(?:на|to)\s+["'`]([^"'`\n]+)["'`]/gi;
+    while ((match = zNaPattern.exec(normalized)) !== null) {
+      const oldText = match[1].trim();
+      const newText = match[2].trim();
+      if (oldText && newText && oldText !== newText) {
+        replacements.push({ oldText, newText });
+      }
+    }
+
+    if (replacements.length > 0) {
+      return replacements;
+    }
+
+    // Pattern 4: "Заміна назви X на Y" / "Замінити X на Y"
+    const zaminaPattern =
+      /(?:замін\w*|replac\w*|updat\w*|оновл\w*)\s+(?:\w+\s+)?["'`]([^"'`\n]+)["'`]\s+(?:на|to|with)\s+["'`]([^"'`\n]+)["'`]/gi;
+    while ((match = zaminaPattern.exec(normalized)) !== null) {
       const oldText = match[1].trim();
       const newText = match[2].trim();
       if (oldText && newText && oldText !== newText) {
@@ -637,6 +673,46 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       const anyFound = replacements.some(rep => file.content.includes(rep.oldText));
       if (anyFound) {
         return fsPath;
+      }
+    }
+    return undefined;
+  }
+
+  private async findMentionedFileForReplacements(
+    content: string,
+    replacements: Array<{ oldText: string }>
+  ): Promise<string | undefined> {
+    // Try to find a file name mentioned in the response, then verify old_text exists there
+    const normalized = content
+      .replace(/[\u201C\u201D\u201E\u201F\u2033\u2036]/g, '"')
+      .replace(/[\u2018\u2019\u201A\u201B\u2032\u2035]/g, "'");
+
+    // Look for file name patterns: "файлі LICENSE", "file LICENSE.md", "in README.md" etc.
+    const fileNamePattern = /(?:файл[іиеа]?|file|in)\s+["'`]?(\S+\.[\w]+)["'`]?/gi;
+    const candidates: string[] = [];
+    let match: RegExpExecArray | null;
+    while ((match = fileNamePattern.exec(normalized)) !== null) {
+      candidates.push(match[1]);
+    }
+    // Also try bare filenames like LICENSE, README etc.
+    const bareNamePattern = /\b(LICENSE|README|CHANGELOG|Makefile|Dockerfile|package\.json|tsconfig\.json)\b/g;
+    while ((match = bareNamePattern.exec(content)) !== null) {
+      if (!candidates.includes(match[1])) {
+        candidates.push(match[1]);
+      }
+    }
+
+    for (const candidate of candidates) {
+      try {
+        const uri = this.resolveWorkspaceUri(candidate);
+        const bytes = await vscode.workspace.fs.readFile(uri);
+        const fileContent = Buffer.from(bytes).toString('utf8');
+        const anyFound = replacements.some(rep => fileContent.includes(rep.oldText));
+        if (anyFound) {
+          return uri.fsPath;
+        }
+      } catch {
+        // File not found — try next candidate
       }
     }
     return undefined;
