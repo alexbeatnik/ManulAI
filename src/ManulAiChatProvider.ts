@@ -424,10 +424,21 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       // --- Fallback layer 4: detect described replacements (old → new code blocks) ---
       const describedReplacements = this.extractDescribedReplacements(finalContent);
       if (describedReplacements.length > 0) {
-        // Resolve filepath: first from attached files, then from file name mentioned in response
+        // Resolve filepath: attached files → mentioned file name → active editor
         let targetFile = this.findAttachedFileForReplacements(describedReplacements);
         if (!targetFile) {
           targetFile = await this.findMentionedFileForReplacements(finalContent, describedReplacements);
+        }
+        if (!targetFile) {
+          // Last resort: check the currently active editor
+          const activeDoc = vscode.window.activeTextEditor?.document;
+          if (activeDoc && !activeDoc.isUntitled) {
+            const activeContent = activeDoc.getText();
+            const anyMatch = describedReplacements.some(rep => activeContent.includes(rep.oldText));
+            if (anyMatch) {
+              targetFile = activeDoc.uri.fsPath;
+            }
+          }
         }
         if (targetFile) {
           const names = [path.basename(targetFile)];
@@ -623,9 +634,9 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       return replacements;
     }
 
-    // Pattern 2: inline quoted pairs — "old_value" на "new_value"
+    // Pattern 2: inline quoted pairs — "old_value" на "new_value" / "old" has been replaced with "new"
     const inlinePattern =
-      /["'`]([^"'`\n]+)["'`]\s*(?:→|->|на|to|replaced with|changed to|замінено на)[:\s]*\s*["'`]([^"'`\n]+)["'`]/gi;
+      /["'`]([^"'`\n]+)["'`]\s*(?:has been\s+|was\s+|було\s+)?(?:→|->|на|to|replaced with|changed to|замінено на)[:\s]*\s*["'`]([^"'`\n]+)["'`]/gi;
     while ((match = inlinePattern.exec(normalized)) !== null) {
       const oldText = match[1].trim();
       const newText = match[2].trim();
@@ -657,6 +668,21 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     const zaminaPattern =
       /(?:замін\w*|replac\w*|updat\w*|оновл\w*)\s+(?:\w+\s+)?["'`]([^"'`\n]+)["'`]\s+(?:на|to|with)\s+["'`]([^"'`\n]+)["'`]/gi;
     while ((match = zaminaPattern.exec(normalized)) !== null) {
+      const oldText = match[1].trim();
+      const newText = match[2].trim();
+      if (oldText && newText && oldText !== newText) {
+        replacements.push({ oldText, newText });
+      }
+    }
+
+    if (replacements.length > 0) {
+      return replacements;
+    }
+
+    // Pattern 5: reversed order — replaced "old" with "new" / замінено "old" на "new"
+    const reversedPattern =
+      /(?:replaced|замінено|змінено|замінив|заміна|changed|updated|оновлено)\s+(?:the\s+)?(?:name\s+|value\s+|text\s+)?["'`]([^"'`\n]+)["'`]\s+(?:with|to|на|->|→)\s+["'`]([^"'`\n]+)["'`]/gi;
+    while ((match = reversedPattern.exec(normalized)) !== null) {
       const oldText = match[1].trim();
       const newText = match[2].trim();
       if (oldText && newText && oldText !== newText) {
