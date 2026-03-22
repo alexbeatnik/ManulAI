@@ -364,15 +364,23 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     const requestMessages: OllamaMessage[] = [];
 
     if (this.agentMode) {
+      const workspaceInstructions = await this.getWorkspaceInstructions();
+
+      let agentMandate = 'You are ManulAI, an autonomous coding Agent operating directly inside VS Code. ' +
+        'You have access to tools to interact with the file system. ' +
+        'CRITICAL INSTRUCTION: When a user asks you to modify, update, rewrite, or create a file, ' +
+        'YOU MUST NOT simply output the modified code in the chat. ' +
+        'YOU MUST actively use the provided tools (e.g., `write_to_file`) to apply the changes directly ' +
+        'to the user\u0027s workspace. Your chat responses should only be used to briefly explain what you changed ' +
+        'AFTER the tool has successfully executed.';
+
+      if (workspaceInstructions) {
+        agentMandate += '\n\n<workspace_instructions>\n' + workspaceInstructions + '\n</workspace_instructions>';
+      }
+
       requestMessages.push({
         role: 'system',
-        content: 'You are ManulAI, an autonomous coding Agent operating directly inside VS Code. ' +
-          'You have access to tools to interact with the file system. ' +
-          'CRITICAL INSTRUCTION: When a user asks you to modify, update, rewrite, or create a file, ' +
-          'YOU MUST NOT simply output the modified code in the chat. ' +
-          'YOU MUST actively use the provided tools (e.g., `write_to_file`) to apply the changes directly ' +
-          'to the user\u0027s workspace. Your chat responses should only be used to briefly explain what you changed ' +
-          'AFTER the tool has successfully executed.',
+        content: agentMandate,
         hiddenFromTranscript: true
       });
     }
@@ -983,6 +991,35 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     }
 
     return value;
+  }
+
+  private async getWorkspaceInstructions(): Promise<string> {
+    const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri;
+    if (!workspaceRoot) {
+      return '';
+    }
+
+    const candidates = [
+      '.manul-instructions',
+      '.cursorrules',
+      '.github/copilot-instructions.md',
+      '.copilot-instructions'
+    ];
+
+    for (const candidate of candidates) {
+      try {
+        const uri = vscode.Uri.joinPath(workspaceRoot, candidate);
+        const bytes = await vscode.workspace.fs.readFile(uri);
+        const content = Buffer.from(bytes).toString('utf8').trim();
+        if (content) {
+          return content;
+        }
+      } catch {
+        // File does not exist or is unreadable — try next candidate.
+      }
+    }
+
+    return '';
   }
 
   private resolveWorkspaceUri(targetPath: string): vscode.Uri {
