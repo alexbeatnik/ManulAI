@@ -111,7 +111,7 @@
         "manulai.agentMode": {
           "type": "boolean",
           "default": true,
-          "description": "When enabled, all tool calls from the model are auto-confirmed. When disabled, each tool call requires manual approval."
+          "description": "When enabled, ManulAI exposes local tools to Ollama and runs the native agent loop automatically. When disabled, requests run as plain chat without tool calling."
         },
         "manulai.systemPrompt": {
           "type": "string",

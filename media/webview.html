@@ -816,7 +816,7 @@
       color: var(--muted);
     }
 
-    /* ── Auto-approve toggle switch ── */
+    /* ── Agent Mode toggle switch ── */
     .toggle-switch {
       display: inline-flex;
       align-items: center;
@@ -910,10 +910,10 @@
     <div class="topbar">
       <div id="dropzone" class="drop-inline" role="button" tabindex="0">Drop files here or click to browse.</div>
       <div class="controls">
-        <label class="toggle-switch" title="Auto-approve tool executions without confirmation">
-          <input type="checkbox" id="autoApproveToggle" />
+        <label class="toggle-switch" title="Enable Agent Mode so Ollama can call local tools automatically">
+          <input type="checkbox" id="agentModeToggle" />
           <span class="toggle-slider"></span>
-          <span id="autoApproveLabel" class="toggle-label">Auto-approve</span>
+          <span id="agentModeLabel" class="toggle-label">Agent Mode</span>
         </label>
         <select id="modelSelect" class="model-select" aria-label="Ollama model"></select>
         <button id="refreshModels" class="ghost-button" type="button">Refresh</button>
@@ -976,8 +976,8 @@
     const composerShellEl = document.getElementById('composerShell');
     const modelSelectEl = document.getElementById('modelSelect');
     const refreshModelsEl = document.getElementById('refreshModels');
-    const autoApproveToggle = document.getElementById('autoApproveToggle');
-    const autoApproveLabel = document.getElementById('autoApproveLabel');
+    const agentModeToggle = document.getElementById('agentModeToggle');
+    const agentModeLabel = document.getElementById('agentModeLabel');
     const statusPillEl = document.getElementById('statusPill');
 
     let busy = false;
@@ -1157,8 +1157,8 @@
       modelSelectEl.disabled = busy;
       refreshModelsEl.disabled = busy;
       sendEl.setAttribute('aria-busy', String(busy));
-      autoApproveToggle.checked = agentMode;
-      autoApproveLabel.textContent = agentMode ? 'Auto-approve' : 'Manual';
+      agentModeToggle.checked = agentMode;
+      agentModeLabel.textContent = 'Agent Mode';
       updateHeaderState();
       autoResizeTextarea();
       historyEl.scrollTop = historyEl.scrollHeight;
@@ -1313,8 +1313,8 @@
       vscode.postMessage({ command: 'refreshModels' });
     });
 
-    autoApproveToggle.addEventListener('change', () => {
-      vscode.postMessage({ command: 'toggleAutoApprove', value: autoApproveToggle.checked });
+    agentModeToggle.addEventListener('change', () => {
+      vscode.postMessage({ command: 'toggleAgentMode', value: agentModeToggle.checked });
     });
 
     inputEl.addEventListener('keydown', event => {
