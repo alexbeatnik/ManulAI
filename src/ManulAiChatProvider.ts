@@ -365,22 +365,33 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     let finalContent = assistantMessage.content ?? '';
 
     if (this.agentMode) {
-      // Fallback: detect code blocks with filepath hints and apply them as file writes
+      // --- Fallback layer 1: detect [Begin of FILE]...[End of FILE] markers ---
+      const markerWrite = this.extractMarkerFileWrite(finalContent);
+      if (markerWrite) {
+        const writeApproved = await this.approveFileWrite([markerWrite.filepath]);
+        if (!writeApproved) {
+          messages.push({ role: 'assistant', content: `[File write denied by user: ${markerWrite.filepath}]` });
+          return;
+        }
+        const result = await this.createOrEditFile(markerWrite.filepath, markerWrite.fileContent);
+        const parsed = JSON.parse(result) as Record<string, unknown>;
+        const summary = parsed.error
+          ? `Failed to write ${markerWrite.filepath}: ${String(parsed.error)}`
+          : `Wrote ${markerWrite.filepath} (${String(parsed.bytesWritten)} bytes)`;
+        const remaining = finalContent.replace(markerWrite.fullMatch, '').trim();
+        finalContent = summary + (remaining ? '\n\n' + this.truncateLongResponse(remaining) : '');
+        messages.push({ role: 'assistant', content: finalContent });
+        return;
+      }
+
+      // --- Fallback layer 2: detect code blocks with filepath hints ---
       const codeBlockWrites = this.extractCodeBlockFileWrites(finalContent);
       if (codeBlockWrites.length > 0) {
-        if (!this.autoApprove) {
-          const fileNames = codeBlockWrites.map(w => w.filepath).join(', ');
-          this.postStatus(`Detected file write in response: ${fileNames}. Waiting for approval...`);
-          const choice = await vscode.window.showInformationMessage(
-            `ManulAI wants to write: ${fileNames}`,
-            { modal: false },
-            'Allow',
-            'Deny'
-          );
-          if (choice !== 'Allow') {
-            messages.push({ role: 'assistant', content: `[File write denied by user: ${fileNames}]` });
-            return;
-          }
+        const fileNames = codeBlockWrites.map(w => w.filepath);
+        const writeApproved = await this.approveFileWrite(fileNames);
+        if (!writeApproved) {
+          messages.push({ role: 'assistant', content: `[File write denied by user: ${fileNames.join(', ')}]` });
+          return;
         }
 
         const appliedSummaries: string[] = [];
@@ -394,15 +405,35 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           }
           finalContent = finalContent.replace(block.fullMatch, '');
         }
-        finalContent = appliedSummaries.join('\n') + (finalContent.trim() ? '\n\n' + finalContent.trim() : '');
-      } else {
-        // Apply legacy [FILE:] blocks
-        finalContent = await this.applyInlineFileBlocks(finalContent);
+        finalContent = appliedSummaries.join('\n') + (finalContent.trim() ? '\n\n' + this.truncateLongResponse(finalContent.trim()) : '');
+        messages.push({ role: 'assistant', content: finalContent });
+        return;
       }
 
-      // If model pasted code but didn't use tools, nudge it once to use tools
+      // --- Fallback layer 3: apply legacy [FILE:] blocks ---
+      finalContent = await this.applyInlineFileBlocks(finalContent);
+
+      // --- Fallback layer 4: if response is suspiciously large, try matching to attached file ---
+      const matchedFile = this.matchResponseToAttachedFile(finalContent);
+      if (matchedFile) {
+        const writeApproved = await this.approveFileWrite([matchedFile.filepath]);
+        if (!writeApproved) {
+          messages.push({ role: 'assistant', content: `[File write denied by user: ${matchedFile.filepath}]` });
+          return;
+        }
+        const result = await this.createOrEditFile(matchedFile.filepath, matchedFile.fileContent);
+        const parsed = JSON.parse(result) as Record<string, unknown>;
+        const summary = parsed.error
+          ? `Failed to write ${matchedFile.filepath}: ${String(parsed.error)}`
+          : `Wrote ${matchedFile.filepath} (${String(parsed.bytesWritten)} bytes)`;
+        messages.push({ role: 'assistant', content: summary });
+        return;
+      }
+
+      // --- Fallback layer 5: nudge the model to use tools if it dumped a lot of content ---
+      const isLongDump = finalContent.length > 800 && retryCount < 1;
       const hasLargeCodeBlocks = /```[\w]*\n[\s\S]{500,}?```/.test(finalContent);
-      if (hasLargeCodeBlocks && codeBlockWrites.length === 0 && retryCount < 1) {
+      if ((isLongDump || hasLargeCodeBlocks) && retryCount < 1) {
         messages.push({
           role: 'assistant',
           content: finalContent,
@@ -410,24 +441,123 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         });
         messages.push({
           role: 'user',
-          content: 'You pasted code in chat instead of using a tool. Do NOT paste code. ' +
-            'Call `replace_in_file` to edit an existing file or `write_to_file` to create/overwrite a file. ' +
-            'Try again now — use a tool call.',
+          content: 'STOP. You printed file content in chat. That is WRONG. You MUST use a tool call to write files. ' +
+            'Call `replace_in_file` to edit part of a file, or `write_to_file` to rewrite a whole file. ' +
+            'DO NOT output any file content in chat. Just call the tool NOW.',
           hiddenFromTranscript: true
         });
-        this.postStatus('Model did not use tools — retrying with nudge...');
+        this.postStatus('Model did not use tools — retrying...');
         await this.processOllamaResponse(messages, retryCount + 1);
         return;
       }
 
-      // Truncate any remaining large code blocks so we don't flood the chat
+      // Final safety: truncate any remaining large output
       finalContent = this.truncateLargeCodeBlocks(finalContent);
+      finalContent = this.truncateLongResponse(finalContent);
     }
 
     messages.push({
       role: 'assistant',
       content: finalContent
     });
+  }
+
+  private extractMarkerFileWrite(content: string): { fullMatch: string; filepath: string; fileContent: string } | undefined {
+    // Detect patterns like: [Begin of LICENSE]...[End of LICENSE]
+    // or **[Begin of filename]**...**[End of filename]**
+    const pattern = /\*?\*?\[Begin\s+of\s+([^\]]+)\]\*?\*?\s*\n([\s\S]*?)\n\s*\*?\*?\[End\s+of\s+\1\]\*?\*?/i;
+    const match = pattern.exec(content);
+    if (!match) {
+      return undefined;
+    }
+    const rawName = match[1].trim();
+
+    // Try to resolve the marker name to an attached file path
+    let filepath = rawName;
+    for (const [fsPath, file] of this.attachedFiles) {
+      const baseName = path.basename(fsPath);
+      if (baseName.toLowerCase() === rawName.toLowerCase() || file.name.toLowerCase() === rawName.toLowerCase()) {
+        filepath = fsPath;
+        break;
+      }
+    }
+
+    // Strip markdown formatting from the extracted content
+    let fileContent = match[2];
+    // Remove leading/trailing --- (markdown hr)
+    fileContent = fileContent.replace(/^\s*---\s*\n?/, '').replace(/\n?\s*---\s*$/, '');
+    // Remove **bold** markdown wrappers on section headers (keep the text)
+    fileContent = fileContent.replace(/\*\*([^*]+)\*\*/g, '$1');
+
+    return {
+      fullMatch: match[0],
+      filepath,
+      fileContent: fileContent.trim()
+    };
+  }
+
+  private matchResponseToAttachedFile(content: string): { filepath: string; fileContent: string } | undefined {
+    if (this.attachedFiles.size === 0 || content.length < 500) {
+      return undefined;
+    }
+
+    // Check if the response is mostly a reproduction of an attached file
+    for (const [fsPath, file] of this.attachedFiles) {
+      // Compare: if >40% of the attached file's lines appear in the response, it's likely a file dump
+      const originalLines = file.content.split('\n').filter(l => l.trim().length > 20);
+      if (originalLines.length < 5) {
+        continue;
+      }
+      let matchCount = 0;
+      for (const line of originalLines) {
+        if (content.includes(line.trim())) {
+          matchCount++;
+        }
+      }
+      const ratio = matchCount / originalLines.length;
+      if (ratio > 0.4) {
+        // The model reproduced this file — try to extract the actual content
+        // Strip obvious chat commentary before/after
+        let extracted = content;
+        // Remove common LLM preamble/postamble patterns
+        extracted = extracted.replace(/^[\s\S]*?(?=(?:Copyright|package|import|<!DOCTYPE|<\?xml|#!\/|{))/i, '');
+        // If we can't cleanly extract, use the whole thing minus first/last short lines
+        const lines = extracted.split('\n');
+        if (lines.length > 10) {
+          // Trim chatty first/last lines
+          while (lines.length > 0 && lines[0].trim().length < 3) { lines.shift(); }
+          while (lines.length > 0 && lines[lines.length - 1].trim().length < 3) { lines.pop(); }
+        }
+        return { filepath: fsPath, fileContent: lines.join('\n') };
+      }
+    }
+    return undefined;
+  }
+
+  private async approveFileWrite(filepaths: string[]): Promise<boolean> {
+    if (this.autoApprove) {
+      return true;
+    }
+    const names = filepaths.map(p => path.basename(p)).join(', ');
+    this.postStatus(`Detected file write in response: ${names}. Waiting for approval...`);
+    const choice = await vscode.window.showInformationMessage(
+      `ManulAI wants to write: ${names}`,
+      { modal: false },
+      'Allow',
+      'Deny'
+    );
+    return choice === 'Allow';
+  }
+
+  private truncateLongResponse(content: string): string {
+    const lines = content.split('\n');
+    if (lines.length <= 25) {
+      return content;
+    }
+    const head = lines.slice(0, 10).join('\n');
+    const tail = lines.slice(-5).join('\n');
+    const omitted = lines.length - 15;
+    return head + '\n\n... (' + String(omitted) + ' lines omitted) ...\n\n' + tail;
   }
 
   private async callOllama(messages: OllamaMessage[]): Promise<OllamaResponse> {
