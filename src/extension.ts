@@ -14,9 +14,25 @@ export function activate(context: vscode.ExtensionContext): void {
 
   context.subscriptions.push(
     vscode.commands.registerCommand('manulai.openChat', async () => {
-      await vscode.commands.executeCommand('manulai.chatView.focus');
+      const commandsToTry = [
+        'workbench.view.extension.manulai',
+        'workbench.action.focusAuxiliaryBar',
+        'manulai.chatView.focus'
+      ];
+
+      for (const command of commandsToTry) {
+        try {
+          await vscode.commands.executeCommand(command);
+        } catch {
+          // Ignore unavailable commands and keep trying the next way to reveal the chat.
+        }
+      }
+
+      provider.reveal(false);
     })
   );
+
+  void vscode.commands.executeCommand('manulai.openChat');
 }
 
 export function deactivate(): void {

@@ -84,6 +84,10 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     );
   }
 
+  public reveal(preserveFocus = false): void {
+    this.webviewView?.show(preserveFocus);
+  }
+
   private async handleWebviewMessage(message: WebviewInboundMessage): Promise<void> {
     switch (message.command) {
       case 'ready':

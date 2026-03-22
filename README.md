@@ -1,11 +1,10 @@
-![ManulAI](./icon.png)
-
 # ManulAI Local Agent
 
-Version: 0.0.0.1
+Version: 0.0.1
 
 ManulAI is a local-first VS Code extension that provides an AI chat assistant powered by Ollama.
 The extension runs against a local Ollama instance and is designed for private code assistance inside VS Code.
+`icon.png` is used as the extension icon bundled inside the VSIX.
 
 ## Current Scope
 
@@ -30,6 +29,11 @@ The extension runs against a local Ollama instance and is designed for private c
 └── tsconfig.json
 ```
 
+## Extension Icon
+
+- `icon.png` is used as the extension icon in the VS Code manifest.
+- `media/manulai-icon.svg` is used for the contributed sidebar view container and view icon.
+
 ## Requirements
 
 - VS Code 1.112 or newer
@@ -42,6 +46,9 @@ The extension runs against a local Ollama instance and is designed for private c
 ```bash
 npm install
 ```
+
+After installing the extension in VS Code, run the `ManulAI: Open Chat` command.
+The command opens the Secondary Sidebar on the right and reveals the `ManulAI` chat view.
 
 ## Development
 
@@ -74,4 +81,4 @@ The extension exposes these settings:
 ## License
 
 This project is licensed under the Apache License 2.0.
-See the [LICENSE](./LICENSE) file for details.
+See the `LICENSE` file included in the extension package for details.

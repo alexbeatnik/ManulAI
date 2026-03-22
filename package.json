@@ -2,12 +2,13 @@
   "name": "manulai-local-agent",
   "displayName": "ManulAI Local Agent",
   "description": "Privacy-first local AI coding agent for VS Code powered entirely by Ollama.",
-  "version": "0.0.0.1",
+  "version": "0.0.1",
   "publisher": "manulai",
+  "icon": "icon.png",
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "https://example.com/manulai-local-agent.git"
+    "url": "https://github.com/manulai/manulai-local-agent.git"
   },
   "engines": {
     "vscode": "^1.112.0"
@@ -15,16 +16,12 @@
   "categories": [
     "Other"
   ],
-  "activationEvents": [
-    "onView:manulai.chatView",
-    "onCommand:manulai.openChat"
-  ],
   "main": "./out/extension.js",
   "contributes": {
     "commands": [
       {
         "command": "manulai.openChat",
-        "title": "ManulAI: Focus Chat",
+        "title": "ManulAI: Open Chat",
         "category": "ManulAI",
         "icon": "$(comment-discussion)"
       }
@@ -45,6 +42,7 @@
           "id": "manulai.chatView",
           "name": "ManulAI Chat",
           "contextualTitle": "ManulAI Chat",
+          "visibility": "visible",
           "icon": "media/manulai-icon.svg"
         }
       ]
