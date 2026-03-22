@@ -383,14 +383,15 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     if (this.agentMode) {
       const workspaceInstructions = await this.getWorkspaceInstructions();
 
-      let agentMandate = 'You are an autonomous VS Code Agent with direct file-system access through tools. ' +
-        'CRITICAL RULES:\n' +
-        '1. When the user asks you to modify, update, fix, or create a file — call the `write_to_file` tool. ' +
-        'Do NOT paste file content into your response text. Do NOT use [FILE:] blocks. ' +
-        'Only tool calls actually write to disk.\n' +
-        '2. Always call `write_to_file` with the COMPLETE new file content, not a diff.\n' +
-        '3. After writing, confirm briefly what you changed — do not repeat the entire file.\n' +
-        '4. You may still use chat text for explanations, questions, or reasoning.';
+      let agentMandate = 'You are an autonomous VS Code Agent with direct file-system access through tools.\n' +
+        'CRITICAL RULES — follow strictly:\n' +
+        '1. To EDIT an existing file — call `replace_in_file` with the exact old text and the new text. ' +
+        'This is preferred for any change that touches only part of a file.\n' +
+        '2. To CREATE a new file or fully rewrite one — call `write_to_file` with complete content.\n' +
+        '3. NEVER paste file content into your chat response. NEVER use [FILE:] blocks. Only tool calls write to disk.\n' +
+        '4. NEVER print an entire file in chat. After a tool call, confirm ONLY what you changed in 1-3 short sentences. ' +
+        'Show at most the changed lines, not the whole file.\n' +
+        '5. You may use chat text for explanations, questions, or reasoning — but keep it concise.';
 
       if (workspaceInstructions) {
         agentMandate += '\n\n<workspace_instructions>\n' + workspaceInstructions + '\n</workspace_instructions>';
@@ -663,6 +664,32 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       {
         type: 'function',
         function: {
+          name: 'replace_in_file',
+          description: 'Replace a specific text snippet inside an existing file. Use this for targeted edits instead of rewriting the whole file. Provide enough context lines so the old_text matches uniquely.',
+          parameters: {
+            type: 'object',
+            properties: {
+              filepath: {
+                type: 'string',
+                description: 'Absolute or workspace-relative path to the file.'
+              },
+              old_text: {
+                type: 'string',
+                description: 'The exact existing text to find (must match uniquely). Include a few surrounding lines for context.'
+              },
+              new_text: {
+                type: 'string',
+                description: 'The replacement text.'
+              }
+            },
+            required: ['filepath', 'old_text', 'new_text'],
+            additionalProperties: false
+          }
+        }
+      },
+      {
+        type: 'function',
+        function: {
           name: 'execute_terminal_command',
           description: 'Execute a shell command in the workspace and return stdout and stderr.',
           parameters: {
@@ -727,6 +754,8 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         return this.createOrEditFile(String(args.filename ?? ''), String(args.content ?? ''));
       case 'write_to_file':
         return this.createOrEditFile(String(args.filepath ?? ''), String(args.content ?? ''));
+      case 'replace_in_file':
+        return this.replaceInFile(String(args.filepath ?? ''), String(args.old_text ?? ''), String(args.new_text ?? ''));
       case 'execute_terminal_command':
         return this.executeTerminalCommand(String(args.command ?? ''));
       default:
@@ -810,6 +839,43 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     } catch (error) {
       return JSON.stringify({
         error: error instanceof Error ? error.message : 'Failed to write file.'
+      });
+    }
+  }
+
+  private async replaceInFile(filepath: string, oldText: string, newText: string): Promise<string> {
+    if (!filepath.trim()) {
+      return JSON.stringify({ error: 'filepath is required.' });
+    }
+    if (!oldText) {
+      return JSON.stringify({ error: 'old_text is required.' });
+    }
+
+    const target = this.resolveWorkspaceUri(filepath);
+
+    try {
+      const bytes = await vscode.workspace.fs.readFile(target);
+      const original = Buffer.from(bytes).toString('utf8');
+      const occurrences = original.split(oldText).length - 1;
+
+      if (occurrences === 0) {
+        return JSON.stringify({ error: 'old_text not found in file. Make sure it matches exactly, including whitespace.' });
+      }
+      if (occurrences > 1) {
+        return JSON.stringify({ error: `old_text matched ${occurrences} times. Add more surrounding context so it matches exactly once.` });
+      }
+
+      const updated = original.replace(oldText, newText);
+      await vscode.workspace.fs.writeFile(target, Buffer.from(updated, 'utf8'));
+
+      return JSON.stringify({
+        path: target.fsPath,
+        replacements: 1,
+        bytesWritten: Buffer.byteLength(updated, 'utf8')
+      });
+    } catch (error) {
+      return JSON.stringify({
+        error: error instanceof Error ? error.message : 'Failed to replace in file.'
       });
     }
   }
