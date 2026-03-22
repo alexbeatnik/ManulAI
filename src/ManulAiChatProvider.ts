@@ -42,12 +42,14 @@ interface ToolDefinition {
 }
 
 interface WebviewInboundMessage {
-  command: 'ready' | 'sendMessage' | 'addFileContext' | 'removeFileContext' | 'selectModel' | 'refreshModels' | 'browseFiles' | 'toggleAgentMode' | 'toggleAutoApprove';
+  command: 'ready' | 'sendMessage' | 'addFileContext' | 'addFileContent' | 'addFilePathContext' | 'removeFileContext' | 'selectModel' | 'refreshModels' | 'browseFiles' | 'toggleAgentMode' | 'toggleAutoApprove';
   text?: string;
   path?: string;
   paths?: string[];
   model?: string;
   value?: boolean;
+  filename?: string;
+  content?: string;
 }
 
 interface WebviewRenderableMessage {
@@ -124,6 +126,21 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           return;
         }
         await this.addFileContext(message.path);
+        return;
+      case 'addFileContent':
+        if (!message.filename || !message.content) {
+          return;
+        }
+        this.addFileContentDirect(message.filename, message.content);
+        return;
+      case 'addFilePathContext':
+        if (Array.isArray(message.paths) && message.paths.length > 0) {
+          for (const uriPath of message.paths) {
+            if (uriPath?.trim()) {
+              await this.addFilePathContext(uriPath.trim());
+            }
+          }
+        }
         return;
       case 'removeFileContext':
         if (!message.path) {
@@ -555,6 +572,61 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Failed to attach file.';
       this.postStatus(`Unable to attach dropped file: ${message}`);
+    }
+  }
+
+  private addFileContentDirect(filename: string, content: string): void {
+    const ext = path.extname(filename).slice(1).toLowerCase();
+    const langMap: Record<string, string> = {
+      ts: 'typescript', tsx: 'typescriptreact', js: 'javascript', jsx: 'javascriptreact',
+      py: 'python', rs: 'rust', go: 'go', java: 'java', c: 'c', cpp: 'cpp',
+      cs: 'csharp', rb: 'ruby', php: 'php', swift: 'swift', kt: 'kotlin',
+      md: 'markdown', json: 'json', yaml: 'yaml', yml: 'yaml',
+      html: 'html', css: 'css', scss: 'scss', xml: 'xml', sql: 'sql',
+      sh: 'shellscript', bash: 'shellscript', zsh: 'shellscript',
+      toml: 'toml', ini: 'ini'
+    };
+    const languageId = langMap[ext] || 'plaintext';
+    const syntheticUri = vscode.Uri.file(path.join('/dropped', filename));
+
+    this.attachedFiles.set(syntheticUri.fsPath, {
+      uri: syntheticUri,
+      name: filename,
+      content,
+      languageId
+    });
+
+    this.postStateToWebview();
+    this.postStatus(`Attached ${filename} to the next requests.`);
+  }
+
+  private async addFilePathContext(rawUri: string): Promise<void> {
+    try {
+      const uri = rawUri.startsWith('file:') ? vscode.Uri.parse(rawUri) : this.resolveWorkspaceUri(rawUri);
+      const bytes = await vscode.workspace.fs.readFile(uri);
+      const content = Buffer.from(bytes).toString('utf8');
+      const name = path.basename(uri.fsPath);
+
+      let languageId = 'plaintext';
+      try {
+        const document = await vscode.workspace.openTextDocument(uri);
+        languageId = document.languageId;
+      } catch {
+        // Keep plaintext fallback
+      }
+
+      this.attachedFiles.set(uri.fsPath, {
+        uri,
+        name,
+        content,
+        languageId
+      });
+
+      this.postStateToWebview();
+      this.postStatus(`Attached ${name} to the next requests.`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Failed to attach file.';
+      this.postStatus(`Unable to attach file: ${message}`);
     }
   }
 

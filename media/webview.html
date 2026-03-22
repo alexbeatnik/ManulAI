@@ -1176,25 +1176,20 @@
         .filter(line => line && !line.startsWith('#'));
     }
 
-    function extractDroppedPaths(event) {
-      const transfer = event.dataTransfer;
-      if (!transfer) {
-        return [];
-      }
-
+    function collectUriPaths(dt) {
       const collected = [];
 
-      const uriList = transfer.getData('text/uri-list');
-      if (uriList) {
-        collected.push(...parseUriList(uriList));
-      }
-
-      const vscodeUri = transfer.getData('application/vnd.code.uri-list');
+      const vscodeUri = dt.getData('application/vnd.code.uri-list');
       if (vscodeUri) {
         collected.push(...parseUriList(vscodeUri));
       }
 
-      const plain = transfer.getData('text/plain').trim();
+      const uriList = dt.getData('text/uri-list');
+      if (uriList) {
+        collected.push(...parseUriList(uriList));
+      }
+
+      const plain = dt.getData('text/plain').trim();
       if (plain) {
         const plainPaths = plain.includes('\n') ? parseUriList(plain) : [plain];
         for (const candidate of plainPaths) {
@@ -1204,37 +1199,25 @@
         }
       }
 
-      if (transfer.items) {
-        for (const item of Array.from(transfer.items)) {
-          if (item.kind === 'string') {
-            const types = ['text/uri-list', 'application/vnd.code.uri-list'];
-            if (types.includes(item.type) && collected.length === 0) {
-              item.getAsString(value => {
-                if (value) {
-                  const paths = parseUriList(value);
-                  if (paths.length > 0) {
-                    vscode.postMessage({ command: 'addFileContext', paths });
-                  }
-                }
-              });
-            }
-          }
-          if (item.kind === 'file') {
-            const file = item.getAsFile();
-            if (file && file.path) {
-              collected.push(file.path);
-            }
-          }
-        }
-      }
-
-      for (const file of Array.from(transfer.files || [])) {
-        if (file.path) {
-          collected.push(file.path);
-        }
-      }
-
       return Array.from(new Set(collected));
+    }
+
+    function readDroppedFile(file) {
+      const reader = new FileReader();
+      reader.onload = function () {
+        const content = reader.result;
+        if (typeof content === 'string') {
+          vscode.postMessage({
+            command: 'addFileContent',
+            filename: file.name,
+            content: content
+          });
+        }
+      };
+      reader.onerror = function () {
+        appendStatus('Failed to read dropped file: ' + file.name);
+      };
+      reader.readAsText(file);
     }
 
     function handleDrop(event) {
@@ -1243,13 +1226,37 @@
       dragDepth = 0;
       setDragging(false);
 
-      const droppedPaths = extractDroppedPaths(event);
-      if (droppedPaths.length === 0) {
-        appendStatus('Drop did not contain a readable file URI.');
+      const dt = event.dataTransfer;
+      if (!dt) {
+        appendStatus('Drop event contained no data.');
         return;
       }
 
-      vscode.postMessage({ command: 'addFileContext', paths: droppedPaths });
+      // Path 1: System file drops (OS file manager) — read content via FileReader
+      let fileItemsFound = false;
+      if (dt.items && dt.items.length > 0) {
+        for (const item of Array.from(dt.items)) {
+          if (item.kind === 'file') {
+            const file = item.getAsFile();
+            if (file) {
+              fileItemsFound = true;
+              readDroppedFile(file);
+            }
+          }
+        }
+      }
+      if (fileItemsFound) {
+        return;
+      }
+
+      // Path 2: VS Code internal drops — send URI paths to backend for vscode.fs read
+      const uriPaths = collectUriPaths(dt);
+      if (uriPaths.length > 0) {
+        vscode.postMessage({ command: 'addFilePathContext', paths: uriPaths });
+        return;
+      }
+
+      appendStatus('Drop did not contain a readable file or URI.');
     }
 
     function submitMessage() {
