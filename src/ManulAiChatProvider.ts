@@ -42,11 +42,12 @@ interface ToolDefinition {
 }
 
 interface WebviewInboundMessage {
-  command: 'ready' | 'sendMessage' | 'addFileContext' | 'removeFileContext' | 'selectModel' | 'refreshModels' | 'browseFiles' | 'toggleAgentMode';
+  command: 'ready' | 'sendMessage' | 'addFileContext' | 'removeFileContext' | 'selectModel' | 'refreshModels' | 'browseFiles' | 'toggleAgentMode' | 'toggleAutoApprove';
   text?: string;
   path?: string;
   paths?: string[];
   model?: string;
+  value?: boolean;
 }
 
 interface WebviewRenderableMessage {
@@ -60,6 +61,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   private webviewView?: vscode.WebviewView;
   private readonly messages: OllamaMessage[] = [];
   private readonly attachedFiles = new Map<string, AttachedFileContext>();
+  private readonly safeTools = new Set(['read_active_file', 'read_specific_file']);
   private availableModels: string[] = [];
   private agentMode = true;
   private requestInFlight = false;
@@ -152,7 +154,18 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           void vscode.workspace.getConfiguration('manulai').update('agentMode', this.agentMode, target);
         }
         this.postStateToWebview();
-        this.postStatus(`Agent mode ${this.agentMode ? 'enabled' : 'disabled'}. Tool calls will ${this.agentMode ? 'auto-execute' : 'require confirmation'}.`);
+        this.postStatus(`Auto-approve ${this.agentMode ? 'enabled' : 'disabled'}. Tool calls will ${this.agentMode ? 'auto-execute' : 'require confirmation'}.`);
+        return;
+      case 'toggleAutoApprove':
+        this.agentMode = message.value !== undefined ? message.value : !this.agentMode;
+        {
+          const target = vscode.workspace.workspaceFolders?.length
+            ? vscode.ConfigurationTarget.Workspace
+            : vscode.ConfigurationTarget.Global;
+          void vscode.workspace.getConfiguration('manulai').update('agentMode', this.agentMode, target);
+        }
+        this.postStateToWebview();
+        this.postStatus(`Auto-approve ${this.agentMode ? 'enabled' : 'disabled'}. Tool calls will ${this.agentMode ? 'auto-execute' : 'require confirmation'}.`);
         return;
       default:
         return;
@@ -574,6 +587,10 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       return true;
     }
 
+    if (this.safeTools.has(toolCall.function.name)) {
+      return true;
+    }
+
     const name = toolCall.function.name;
     const args = toolCall.function.arguments;
     const argsPreview = Object.entries(args)
@@ -595,14 +612,23 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   }
 
   private normalizeDroppedPath(rawPath: string): string {
-    const value = rawPath.trim();
+    let value = rawPath.trim();
 
     if (!value) {
       throw new Error('Dropped path is empty.');
     }
 
     if (value.includes('\n')) {
-      return value.split(/\r?\n/)[0].trim();
+      value = value.split(/\r?\n/)[0].trim();
+    }
+
+    // Decode percent-encoded characters from file:// URIs
+    if (value.startsWith('file:')) {
+      try {
+        value = decodeURIComponent(value);
+      } catch {
+        // Keep original if decoding fails
+      }
     }
 
     return value;

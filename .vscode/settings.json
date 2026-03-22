@@ -1,3 +1,4 @@
 {
-    "manulai.ollamaModel": "qwen2.5-coder:14b"
+    "manulai.ollamaModel": "qwen2.5-coder:14b",
+    "manulai.agentMode": true
 }

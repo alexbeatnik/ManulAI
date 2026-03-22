@@ -766,9 +766,135 @@
         transform: translateY(0);
       }
     }
+
+    /* ── Body drop overlay ── */
+    .body-drop-overlay {
+      position: fixed;
+      inset: 0;
+      z-index: 1000;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      background: color-mix(in srgb, var(--bg) 86%, transparent);
+      backdrop-filter: blur(8px);
+      border: 3px dashed var(--accent);
+      pointer-events: none;
+    }
+
+    body.dragging .body-drop-overlay {
+      display: flex;
+      pointer-events: auto;
+    }
+
+    .body-drop-overlay-inner {
+      display: grid;
+      gap: 8px;
+      text-align: center;
+      color: var(--text);
+    }
+
+    .body-drop-overlay-icon {
+      display: grid;
+      place-items: center;
+      width: 44px;
+      height: 44px;
+      margin: 0 auto 4px;
+      border-radius: 999px;
+      background: color-mix(in srgb, var(--accent) 18%, transparent);
+      color: var(--accent);
+      font-size: 22px;
+      font-weight: 700;
+    }
+
+    .body-drop-overlay-title {
+      font-size: 14px;
+      font-weight: 700;
+    }
+
+    .body-drop-overlay-copy {
+      font-size: 11px;
+      color: var(--muted);
+    }
+
+    /* ── Auto-approve toggle switch ── */
+    .toggle-switch {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      cursor: pointer;
+      flex-shrink: 0;
+      user-select: none;
+    }
+
+    .toggle-switch input {
+      position: absolute;
+      width: 0;
+      height: 0;
+      opacity: 0;
+      pointer-events: none;
+    }
+
+    .toggle-slider {
+      position: relative;
+      width: 32px;
+      height: 18px;
+      border-radius: 999px;
+      background: color-mix(in srgb, var(--muted) 30%, transparent);
+      border: 1px solid var(--border-muted);
+      transition: background 160ms ease, border-color 160ms ease;
+      flex-shrink: 0;
+    }
+
+    .toggle-slider::after {
+      content: '';
+      position: absolute;
+      top: 2px;
+      left: 2px;
+      width: 12px;
+      height: 12px;
+      border-radius: 999px;
+      background: var(--muted);
+      transition: transform 160ms ease, background 160ms ease;
+    }
+
+    .toggle-switch input:checked + .toggle-slider {
+      background: color-mix(in srgb, var(--accent) 28%, transparent);
+      border-color: color-mix(in srgb, var(--accent) 50%, var(--border-muted));
+    }
+
+    .toggle-switch input:checked + .toggle-slider::after {
+      transform: translateX(14px);
+      background: var(--accent);
+    }
+
+    .toggle-switch input:focus-visible + .toggle-slider {
+      outline: 2px solid var(--accent);
+      outline-offset: 2px;
+    }
+
+    .toggle-label {
+      font-size: 10px;
+      font-weight: 600;
+      letter-spacing: 0.04em;
+      white-space: nowrap;
+      color: var(--muted);
+      transition: color 140ms ease;
+    }
+
+    .toggle-switch input:checked ~ .toggle-label {
+      color: var(--accent);
+    }
   </style>
 </head>
 <body>
+  <div id="bodyDropOverlay" class="body-drop-overlay" aria-hidden="true">
+    <div class="body-drop-overlay-inner">
+      <div class="body-drop-overlay-icon">+</div>
+      <div class="body-drop-overlay-title">Drop files to attach</div>
+      <div class="body-drop-overlay-copy">Files will be added as context for your next message.</div>
+    </div>
+  </div>
+
   <header class="header">
     <div class="header-row">
       <div class="title-wrap">
@@ -784,7 +910,11 @@
     <div class="topbar">
       <div id="dropzone" class="drop-inline" role="button" tabindex="0">Drop files here or click to browse.</div>
       <div class="controls">
-        <button id="agentToggle" class="ghost-button agent-toggle" type="button" title="Agent mode: auto-confirm all tool calls">Agent: ON</button>
+        <label class="toggle-switch" title="Auto-approve tool executions without confirmation">
+          <input type="checkbox" id="autoApproveToggle" />
+          <span class="toggle-slider"></span>
+          <span id="autoApproveLabel" class="toggle-label">Auto-approve</span>
+        </label>
         <select id="modelSelect" class="model-select" aria-label="Ollama model"></select>
         <button id="refreshModels" class="ghost-button" type="button">Refresh</button>
       </div>
@@ -846,7 +976,8 @@
     const composerShellEl = document.getElementById('composerShell');
     const modelSelectEl = document.getElementById('modelSelect');
     const refreshModelsEl = document.getElementById('refreshModels');
-    const agentToggleEl = document.getElementById('agentToggle');
+    const autoApproveToggle = document.getElementById('autoApproveToggle');
+    const autoApproveLabel = document.getElementById('autoApproveLabel');
     const statusPillEl = document.getElementById('statusPill');
 
     let busy = false;
@@ -884,6 +1015,7 @@
       dropzoneEl.classList.toggle('active', active);
       inputShellEl.classList.toggle('active', active);
       dropOverlayEl.setAttribute('aria-hidden', String(!active));
+      document.getElementById('bodyDropOverlay').setAttribute('aria-hidden', String(!active));
     }
 
     function updateHeaderState() {
@@ -1025,8 +1157,8 @@
       modelSelectEl.disabled = busy;
       refreshModelsEl.disabled = busy;
       sendEl.setAttribute('aria-busy', String(busy));
-      agentToggleEl.textContent = agentMode ? 'Agent: ON' : 'Agent: OFF';
-      agentToggleEl.classList.toggle('active', agentMode);
+      autoApproveToggle.checked = agentMode;
+      autoApproveLabel.textContent = agentMode ? 'Auto-approve' : 'Manual';
       updateHeaderState();
       autoResizeTextarea();
       historyEl.scrollTop = historyEl.scrollHeight;
@@ -1151,8 +1283,8 @@
       vscode.postMessage({ command: 'refreshModels' });
     });
 
-    agentToggleEl.addEventListener('click', () => {
-      vscode.postMessage({ command: 'toggleAgentMode' });
+    autoApproveToggle.addEventListener('change', () => {
+      vscode.postMessage({ command: 'toggleAutoApprove', value: autoApproveToggle.checked });
     });
 
     inputEl.addEventListener('keydown', event => {
@@ -1162,29 +1294,42 @@
       }
     });
 
-    ['dragenter', 'dragover'].forEach(type => {
-      window.addEventListener(type, event => {
-        event.preventDefault();
-        dragDepth += type === 'dragenter' ? 1 : 0;
-        setDragging(true);
-      });
-    });
+    document.addEventListener('dragenter', event => {
+      event.preventDefault();
+      event.stopPropagation();
+      dragDepth += 1;
+      setDragging(true);
+    }, true);
 
-    ['dragleave', 'dragend'].forEach(type => {
-      window.addEventListener(type, event => {
-        event.preventDefault();
-        dragDepth = Math.max(0, dragDepth - (type === 'dragleave' ? 1 : dragDepth));
-        if (dragDepth === 0) {
-          setDragging(false);
-        }
-      });
-    });
+    document.addEventListener('dragover', event => {
+      event.preventDefault();
+      event.stopPropagation();
+      if (event.dataTransfer) {
+        event.dataTransfer.dropEffect = 'copy';
+      }
+    }, true);
 
-    window.addEventListener('drop', handleDrop);
-    dropzoneEl.addEventListener('drop', handleDrop);
-    inputShellEl.addEventListener('drop', handleDrop);
-    dropOverlayEl.addEventListener('drop', handleDrop);
-    composerShellEl.addEventListener('drop', handleDrop);
+    document.addEventListener('dragleave', event => {
+      event.preventDefault();
+      event.stopPropagation();
+      dragDepth = Math.max(0, dragDepth - 1);
+      if (dragDepth === 0) {
+        setDragging(false);
+      }
+    }, true);
+
+    document.addEventListener('dragend', event => {
+      event.preventDefault();
+      event.stopPropagation();
+      dragDepth = 0;
+      setDragging(false);
+    }, true);
+
+    document.addEventListener('drop', event => {
+      event.preventDefault();
+      event.stopPropagation();
+      handleDrop(event);
+    }, true);
 
     dropzoneEl.addEventListener('click', () => {
       vscode.postMessage({ command: 'browseFiles' });
