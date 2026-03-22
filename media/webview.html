@@ -990,6 +990,7 @@
     let busy = false;
     let messages = [];
     let attachments = [];
+    let attachedFiles = [];
     let availableModels = [];
     let currentModel = '';
     let dragDepth = 0;
@@ -1027,7 +1028,7 @@
     }
 
     function updateHeaderState() {
-      const attachmentCount = attachments.length;
+      const attachmentCount = attachments.length + attachedFiles.length;
       const messageCount = messages.filter(message => message.role !== 'status').length;
       historyCountEl.textContent = String(attachmentCount + messageCount);
       historyStateEl.innerHTML = busy
@@ -1078,7 +1079,8 @@
       }
 
       chipsEl.innerHTML = '';
-      chipsEl.style.display = attachments.length > 0 ? 'flex' : 'none';
+      const hasChips = attachments.length > 0 || attachedFiles.length > 0;
+      chipsEl.style.display = hasChips ? 'flex' : 'none';
       for (const attachment of attachments) {
         const chip = document.createElement('div');
         chip.className = 'chip';
@@ -1092,6 +1094,25 @@
         remove.textContent = '×';
         remove.addEventListener('click', () => {
           vscode.postMessage({ command: 'removeFileContext', path: attachment.path });
+        });
+
+        chip.append(label, remove);
+        chipsEl.appendChild(chip);
+      }
+      for (const localFile of attachedFiles) {
+        const chip = document.createElement('div');
+        chip.className = 'chip';
+        chip.title = localFile.name;
+
+        const label = document.createElement('span');
+        label.textContent = localFile.name;
+
+        const remove = document.createElement('button');
+        remove.type = 'button';
+        remove.textContent = '×';
+        remove.addEventListener('click', () => {
+          attachedFiles = attachedFiles.filter(f => f !== localFile);
+          render();
         });
 
         chip.append(label, remove);
@@ -1187,11 +1208,8 @@
       reader.onload = function () {
         const content = reader.result;
         if (typeof content === 'string') {
-          vscode.postMessage({
-            command: 'addFileContent',
-            filename: file.name,
-            content: content
-          });
+          attachedFiles.push({ name: file.name, content: content });
+          render();
         }
       };
       reader.onerror = function () {
@@ -1247,7 +1265,10 @@
 
       inputEl.value = '';
       autoResizeTextarea();
-      vscode.postMessage({ command: 'sendMessage', text });
+      const payload = { command: 'sendMessage', text: text, attachments: attachedFiles.slice() };
+      vscode.postMessage(payload);
+      attachedFiles = [];
+      render();
     }
 
     sendEl.addEventListener('click', submitMessage);

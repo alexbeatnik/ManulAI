@@ -70,6 +70,7 @@ interface WebviewInboundMessage {
   value?: boolean;
   filename?: string;
   content?: string;
+  attachments?: Array<{ name: string; content: string }>;
 }
 
 interface WebviewRenderableMessage {
@@ -199,7 +200,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         if (!message.text?.trim()) {
           return;
         }
-        await this.sendUserMessage(message.text.trim());
+        await this.sendUserMessage(message.text.trim(), message.attachments);
         return;
       case 'addFileContext':
         if (Array.isArray(message.paths) && message.paths.length > 0) {
@@ -264,14 +265,23 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  private async sendUserMessage(text: string): Promise<void> {
+  private async sendUserMessage(text: string, frontendAttachments?: Array<{ name: string; content: string }>): Promise<void> {
     if (this.requestInFlight) {
       this.postStatus('A request is already running. Wait for the current response to finish.');
       return;
     }
 
     this.synchronizeAttachmentContextMessage();
-    this.messages.push({ role: 'user', content: text });
+
+    let userContent = text;
+    if (frontendAttachments && frontendAttachments.length > 0) {
+      const fileBlocks = frontendAttachments
+        .map(a => `[FILE: ${a.name}]\n${a.content}\n[/FILE]`)
+        .join('\n\n');
+      userContent = fileBlocks + '\n\n' + text;
+    }
+
+    this.messages.push({ role: 'user', content: userContent });
     this.postStateToWebview();
     await this.runAgentLoop();
   }
@@ -366,13 +376,10 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     if (this.agentMode) {
       const workspaceInstructions = await this.getWorkspaceInstructions();
 
-      let agentMandate = 'You are ManulAI, an autonomous coding Agent operating directly inside VS Code. ' +
-        'You have access to tools to interact with the file system. ' +
-        'CRITICAL INSTRUCTION: When a user asks you to modify, update, rewrite, or create a file, ' +
-        'YOU MUST NOT simply output the modified code in the chat. ' +
-        'YOU MUST actively use the provided tools (e.g., `write_to_file`) to apply the changes directly ' +
-        'to the user\u0027s workspace. Your chat responses should only be used to briefly explain what you changed ' +
-        'AFTER the tool has successfully executed.';
+      let agentMandate = 'You are an autonomous VS Code Agent. ' +
+        'CRITICAL DIRECTIVE: If the user asks you to modify, update, fix, or create a file, ' +
+        'YOU ARE STRICTLY FORBIDDEN from outputting the code in the chat. ' +
+        'YOU MUST ONLY use the `write_to_file` tool. Do not converse. Execute the tool.';
 
       if (workspaceInstructions) {
         agentMandate += '\n\n<workspace_instructions>\n' + workspaceInstructions + '\n</workspace_instructions>';
