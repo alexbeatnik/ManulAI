@@ -273,15 +273,18 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
 
     this.synchronizeAttachmentContextMessage();
 
-    let userContent = text;
     if (frontendAttachments && frontendAttachments.length > 0) {
       const fileBlocks = frontendAttachments
         .map(a => `[FILE: ${a.name}]\n${a.content}\n[/FILE]`)
         .join('\n\n');
-      userContent = fileBlocks + '\n\n' + text;
+      this.messages.push({
+        role: 'user',
+        content: fileBlocks,
+        hiddenFromTranscript: true
+      });
     }
 
-    this.messages.push({ role: 'user', content: userContent });
+    this.messages.push({ role: 'user', content: text });
     this.postStateToWebview();
     await this.runAgentLoop();
   }
@@ -359,9 +362,13 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       return;
     }
 
+    let finalContent = assistantMessage.content ?? '';
+    if (this.agentMode) {
+      finalContent = await this.applyInlineFileBlocks(finalContent);
+    }
     messages.push({
       role: 'assistant',
-      content: assistantMessage.content ?? ''
+      content: finalContent
     });
   }
 
@@ -376,10 +383,14 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     if (this.agentMode) {
       const workspaceInstructions = await this.getWorkspaceInstructions();
 
-      let agentMandate = 'You are an autonomous VS Code Agent. ' +
-        'CRITICAL DIRECTIVE: If the user asks you to modify, update, fix, or create a file, ' +
-        'YOU ARE STRICTLY FORBIDDEN from outputting the code in the chat. ' +
-        'YOU MUST ONLY use the `write_to_file` tool. Do not converse. Execute the tool.';
+      let agentMandate = 'You are an autonomous VS Code Agent with direct file-system access through tools. ' +
+        'CRITICAL RULES:\n' +
+        '1. When the user asks you to modify, update, fix, or create a file — call the `write_to_file` tool. ' +
+        'Do NOT paste file content into your response text. Do NOT use [FILE:] blocks. ' +
+        'Only tool calls actually write to disk.\n' +
+        '2. Always call `write_to_file` with the COMPLETE new file content, not a diff.\n' +
+        '3. After writing, confirm briefly what you changed — do not repeat the entire file.\n' +
+        '4. You may still use chat text for explanations, questions, or reasoning.';
 
       if (workspaceInstructions) {
         agentMandate += '\n\n<workspace_instructions>\n' + workspaceInstructions + '\n</workspace_instructions>';
@@ -668,6 +679,39 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         }
       }
     ];
+  }
+
+  private extractInlineFileBlocks(content: string): Array<{ fullMatch: string; filepath: string; fileContent: string }> {
+    const blocks: Array<{ fullMatch: string; filepath: string; fileContent: string }> = [];
+    const pattern = /(?:```[\w]*\s*\n?)?\[FILE:\s*([^\]]+)\]\s*\n([\s\S]*?)\n?\s*\[\/FILE\]\s*(?:\n?```)?/g;
+    let match: RegExpExecArray | null;
+    while ((match = pattern.exec(content)) !== null) {
+      blocks.push({
+        fullMatch: match[0],
+        filepath: match[1].trim(),
+        fileContent: match[2]
+      });
+    }
+    return blocks;
+  }
+
+  private async applyInlineFileBlocks(content: string): Promise<string> {
+    const blocks = this.extractInlineFileBlocks(content);
+    if (blocks.length === 0) {
+      return content;
+    }
+
+    let result = content;
+    for (const block of blocks) {
+      const writeResult = await this.createOrEditFile(block.filepath, block.fileContent);
+      const parsed = JSON.parse(writeResult) as Record<string, unknown>;
+      const status = parsed.error
+        ? `Failed to write ${block.filepath}: ${String(parsed.error)}`
+        : `Wrote ${block.filepath} (${String(parsed.bytesWritten)} bytes)`;
+      result = result.replace(block.fullMatch, status);
+    }
+
+    return result;
   }
 
   private async executeToolCall(toolCall: ToolFunctionCall): Promise<string> {
