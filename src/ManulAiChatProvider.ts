@@ -362,6 +362,21 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     const systemPrompt = String(config.get('systemPrompt', '')).trim();
 
     const requestMessages: OllamaMessage[] = [];
+
+    if (this.agentMode) {
+      requestMessages.push({
+        role: 'system',
+        content: 'You are ManulAI, an autonomous coding Agent operating directly inside VS Code. ' +
+          'You have access to tools to interact with the file system. ' +
+          'CRITICAL INSTRUCTION: When a user asks you to modify, update, rewrite, or create a file, ' +
+          'YOU MUST NOT simply output the modified code in the chat. ' +
+          'YOU MUST actively use the provided tools (e.g., `write_to_file`) to apply the changes directly ' +
+          'to the user\u0027s workspace. Your chat responses should only be used to briefly explain what you changed ' +
+          'AFTER the tool has successfully executed.',
+        hiddenFromTranscript: true
+      });
+    }
+
     if (systemPrompt) {
       requestMessages.push({ role: 'system', content: systemPrompt, hiddenFromTranscript: true });
     }
@@ -600,6 +615,28 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       {
         type: 'function',
         function: {
+          name: 'write_to_file',
+          description: 'Overwrites or creates a file with new content. Use this IMMEDIATELY when the user asks to change code or update a file.',
+          parameters: {
+            type: 'object',
+            properties: {
+              filepath: {
+                type: 'string',
+                description: 'The absolute or workspace-relative path to the file.'
+              },
+              content: {
+                type: 'string',
+                description: 'The complete new content for the file.'
+              }
+            },
+            required: ['filepath', 'content'],
+            additionalProperties: false
+          }
+        }
+      },
+      {
+        type: 'function',
+        function: {
           name: 'execute_terminal_command',
           description: 'Execute a shell command in the workspace and return stdout and stderr.',
           parameters: {
@@ -629,6 +666,8 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         return this.readSpecificFile(String(args.filepath ?? ''));
       case 'create_or_edit_file':
         return this.createOrEditFile(String(args.filename ?? ''), String(args.content ?? ''));
+      case 'write_to_file':
+        return this.createOrEditFile(String(args.filepath ?? ''), String(args.content ?? ''));
       case 'execute_terminal_command':
         return this.executeTerminalCommand(String(args.command ?? ''));
       default:
@@ -904,14 +943,15 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   private renderAttachmentContextMessage(): string {
     const renderedFiles = Array.from(this.attachedFiles.values())
       .map(file => {
+        const filePath = file.uri.fsPath.startsWith('/dropped/') || file.uri.fsPath.startsWith('/attached/')
+          ? (vscode.workspace.workspaceFolders?.[0]?.uri.fsPath
+            ? `${vscode.workspace.workspaceFolders[0].uri.fsPath}/${file.name}`
+            : file.name)
+          : file.uri.fsPath;
         return [
-          '<attached_file>',
-          `name: ${file.name}`,
-          `path: ${this.getDisplayPath(file)}`,
-          `language: ${file.languageId || 'plaintext'}`,
-          'content:',
+          `[Attached File: ${file.name} | Path: ${filePath}]`,
           file.content,
-          '</attached_file>'
+          '[/Attached File]'
         ].join('\n');
       })
       .join('\n\n');
