@@ -93,6 +93,11 @@
           "default": "http://localhost:11434",
           "description": "Base URL for the local Ollama server."
         },
+        "manulai.agentMode": {
+          "type": "boolean",
+          "default": true,
+          "description": "When enabled, all tool calls from the model are auto-confirmed. When disabled, each tool call requires manual approval."
+        },
         "manulai.systemPrompt": {
           "type": "string",
           "default": "You are ManulAI, a privacy-first local coding agent running inside VS Code. Work across any programming language. Use tools when needed to inspect files, edit files, and run commands. Prefer precise, minimal changes and explain results clearly.",

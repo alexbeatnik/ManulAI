@@ -242,6 +242,33 @@
       transform: none;
     }
 
+    .agent-toggle {
+      font-size: 10px;
+      font-weight: 600;
+      letter-spacing: 0.04em;
+      white-space: nowrap;
+    }
+
+    .agent-toggle.active {
+      border-color: color-mix(in srgb, var(--accent) 50%, var(--border-muted));
+      background: color-mix(in srgb, var(--accent) 14%, var(--panel-strong));
+      color: var(--accent);
+    }
+
+    .drop-inline {
+      cursor: pointer;
+    }
+
+    .drop-inline:hover {
+      border-color: var(--accent);
+      background: color-mix(in srgb, var(--accent) 5%, var(--panel));
+    }
+
+    .drop-inline:focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: 2px;
+    }
+
     .history-shell {
       min-height: 0;
       border: 1px solid var(--border-muted);
@@ -309,6 +336,104 @@
       flex-direction: column;
       gap: 10px;
       min-height: 0;
+    }
+
+    .context-files {
+      padding: 10px 12px;
+      border: 1px solid var(--border-muted);
+      border-radius: 14px;
+      background:
+        linear-gradient(135deg, color-mix(in srgb, var(--accent) 8%, transparent), transparent 40%),
+        color-mix(in srgb, var(--panel-soft) 90%, transparent);
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.02);
+    }
+
+    .context-files-header {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 8px;
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      color: var(--accent);
+    }
+
+    .context-files-header .count {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 16px;
+      height: 16px;
+      padding: 0 5px;
+      border-radius: 999px;
+      background: color-mix(in srgb, var(--accent) 18%, transparent);
+      font-size: 9px;
+      font-weight: 700;
+      color: var(--accent);
+    }
+
+    .context-files-list {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+
+    .context-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      max-width: 100%;
+      padding: 5px 8px 5px 10px;
+      border-radius: 999px;
+      background: color-mix(in srgb, var(--panel-strong) 86%, transparent);
+      border: 1px solid var(--border-muted);
+      font-size: 11px;
+      color: var(--text);
+      transition: border-color 140ms ease, background 140ms ease;
+    }
+
+    .context-chip:hover {
+      border-color: color-mix(in srgb, var(--accent) 40%, var(--border-muted));
+    }
+
+    .context-chip .file-icon {
+      font-size: 9px;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      color: var(--accent);
+      flex-shrink: 0;
+    }
+
+    .context-chip .file-name {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      min-width: 0;
+    }
+
+    .context-chip .remove-btn {
+      border: 0;
+      background: color-mix(in srgb, var(--muted) 16%, transparent);
+      color: var(--muted);
+      cursor: pointer;
+      padding: 0;
+      width: 18px;
+      height: 18px;
+      border-radius: 999px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 13px;
+      line-height: 1;
+      flex-shrink: 0;
+      transition: background 120ms ease, color 120ms ease;
+    }
+
+    .context-chip .remove-btn:hover {
+      background: color-mix(in srgb, var(--vscode-errorForeground, #f44) 20%, transparent);
+      color: var(--vscode-errorForeground, #f44);
     }
 
     .empty {
@@ -657,8 +782,9 @@
 
   <section class="workspace">
     <div class="topbar">
-      <div id="dropzone" class="drop-inline">Drop files here or straight into the question field.</div>
+      <div id="dropzone" class="drop-inline" role="button" tabindex="0">Drop files here or click to browse.</div>
       <div class="controls">
+        <button id="agentToggle" class="ghost-button agent-toggle" type="button" title="Agent mode: auto-confirm all tool calls">Agent: ON</button>
         <select id="modelSelect" class="model-select" aria-label="Ollama model"></select>
         <button id="refreshModels" class="ghost-button" type="button">Refresh</button>
       </div>
@@ -720,6 +846,7 @@
     const composerShellEl = document.getElementById('composerShell');
     const modelSelectEl = document.getElementById('modelSelect');
     const refreshModelsEl = document.getElementById('refreshModels');
+    const agentToggleEl = document.getElementById('agentToggle');
     const statusPillEl = document.getElementById('statusPill');
 
     let busy = false;
@@ -728,6 +855,7 @@
     let availableModels = [];
     let currentModel = '';
     let dragDepth = 0;
+    let agentMode = true;
     const seenMessageKeys = new Set();
 
     function roleLabel(role) {
@@ -769,14 +897,67 @@
       document.body.classList.toggle('busy', busy);
     }
 
+    function renderContextFiles() {
+      const existing = historyEl.querySelector('.context-files');
+      if (existing) {
+        existing.remove();
+      }
+
+      if (attachments.length === 0) {
+        return;
+      }
+
+      const panel = document.createElement('div');
+      panel.className = 'context-files';
+
+      const header = document.createElement('div');
+      header.className = 'context-files-header';
+      header.innerHTML = 'Context files <span class="count">' + attachments.length + '</span>';
+
+      const list = document.createElement('div');
+      list.className = 'context-files-list';
+
+      for (const attachment of attachments) {
+        const chip = document.createElement('div');
+        chip.className = 'context-chip';
+        chip.title = attachment.path;
+
+        const icon = document.createElement('span');
+        icon.className = 'file-icon';
+        const ext = attachment.name.includes('.') ? attachment.name.split('.').pop() : 'file';
+        icon.textContent = ext;
+
+        const name = document.createElement('span');
+        name.className = 'file-name';
+        name.textContent = attachment.name;
+
+        const remove = document.createElement('button');
+        remove.className = 'remove-btn';
+        remove.type = 'button';
+        remove.title = 'Remove from context';
+        remove.textContent = String.fromCharCode(0xd7);
+        remove.addEventListener('click', () => {
+          vscode.postMessage({ command: 'removeFileContext', path: attachment.path });
+        });
+
+        chip.append(icon, name, remove);
+        list.appendChild(chip);
+      }
+
+      panel.append(header, list);
+      historyEl.prepend(panel);
+    }
+
     function render() {
       historyEl.innerHTML = '';
 
-      if (messages.length === 0) {
+      if (messages.length === 0 && attachments.length === 0) {
         const empty = document.createElement('div');
         empty.className = 'empty';
         empty.innerHTML = '<strong>Start with a task.</strong>Ask for a code change, drag files into the composer, or let the model inspect the workspace with tools.';
         historyEl.appendChild(empty);
+      } else if (messages.length === 0) {
+        // Only context files, no messages yet
       } else {
         messages.forEach((message, index) => {
           const wrapper = document.createElement('div');
@@ -806,6 +987,8 @@
         thinking.innerHTML = '<div class="dots" aria-hidden="true"><span></span><span></span><span></span></div><div class="label">Model is thinking, may call tools, and will answer in this thread.</div>';
         historyEl.appendChild(thinking);
       }
+
+      renderContextFiles();
 
       chipsEl.innerHTML = '';
       chipsEl.style.display = attachments.length > 0 ? 'flex' : 'none';
@@ -842,6 +1025,8 @@
       modelSelectEl.disabled = busy;
       refreshModelsEl.disabled = busy;
       sendEl.setAttribute('aria-busy', String(busy));
+      agentToggleEl.textContent = agentMode ? 'Agent: ON' : 'Agent: OFF';
+      agentToggleEl.classList.toggle('active', agentMode);
       updateHeaderState();
       autoResizeTextarea();
       historyEl.scrollTop = historyEl.scrollHeight;
@@ -887,6 +1072,30 @@
         }
       }
 
+      if (transfer.items) {
+        for (const item of Array.from(transfer.items)) {
+          if (item.kind === 'string') {
+            const types = ['text/uri-list', 'application/vnd.code.uri-list'];
+            if (types.includes(item.type) && collected.length === 0) {
+              item.getAsString(value => {
+                if (value) {
+                  const paths = parseUriList(value);
+                  if (paths.length > 0) {
+                    vscode.postMessage({ command: 'addFileContext', paths });
+                  }
+                }
+              });
+            }
+          }
+          if (item.kind === 'file') {
+            const file = item.getAsFile();
+            if (file && file.path) {
+              collected.push(file.path);
+            }
+          }
+        }
+      }
+
       for (const file of Array.from(transfer.files || [])) {
         if (file.path) {
           collected.push(file.path);
@@ -898,6 +1107,7 @@
 
     function handleDrop(event) {
       event.preventDefault();
+      event.stopPropagation();
       dragDepth = 0;
       setDragging(false);
 
@@ -941,6 +1151,10 @@
       vscode.postMessage({ command: 'refreshModels' });
     });
 
+    agentToggleEl.addEventListener('click', () => {
+      vscode.postMessage({ command: 'toggleAgentMode' });
+    });
+
     inputEl.addEventListener('keydown', event => {
       if (event.key === 'Enter' && !event.shiftKey) {
         event.preventDefault();
@@ -972,6 +1186,16 @@
     dropOverlayEl.addEventListener('drop', handleDrop);
     composerShellEl.addEventListener('drop', handleDrop);
 
+    dropzoneEl.addEventListener('click', () => {
+      vscode.postMessage({ command: 'browseFiles' });
+    });
+    dropzoneEl.addEventListener('keydown', event => {
+      if (event.key === 'Enter' || event.key === ' ') {
+        event.preventDefault();
+        vscode.postMessage({ command: 'browseFiles' });
+      }
+    });
+
     window.addEventListener('message', event => {
       const payload = event.data;
 
@@ -980,6 +1204,7 @@
         attachments = payload.attachments;
         availableModels = payload.availableModels || [];
         currentModel = payload.currentModel || '';
+        agentMode = payload.agentMode !== undefined ? payload.agentMode : agentMode;
         render();
         return;
       }

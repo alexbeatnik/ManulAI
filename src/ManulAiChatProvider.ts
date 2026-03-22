@@ -42,7 +42,7 @@ interface ToolDefinition {
 }
 
 interface WebviewInboundMessage {
-  command: 'ready' | 'sendMessage' | 'addFileContext' | 'removeFileContext' | 'selectModel' | 'refreshModels';
+  command: 'ready' | 'sendMessage' | 'addFileContext' | 'removeFileContext' | 'selectModel' | 'refreshModels' | 'browseFiles' | 'toggleAgentMode';
   text?: string;
   path?: string;
   paths?: string[];
@@ -61,6 +61,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   private readonly messages: OllamaMessage[] = [];
   private readonly attachedFiles = new Map<string, AttachedFileContext>();
   private availableModels: string[] = [];
+  private agentMode = true;
   private requestInFlight = false;
 
   public constructor(private readonly extensionContext: vscode.ExtensionContext) {}
@@ -135,6 +136,14 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       case 'refreshModels':
         await this.refreshModelCatalog(true);
         this.postStateToWebview();
+        return;
+      case 'browseFiles':
+        await this.browseAndAttachFiles();
+        return;
+      case 'toggleAgentMode':
+        this.agentMode = !this.agentMode;
+        this.postStateToWebview();
+        this.postStatus(`Agent mode ${this.agentMode ? 'enabled' : 'disabled'}. Tool calls will ${this.agentMode ? 'auto-execute' : 'require confirmation'}.`);
         return;
       default:
         return;
@@ -234,6 +243,17 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
 
         if (assistantMessage.tool_calls?.length) {
           for (const toolCall of assistantMessage.tool_calls) {
+            const approved = await this.confirmToolCall(toolCall);
+            if (!approved) {
+              this.messages.push({
+                role: 'tool',
+                content: JSON.stringify({ error: 'Tool call rejected by user.' }),
+                tool_name: toolCall.function.name
+              });
+              this.postToolResult(toolCall.function.name, 'Rejected by user.');
+              continue;
+            }
+
             const toolResult = await this.executeToolCall(toolCall);
             this.messages.push({
               role: 'tool',
@@ -514,6 +534,49 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     }
   }
 
+  private async browseAndAttachFiles(): Promise<void> {
+    const uris = await vscode.window.showOpenDialog({
+      canSelectMany: true,
+      canSelectFiles: true,
+      canSelectFolders: false,
+      openLabel: 'Attach',
+      title: 'Attach files to ManulAI context'
+    });
+
+    if (!uris?.length) {
+      return;
+    }
+
+    for (const uri of uris) {
+      await this.addFileContext(uri.fsPath);
+    }
+  }
+
+  private async confirmToolCall(toolCall: ToolFunctionCall): Promise<boolean> {
+    if (this.agentMode) {
+      return true;
+    }
+
+    const name = toolCall.function.name;
+    const args = toolCall.function.arguments;
+    const argsPreview = Object.entries(args)
+      .map(([key, value]) => {
+        const stringVal = String(value);
+        return `${key}: ${stringVal.length > 80 ? stringVal.slice(0, 80) + '...' : stringVal}`;
+      })
+      .join(', ');
+
+    const detail = argsPreview ? `${name}(${argsPreview})` : name;
+    const choice = await vscode.window.showWarningMessage(
+      `ManulAI wants to call tool: ${detail}`,
+      { modal: true },
+      'Approve',
+      'Reject'
+    );
+
+    return choice === 'Approve';
+  }
+
   private normalizeDroppedPath(rawPath: string): string {
     const value = rawPath.trim();
 
@@ -581,6 +644,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       messages: renderableMessages,
       currentModel: this.getSelectedModel(),
       availableModels: this.availableModels,
+      agentMode: this.agentMode,
       attachments: Array.from(this.attachedFiles.values()).map(file => ({
         path: file.uri.fsPath,
         name: file.name
