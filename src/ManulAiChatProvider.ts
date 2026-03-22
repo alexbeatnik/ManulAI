@@ -410,10 +410,37 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         return;
       }
 
-      // --- Fallback layer 3: apply legacy [FILE:] blocks ---
+      // --- Fallback layer 3: detect described replacements (old → new code blocks) ---
+      const describedReplacements = this.extractDescribedReplacements(finalContent);
+      if (describedReplacements.length > 0 && this.attachedFiles.size > 0) {
+        // Resolve filepath from attached files
+        const targetFile = this.findAttachedFileForReplacements(describedReplacements);
+        if (targetFile) {
+          const names = [path.basename(targetFile)];
+          const writeApproved = await this.approveFileWrite([targetFile]);
+          if (!writeApproved) {
+            messages.push({ role: 'assistant', content: `[Replacement denied by user: ${names.join(', ')}]` });
+            return;
+          }
+          const appliedSummaries: string[] = [];
+          for (const rep of describedReplacements) {
+            const result = await this.replaceInFile(targetFile, rep.oldText, rep.newText);
+            const parsed = JSON.parse(result) as Record<string, unknown>;
+            if (parsed.error) {
+              appliedSummaries.push(`Replace failed in ${path.basename(targetFile)}: ${String(parsed.error)}`);
+            } else {
+              appliedSummaries.push(`Replaced in ${path.basename(targetFile)}: "${rep.oldText.slice(0, 50)}..." → "${rep.newText.slice(0, 50)}..."`);
+            }
+          }
+          messages.push({ role: 'assistant', content: appliedSummaries.join('\n') });
+          return;
+        }
+      }
+
+      // --- Fallback layer 4: apply legacy [FILE:] blocks ---
       finalContent = await this.applyInlineFileBlocks(finalContent);
 
-      // --- Fallback layer 4: if response is suspiciously large, try matching to attached file ---
+      // --- Fallback layer 5: if response is suspiciously large, try matching to attached file ---
       const matchedFile = this.matchResponseToAttachedFile(finalContent);
       if (matchedFile) {
         const writeApproved = await this.approveFileWrite([matchedFile.filepath]);
@@ -430,10 +457,11 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         return;
       }
 
-      // --- Fallback layer 5: nudge the model to use tools if it dumped a lot of content ---
-      const isLongDump = finalContent.length > 800 && retryCount < 1;
-      const hasLargeCodeBlocks = /```[\w]*\n[\s\S]{500,}?```/.test(finalContent);
-      if ((isLongDump || hasLargeCodeBlocks) && retryCount < 1) {
+      // --- Fallback layer 6: nudge the model to use tools if it didn't ---
+      const isLongDump = finalContent.length > 300;
+      const hasLargeCodeBlocks = /```[\w]*\n[\s\S]{200,}?```/.test(finalContent);
+      const mentionsChange = /(?:змін|зроби|оновл|replac|chang|updat|modif)/i.test(finalContent);
+      if ((isLongDump || hasLargeCodeBlocks || mentionsChange) && retryCount < 1) {
         messages.push({
           role: 'assistant',
           content: finalContent,
@@ -560,6 +588,60 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     return head + '\n\n... (' + String(omitted) + ' lines omitted) ...\n\n' + tail;
   }
 
+  private extractDescribedReplacements(content: string): Array<{ oldText: string; newText: string }> {
+    const replacements: Array<{ oldText: string; newText: string }> = [];
+
+    // Pattern 1: markdown code blocks with old → new separated by "На:" / "To:" / "→"
+    // Matches:
+    //   ```\nCopyright 2026 Jane\n```\n На:\n ```\nCopyright 2026 John\n```
+    const codeBlockPairPattern =
+      /```[^\n]*\n([\s\S]*?)```\s*(?:\n\s*)?(?:На|на|To|to|→|->|replaced with|замінено на|changed to)[:\s]*\s*```[^\n]*\n([\s\S]*?)```/gi;
+    let match: RegExpExecArray | null;
+    while ((match = codeBlockPairPattern.exec(content)) !== null) {
+      const oldText = match[1].trim();
+      const newText = match[2].trim();
+      if (oldText && newText && oldText !== newText) {
+        replacements.push({ oldText, newText });
+      }
+    }
+
+    if (replacements.length > 0) {
+      return replacements;
+    }
+
+    // Pattern 2: numbered list with "Змінено ... На:" pairs (inline)
+    //   Змінено ім'я: `old_value` → `new_value`  OR  `old_value` На: `new_value`
+    const inlinePattern =
+      /[`"«]([^`"»\n]+)[`"»]\s*(?:→|->|на|to|replaced with|changed to)[:\s]*\s*[`"«]([^`"»\n]+)[`"»]/gi;
+    while ((match = inlinePattern.exec(content)) !== null) {
+      const oldText = match[1].trim();
+      const newText = match[2].trim();
+      if (oldText && newText && oldText !== newText) {
+        replacements.push({ oldText, newText });
+      }
+    }
+
+    return replacements;
+  }
+
+  private findAttachedFileForReplacements(replacements: Array<{ oldText: string }>): string | undefined {
+    // Find which attached file contains the old_text strings
+    for (const [fsPath, file] of this.attachedFiles) {
+      const allFound = replacements.every(rep => file.content.includes(rep.oldText));
+      if (allFound) {
+        return fsPath;
+      }
+    }
+    // Partial match: at least one replacement matches
+    for (const [fsPath, file] of this.attachedFiles) {
+      const anyFound = replacements.some(rep => file.content.includes(rep.oldText));
+      if (anyFound) {
+        return fsPath;
+      }
+    }
+    return undefined;
+  }
+
   private async callOllama(messages: OllamaMessage[]): Promise<OllamaResponse> {
     const config = vscode.workspace.getConfiguration('manulai');
     const baseUrl = String(config.get('ollamaBaseUrl', 'http://localhost:11434')).replace(/\/$/, '');
@@ -571,16 +653,20 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     if (this.agentMode) {
       const workspaceInstructions = await this.getWorkspaceInstructions();
 
-      let agentMandate = 'You are an autonomous VS Code Agent with direct file-system access through tools.\n' +
-        'ABSOLUTE RULES — you MUST follow these without exception:\n' +
-        '1. To EDIT an existing file — ALWAYS call the `replace_in_file` tool with `old_text` (the exact existing text) and `new_text` (the replacement). ' +
-        'Include 2-3 lines of surrounding context in `old_text` so it matches uniquely. This is the PREFERRED tool for any partial change.\n' +
-        '2. To CREATE a new file or fully rewrite one — call the `write_to_file` tool.\n' +
-        '3. NEVER output code in your chat message. NEVER paste file content in chat. NEVER use markdown code blocks to show file content. ' +
-        'ONLY tool calls can modify files. If you want to change a file, you MUST use a tool call.\n' +
-        '4. After a tool call, respond with a 1-3 sentence summary of what you changed. Do NOT show the file or the changed code in chat.\n' +
-        '5. If you need to read a file first, call `read_specific_file` or `read_active_file`.\n' +
-        '6. IMPORTANT: Do NOT explain what code you would write. Just call the tool and write it directly.';
+      let agentMandate = 'You are a VS Code coding agent. You MUST use tool calls to modify files. NEVER describe changes in chat — call a tool instead.\n\n' +
+        'Available tools:\n' +
+        '- replace_in_file(filepath, old_text, new_text) — replace a snippet in a file. ALWAYS use this for edits.\n' +
+        '- write_to_file(filepath, content) — create or fully overwrite a file.\n' +
+        '- read_specific_file(filepath) — read a file.\n' +
+        '- read_active_file() — read the currently open file.\n' +
+        '- execute_terminal_command(command) — run a shell command.\n\n' +
+        'Example — user says "change author to John" in a file with "Copyright 2026 Jane":\n' +
+        'CORRECT: call replace_in_file with filepath="LICENSE", old_text="Copyright 2026 Jane", new_text="Copyright 2026 John"\n' +
+        'WRONG: writing "I changed Jane to John" in chat without calling a tool.\n\n' +
+        'Rules:\n' +
+        '1. ALWAYS call a tool to make file changes. Do not just describe them.\n' +
+        '2. After calling a tool, say briefly what you did (1 sentence). Do not show file content.\n' +
+        '3. If attached file context is provided, you already have the content — call replace_in_file directly, no need to read first.';
 
       if (workspaceInstructions) {
         agentMandate += '\n\n<workspace_instructions>\n' + workspaceInstructions + '\n</workspace_instructions>';
