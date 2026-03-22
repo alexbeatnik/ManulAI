@@ -64,7 +64,10 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   private agentMode = true;
   private requestInFlight = false;
 
-  public constructor(private readonly extensionContext: vscode.ExtensionContext) {}
+  public constructor(private readonly extensionContext: vscode.ExtensionContext) {
+    const config = vscode.workspace.getConfiguration('manulai');
+    this.agentMode = Boolean(config.get('agentMode', true));
+  }
 
   public resolveWebviewView(
     webviewView: vscode.WebviewView,
@@ -142,6 +145,12 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         return;
       case 'toggleAgentMode':
         this.agentMode = !this.agentMode;
+        {
+          const target = vscode.workspace.workspaceFolders?.length
+            ? vscode.ConfigurationTarget.Workspace
+            : vscode.ConfigurationTarget.Global;
+          void vscode.workspace.getConfiguration('manulai').update('agentMode', this.agentMode, target);
+        }
         this.postStateToWebview();
         this.postStatus(`Agent mode ${this.agentMode ? 'enabled' : 'disabled'}. Tool calls will ${this.agentMode ? 'auto-execute' : 'require confirmation'}.`);
         return;
@@ -206,6 +215,8 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   }
 
   public async handleConfigurationChange(): Promise<void> {
+    const config = vscode.workspace.getConfiguration('manulai');
+    this.agentMode = Boolean(config.get('agentMode', true));
     await this.refreshModelCatalog(false);
     this.postStateToWebview();
   }
@@ -531,6 +542,12 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Failed to attach file.';
       this.postStatus(`Unable to attach dropped file: ${message}`);
+    }
+  }
+
+  public async attachFilesByUri(uris: vscode.Uri[]): Promise<void> {
+    for (const uri of uris) {
+      await this.addFileContext(uri.fsPath);
     }
   }
 

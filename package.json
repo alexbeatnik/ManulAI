@@ -36,8 +36,23 @@
         "title": "ManulAI: Select Ollama Model",
         "category": "ManulAI",
         "icon": "$(hubot)"
+      },
+      {
+        "command": "manulai.attachFile",
+        "title": "Attach to ManulAI Chat",
+        "category": "ManulAI",
+        "icon": "$(add)"
       }
     ],
+    "menus": {
+      "explorer/context": [
+        {
+          "command": "manulai.attachFile",
+          "group": "manulai@1",
+          "when": "!explorerResourceIsFolder"
+        }
+      ]
+    },
     "viewsContainers": {
       "activitybar": [
         {

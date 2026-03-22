@@ -70,6 +70,36 @@ export function activate(context: vscode.ExtensionContext): void {
   );
 
   context.subscriptions.push(
+    vscode.commands.registerCommand('manulai.attachFile', async (...args: unknown[]) => {
+      let uris: vscode.Uri[] = [];
+
+      // When invoked from Explorer context menu, VS Code passes the clicked URI as the first arg
+      // and all selected URIs as the second arg.
+      if (args.length >= 2 && Array.isArray(args[1])) {
+        uris = (args[1] as vscode.Uri[]).filter(u => u instanceof vscode.Uri);
+      } else if (args.length >= 1 && args[0] instanceof vscode.Uri) {
+        uris = [args[0]];
+      }
+
+      if (uris.length === 0) {
+        // Fallback: attach active editor file
+        const activeUri = vscode.window.activeTextEditor?.document.uri;
+        if (activeUri) {
+          uris = [activeUri];
+        }
+      }
+
+      if (uris.length === 0) {
+        void vscode.window.showWarningMessage('No file selected to attach.');
+        return;
+      }
+
+      await provider.attachFilesByUri(uris);
+      await openChat();
+    })
+  );
+
+  context.subscriptions.push(
     vscode.commands.registerCommand('manulai.selectModel', async () => {
       await provider.refreshModelCatalog(true);
 
@@ -100,11 +130,9 @@ export function activate(context: vscode.ExtensionContext): void {
 
   context.subscriptions.push(
     vscode.workspace.onDidChangeConfiguration(async event => {
-      if (!event.affectsConfiguration('manulai.ollamaBaseUrl') && !event.affectsConfiguration('manulai.ollamaModel')) {
-        return;
+      if (event.affectsConfiguration('manulai.ollamaBaseUrl') || event.affectsConfiguration('manulai.ollamaModel') || event.affectsConfiguration('manulai.agentMode')) {
+        await provider.handleConfigurationChange();
       }
-
-      await provider.handleConfigurationChange();
     })
   );
 
