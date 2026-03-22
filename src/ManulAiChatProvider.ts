@@ -373,11 +373,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           messages.push({ role: 'assistant', content: `[File write denied by user: ${markerWrite.filepath}]` });
           return;
         }
-        const result = await this.createOrEditFile(markerWrite.filepath, markerWrite.fileContent);
-        const parsed = JSON.parse(result) as Record<string, unknown>;
-        const summary = parsed.error
-          ? `Failed to write ${markerWrite.filepath}: ${String(parsed.error)}`
-          : `Wrote ${markerWrite.filepath} (${String(parsed.bytesWritten)} bytes)`;
+        const summary = await this.writeFileWithDiff(markerWrite.filepath, markerWrite.fileContent);
         const remaining = finalContent.replace(markerWrite.fullMatch, '').trim();
         finalContent = summary + (remaining ? '\n\n' + this.truncateLongResponse(remaining) : '');
         messages.push({ role: 'assistant', content: finalContent });
@@ -396,21 +392,36 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
 
         const appliedSummaries: string[] = [];
         for (const block of codeBlockWrites) {
-          const result = await this.createOrEditFile(block.filepath, block.fileContent);
-          const parsed = JSON.parse(result) as Record<string, unknown>;
-          if (parsed.error) {
-            appliedSummaries.push(`Failed to write ${block.filepath}: ${String(parsed.error)}`);
-          } else {
-            appliedSummaries.push(`Wrote ${block.filepath} (${String(parsed.bytesWritten)} bytes)`);
-          }
+          appliedSummaries.push(await this.writeFileWithDiff(block.filepath, block.fileContent));
           finalContent = finalContent.replace(block.fullMatch, '');
         }
-        finalContent = appliedSummaries.join('\n') + (finalContent.trim() ? '\n\n' + this.truncateLongResponse(finalContent.trim()) : '');
+        finalContent = appliedSummaries.join('\n\n') + (finalContent.trim() ? '\n\n' + this.truncateLongResponse(finalContent.trim()) : '');
         messages.push({ role: 'assistant', content: finalContent });
         return;
       }
 
-      // --- Fallback layer 3: detect described replacements (old → new code blocks) ---
+      // --- Fallback layer 3: apply [FILE:] blocks ---
+      const inlineFileBlocks = this.extractInlineFileBlocks(finalContent);
+      if (inlineFileBlocks.length > 0) {
+        const fileNames = inlineFileBlocks.map(b => b.filepath);
+        const writeApproved = await this.approveFileWrite(fileNames);
+        if (!writeApproved) {
+          messages.push({ role: 'assistant', content: `[File write denied by user: ${fileNames.join(', ')}]` });
+          return;
+        }
+        const appliedSummaries: string[] = [];
+        let remaining = finalContent;
+        for (const block of inlineFileBlocks) {
+          appliedSummaries.push(await this.writeFileWithDiff(block.filepath, block.fileContent));
+          remaining = remaining.replace(block.fullMatch, '');
+        }
+        remaining = remaining.trim();
+        finalContent = appliedSummaries.join('\n\n') + (remaining ? '\n\n' + this.truncateLongResponse(remaining) : '');
+        messages.push({ role: 'assistant', content: finalContent });
+        return;
+      }
+
+      // --- Fallback layer 4: detect described replacements (old → new code blocks) ---
       const describedReplacements = this.extractDescribedReplacements(finalContent);
       if (describedReplacements.length > 0) {
         // Resolve filepath: first from attached files, then from file name mentioned in response
@@ -451,11 +462,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           messages.push({ role: 'assistant', content: `[File write denied by user: ${matchedFile.filepath}]` });
           return;
         }
-        const result = await this.createOrEditFile(matchedFile.filepath, matchedFile.fileContent);
-        const parsed = JSON.parse(result) as Record<string, unknown>;
-        const summary = parsed.error
-          ? `Failed to write ${matchedFile.filepath}: ${String(parsed.error)}`
-          : `Wrote ${matchedFile.filepath} (${String(parsed.bytesWritten)} bytes)`;
+        const summary = await this.writeFileWithDiff(matchedFile.filepath, matchedFile.fileContent);
         messages.push({ role: 'assistant', content: summary });
         return;
       }
@@ -1121,12 +1128,8 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
 
     let result = content;
     for (const block of blocks) {
-      const writeResult = await this.createOrEditFile(block.filepath, block.fileContent);
-      const parsed = JSON.parse(writeResult) as Record<string, unknown>;
-      const status = parsed.error
-        ? `Failed to write ${block.filepath}: ${String(parsed.error)}`
-        : `Wrote ${block.filepath} (${String(parsed.bytesWritten)} bytes)`;
-      result = result.replace(block.fullMatch, status);
+      const summary = await this.writeFileWithDiff(block.filepath, block.fileContent);
+      result = result.replace(block.fullMatch, summary);
     }
 
     return result;
@@ -1232,6 +1235,104 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         error: error instanceof Error ? error.message : 'Failed to write file.'
       });
     }
+  }
+
+  private async writeFileWithDiff(filepath: string, newContent: string): Promise<string> {
+    const target = this.resolveWorkspaceUri(filepath);
+    const displayName = path.basename(target.fsPath);
+
+    // Read old content for diff (may not exist yet)
+    let oldContent: string | undefined;
+    try {
+      const bytes = await vscode.workspace.fs.readFile(target);
+      oldContent = Buffer.from(bytes).toString('utf8');
+    } catch {
+      // File doesn't exist yet — new file
+    }
+
+    // Write the file
+    const writeResult = await this.createOrEditFile(filepath, newContent);
+    const parsed = JSON.parse(writeResult) as Record<string, unknown>;
+    if (parsed.error) {
+      return `Failed to write ${displayName}: ${String(parsed.error)}`;
+    }
+
+    // Compute diff
+    if (oldContent === undefined) {
+      // New file created
+      const lineCount = newContent.split('\n').length;
+      return `Created ${displayName} (${lineCount} lines)`;
+    }
+
+    if (oldContent === newContent) {
+      return `${displayName}: no changes detected.`;
+    }
+
+    const diffLines = this.computeLineDiff(oldContent, newContent);
+    if (diffLines.length === 0) {
+      return `Updated ${displayName} (whitespace-only changes)`;
+    }
+
+    const header = `Updated **${displayName}** — changed lines:`;
+    const diffBlock = '```diff\n' + diffLines.join('\n') + '\n```';
+    return header + '\n' + diffBlock;
+  }
+
+  private computeLineDiff(oldContent: string, newContent: string): string[] {
+    const oldLines = oldContent.split('\n');
+    const newLines = newContent.split('\n');
+    const diffResult: string[] = [];
+
+    // Simple line-by-line diff with context
+    const maxLen = Math.max(oldLines.length, newLines.length);
+    let inChange = false;
+    let contextBuffer: string[] = [];
+
+    for (let i = 0; i < maxLen; i++) {
+      const oldLine = i < oldLines.length ? oldLines[i] : undefined;
+      const newLine = i < newLines.length ? newLines[i] : undefined;
+
+      if (oldLine === newLine) {
+        // Same line — buffer as potential context
+        if (inChange) {
+          // Show 1 line of trailing context after a change
+          diffResult.push(`  ${oldLine ?? ''}`);
+          inChange = false;
+        }
+        contextBuffer = [`  ${oldLine ?? ''}`];
+        continue;
+      }
+
+      // Lines differ
+      if (!inChange && contextBuffer.length > 0) {
+        // Show 1 line of leading context before a change
+        const lineNum = i;
+        diffResult.push(`@@ line ${lineNum} @@`);
+        diffResult.push(...contextBuffer);
+      } else if (!inChange) {
+        const lineNum = i + 1;
+        diffResult.push(`@@ line ${lineNum} @@`);
+      }
+      inChange = true;
+      contextBuffer = [];
+
+      if (oldLine !== undefined && newLine !== undefined) {
+        diffResult.push(`- ${oldLine}`);
+        diffResult.push(`+ ${newLine}`);
+      } else if (oldLine !== undefined) {
+        diffResult.push(`- ${oldLine}`);
+      } else if (newLine !== undefined) {
+        diffResult.push(`+ ${newLine}`);
+      }
+    }
+
+    // Cap output at 30 lines to keep chat reasonable
+    if (diffResult.length > 30) {
+      const omitted = diffResult.length - 20;
+      return [...diffResult.slice(0, 15), `... (${omitted} more diff lines) ...`, ...diffResult.slice(-5)];
+    }
+
+    return diffResult;
   }
 
   private async replaceInFile(filepath: string, oldText: string, newText: string): Promise<string> {
