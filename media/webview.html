@@ -11,89 +11,445 @@
   <style>
     :root {
       color-scheme: light dark;
-      --bg: var(--vscode-sideBar-background);
-      --panel: color-mix(in srgb, var(--vscode-editor-background) 88%, transparent);
-      --panel-strong: color-mix(in srgb, var(--vscode-input-background) 90%, transparent);
-      --border: var(--vscode-panel-border);
+      --bg: color-mix(in srgb, var(--vscode-sideBar-background) 86%, #081018 14%);
+      --panel: color-mix(in srgb, var(--vscode-editor-background) 82%, #0d1b26 18%);
+      --panel-strong: color-mix(in srgb, var(--vscode-input-background) 78%, #10263a 22%);
+      --panel-soft: color-mix(in srgb, var(--vscode-editor-background) 92%, transparent);
+      --border: color-mix(in srgb, var(--vscode-panel-border) 60%, #c49a00 40%);
+      --border-muted: color-mix(in srgb, var(--vscode-panel-border) 78%, transparent);
       --text: var(--vscode-foreground);
-      --muted: var(--vscode-descriptionForeground);
-      --accent: var(--vscode-focusBorder);
-      --user: color-mix(in srgb, var(--vscode-textLink-foreground) 18%, var(--vscode-editor-background));
-      --assistant: color-mix(in srgb, var(--vscode-button-background) 10%, var(--vscode-editor-background));
-      --tool: color-mix(in srgb, var(--vscode-terminal-ansiGreen) 10%, var(--vscode-editor-background));
-      --status: color-mix(in srgb, var(--vscode-terminal-ansiYellow) 14%, var(--vscode-editor-background));
-      --danger: var(--vscode-errorForeground);
-      font-family: var(--vscode-font-family);
+      --muted: color-mix(in srgb, var(--vscode-descriptionForeground) 90%, #c4cbd3 10%);
+      --accent: color-mix(in srgb, var(--vscode-focusBorder) 70%, #e4ad07 30%);
+      --accent-strong: color-mix(in srgb, var(--vscode-button-background) 55%, #0b7eff 45%);
+      --accent-soft: color-mix(in srgb, var(--accent) 14%, transparent);
+      --user: color-mix(in srgb, var(--vscode-textLink-foreground) 13%, var(--panel));
+      --assistant: color-mix(in srgb, var(--vscode-editor-background) 80%, #16304a 20%);
+      --tool: color-mix(in srgb, var(--vscode-terminal-ansiGreen) 10%, var(--panel));
+      --status: color-mix(in srgb, var(--vscode-terminal-ansiYellow) 10%, var(--panel));
+      --shadow: 0 18px 40px rgba(0, 0, 0, 0.18);
+      --shadow-soft: 0 10px 24px rgba(0, 0, 0, 0.12);
+      font-family: 'Segoe UI Variable Text', 'Inter', var(--vscode-font-family);
     }
 
     * {
       box-sizing: border-box;
     }
 
+    html,
+    body {
+      height: 100%;
+    }
+
     body {
       margin: 0;
       min-height: 100vh;
       display: grid;
-      grid-template-rows: auto auto 1fr auto;
+      grid-template-rows: auto 1fr auto;
       background:
-        radial-gradient(circle at top right, color-mix(in srgb, var(--accent) 18%, transparent), transparent 32%),
-        linear-gradient(180deg, color-mix(in srgb, var(--bg) 92%, black 8%), var(--bg));
+        radial-gradient(circle at top right, color-mix(in srgb, var(--accent) 18%, transparent), transparent 34%),
+        radial-gradient(circle at bottom left, color-mix(in srgb, var(--accent-strong) 16%, transparent), transparent 30%),
+        linear-gradient(180deg, color-mix(in srgb, var(--bg) 94%, black 6%), var(--bg));
       color: var(--text);
+      overflow: hidden;
+    }
+
+    body.dragging .composer-shell,
+    body.dragging .drop-inline {
+      border-color: var(--accent);
+      background: color-mix(in srgb, var(--accent) 7%, var(--panel));
+      box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 42%, transparent), var(--shadow);
     }
 
     .header {
-      padding: 14px 14px 10px;
-      border-bottom: 1px solid var(--border);
+      padding: 14px 14px 12px;
+      border-bottom: 1px solid var(--border-muted);
+      background: linear-gradient(180deg, color-mix(in srgb, var(--panel-soft) 70%, transparent), transparent);
+      backdrop-filter: blur(8px);
+    }
+
+    .header-row {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 12px;
+    }
+
+    .title-wrap {
+      min-width: 0;
+    }
+
+    .eyebrow {
+      margin: 0 0 6px;
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+      color: var(--accent);
     }
 
     .title {
-      font-size: 13px;
+      margin: 0;
+      font-size: 15px;
       font-weight: 700;
-      letter-spacing: 0.08em;
-      text-transform: uppercase;
-      margin: 0 0 4px;
+      letter-spacing: 0.01em;
     }
 
     .subtitle {
-      margin: 0;
+      margin: 4px 0 0;
       font-size: 12px;
       color: var(--muted);
+      line-height: 1.45;
     }
 
-    .dropzone {
-      margin: 12px 14px 0;
-      padding: 12px;
-      border: 1px dashed color-mix(in srgb, var(--accent) 55%, var(--border));
-      border-radius: 12px;
-      background: color-mix(in srgb, var(--panel) 78%, transparent);
+    .status-pill {
+      flex-shrink: 0;
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 11px;
+      border-radius: 999px;
+      border: 1px solid var(--border-muted);
+      background: color-mix(in srgb, var(--panel) 82%, transparent);
       color: var(--muted);
-      font-size: 12px;
-      transition: border-color 120ms ease, background 120ms ease, transform 120ms ease;
+      font-size: 11px;
+      white-space: nowrap;
     }
 
-    .dropzone.active {
-      border-color: var(--accent);
-      background: color-mix(in srgb, var(--accent) 10%, var(--panel));
+    .status-pill::before {
+      content: '';
+      width: 8px;
+      height: 8px;
+      border-radius: 999px;
+      background: color-mix(in srgb, var(--vscode-terminal-ansiGreen) 76%, #86d993 24%);
+      box-shadow: 0 0 0 4px color-mix(in srgb, var(--vscode-terminal-ansiGreen) 14%, transparent);
+    }
+
+    body.busy .status-pill {
       color: var(--text);
+      border-color: color-mix(in srgb, var(--accent) 38%, transparent);
+    }
+
+    body.busy .status-pill::before {
+      background: var(--accent);
+      box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 18%, transparent);
+      animation: pulse-ring 1.45s ease-out infinite;
+    }
+
+    .workspace {
+      min-height: 0;
+      display: grid;
+      grid-template-rows: auto 1fr;
+      gap: 12px;
+      padding: 12px 14px 0;
+    }
+
+    .topbar {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 10px;
+      align-items: center;
+    }
+
+    .drop-inline {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      min-width: 0;
+      padding: 10px 12px;
+      border-radius: 14px;
+      border: 1px dashed color-mix(in srgb, var(--accent) 50%, var(--border-muted));
+      background: color-mix(in srgb, var(--panel) 70%, transparent);
+      color: var(--muted);
+      font-size: 12px;
+      transition: border-color 140ms ease, background 140ms ease, transform 140ms ease, box-shadow 140ms ease;
+    }
+
+    .drop-inline::before {
+      content: '+';
+      display: grid;
+      place-items: center;
+      width: 20px;
+      height: 20px;
+      border-radius: 999px;
+      background: color-mix(in srgb, var(--accent) 14%, transparent);
+      color: var(--accent);
+      font-weight: 700;
+      flex-shrink: 0;
+    }
+
+    .drop-inline.active {
+      color: var(--text);
+      border-color: var(--accent);
       transform: translateY(-1px);
+      box-shadow: var(--shadow-soft);
+    }
+
+    .controls {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      min-width: 0;
+    }
+
+    .model-select,
+    .ghost-button,
+    .send {
+      border-radius: 12px;
+      font: inherit;
+      transition: transform 140ms ease, border-color 140ms ease, background 140ms ease, opacity 140ms ease;
+    }
+
+    .model-select {
+      min-width: 0;
+      width: 100%;
+      border: 1px solid var(--border-muted);
+      background: color-mix(in srgb, var(--panel-strong) 88%, transparent);
+      color: var(--text);
+      padding: 9px 12px;
+      outline: none;
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.02);
+    }
+
+    .model-select:focus,
+    .ghost-button:focus,
+    textarea:focus,
+    .send:focus {
+      border-color: var(--accent);
+      outline: none;
+    }
+
+    .ghost-button {
+      border: 1px solid var(--border-muted);
+      background: color-mix(in srgb, var(--panel-strong) 84%, transparent);
+      color: var(--text);
+      padding: 9px 12px;
+      cursor: pointer;
+      flex-shrink: 0;
+    }
+
+    .ghost-button:hover:not([disabled]),
+    .send:hover:not([disabled]) {
+      transform: translateY(-1px);
+    }
+
+    .ghost-button[disabled],
+    .send[disabled] {
+      opacity: 0.55;
+      cursor: default;
+      transform: none;
+    }
+
+    .history-shell {
+      min-height: 0;
+      border: 1px solid var(--border-muted);
+      border-radius: 18px;
+      background:
+        linear-gradient(180deg, color-mix(in srgb, var(--panel-soft) 88%, transparent), transparent 26%),
+        color-mix(in srgb, var(--panel) 92%, transparent);
+      box-shadow: var(--shadow-soft);
+      overflow: hidden;
+      display: grid;
+      grid-template-rows: auto 1fr;
+    }
+
+    .history-meta {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--border-muted);
+      background: color-mix(in srgb, var(--panel-soft) 76%, transparent);
+      font-size: 11px;
+      color: var(--muted);
+    }
+
+    .history-meta strong {
+      color: var(--text);
+      font-weight: 600;
+    }
+
+    .thinking-inline {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .dots {
+      display: inline-flex;
+      gap: 5px;
+      align-items: center;
+      min-width: 22px;
+    }
+
+    .dots span {
+      width: 5px;
+      height: 5px;
+      border-radius: 999px;
+      background: var(--accent);
+      opacity: 0.28;
+      animation: bounce 1.1s infinite ease-in-out;
+    }
+
+    .dots span:nth-child(2) {
+      animation-delay: 0.14s;
+    }
+
+    .dots span:nth-child(3) {
+      animation-delay: 0.28s;
+    }
+
+    .history {
+      overflow-y: auto;
+      padding: 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      min-height: 0;
+    }
+
+    .empty {
+      margin: auto 0;
+      padding: 18px;
+      border: 1px solid var(--border-muted);
+      border-radius: 16px;
+      background:
+        linear-gradient(135deg, color-mix(in srgb, var(--accent) 10%, transparent), transparent 42%),
+        color-mix(in srgb, var(--panel-soft) 88%, transparent);
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.6;
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.02);
+    }
+
+    .empty strong {
+      display: block;
+      margin-bottom: 8px;
+      color: var(--text);
+      font-size: 13px;
+      font-weight: 600;
+    }
+
+    .message {
+      display: flex;
+      flex-direction: column;
+      gap: 7px;
+      max-width: 100%;
+    }
+
+    .message.user {
+      align-items: flex-end;
+    }
+
+    .message-meta-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 10px;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      color: var(--muted);
+    }
+
+    .message-card {
+      border: 1px solid var(--border-muted);
+      border-radius: 16px;
+      padding: 11px 13px;
+      line-height: 1.55;
+      font-size: 12px;
+      white-space: pre-wrap;
+      word-break: break-word;
+      box-shadow: var(--shadow-soft);
+      max-width: 100%;
+    }
+
+    .message.user .message-card {
+      background: linear-gradient(180deg, color-mix(in srgb, var(--user) 94%, transparent), color-mix(in srgb, var(--user) 82%, transparent));
+      max-width: 92%;
+    }
+
+    .message.assistant .message-card {
+      background: linear-gradient(180deg, color-mix(in srgb, var(--assistant) 96%, transparent), color-mix(in srgb, var(--assistant) 88%, transparent));
+    }
+
+    .message.tool .message-card {
+      background: linear-gradient(180deg, color-mix(in srgb, var(--tool) 96%, transparent), color-mix(in srgb, var(--tool) 88%, transparent));
+      font-family: var(--vscode-editor-font-family);
+      font-size: 11px;
+    }
+
+    .message.status .message-card {
+      background: linear-gradient(180deg, color-mix(in srgb, var(--status) 96%, transparent), color-mix(in srgb, var(--status) 88%, transparent));
+      border-style: dashed;
+      color: var(--muted);
+    }
+
+    .thinking-card {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 12px 13px;
+      border-radius: 16px;
+      border: 1px solid color-mix(in srgb, var(--accent) 30%, transparent);
+      background:
+        linear-gradient(120deg, color-mix(in srgb, var(--accent) 11%, transparent), transparent 34%),
+        color-mix(in srgb, var(--assistant) 92%, transparent);
+      box-shadow: var(--shadow-soft);
+    }
+
+    .thinking-card .label {
+      font-size: 12px;
+      color: var(--text);
+    }
+
+    .composer {
+      padding: 12px 14px 14px;
+      background: linear-gradient(180deg, transparent, color-mix(in srgb, var(--bg) 80%, black 20%) 36%);
+    }
+
+    .composer-shell {
+      border: 1px solid var(--border-muted);
+      border-radius: 18px;
+      background:
+        linear-gradient(180deg, color-mix(in srgb, var(--panel-soft) 90%, transparent), transparent 38%),
+        color-mix(in srgb, var(--panel) 96%, transparent);
+      box-shadow: var(--shadow);
+      overflow: hidden;
+      transition: border-color 140ms ease, background 140ms ease, box-shadow 140ms ease;
     }
 
     .chips {
       display: flex;
       flex-wrap: wrap;
       gap: 8px;
-      padding: 10px 14px 0;
+      padding: 12px 12px 0;
     }
 
     .chip {
       display: inline-flex;
       align-items: center;
       gap: 8px;
+      max-width: 100%;
       padding: 6px 10px;
       border-radius: 999px;
-      background: var(--panel-strong);
-      border: 1px solid var(--border);
-      font-size: 12px;
+      background: color-mix(in srgb, var(--panel-strong) 86%, transparent);
+      border: 1px solid var(--border-muted);
+      font-size: 11px;
+      color: var(--text);
+    }
+
+    .chip::before {
+      content: 'file';
+      font-size: 9px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--accent);
+    }
+
+    .chip span {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
     }
 
     .chip button {
@@ -104,142 +460,244 @@
       padding: 0;
       line-height: 1;
       font-size: 14px;
+      flex-shrink: 0;
     }
 
-    .history {
-      overflow-y: auto;
-      padding: 12px 14px 18px;
-      display: flex;
-      flex-direction: column;
-      gap: 10px;
+    .chip button:hover {
+      color: var(--text);
     }
 
-    .empty {
-      margin: auto 0;
-      padding: 18px;
-      border: 1px solid var(--border);
-      border-radius: 14px;
-      background: color-mix(in srgb, var(--panel) 88%, transparent);
-      color: var(--muted);
-      font-size: 12px;
-      line-height: 1.5;
-    }
-
-    .message {
-      border: 1px solid var(--border);
-      border-radius: 14px;
-      padding: 10px 12px;
-      line-height: 1.5;
-      font-size: 12px;
-      white-space: pre-wrap;
-      word-break: break-word;
-      box-shadow: 0 12px 24px rgba(0, 0, 0, 0.08);
-    }
-
-    .message.user {
-      background: var(--user);
-      align-self: flex-end;
-      max-width: 92%;
-    }
-
-    .message.assistant {
-      background: var(--assistant);
-    }
-
-    .message.tool {
-      background: var(--tool);
-      font-family: var(--vscode-editor-font-family);
-      font-size: 11px;
-    }
-
-    .message.status {
-      background: var(--status);
-      color: var(--muted);
-      border-style: dashed;
-    }
-
-    .composer {
-      border-top: 1px solid var(--border);
-      padding: 12px 14px 14px;
-      background: color-mix(in srgb, var(--bg) 86%, transparent);
-    }
-
-    .composer-row {
+    .composer-inner {
+      padding: 12px;
       display: grid;
-      grid-template-columns: 1fr auto;
       gap: 10px;
+    }
+
+    .input-shell {
+      border: 1px solid var(--border-muted);
+      border-radius: 16px;
+      background: color-mix(in srgb, var(--panel-strong) 92%, transparent);
+      overflow: hidden;
+      transition: border-color 140ms ease, background 140ms ease, box-shadow 140ms ease;
+    }
+
+    .input-shell.active {
+      border-color: var(--accent);
+      box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 30%, transparent);
     }
 
     textarea {
       width: 100%;
-      resize: vertical;
-      min-height: 76px;
+      resize: none;
+      min-height: 92px;
       max-height: 220px;
-      border-radius: 12px;
-      border: 1px solid var(--border);
-      background: var(--panel-strong);
+      border: 0;
+      background: transparent;
       color: var(--text);
-      padding: 10px 12px;
+      padding: 14px 14px 10px;
       outline: none;
       font: inherit;
+      line-height: 1.5;
     }
 
-    textarea:focus {
-      border-color: var(--accent);
+    textarea::placeholder {
+      color: color-mix(in srgb, var(--muted) 84%, transparent);
     }
 
-    button.send {
+    .composer-actions {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 0 12px 12px;
+    }
+
+    .composer-hint {
+      min-width: 0;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      color: var(--muted);
+      font-size: 11px;
+      line-height: 1.4;
+    }
+
+    .composer-hint strong {
+      color: var(--text);
+      font-weight: 600;
+    }
+
+    .send {
       align-self: end;
-      border: 0;
-      border-radius: 12px;
-      padding: 10px 14px;
-      background: var(--vscode-button-background);
+      border: 1px solid transparent;
+      padding: 10px 15px;
+      background: linear-gradient(180deg, color-mix(in srgb, var(--accent-strong) 86%, white 14%), var(--accent-strong));
       color: var(--vscode-button-foreground);
       cursor: pointer;
-      font: inherit;
-      min-width: 74px;
+      min-width: 90px;
+      box-shadow: 0 10px 24px color-mix(in srgb, var(--accent-strong) 22%, transparent);
     }
 
-    button.send[disabled] {
-      opacity: 0.5;
-      cursor: default;
+    .send-label {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      justify-content: center;
+    }
+
+    .send-label .dots {
+      display: none;
+    }
+
+    body.busy .send-label .idle-text {
+      display: none;
+    }
+
+    body.busy .send-label .dots {
+      display: inline-flex;
+    }
+
+    @keyframes bounce {
+      0%,
+      80%,
+      100% {
+        transform: translateY(0);
+        opacity: 0.24;
+      }
+
+      40% {
+        transform: translateY(-3px);
+        opacity: 1;
+      }
+    }
+
+    @keyframes pulse-ring {
+      0% {
+        box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 28%, transparent);
+      }
+
+      100% {
+        box-shadow: 0 0 0 8px color-mix(in srgb, var(--accent) 0%, transparent);
+      }
     }
   </style>
 </head>
 <body>
   <header class="header">
-    <p class="title">ManulAI Chat</p>
-    <p class="subtitle">Local-first coding agent in the right sidebar. Drop files to attach context.</p>
+    <div class="header-row">
+      <div class="title-wrap">
+        <p class="eyebrow">Chat</p>
+        <p class="title">ManulAI</p>
+        <p class="subtitle">Local-first coding agent in the right sidebar. Drag files into the composer to attach context.</p>
+      </div>
+      <div id="statusPill" class="status-pill">Ready</div>
+    </div>
   </header>
 
-  <section id="dropzone" class="dropzone">
-    Drop files from Explorer or your desktop here to attach them as chat context.
+  <section class="workspace">
+    <div class="topbar">
+      <div id="dropzone" class="drop-inline">Drop files here or straight into the question field.</div>
+      <div class="controls">
+        <select id="modelSelect" class="model-select" aria-label="Ollama model"></select>
+        <button id="refreshModels" class="ghost-button" type="button">Refresh</button>
+      </div>
+    </div>
+
+    <section class="history-shell">
+      <div class="history-meta">
+        <span><strong id="historyCount">0</strong> items in context</span>
+        <span id="historyState">Idle</span>
+      </div>
+      <main id="history" class="history">
+        <div class="empty">
+          <strong>Start with a task.</strong>
+          Ask for a code change, drag files into the composer, or let the model inspect the workspace with tools.
+        </div>
+      </main>
+    </section>
   </section>
 
-  <section id="chips" class="chips"></section>
-
-  <main id="history" class="history">
-    <div class="empty">Ask a coding question, drop files for context, or let the model call tools to inspect and modify the workspace.</div>
-  </main>
-
   <footer class="composer">
-    <div class="composer-row">
-      <textarea id="input" placeholder="Ask ManulAI to inspect, change, or explain code..."></textarea>
-      <button id="send" class="send">Send</button>
+    <div id="composerShell" class="composer-shell">
+      <section id="chips" class="chips"></section>
+      <div class="composer-inner">
+        <div id="inputShell" class="input-shell">
+          <textarea id="input" placeholder="Ask ManulAI to inspect, change, or explain code..."></textarea>
+          <div class="composer-actions">
+            <div class="composer-hint">
+              <span><strong>Tip:</strong> drag files directly into this field to attach them as context.</span>
+            </div>
+            <button id="send" class="send" type="button">
+              <span class="send-label">
+                <span class="idle-text">Send</span>
+                <span class="dots" aria-hidden="true"><span></span><span></span><span></span></span>
+              </span>
+            </button>
+          </div>
+        </div>
+      </div>
     </div>
   </footer>
 
   <script nonce="{{nonce}}">
     const vscode = acquireVsCodeApi();
     const historyEl = document.getElementById('history');
+    const historyCountEl = document.getElementById('historyCount');
+    const historyStateEl = document.getElementById('historyState');
     const chipsEl = document.getElementById('chips');
     const inputEl = document.getElementById('input');
+    const inputShellEl = document.getElementById('inputShell');
     const sendEl = document.getElementById('send');
     const dropzoneEl = document.getElementById('dropzone');
+    const composerShellEl = document.getElementById('composerShell');
+    const modelSelectEl = document.getElementById('modelSelect');
+    const refreshModelsEl = document.getElementById('refreshModels');
+    const statusPillEl = document.getElementById('statusPill');
 
     let busy = false;
     let messages = [];
     let attachments = [];
+    let availableModels = [];
+    let currentModel = '';
+    let dragDepth = 0;
+
+    function roleLabel(role) {
+      if (role === 'user') {
+        return 'You';
+      }
+
+      if (role === 'assistant') {
+        return 'ManulAI';
+      }
+
+      if (role === 'tool') {
+        return 'Tool';
+      }
+
+      return 'Status';
+    }
+
+    function autoResizeTextarea() {
+      inputEl.style.height = '0px';
+      inputEl.style.height = `${Math.min(inputEl.scrollHeight, 220)}px`;
+    }
+
+    function setDragging(active) {
+      document.body.classList.toggle('dragging', active);
+      dropzoneEl.classList.toggle('active', active);
+      inputShellEl.classList.toggle('active', active);
+    }
+
+    function updateHeaderState() {
+      const attachmentCount = attachments.length;
+      const messageCount = messages.filter(message => message.role !== 'status').length;
+      historyCountEl.textContent = String(attachmentCount + messageCount);
+      historyStateEl.innerHTML = busy
+        ? '<span class="thinking-inline">Thinking<span class="dots"><span></span><span></span><span></span></span></span>'
+        : 'Idle';
+      statusPillEl.textContent = busy ? `Thinking with ${currentModel || 'model'}` : `Model: ${currentModel || 'llama3.2'}`;
+      document.body.classList.toggle('busy', busy);
+    }
 
     function render() {
       historyEl.innerHTML = '';
@@ -247,18 +705,35 @@
       if (messages.length === 0) {
         const empty = document.createElement('div');
         empty.className = 'empty';
-        empty.textContent = 'Ask a coding question, drop files for context, or let the model call tools to inspect and modify the workspace.';
+        empty.innerHTML = '<strong>Start with a task.</strong>Ask for a code change, drag files into the composer, or let the model inspect the workspace with tools.';
         historyEl.appendChild(empty);
       } else {
         for (const message of messages) {
-          const element = document.createElement('div');
-          element.className = `message ${message.role}`;
-          element.textContent = message.content;
-          historyEl.appendChild(element);
+          const wrapper = document.createElement('div');
+          wrapper.className = `message ${message.role}`;
+
+          const meta = document.createElement('div');
+          meta.className = 'message-meta-row';
+          meta.textContent = roleLabel(message.role);
+
+          const card = document.createElement('div');
+          card.className = 'message-card';
+          card.textContent = message.content;
+
+          wrapper.append(meta, card);
+          historyEl.appendChild(wrapper);
         }
       }
 
+      if (busy) {
+        const thinking = document.createElement('div');
+        thinking.className = 'thinking-card';
+        thinking.innerHTML = '<div class="dots" aria-hidden="true"><span></span><span></span><span></span></div><div class="label">Model is thinking, may call tools, and will answer in this thread.</div>';
+        historyEl.appendChild(thinking);
+      }
+
       chipsEl.innerHTML = '';
+      chipsEl.style.display = attachments.length > 0 ? 'flex' : 'none';
       for (const attachment of attachments) {
         const chip = document.createElement('div');
         chip.className = 'chip';
@@ -278,7 +753,22 @@
         chipsEl.appendChild(chip);
       }
 
+      modelSelectEl.innerHTML = '';
+      const modelNames = availableModels.length > 0 ? availableModels : [currentModel || 'llama3.2'];
+      for (const modelName of modelNames) {
+        const option = document.createElement('option');
+        option.value = modelName;
+        option.textContent = modelName;
+        option.selected = modelName === currentModel;
+        modelSelectEl.appendChild(option);
+      }
+
       sendEl.disabled = busy;
+      modelSelectEl.disabled = busy;
+      refreshModelsEl.disabled = busy;
+      sendEl.setAttribute('aria-busy', String(busy));
+      updateHeaderState();
+      autoResizeTextarea();
       historyEl.scrollTop = historyEl.scrollHeight;
     }
 
@@ -287,28 +777,62 @@
       render();
     }
 
-    function extractDroppedPath(event) {
+    function parseUriList(value) {
+      return value
+        .split(/\r?\n/)
+        .map(line => line.trim())
+        .filter(line => line && !line.startsWith('#'));
+    }
+
+    function extractDroppedPaths(event) {
       const transfer = event.dataTransfer;
       if (!transfer) {
-        return '';
+        return [];
       }
+
+      const collected = [];
 
       const uriList = transfer.getData('text/uri-list');
       if (uriList) {
-        return uriList.split(/\r?\n/).find(line => line && !line.startsWith('#')) || '';
+        collected.push(...parseUriList(uriList));
       }
 
       const vscodeUri = transfer.getData('application/vnd.code.uri-list');
       if (vscodeUri) {
-        return vscodeUri.split(/\r?\n/).find(line => line && !line.startsWith('#')) || '';
+        collected.push(...parseUriList(vscodeUri));
       }
 
-      const plain = transfer.getData('text/plain');
-      if (plain.startsWith('file:') || plain.startsWith('/')) {
-        return plain;
+      const plain = transfer.getData('text/plain').trim();
+      if (plain) {
+        const plainPaths = plain.includes('\n') ? parseUriList(plain) : [plain];
+        for (const candidate of plainPaths) {
+          if (candidate.startsWith('file:') || candidate.startsWith('/')) {
+            collected.push(candidate);
+          }
+        }
       }
 
-      return '';
+      for (const file of Array.from(transfer.files || [])) {
+        if (file.path) {
+          collected.push(file.path);
+        }
+      }
+
+      return Array.from(new Set(collected));
+    }
+
+    function handleDrop(event) {
+      event.preventDefault();
+      dragDepth = 0;
+      setDragging(false);
+
+      const droppedPaths = extractDroppedPaths(event);
+      if (droppedPaths.length === 0) {
+        appendStatus('Drop did not contain a readable file URI.');
+        return;
+      }
+
+      vscode.postMessage({ command: 'addFileContext', paths: droppedPaths });
     }
 
     function submitMessage() {
@@ -318,10 +842,29 @@
       }
 
       inputEl.value = '';
+      autoResizeTextarea();
       vscode.postMessage({ command: 'sendMessage', text });
     }
 
     sendEl.addEventListener('click', submitMessage);
+    inputEl.addEventListener('input', autoResizeTextarea);
+
+    modelSelectEl.addEventListener('change', () => {
+      const model = modelSelectEl.value.trim();
+      if (!model || model === currentModel || busy) {
+        return;
+      }
+
+      vscode.postMessage({ command: 'selectModel', model });
+    });
+
+    refreshModelsEl.addEventListener('click', () => {
+      if (busy) {
+        return;
+      }
+
+      vscode.postMessage({ command: 'refreshModels' });
+    });
 
     inputEl.addEventListener('keydown', event => {
       if (event.key === 'Enter' && !event.shiftKey) {
@@ -331,29 +874,26 @@
     });
 
     ['dragenter', 'dragover'].forEach(type => {
-      dropzoneEl.addEventListener(type, event => {
+      document.addEventListener(type, event => {
         event.preventDefault();
-        dropzoneEl.classList.add('active');
+        dragDepth += type === 'dragenter' ? 1 : 0;
+        setDragging(true);
       });
     });
 
     ['dragleave', 'dragend'].forEach(type => {
-      dropzoneEl.addEventListener(type, () => {
-        dropzoneEl.classList.remove('active');
+      document.addEventListener(type, event => {
+        event.preventDefault();
+        dragDepth = Math.max(0, dragDepth - (type === 'dragleave' ? 1 : dragDepth));
+        if (dragDepth === 0) {
+          setDragging(false);
+        }
       });
     });
 
-    dropzoneEl.addEventListener('drop', event => {
-      event.preventDefault();
-      dropzoneEl.classList.remove('active');
-      const droppedPath = extractDroppedPath(event);
-      if (!droppedPath) {
-        appendStatus('Drop did not contain a readable file URI.');
-        return;
-      }
-
-      vscode.postMessage({ command: 'addFileContext', path: droppedPath });
-    });
+    dropzoneEl.addEventListener('drop', handleDrop);
+    inputShellEl.addEventListener('drop', handleDrop);
+    composerShellEl.addEventListener('drop', handleDrop);
 
     window.addEventListener('message', event => {
       const payload = event.data;
@@ -361,6 +901,8 @@
       if (payload.command === 'state') {
         messages = payload.messages;
         attachments = payload.attachments;
+        availableModels = payload.availableModels || [];
+        currentModel = payload.currentModel || '';
         render();
         return;
       }
@@ -382,6 +924,7 @@
       }
     });
 
+    autoResizeTextarea();
     vscode.postMessage({ command: 'ready' });
   </script>
 </body>

@@ -8,8 +8,10 @@ The extension runs against a local Ollama instance and is designed for private c
 
 ## Current Scope
 
+- Activity Bar launcher icon for quick access
 - Right-side chat view in the Secondary Sidebar
 - Webview-based chat UI with drag-and-drop file context
+- Ollama model picker in the chat UI and command palette
 - In-memory conversation history
 - Native Ollama tool-calling loop
 - File reading, file writing, and terminal command execution tools
@@ -49,6 +51,8 @@ npm install
 
 After installing the extension in VS Code, run the `ManulAI: Open Chat` command.
 The command opens the Secondary Sidebar on the right and reveals the `ManulAI` chat view.
+The `ManulAI` icon is also visible in the left Activity Bar as a launcher.
+If the right panel is hidden, run `ManulAI: Open Secondary Sidebar`.
 
 ## Development
 
@@ -71,6 +75,11 @@ The extension exposes these settings:
 - `manulai.ollamaBaseUrl`
 - `manulai.ollamaModel`
 - `manulai.systemPrompt`
+
+You can switch the active Ollama model in two ways:
+
+- Use the model selector at the top of the chat view.
+- Run `ManulAI: Select Ollama Model` from the Command Palette.
 
 ## Notes
 

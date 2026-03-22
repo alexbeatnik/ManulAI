@@ -1,8 +1,50 @@
 import * as vscode from 'vscode';
 import { ManulAiChatProvider } from './ManulAiChatProvider';
 
+class ManulAiLauncherProvider implements vscode.TreeDataProvider<string> {
+  private readonly onDidChangeTreeDataEmitter = new vscode.EventEmitter<string | undefined>();
+
+  public readonly onDidChangeTreeData = this.onDidChangeTreeDataEmitter.event;
+
+  public getTreeItem(element: string): vscode.TreeItem {
+    return new vscode.TreeItem(element);
+  }
+
+  public getChildren(): string[] {
+    return [];
+  }
+}
+
 export function activate(context: vscode.ExtensionContext): void {
   const provider = new ManulAiChatProvider(context);
+  const launcherProvider = new ManulAiLauncherProvider();
+
+  const openSecondarySidebar = async (): Promise<void> => {
+    const commandsToTry = [
+      'workbench.action.focusAuxiliaryBar',
+      'workbench.view.extension.manulai'
+    ];
+
+    for (const command of commandsToTry) {
+      try {
+        await vscode.commands.executeCommand(command);
+      } catch {
+        // Ignore unavailable commands and keep trying the next way to reveal the sidebar.
+      }
+    }
+  };
+
+  const openChat = async (): Promise<void> => {
+    await openSecondarySidebar();
+
+    try {
+      await vscode.commands.executeCommand('manulai.chatView.focus');
+    } catch {
+      // Ignore and fall back to the provider reveal.
+    }
+
+    provider.reveal(false);
+  };
 
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider(ManulAiChatProvider.viewType, provider, {
@@ -12,27 +54,61 @@ export function activate(context: vscode.ExtensionContext): void {
     })
   );
 
+  context.subscriptions.push(vscode.window.registerTreeDataProvider('manulai.launcherView', launcherProvider));
+
   context.subscriptions.push(
     vscode.commands.registerCommand('manulai.openChat', async () => {
-      const commandsToTry = [
-        'workbench.view.extension.manulai',
-        'workbench.action.focusAuxiliaryBar',
-        'manulai.chatView.focus'
-      ];
-
-      for (const command of commandsToTry) {
-        try {
-          await vscode.commands.executeCommand(command);
-        } catch {
-          // Ignore unavailable commands and keep trying the next way to reveal the chat.
-        }
-      }
-
-      provider.reveal(false);
+      await openChat();
     })
   );
 
-  void vscode.commands.executeCommand('manulai.openChat');
+  context.subscriptions.push(
+    vscode.commands.registerCommand('manulai.openSecondarySidebar', async () => {
+      await openSecondarySidebar();
+      provider.reveal(true);
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('manulai.selectModel', async () => {
+      await provider.refreshModelCatalog(true);
+
+      const currentModel = provider.getSelectedModel();
+      const availableModels = provider.getAvailableModels().map(model => ({
+        label: model,
+        description: model === currentModel ? 'Current model' : undefined
+      }));
+
+      if (availableModels.length === 0) {
+        void vscode.window.showWarningMessage('No Ollama models were found. Check the local Ollama server and try again.');
+        return;
+      }
+
+      const selected = await vscode.window.showQuickPick(availableModels, {
+        title: 'Select Ollama model for ManulAI',
+        placeHolder: 'Choose a local Ollama model'
+      });
+
+      if (!selected) {
+        return;
+      }
+
+      await provider.setSelectedModel(selected.label);
+      await openChat();
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.workspace.onDidChangeConfiguration(async event => {
+      if (!event.affectsConfiguration('manulai.ollamaBaseUrl') && !event.affectsConfiguration('manulai.ollamaModel')) {
+        return;
+      }
+
+      await provider.handleConfigurationChange();
+    })
+  );
+
+  void openChat();
 }
 
 export function deactivate(): void {

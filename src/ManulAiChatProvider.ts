@@ -42,9 +42,11 @@ interface ToolDefinition {
 }
 
 interface WebviewInboundMessage {
-  command: 'ready' | 'sendMessage' | 'addFileContext' | 'removeFileContext';
+  command: 'ready' | 'sendMessage' | 'addFileContext' | 'removeFileContext' | 'selectModel' | 'refreshModels';
   text?: string;
   path?: string;
+  paths?: string[];
+  model?: string;
 }
 
 interface WebviewRenderableMessage {
@@ -58,6 +60,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   private webviewView?: vscode.WebviewView;
   private readonly messages: OllamaMessage[] = [];
   private readonly attachedFiles = new Map<string, AttachedFileContext>();
+  private availableModels: string[] = [];
   private requestInFlight = false;
 
   public constructor(private readonly extensionContext: vscode.ExtensionContext) {}
@@ -91,6 +94,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   private async handleWebviewMessage(message: WebviewInboundMessage): Promise<void> {
     switch (message.command) {
       case 'ready':
+        await this.refreshModelCatalog(false);
         this.postStateToWebview();
         return;
       case 'sendMessage':
@@ -100,6 +104,16 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         await this.sendUserMessage(message.text.trim());
         return;
       case 'addFileContext':
+        if (Array.isArray(message.paths) && message.paths.length > 0) {
+          for (const pathToAdd of message.paths) {
+            if (!pathToAdd?.trim()) {
+              continue;
+            }
+
+            await this.addFileContext(pathToAdd);
+          }
+          return;
+        }
         if (!message.path) {
           return;
         }
@@ -112,9 +126,79 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         this.attachedFiles.delete(message.path);
         this.postStateToWebview();
         return;
+      case 'selectModel':
+        if (!message.model?.trim()) {
+          return;
+        }
+        await this.setSelectedModel(message.model.trim());
+        return;
+      case 'refreshModels':
+        await this.refreshModelCatalog(true);
+        this.postStateToWebview();
+        return;
       default:
         return;
     }
+  }
+
+  public async refreshModelCatalog(postStatusOnError = false): Promise<void> {
+    const currentModel = this.getSelectedModel();
+
+    try {
+      const config = vscode.workspace.getConfiguration('manulai');
+      const baseUrl = String(config.get('ollamaBaseUrl', 'http://localhost:11434')).replace(/\/$/, '');
+      const response = await fetch(`${baseUrl}/api/tags`);
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(`Ollama HTTP ${response.status}: ${errorText}`);
+      }
+
+      const payload = (await response.json()) as { models?: Array<{ name?: string }> };
+      const names = (payload.models ?? [])
+        .map(model => String(model.name ?? '').trim())
+        .filter(Boolean)
+        .sort((left, right) => left.localeCompare(right));
+
+      this.availableModels = Array.from(new Set([currentModel, ...names].filter(Boolean)));
+    } catch (error) {
+      this.availableModels = Array.from(new Set([currentModel, ...this.availableModels].filter(Boolean)));
+
+      if (postStatusOnError) {
+        const message = error instanceof Error ? error.message : 'Failed to load Ollama models.';
+        this.postStatus(`Unable to refresh Ollama models: ${message}`);
+      }
+    }
+  }
+
+  public getSelectedModel(): string {
+    const config = vscode.workspace.getConfiguration('manulai');
+    return String(config.get('ollamaModel', 'llama3.2'));
+  }
+
+  public async setSelectedModel(model: string): Promise<void> {
+    const normalizedModel = model.trim();
+    if (!normalizedModel) {
+      return;
+    }
+
+    const target = vscode.workspace.workspaceFolders?.length
+      ? vscode.ConfigurationTarget.Workspace
+      : vscode.ConfigurationTarget.Global;
+
+    await vscode.workspace.getConfiguration('manulai').update('ollamaModel', normalizedModel, target);
+    await this.refreshModelCatalog(false);
+    this.postStateToWebview();
+    this.postStatus(`Ollama model set to ${normalizedModel}.`);
+  }
+
+  public getAvailableModels(): string[] {
+    return [...this.availableModels];
+  }
+
+  public async handleConfigurationChange(): Promise<void> {
+    await this.refreshModelCatalog(false);
+    this.postStateToWebview();
   }
 
   private async sendUserMessage(text: string): Promise<void> {
@@ -177,7 +261,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   private async callOllama(): Promise<OllamaResponse> {
     const config = vscode.workspace.getConfiguration('manulai');
     const baseUrl = String(config.get('ollamaBaseUrl', 'http://localhost:11434')).replace(/\/$/, '');
-    const model = String(config.get('ollamaModel', 'llama3.2'));
+    const model = this.getSelectedModel();
     const systemPrompt = String(config.get('systemPrompt', ''));
 
     const contextMessages: OllamaMessage[] = [];
@@ -495,6 +579,8 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     void this.webviewView.webview.postMessage({
       command: 'state',
       messages: renderableMessages,
+      currentModel: this.getSelectedModel(),
+      availableModels: this.availableModels,
       attachments: Array.from(this.attachedFiles.values()).map(file => ({
         path: file.uri.fsPath,
         name: file.name

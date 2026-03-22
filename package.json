@@ -24,9 +24,28 @@
         "title": "ManulAI: Open Chat",
         "category": "ManulAI",
         "icon": "$(comment-discussion)"
+      },
+      {
+        "command": "manulai.openSecondarySidebar",
+        "title": "ManulAI: Open Secondary Sidebar",
+        "category": "ManulAI",
+        "icon": "$(layout-sidebar-right)"
+      },
+      {
+        "command": "manulai.selectModel",
+        "title": "ManulAI: Select Ollama Model",
+        "category": "ManulAI",
+        "icon": "$(hubot)"
       }
     ],
     "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "manulai-launcher",
+          "title": "ManulAI",
+          "icon": "media/manulai-icon.svg"
+        }
+      ],
       "secondarySidebar": [
         {
           "id": "manulai",
@@ -36,6 +55,14 @@
       ]
     },
     "views": {
+      "manulai-launcher": [
+        {
+          "id": "manulai.launcherView",
+          "name": "Launcher",
+          "visibility": "visible",
+          "icon": "media/manulai-icon.svg"
+        }
+      ],
       "manulai": [
         {
           "type": "webview",
@@ -47,6 +74,12 @@
         }
       ]
     },
+    "viewsWelcome": [
+      {
+        "view": "manulai.launcherView",
+        "contents": "Open the chat in the right-side Secondary Sidebar.\n[Open Chat](command:manulai.openChat)\n[Open Secondary Sidebar](command:manulai.openSecondarySidebar)\n[Select Ollama Model](command:manulai.selectModel)"
+      }
+    ],
     "configuration": {
       "title": "ManulAI",
       "properties": {
