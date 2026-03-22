@@ -1037,57 +1037,6 @@
       document.body.classList.toggle('busy', busy);
     }
 
-    function renderContextFiles() {
-      const existing = historyEl.querySelector('.context-files');
-      if (existing) {
-        existing.remove();
-      }
-
-      if (attachments.length === 0) {
-        return;
-      }
-
-      const panel = document.createElement('div');
-      panel.className = 'context-files';
-
-      const header = document.createElement('div');
-      header.className = 'context-files-header';
-      header.innerHTML = 'Context files <span class="count">' + attachments.length + '</span>';
-
-      const list = document.createElement('div');
-      list.className = 'context-files-list';
-
-      for (const attachment of attachments) {
-        const chip = document.createElement('div');
-        chip.className = 'context-chip';
-        chip.title = attachment.path;
-
-        const icon = document.createElement('span');
-        icon.className = 'file-icon';
-        const ext = attachment.name.includes('.') ? attachment.name.split('.').pop() : 'file';
-        icon.textContent = ext;
-
-        const name = document.createElement('span');
-        name.className = 'file-name';
-        name.textContent = attachment.name;
-
-        const remove = document.createElement('button');
-        remove.className = 'remove-btn';
-        remove.type = 'button';
-        remove.title = 'Remove from context';
-        remove.textContent = String.fromCharCode(0xd7);
-        remove.addEventListener('click', () => {
-          vscode.postMessage({ command: 'removeFileContext', path: attachment.path });
-        });
-
-        chip.append(icon, name, remove);
-        list.appendChild(chip);
-      }
-
-      panel.append(header, list);
-      historyEl.prepend(panel);
-    }
-
     function render() {
       historyEl.innerHTML = '';
 
@@ -1128,14 +1077,12 @@
         historyEl.appendChild(thinking);
       }
 
-      renderContextFiles();
-
       chipsEl.innerHTML = '';
       chipsEl.style.display = attachments.length > 0 ? 'flex' : 'none';
       for (const attachment of attachments) {
         const chip = document.createElement('div');
         chip.className = 'chip';
-        chip.title = attachment.path;
+        chip.title = attachment.displayPath || attachment.name;
 
         const label = document.createElement('span');
         label.textContent = attachment.name;
