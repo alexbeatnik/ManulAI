@@ -465,7 +465,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       // --- Fallback layer 4: apply legacy [FILE:] blocks ---
       finalContent = await this.applyInlineFileBlocks(finalContent);
 
-      // --- Fallback layer 5: if response is suspiciously large, try matching to attached file ---
+      // --- Fallback layer 5: if response is suspiciously large, try matching to attached or active file ---
       const matchedFile = this.matchResponseToAttachedFile(finalContent);
       if (matchedFile) {
         const writeApproved = await this.approveFileWrite([matchedFile.filepath]);
@@ -474,6 +474,18 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           return;
         }
         const summary = await this.writeFileWithDiff(matchedFile.filepath, matchedFile.fileContent);
+        messages.push({ role: 'assistant', content: summary });
+        return;
+      }
+
+      const matchedActiveFile = this.matchResponseToActiveFile(finalContent);
+      if (matchedActiveFile) {
+        const writeApproved = await this.approveFileWrite([matchedActiveFile.filepath]);
+        if (!writeApproved) {
+          messages.push({ role: 'assistant', content: `[File write denied by user: ${matchedActiveFile.filepath}]` });
+          return;
+        }
+        const summary = await this.writeFileWithDiff(matchedActiveFile.filepath, matchedActiveFile.fileContent);
         messages.push({ role: 'assistant', content: summary });
         return;
       }
@@ -565,22 +577,66 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       }
       const ratio = matchCount / originalLines.length;
       if (ratio > 0.4) {
-        // The model reproduced this file — try to extract the actual content
-        // Strip obvious chat commentary before/after
-        let extracted = content;
-        // Remove common LLM preamble/postamble patterns
-        extracted = extracted.replace(/^[\s\S]*?(?=(?:Copyright|package|import|<!DOCTYPE|<\?xml|#!\/|{))/i, '');
-        // If we can't cleanly extract, use the whole thing minus first/last short lines
-        const lines = extracted.split('\n');
-        if (lines.length > 10) {
-          // Trim chatty first/last lines
-          while (lines.length > 0 && lines[0].trim().length < 3) { lines.shift(); }
-          while (lines.length > 0 && lines[lines.length - 1].trim().length < 3) { lines.pop(); }
-        }
-        return { filepath: fsPath, fileContent: lines.join('\n') };
+        return { filepath: fsPath, fileContent: this.extractLikelyFileContent(content) };
       }
     }
     return undefined;
+  }
+
+  private matchResponseToActiveFile(content: string): { filepath: string; fileContent: string } | undefined {
+    const activeDoc = vscode.window.activeTextEditor?.document;
+    if (!activeDoc || activeDoc.isUntitled || content.length < 500) {
+      return undefined;
+    }
+
+    const originalContent = activeDoc.getText();
+    const originalLines = originalContent.split('\n').filter(l => l.trim().length > 20);
+    if (originalLines.length < 5) {
+      return undefined;
+    }
+
+    let matchCount = 0;
+    for (const line of originalLines) {
+      if (content.includes(line.trim())) {
+        matchCount++;
+      }
+    }
+
+    const ratio = matchCount / originalLines.length;
+    if (ratio <= 0.4) {
+      return undefined;
+    }
+
+    return {
+      filepath: activeDoc.uri.fsPath,
+      fileContent: this.extractLikelyFileContent(content)
+    };
+  }
+
+  private extractLikelyFileContent(content: string): string {
+    const fencedBlocks = Array.from(content.matchAll(/```(?:[\w.+-]+)?\n([\s\S]*?)```/g));
+    if (fencedBlocks.length > 0) {
+      const largestBlock = fencedBlocks.reduce((largest, current) => {
+        const largestContent = largest[1] ?? '';
+        const currentContent = current[1] ?? '';
+        return currentContent.length > largestContent.length ? current : largest;
+      });
+      const blockContent = (largestBlock[1] ?? '').trim();
+      if (blockContent.length > 0) {
+        return blockContent;
+      }
+    }
+
+    let extracted = content.replace(/^[\s\S]*?(?=(?:Copyright|package|import|<!DOCTYPE|<\?xml|#!\/|{))/i, '');
+    extracted = extracted.replace(/\n?```\s*$/g, '');
+
+    const lines = extracted.split('\n');
+    if (lines.length > 10) {
+      while (lines.length > 0 && lines[0].trim().length < 3) { lines.shift(); }
+      while (lines.length > 0 && lines[lines.length - 1].trim().length < 3) { lines.pop(); }
+    }
+
+    return lines.join('\n').trim();
   }
 
   private async approveFileWrite(filepaths: string[]): Promise<boolean> {
