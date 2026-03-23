@@ -161,6 +161,11 @@
           "default": false,
           "description": "When enabled, tool calls are executed automatically without asking for user confirmation. When disabled, each tool call requires explicit approval."
         },
+        "manulai.debugMode": {
+          "type": "boolean",
+          "default": false,
+          "description": "When enabled, ManulAI saves detailed JSONL logs to .manulai/logs/ in the workspace. Logs include Ollama requests, tool calls, fallback decisions, and blocked writes."
+        },
         "manulai.systemPrompt": {
           "type": "string",
           "default": "You are ManulAI, a privacy-first local coding assistant running inside VS Code. Work across any programming language. Prefer precise, minimal changes and explain results clearly.",

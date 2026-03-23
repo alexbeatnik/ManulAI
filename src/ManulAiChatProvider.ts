@@ -72,7 +72,8 @@ interface WebviewInboundMessage {
     | 'browseFolder'
     | 'attachProject'
     | 'toggleAgentMode'
-    | 'toggleAutoApprove';
+    | 'toggleAutoApprove'
+    | 'toggleDebugMode';
   text?: string;
   path?: string;
   paths?: string[];
@@ -133,17 +134,24 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   private availableModels: string[] = [];
   private agentMode = true;
   private autoApprove = false;
+  private debugMode = false;
   private requestInFlight = false;
   private stopRequested = false;
   private currentRequestAbortController?: AbortController;
   private pendingApproval?: WebviewPendingApprovalState;
   private pendingApprovalResolver?: (approved: boolean) => void;
   private readonly revertSnapshots = new Map<string, RevertSnapshot>();
+  private debugLogStream?: fs.WriteStream;
+  private debugSessionId = '';
 
   public constructor(private readonly extensionContext: vscode.ExtensionContext) {
     const config = vscode.workspace.getConfiguration('manulai');
     this.agentMode = Boolean(config.get('agentMode', true));
     this.autoApprove = Boolean(config.get('autoApprove', false));
+    this.debugMode = Boolean(config.get('debugMode', false));
+    if (this.debugMode) {
+      this.startDebugSession();
+    }
   }
 
   public resolveWebviewView(
@@ -386,6 +394,9 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       case 'toggleAutoApprove':
         await this.setAutoApprove(message.value);
         return;
+      case 'toggleDebugMode':
+        await this.setDebugMode(message.value);
+        return;
       default:
         return;
     }
@@ -583,6 +594,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   private async processOllamaResponse(messages: OllamaMessage[], retryCount = 0): Promise<void> {
     this.throwIfRequestStopped();
     this.postStatus(retryCount > 0 ? `Retry ${retryCount}: calling Ollama...` : 'Calling Ollama...');
+    this.debugLog('ollama_request', { retryCount, messageCount: messages.length, model: this.getSelectedModel() });
     const responseData = await this.callOllama(messages);
     this.throwIfRequestStopped();
     const assistantMessage = responseData.message;
@@ -595,6 +607,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
 
     if (resolvedToolCalls.length > 0) {
       const wasNative = (assistantMessage.tool_calls?.length ?? 0) > 0;
+      this.debugLog('tool_calls_detected', { count: resolvedToolCalls.length, native: wasNative, tools: resolvedToolCalls.map(tc => tc.function?.name) });
       const visibleContent = wasNative
         ? (assistantMessage.content ?? '')
         : this.stripToolCallsFromContent(assistantMessage.content ?? '');
@@ -628,7 +641,9 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       for (const toolCall of resolvedToolCalls) {
         this.throwIfRequestStopped();
         const toolName = toolCall.function?.name || 'unknown_tool';
+        this.debugLog('tool_exec_start', { tool: toolName, args: toolCall.function?.arguments });
         const toolResult = await this.executeToolCall(toolCall);
+        this.debugLog('tool_exec_result', { tool: toolName, result: toolResult.substring(0, 500) });
         this.throwIfRequestStopped();
         messages.push({
           role: 'tool',
@@ -643,6 +658,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     }
 
     let finalContent = assistantMessage.content ?? '';
+    this.debugLog('ollama_response', { contentLength: finalContent.length, hasToolCalls: resolvedToolCalls.length > 0, contentPreview: finalContent.substring(0, 300) });
 
     if (!this.agentMode) {
       // Chat mode: display the model response as-is, no file-write fallback processing.
@@ -658,6 +674,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       // --- Fallback layer 1: detect [Begin of FILE]...[End of FILE] markers ---
       const markerWrite = this.extractMarkerFileWrite(finalContent);
       if (markerWrite) {
+        this.debugLog('fallback_layer', { layer: 1, type: 'marker_write', filepath: markerWrite.filepath });
         const writeApproved = await this.approveFileWrite([markerWrite.filepath]);
         if (!writeApproved) {
           messages.push({ role: 'assistant', content: `[File write denied by user: ${markerWrite.filepath}]` });
@@ -673,6 +690,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       // --- Fallback layer 2: detect code blocks with filepath hints ---
       const codeBlockWrites = this.extractCodeBlockFileWrites(finalContent);
       if (codeBlockWrites.length > 0) {
+        this.debugLog('fallback_layer', { layer: 2, type: 'code_block_write', files: codeBlockWrites.map(b => b.filepath) });
         const fileNames = codeBlockWrites.map(w => w.filepath);
         const writeApproved = await this.approveFileWrite(fileNames);
         if (!writeApproved) {
@@ -682,14 +700,35 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
 
         const appliedSummaries: string[] = [];
         const revertOperationIds: string[] = [];
+        let allBlocked = true;
         for (const block of codeBlockWrites) {
           const summary = await this.writeFileWithDiff(block.filepath, block.fileContent);
           appliedSummaries.push(summary.summary);
           if (summary.revertOperationId) {
             revertOperationIds.push(summary.revertOperationId);
           }
+          if (!summary.summary.startsWith('Blocked write to ')) {
+            allBlocked = false;
+          }
           finalContent = finalContent.replace(block.fullMatch, '');
         }
+
+        // If ALL writes were blocked by destructive write guard, nudge model to use tools properly
+        if (allBlocked && retryCount < 2) {
+          this.debugLog('blocked_write_retry', { retryCount, source: 'code_block_extraction', summaries: appliedSummaries });
+          messages.push({ role: 'assistant', content: appliedSummaries.join('\n'), hiddenFromTranscript: true });
+          messages.push({
+            role: 'user',
+            content: 'Your file write was blocked because you tried to rewrite the entire file with partial content. ' +
+              'Do NOT output the full file in a code block. Instead, use the replace_in_file tool to change ONLY the specific lines that need to change. ' +
+              'First call read_specific_file to see the current content, then call replace_in_file with the exact old_text and new_text.',
+            hiddenFromTranscript: true
+          });
+          this.postStatus('Blocked partial write — nudging model to use replace_in_file...');
+          await this.processOllamaResponse(messages, retryCount + 1);
+          return;
+        }
+
         finalContent = appliedSummaries.join('\n\n') + (finalContent.trim() ? '\n\n' + this.truncateLongResponse(finalContent.trim()) : '');
         messages.push(this.createAssistantMessage(finalContent, revertOperationIds));
         return;
@@ -893,6 +932,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         // nudge the model to use replace_in_file instead of rewriting the whole file.
         const wasBlocked = /^Blocked write to /i.test(finalContent.trim());
         if (wasBlocked && retryCount < 2) {
+          this.debugLog('blocked_write_retry', { retryCount, content: finalContent.substring(0, 200) });
           messages.push({ role: 'assistant', content: finalContent, hiddenFromTranscript: true });
           messages.push({
             role: 'user',
@@ -907,6 +947,18 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         }
 
         // --- Fallback layer 6b: nudge the model to use tools if it didn't ---
+        // If tools were already used in the CURRENT exchange (after the last user message),
+        // the model's text response is a legitimate summary — don't nudge it.
+        // We only check messages after the last user message to avoid stale tool results
+        // from previous exchanges disabling the nudge.
+        const lastUserIdx = (() => {
+          for (let i = messages.length - 1; i >= 0; i--) {
+            if (messages[i].role === 'user') { return i; }
+          }
+          return -1;
+        })();
+        const hasRecentToolResults = lastUserIdx >= 0 && messages.slice(lastUserIdx).some(m => m.role === 'tool');
+
         const isLongDump = finalContent.length > 300;
         const hasLargeCodeBlocks = /```[\w]*\n[\s\S]{100,}?```/.test(finalContent);
         const claimsDone = /(?:зробив|замінив|оновив|готово|i've made|i have made|i have updated|summary of the changes)/i.test(finalContent);
@@ -923,9 +975,10 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         const stepMatch = finalContent.match(/step\s+(\d+)\s*[\/of]+\s*(\d+)/i);
         const hasIncompletePlan = stepMatch && parseInt(stepMatch[1], 10) < parseInt(stepMatch[2], 10);
 
-        const shouldNudge = (isLongDump || hasLargeCodeBlocks || claimsDone || mentionsChange || isLazyAcknowledgment || hasIncompletePlan || isPassingToUser) && retryCount < 2;
+        const shouldNudge = !hasRecentToolResults && (isLongDump || hasLargeCodeBlocks || claimsDone || mentionsChange || isLazyAcknowledgment || hasIncompletePlan || isPassingToUser) && retryCount < 2;
 
         if (shouldNudge) {
+          this.debugLog('nudge', { retryCount, isLongDump, hasLargeCodeBlocks, claimsDone, mentionsChange, isLazyAcknowledgment, hasIncompletePlan: !!hasIncompletePlan, isPassingToUser, contentPreview: finalContent.substring(0, 200) });
           // Show plan/progress text to the user before nudging
           if (hasIncompletePlan || claimsDone || mentionsChange) {
             const planText = finalContent.trim();
@@ -1798,13 +1851,17 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           'If no tool is needed, answer normally and concisely.\n' +
           'Do not claim that a file was changed unless a tool actually changed it.\n' +
           'Avoid dumping full file contents unless the user explicitly asks for them.\n' +
+          'ACTION FIRST — DO NOT JUST DESCRIBE:\n' +
+          '- When you identify a problem in a file, fix it IMMEDIATELY by calling a tool. Do not just describe what needs to change — use replace_in_file or create_or_edit_file to make the change right away.\n' +
+          '- When a command needs to be run (install dependencies, build, start a server, run tests, etc.), use execute_terminal_command to run it yourself. NEVER ask the user to run commands manually.\n' +
+          '- If you know what the fix is, apply it. Do not output the fix as text and stop.\n' +
           'PLANNING AND PROGRESS:\n' +
           '- Before starting any non-trivial task, output a numbered plan in English. Example:\n' +
           '  **Plan:**\n' +
           '  1. Read project structure\n' +
           '  2. Find and read the relevant files\n' +
           '  3. Make the necessary changes\n' +
-          '- Then execute each step, announcing progress before each one:\n' +
+          '- Then execute each step BY CALLING TOOLS, announcing progress before each one:\n' +
           '  "Step 1/3: Reading project structure..."\n' +
           '- After completing all steps, give a short summary of what was done.\n' +
           '- Keep all plans, progress messages, and summaries in English.\n' +
@@ -1818,7 +1875,9 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           'TOOL USAGE RULES:\n' +
           '- Always call tools using the native tool-calling mechanism. Never output raw JSON as text.\n' +
           '- After reading a file, analyze the actual content and fix the real problem. Do not add cosmetic changes like borders or colors unless specifically asked.\n' +
-          '- Think step by step: first read the file, then identify the issue, then make targeted fixes.';
+          '- Think step by step: first read the file, then identify the issue, then make targeted fixes.\n' +
+          '- When you see an error message, diagnose and fix it using tools. Do not just explain the error.\n' +
+          '- If dependencies are missing, run the install command with execute_terminal_command.';
 
       if (workspaceInstructions) {
         agentMandate += '\n\n<workspace_instructions>\n' + workspaceInstructions + '\n</workspace_instructions>';
@@ -2625,6 +2684,18 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       
       await vscode.workspace.fs.createDirectory(vscode.Uri.file(path.dirname(targetUri.fsPath)));
 
+      // Guard against destructive writes from tool calls
+      const displayName = path.basename(targetUri.fsPath);
+      let oldContent: string | undefined;
+      try { oldContent = await this.readWorkspaceText(targetUri); } catch { /* new file */ }
+      if (this.looksLikeToolCallContent(content)) {
+        return JSON.stringify({ error: `Blocked: content is a tool-call definition, not file content.` });
+      }
+      const destructiveGuard = this.detectDestructiveWrite(displayName, content, oldContent);
+      if (destructiveGuard) {
+        return JSON.stringify({ error: `Blocked write to ${displayName}: ${destructiveGuard}` });
+      }
+
         await this.writeWorkspaceText(targetUri, content);
 
       return JSON.stringify({
@@ -2705,6 +2776,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     // Block obviously destructive writes to structured files
     const destructiveGuard = this.detectDestructiveWrite(displayName, sanitizedContent, oldContent);
     if (destructiveGuard) {
+      this.debugLog('destructive_write_blocked', { filepath, reason: destructiveGuard, contentLength: sanitizedContent.length, oldContentLength: oldContent?.length });
       return { summary: `Blocked write to ${displayName}: ${destructiveGuard}` };
     }
 
@@ -3287,6 +3359,70 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     );
   }
 
+  private async setDebugMode(value: boolean | undefined): Promise<void> {
+    this.debugMode = value !== undefined ? value : !this.debugMode;
+
+    const target = vscode.workspace.workspaceFolders?.length
+      ? vscode.ConfigurationTarget.Workspace
+      : vscode.ConfigurationTarget.Global;
+
+    await vscode.workspace.getConfiguration('manulai').update('debugMode', this.debugMode, target);
+
+    if (this.debugMode) {
+      this.startDebugSession();
+      this.postStatus('Debug Mode enabled. Logs are saved to .manulai/ folder.');
+    } else {
+      this.stopDebugSession();
+      this.postStatus('Debug Mode disabled.');
+    }
+    this.postStateToWebview();
+  }
+
+  private getDebugLogDir(): string | undefined {
+    const folders = vscode.workspace.workspaceFolders;
+    if (!folders?.length) { return undefined; }
+    return path.join(folders[0].uri.fsPath, '.manulai', 'logs');
+  }
+
+  private startDebugSession(): void {
+    const logDir = this.getDebugLogDir();
+    if (!logDir) { return; }
+    try {
+      fs.mkdirSync(logDir, { recursive: true });
+      // Ensure .manulai is gitignored
+      const gitignorePath = path.join(path.dirname(logDir), '.gitignore');
+      if (!fs.existsSync(gitignorePath)) {
+        fs.writeFileSync(gitignorePath, 'logs/\n', 'utf8');
+      }
+      const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+      this.debugSessionId = timestamp;
+      const logFile = path.join(logDir, `session-${timestamp}.jsonl`);
+      this.debugLogStream = fs.createWriteStream(logFile, { flags: 'a', encoding: 'utf8' });
+      this.debugLog('session_start', { version: this.extensionContext.extension.packageJSON?.version, model: this.getSelectedModel(), agentMode: this.agentMode, autoApprove: this.autoApprove });
+    } catch {
+      // Silently fail if we can't write logs
+    }
+  }
+
+  private stopDebugSession(): void {
+    if (this.debugLogStream) {
+      this.debugLog('session_end', {});
+      this.debugLogStream.end();
+      this.debugLogStream = undefined;
+    }
+    this.debugSessionId = '';
+  }
+
+  private debugLog(event: string, data: Record<string, unknown>): void {
+    if (!this.debugMode || !this.debugLogStream) { return; }
+    try {
+      const entry = { ts: new Date().toISOString(), event, ...data };
+      this.debugLogStream.write(JSON.stringify(entry) + '\n');
+    } catch {
+      // Silently fail
+    }
+  }
+
   private synchronizeAttachmentContextMessage(): void {
     this.removeAttachmentContextMessages();
 
@@ -3616,6 +3752,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       availableModels: this.availableModels,
       agentMode: this.agentMode,
       autoApprove: this.autoApprove,
+      debugMode: this.debugMode,
       pendingApproval: this.pendingApproval,
       activeFile: this.getActiveFileState(),
       extensionVersion,

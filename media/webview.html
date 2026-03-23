@@ -1251,6 +1251,11 @@
               <span class="toggle-slider"></span>
               <span id="autoApproveLabel" class="toggle-label">Auto-Approve</span>
             </label>
+            <label class="toggle-switch" title="Debug Mode — save detailed logs to .manulai/logs/ folder">
+              <input type="checkbox" id="debugModeToggle" />
+              <span class="toggle-slider"></span>
+              <span id="debugModeLabel" class="toggle-label">Debug</span>
+            </label>
           </div>
           <div class="control-group secondary">
             <select id="modelSelect" class="model-select" aria-label="Ollama model"></select>
@@ -1330,6 +1335,8 @@
     const agentModeLabel = document.getElementById('agentModeLabel');
     const autoApproveToggle = document.getElementById('autoApproveToggle');
     const autoApproveLabel = document.getElementById('autoApproveLabel');
+    const debugModeToggle = document.getElementById('debugModeToggle');
+    const debugModeLabel = document.getElementById('debugModeLabel');
     const statusPillEl = document.getElementById('statusPill');
 
     let busy = false;
@@ -1561,6 +1568,9 @@
       agentModeLabel.textContent = 'Agent Mode';
       autoApproveToggle.checked = autoApprove;
       autoApproveLabel.textContent = 'Auto-Approve';
+      if (data.debugMode !== undefined) {
+        debugModeToggle.checked = data.debugMode;
+      }
       updateHeaderState();
       autoResizeTextarea();
       historyEl.scrollTop = historyEl.scrollHeight;
@@ -1710,6 +1720,8 @@
         const content = reader.result;
         if (typeof content === 'string') {
           attachedFiles.push({ name: file.name, content: content });
+          // Also register with the extension backend so the file persists across re-renders
+          vscode.postMessage({ command: 'addFileContent', filename: file.name, content: content });
           render();
         }
       };
@@ -1731,14 +1743,8 @@
         return;
       }
 
-      // Path 1: VS Code internal drops from Explorer/editors/tree views.
-      const uriPaths = collectUriPaths(dt);
-      if (uriPaths.length > 0) {
-        vscode.postMessage({ command: 'addFilePathContext', paths: uriPaths });
-        return;
-      }
-
-      // Path 2: System file drops (desktop/file manager) — read content via FileReader.
+      // Path 1: System file drops (desktop/file manager) — read content via FileReader.
+      // Prioritize this over URI paths since FileReader works reliably in the webview sandbox.
       let fileItemsFound = false;
       if (dt.items && dt.items.length > 0) {
         for (const item of Array.from(dt.items)) {
@@ -1752,6 +1758,13 @@
         }
       }
       if (fileItemsFound) {
+        return;
+      }
+
+      // Path 2: VS Code internal drops from Explorer/editors/tree views (no File objects available).
+      const uriPaths = collectUriPaths(dt);
+      if (uriPaths.length > 0) {
+        vscode.postMessage({ command: 'addFilePathContext', paths: uriPaths });
         return;
       }
 
@@ -1831,6 +1844,10 @@
 
     autoApproveToggle.addEventListener('change', () => {
       vscode.postMessage({ command: 'toggleAutoApprove', value: autoApproveToggle.checked });
+    });
+
+    debugModeToggle.addEventListener('change', () => {
+      vscode.postMessage({ command: 'toggleDebugMode', value: debugModeToggle.checked });
     });
 
     inputEl.addEventListener('keydown', event => {
