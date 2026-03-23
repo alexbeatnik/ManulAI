@@ -592,7 +592,11 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           }
           const ratio = matchCount / originalLines.length;
           if (ratio > 0.4) {
-            const summary = await this.writeFileWithDiff(fileUri.fsPath, this.extractLikelyFileContent(finalContent));
+            const extractedContent = this.extractTrustedFullFileContent(finalContent, fileContent);
+            if (!extractedContent) {
+              continue;
+            }
+            const summary = await this.writeFileWithDiff(fileUri.fsPath, extractedContent);
             messages.push({ role: 'assistant', content: summary });
             return;
           }
@@ -700,7 +704,10 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       }
       const ratio = matchCount / originalLines.length;
       if (ratio > 0.4) {
-        return { filepath: fsPath, fileContent: this.extractLikelyFileContent(content) };
+        const fileContent = this.extractTrustedFullFileContent(content, file.content);
+        if (fileContent) {
+          return { filepath: fsPath, fileContent };
+        }
       }
     }
     return undefined;
@@ -730,22 +737,116 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       return undefined;
     }
 
+    const fileContent = this.extractTrustedFullFileContent(content, originalContent);
+    if (!fileContent) {
+      return undefined;
+    }
+
     return {
       filepath: activeDoc.uri.fsPath,
-      fileContent: this.extractLikelyFileContent(content)
+      fileContent
     };
   }
 
+  private extractTrustedFullFileContent(content: string, originalContent?: string): string | undefined {
+    const extracted = this.sanitizeGeneratedFileContent(this.extractLikelyFileContent(content));
+    if (!extracted) {
+      return undefined;
+    }
+
+    if (this.looksLikeDiffOutput(content) || this.looksLikeDiffOutput(extracted)) {
+      return undefined;
+    }
+
+    const extractedLineCount = extracted.split('\n').filter(line => line.trim().length > 0).length;
+    if (extractedLineCount < 8) {
+      return undefined;
+    }
+
+    if (!originalContent) {
+      return extracted.length >= 200 ? extracted : undefined;
+    }
+
+    const originalLength = originalContent.trim().length;
+    if (originalLength > 500 && extracted.length < originalLength * 0.6) {
+      return undefined;
+    }
+
+    return extracted;
+  }
+
+  private sanitizeGeneratedFileContent(content: string): string {
+    if (!content) {
+      return content;
+    }
+
+    const sanitizedLines = content
+      .split('\n')
+      .filter(line => {
+        const trimmed = line.trim();
+        if (!trimmed) {
+          return true;
+        }
+
+        if (/^\[(?:Active|Attached) File:.*\]$/i.test(trimmed)) {
+          return false;
+        }
+
+        if (/^\[\/(?:Active|Attached) File\]$/i.test(trimmed)) {
+          return false;
+        }
+
+        if (/^<\/?manulai_(?:active_editor_context|attached_file)\b.*>$/i.test(trimmed)) {
+          return false;
+        }
+
+        return true;
+      });
+
+    return sanitizedLines.join('\n').trim();
+  }
+
+  private looksLikeDiffOutput(content: string): boolean {
+    const trimmed = content.trim();
+    if (!trimmed) {
+      return false;
+    }
+
+    if (/```(?:diff|patch)\b/i.test(trimmed)) {
+      return true;
+    }
+
+    if (/^(?:diff\s+--git|index\s+[0-9a-f]+\.\.[0-9a-f]+|---\s+.+|\+\+\+\s+.+|@@\s+[-+,0-9\s]+@@)/m.test(trimmed)) {
+      return true;
+    }
+
+    const lines = trimmed.split('\n').map(line => line.trim()).filter(Boolean);
+    if (lines.length === 0) {
+      return false;
+    }
+
+    const changedLineCount = lines.filter(line => {
+      if (/^(?:\+|-)(?![-+]{2}\s)/.test(line)) {
+        return true;
+      }
+
+      return /^changed\s+lines:?$/i.test(line);
+    }).length;
+
+    return changedLineCount >= 3 && changedLineCount / lines.length > 0.15;
+  }
+
   private extractLikelyFileContent(content: string): string {
-    const fencedBlocks = Array.from(content.matchAll(/```(?:[\w.+-]+)?\n([\s\S]*?)```/g));
+    const fencedBlocks = Array.from(content.matchAll(/```(?:([\w.+-]+))?\n([\s\S]*?)```/g));
     if (fencedBlocks.length > 0) {
       const largestBlock = fencedBlocks.reduce((largest, current) => {
-        const largestContent = largest[1] ?? '';
-        const currentContent = current[1] ?? '';
+        const largestContent = largest[2] ?? '';
+        const currentContent = current[2] ?? '';
         return currentContent.length > largestContent.length ? current : largest;
       });
-      const blockContent = (largestBlock[1] ?? '').trim();
-      if (blockContent.length > 0) {
+      const blockLanguage = (largestBlock[1] ?? '').trim().toLowerCase();
+      const blockContent = (largestBlock[2] ?? '').trim();
+      if (blockContent.length > 0 && blockLanguage !== 'diff' && blockLanguage !== 'patch' && !this.looksLikeDiffOutput(blockContent)) {
         return blockContent;
       }
     }
@@ -1037,37 +1138,56 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   }
 
   private async extractDescribedFileDump(content: string): Promise<{ fullMatch: string; filepath: string; fileContent: string } | undefined> {
-    const fencedBlocks = Array.from(content.matchAll(/```(?:[\w.+-]+)?\n([\s\S]*?)```/g));
+    const fencedBlocks = Array.from(content.matchAll(/```(?:([\w.+-]+))?\n([\s\S]*?)```/g));
     if (fencedBlocks.length === 0) {
       return undefined;
     }
 
     const largestBlock = fencedBlocks.reduce((largest, current) => {
-      const largestContent = (largest[1] ?? '').trim();
-      const currentContent = (current[1] ?? '').trim();
+      const largestContent = (largest[2] ?? '').trim();
+      const currentContent = (current[2] ?? '').trim();
       return currentContent.length > largestContent.length ? current : largest;
     });
 
-    const fileContent = (largestBlock[1] ?? '').trim();
+    const blockLanguage = (largestBlock[1] ?? '').trim().toLowerCase();
+    const fileContent = (largestBlock[2] ?? '').trim();
     if (fileContent.length < 200) {
+      return undefined;
+    }
+
+    if (blockLanguage === 'diff' || blockLanguage === 'patch' || this.looksLikeDiffOutput(fileContent)) {
       return undefined;
     }
 
     const mentionedFile = await this.findMentionedFileInContent(content);
     if (mentionedFile) {
-      return {
-        fullMatch: largestBlock[0],
-        filepath: mentionedFile,
-        fileContent
-      };
+      try {
+        const bytes = await vscode.workspace.fs.readFile(vscode.Uri.file(mentionedFile));
+        const currentContent = Buffer.from(bytes).toString('utf8');
+        const trustedContent = this.extractTrustedFullFileContent(content, currentContent);
+        if (!trustedContent) {
+          return undefined;
+        }
+        return {
+          fullMatch: largestBlock[0],
+          filepath: mentionedFile,
+          fileContent: trustedContent
+        };
+      } catch {
+        return undefined;
+      }
     }
 
     const activeDoc = vscode.window.activeTextEditor?.document;
     if (activeDoc && !activeDoc.isUntitled) {
+      const trustedContent = this.extractTrustedFullFileContent(content, activeDoc.getText());
+      if (!trustedContent) {
+        return undefined;
+      }
       return {
         fullMatch: largestBlock[0],
         filepath: activeDoc.uri.fsPath,
-        fileContent
+        fileContent: trustedContent
       };
     }
 
@@ -1640,6 +1760,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   private async writeFileWithDiff(filepath: string, newContent: string): Promise<string> {
     const target = this.resolveWorkspaceUri(filepath);
     const displayName = path.basename(target.fsPath);
+    const sanitizedContent = this.sanitizeGeneratedFileContent(newContent);
 
     // Read old content for diff (may not exist yet)
     let oldContent: string | undefined;
@@ -1651,7 +1772,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     }
 
     // Write the file
-    const writeResult = await this.createOrEditFile(filepath, newContent);
+    const writeResult = await this.createOrEditFile(filepath, sanitizedContent);
     const parsed = JSON.parse(writeResult) as Record<string, unknown>;
     if (parsed.error) {
       return `Failed to write ${displayName}: ${String(parsed.error)}`;
@@ -1660,15 +1781,15 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     // Compute diff
     if (oldContent === undefined) {
       // New file created
-      const lineCount = newContent.split('\n').length;
+      const lineCount = sanitizedContent.split('\n').length;
       return `Created ${displayName} (${lineCount} lines)`;
     }
 
-    if (oldContent === newContent) {
+    if (oldContent === sanitizedContent) {
       return `${displayName}: no changes detected.`;
     }
 
-    const diffLines = this.computeLineDiff(oldContent, newContent);
+    const diffLines = this.computeLineDiff(oldContent, sanitizedContent);
     if (diffLines.length === 0) {
       return `Updated ${displayName} (whitespace-only changes)`;
     }
@@ -2023,9 +2144,9 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         'The user currently has the following file open in the active editor. Use it as current working context.',
         'This content reflects the current editor state and may include unsaved changes.',
         '',
-        `[Active File: ${fileName} | Path: ${filePath}]`,
+        `<manulai_active_editor_context file="${fileName}" path="${filePath}">`,
         content,
-        '[/Active File]'
+        '</manulai_active_editor_context>'
       ].join('\n'),
       hiddenFromTranscript: true,
       activeEditorContext: true
@@ -2057,9 +2178,9 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
             : file.name)
           : file.uri.fsPath;
         return [
-          `[Attached File: ${file.name} | Path: ${filePath}]`,
+          `<manulai_attached_file file="${file.name}" path="${filePath}">`,
           file.content,
-          '[/Attached File]'
+          '</manulai_attached_file>'
         ].join('\n');
       })
       .join('\n\n');
