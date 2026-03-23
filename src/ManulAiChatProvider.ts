@@ -893,10 +893,25 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         const hasLargeCodeBlocks = /```[\w]*\n[\s\S]{100,}?```/.test(finalContent);
         const claimsDone = /(?:зробив|замінив|оновив|готово|i've made|i have made|i have updated|summary of the changes)/i.test(finalContent);
         const mentionsChange = /(?:змін|зроби|оновл|replac|chang|updat|modif)/i.test(finalContent);
-        
-        const shouldNudge = (isLongDump || hasLargeCodeBlocks || claimsDone || mentionsChange) && retryCount < 1;
+        const isLazyAcknowledgment = /^(?:understood|sure|ok|okay|got it|i will|let me know|i can help|i'll make sure)\b/i.test(finalContent.trim())
+          && finalContent.trim().length < 300;
+
+        // Detect incomplete plan execution: model mentions "Step N/M" but hasn't reached the final step
+        const stepMatch = finalContent.match(/step\s+(\d+)\s*[\/of]+\s*(\d+)/i);
+        const hasIncompletePlan = stepMatch && parseInt(stepMatch[1], 10) < parseInt(stepMatch[2], 10);
+
+        const shouldNudge = (isLongDump || hasLargeCodeBlocks || claimsDone || mentionsChange || isLazyAcknowledgment || hasIncompletePlan) && retryCount < 2;
 
         if (shouldNudge) {
+          // Show plan/progress text to the user before nudging
+          if (hasIncompletePlan || claimsDone || mentionsChange) {
+            const planText = finalContent.trim();
+            if (planText) {
+              messages.push({ role: 'assistant', content: planText });
+              this.postStateToWebview();
+            }
+          }
+
           messages.push({
             role: 'assistant',
             content: finalContent,
@@ -904,7 +919,11 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           });
           
           let nudgeMessage = '';
-          if (isLongDump || hasLargeCodeBlocks) {
+          if (hasIncompletePlan) {
+            nudgeMessage = `You are on step ${stepMatch![1]} of ${stepMatch![2]} but stopped. Continue executing your plan. Proceed to the next step now — use the provided tools.`;
+          } else if (isLazyAcknowledgment) {
+            nudgeMessage = 'Do not just acknowledge the request. Actually perform the task now. Read the relevant files and make the changes the user asked for. Use the provided tools.';
+          } else if (isLongDump || hasLargeCodeBlocks) {
             nudgeMessage = 'You returned code or a large file dump without using a tool. If you need to inspect or modify files, call one of the provided tools directly. If no tool is needed, answer briefly without dumping full file contents.';
           } else {
             nudgeMessage = 'You described changes but did not call a tool. If you need to modify files, use one of the provided tools. If no file change is needed, answer normally.';
@@ -915,7 +934,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
             content: nudgeMessage,
             hiddenFromTranscript: true
           });
-          this.postStatus(`Model did not use tools (attempt ${retryCount + 1}) — retrying...`);
+          this.postStatus(`Model did not use tools (attempt ${retryCount + 1}) — continuing...`);
           await this.processOllamaResponse(messages, retryCount + 1);
           return;
         }
@@ -1142,14 +1161,18 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     }).join('\n');
   }
 
-  private detectDestructiveWrite(displayName: string, content: string): string | undefined {
+  private detectDestructiveWrite(displayName: string, content: string, oldContent?: string): string | undefined {
     const trimmed = content.trim();
     const ext = displayName.split('.').pop()?.toLowerCase();
 
     // Block writing non-JSON content to .json files
     if (ext === 'json') {
       try {
-        JSON.parse(trimmed);
+        const parsed = JSON.parse(trimmed) as unknown;
+        // package.json must have a "name" field — partial JSON dumps are destructive
+        if (displayName.toLowerCase() === 'package.json' && typeof parsed === 'object' && parsed !== null && !('name' in parsed)) {
+          return 'Content is missing required "name" field for package.json. This looks like a partial write.';
+        }
       } catch {
         return 'Content is not valid JSON.';
       }
@@ -1159,6 +1182,11 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     const criticalFiles = ['package.json', 'tsconfig.json', 'package-lock.json'];
     if (criticalFiles.includes(displayName.toLowerCase()) && trimmed.length < 20) {
       return 'Content is suspiciously short for a structured project file.';
+    }
+
+    // Block writes that lose >60% of the original file's content (likely partial/truncated)
+    if (oldContent && oldContent.length > 100 && trimmed.length < oldContent.length * 0.4) {
+      return `Content is ${trimmed.length} bytes vs original ${oldContent.length} bytes — too much content lost. This looks like a partial write.`;
     }
 
     // Block writing content that looks like a shell command rather than file content
@@ -1738,12 +1766,27 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           'If no tool is needed, answer normally and concisely.\n' +
           'Do not claim that a file was changed unless a tool actually changed it.\n' +
           'Avoid dumping full file contents unless the user explicitly asks for them.\n' +
+          'PLANNING AND PROGRESS:\n' +
+          '- Before starting any non-trivial task, output a numbered plan in English. Example:\n' +
+          '  **Plan:**\n' +
+          '  1. Read project structure\n' +
+          '  2. Find and read the relevant files\n' +
+          '  3. Make the necessary changes\n' +
+          '- Then execute each step, announcing progress before each one:\n' +
+          '  "Step 1/3: Reading project structure..."\n' +
+          '- After completing all steps, give a short summary of what was done.\n' +
+          '- Keep all plans, progress messages, and summaries in English.\n' +
           'CRITICAL FILE EDITING RULES:\n' +
           '- When asked to make a small change, change ONLY the specific lines affected. Never rewrite or replace the entire file.\n' +
           '- Never delete content that was not explicitly asked to be removed.\n' +
           '- Prefer replace_in_file for surgical edits over create_or_edit_file with full file content.\n' +
           '- Always read the file first before editing to understand its full structure.\n' +
-          '- After editing, the file must keep all original content except the targeted change.';
+          '- After editing, the file must keep all original content except the targeted change.\n' +
+          '- When multiple changes are needed, make them ONE AT A TIME. Call replace_in_file once, wait for the result, then call it again for the next change. Never batch all changes into a single tool call.\n' +
+          'TOOL USAGE RULES:\n' +
+          '- Always call tools using the native tool-calling mechanism. Never output raw JSON as text.\n' +
+          '- After reading a file, analyze the actual content and fix the real problem. Do not add cosmetic changes like borders or colors unless specifically asked.\n' +
+          '- Think step by step: first read the file, then identify the issue, then make targeted fixes.';
 
       if (workspaceInstructions) {
         agentMandate += '\n\n<workspace_instructions>\n' + workspaceInstructions + '\n</workspace_instructions>';
@@ -1867,6 +1910,16 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     let stripped = content;
     stripped = stripped.replace(/```(?:json|tool_call|tool)?\s*\n?[\s\S]*?```/g, '');
     stripped = stripped.replace(/<tool_call>\s*[\s\S]*?\s*<\/tool_call>/g, '');
+    // Strip plain JSON tool call objects from the text
+    const toolNamePattern = /\{\s*"name"\s*:\s*"/g;
+    let match: RegExpExecArray | null;
+    while ((match = toolNamePattern.exec(stripped)) !== null) {
+      const jsonStr = this.extractBalancedJson(stripped, match.index);
+      if (jsonStr) {
+        stripped = stripped.slice(0, match.index) + stripped.slice(match.index + jsonStr.length);
+        toolNamePattern.lastIndex = match.index;
+      }
+    }
     return stripped.trim();
   }
 
@@ -1895,8 +1948,6 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
 
     const codeBlockPattern = /```(?:json|tool_call|tool)?\s*\n?([\s\S]*?)```/g;
     const tagPattern = /<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/g;
-    // Catch-all for plain JSON objects that define a tool call (Llama / Qwen often hallucinate these directly into content)
-    const jsonBlockPattern = /(\{\s*"name"\s*:\s*"[^"]+"\s*,\s*"arguments"\s*:\s*\{[\s\S]*?\}\s*\})/g;
 
     let match: RegExpExecArray | null;
     while ((match = codeBlockPattern.exec(trimmed)) !== null) {
@@ -1907,8 +1958,13 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       const inner = match[1].trim();
       if (inner.startsWith('{') || inner.startsWith('[')) candidates.push(inner);
     }
-    while ((match = jsonBlockPattern.exec(trimmed)) !== null) {
-      candidates.push(match[1].trim());
+
+    // Catch-all: extract balanced JSON objects that look like tool calls from plain text.
+    // Models like Llama/Qwen/Gemma often output raw JSON tool calls directly.
+    const toolNamePattern = /\{\s*"name"\s*:\s*"/g;
+    while ((match = toolNamePattern.exec(trimmed)) !== null) {
+      const jsonStr = this.extractBalancedJson(trimmed, match.index);
+      if (jsonStr) { candidates.push(jsonStr); }
     }
 
     for (const candidate of candidates) {
@@ -1925,6 +1981,28 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     }
 
     return [];
+  }
+
+  /** Extract a balanced JSON object starting at `startIndex` in `text`. */
+  private extractBalancedJson(text: string, startIndex: number): string | undefined {
+    let depth = 0;
+    let inString = false;
+    let escape = false;
+    for (let i = startIndex; i < text.length; i++) {
+      const ch = text[i];
+      if (escape) { escape = false; continue; }
+      if (ch === '\\' && inString) { escape = true; continue; }
+      if (ch === '"') { inString = !inString; continue; }
+      if (inString) { continue; }
+      if (ch === '{') { depth++; }
+      else if (ch === '}') {
+        depth--;
+        if (depth === 0) {
+          return text.slice(startIndex, i + 1);
+        }
+      }
+    }
+    return undefined;
   }
 
   private normalizeParsedToolCalls(rawValue: unknown): ToolFunctionCall[] {
@@ -2495,18 +2573,18 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       sanitizedContent = this.stripDiffPrefixes(sanitizedContent);
     }
 
-    // Block obviously destructive writes to structured files
-    const destructiveGuard = this.detectDestructiveWrite(displayName, sanitizedContent);
-    if (destructiveGuard) {
-      return { summary: `Blocked write to ${displayName}: ${destructiveGuard}` };
-    }
-
-    // Read old content for diff (may not exist yet)
+    // Read old content early so we can compare sizes for destructive write detection
     let oldContent: string | undefined;
     try {
       oldContent = await this.readWorkspaceText(target);
     } catch {
       // File doesn't exist yet — new file
+    }
+
+    // Block obviously destructive writes to structured files
+    const destructiveGuard = this.detectDestructiveWrite(displayName, sanitizedContent, oldContent);
+    if (destructiveGuard) {
+      return { summary: `Blocked write to ${displayName}: ${destructiveGuard}` };
     }
 
     // Write the file
@@ -2838,6 +2916,11 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   private async addFileContext(rawPath: string): Promise<void> {
     try {
       const uri = this.parseDroppedUri(rawPath);
+      const stat = await vscode.workspace.fs.stat(uri);
+      if (stat.type === vscode.FileType.Directory || stat.type === (vscode.FileType.Directory | vscode.FileType.SymbolicLink)) {
+        await this.addFolderContext(uri);
+        return;
+      }
       const bytes = await vscode.workspace.fs.readFile(uri);
       const content = Buffer.from(bytes).toString('utf8');
       const document = await vscode.workspace.openTextDocument(uri);
@@ -2887,6 +2970,11 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   private async addFilePathContext(rawUri: string): Promise<void> {
     try {
       const uri = this.parseDroppedUri(rawUri);
+      const stat = await vscode.workspace.fs.stat(uri);
+      if (stat.type === vscode.FileType.Directory || stat.type === (vscode.FileType.Directory | vscode.FileType.SymbolicLink)) {
+        await this.addFolderContext(uri);
+        return;
+      }
       const bytes = await vscode.workspace.fs.readFile(uri);
       const content = Buffer.from(bytes).toString('utf8');
       const name = path.basename(uri.fsPath);
@@ -2980,19 +3068,20 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         if (collected.length >= maxFiles) { break; }
         const childUri = vscode.Uri.joinPath(dir, name);
 
-        if (type === vscode.FileType.Directory) {
+        if (type & vscode.FileType.Directory) {
           if (!skipDirs.has(name) && !name.startsWith('.')) {
             await walk(childUri, depth + 1);
           }
           continue;
         }
 
-        if (type !== vscode.FileType.File) { continue; }
+        if (!(type & vscode.FileType.File)) { continue; }
         const ext = path.extname(name).toLowerCase();
         if (skipExtensions.has(ext)) { continue; }
 
         try {
           const stat = await vscode.workspace.fs.stat(childUri);
+          if (stat.type & vscode.FileType.Directory) { continue; }
           if (stat.size > maxFileSize) { continue; }
           const bytes = await vscode.workspace.fs.readFile(childUri);
           const text = Buffer.from(bytes).toString('utf8');
