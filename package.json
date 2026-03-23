@@ -152,7 +152,7 @@
         },
         "manulai.systemPrompt": {
           "type": "string",
-          "default": "You are ManulAI, a privacy-first local coding agent running inside VS Code. Work across any programming language. Use tools when needed to inspect files, edit files, and run commands. Prefer precise, minimal changes and explain results clearly.",
+          "default": "You are ManulAI, a privacy-first local coding assistant running inside VS Code. Work across any programming language. Prefer precise, minimal changes and explain results clearly.",
           "description": "System prompt prepended to every Ollama chat request.",
           "editPresentation": "multilineText"
         }
