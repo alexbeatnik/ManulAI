@@ -43,6 +43,18 @@
         "title": "Attach to ManulAI Chat",
         "category": "ManulAI",
         "icon": "$(add)"
+      },
+      {
+        "command": "manulai.attachActiveFile",
+        "title": "Attach Active File to ManulAI Chat",
+        "category": "ManulAI",
+        "icon": "$(file-code)"
+      },
+      {
+        "command": "manulai.attachExplorerSelection",
+        "title": "Attach Explorer Selection to ManulAI Chat",
+        "category": "ManulAI",
+        "icon": "$(files)"
       }
     ],
     "menus": {
@@ -51,6 +63,25 @@
           "command": "manulai.attachFile",
           "group": "manulai@1",
           "when": "!explorerResourceIsFolder"
+        }
+      ],
+      "view/title": [
+        {
+          "command": "manulai.attachExplorerSelection",
+          "group": "navigation@45",
+          "when": "view == workbench.explorer.fileView || view == workbench.view.extension.test || view == workbench.view.scm"
+        }
+      ],
+      "editor/title": [
+        {
+          "command": "manulai.attachActiveFile",
+          "group": "navigation@10"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "manulai.attachActiveFile",
+          "group": "navigation@10"
         }
       ]
     },

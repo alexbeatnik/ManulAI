@@ -58,6 +58,7 @@ interface WebviewInboundMessage {
     | 'sendMessage'
     | 'stopRequest'
     | 'clearChat'
+    | 'attachActiveFile'
     | 'revertFileChanges'
     | 'approvePendingAction'
     | 'declinePendingAction'
@@ -238,7 +239,41 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
 
   public async attachFilesByUri(uris: vscode.Uri[]): Promise<void> {
     for (const uri of uris) {
-      await this.addFileContext(uri.fsPath);
+      await this.addFileContext(uri.toString());
+    }
+  }
+
+  public async attachActiveEditorFile(): Promise<void> {
+    const activeUri = vscode.window.activeTextEditor?.document.uri;
+    if (!activeUri || activeUri.scheme === 'untitled') {
+      this.postStatus('No saved active editor file to attach.');
+      return;
+    }
+
+    await this.addFileContext(activeUri.toString());
+  }
+
+  public async attachExplorerSelectionFromClipboard(): Promise<void> {
+    const previousClipboard = await vscode.env.clipboard.readText();
+
+    try {
+      await vscode.commands.executeCommand('copyFilePath');
+      const clipboardText = await vscode.env.clipboard.readText();
+      const candidates = clipboardText
+        .split(/\r?\n/)
+        .map(line => line.trim())
+        .filter(Boolean);
+
+      if (candidates.length === 0 || clipboardText === previousClipboard) {
+        this.postStatus('No Explorer file selection was available to attach. Focus Explorer and select a file first.');
+        return;
+      }
+
+      for (const candidate of candidates) {
+        await this.addFileContext(candidate);
+      }
+    } finally {
+      await vscode.env.clipboard.writeText(previousClipboard);
     }
   }
 
@@ -250,6 +285,9 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         return;
       case 'clearChat':
         this.clearChat();
+        return;
+      case 'attachActiveFile':
+        await this.attachActiveEditorFile();
         return;
       case 'revertFileChanges':
         await this.revertFileChanges(message.operationIds);
@@ -2334,8 +2372,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
 
   private async addFileContext(rawPath: string): Promise<void> {
     try {
-      const decodedPath = this.normalizeDroppedPath(rawPath);
-      const uri = decodedPath.startsWith('file:') ? vscode.Uri.parse(decodedPath) : this.resolveWorkspaceUri(decodedPath);
+      const uri = this.parseDroppedUri(rawPath);
       const bytes = await vscode.workspace.fs.readFile(uri);
       const content = Buffer.from(bytes).toString('utf8');
       const document = await vscode.workspace.openTextDocument(uri);
@@ -2384,7 +2421,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
 
   private async addFilePathContext(rawUri: string): Promise<void> {
     try {
-      const uri = rawUri.startsWith('file:') ? vscode.Uri.parse(rawUri) : this.resolveWorkspaceUri(rawUri);
+      const uri = this.parseDroppedUri(rawUri);
       const bytes = await vscode.workspace.fs.readFile(uri);
       const content = Buffer.from(bytes).toString('utf8');
       const name = path.basename(uri.fsPath);
@@ -2593,6 +2630,13 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     }
 
     return value;
+  }
+
+  private parseDroppedUri(rawPath: string): vscode.Uri {
+    const value = this.normalizeDroppedPath(rawPath);
+    return /^[a-z][a-z0-9+.-]*:/i.test(value)
+      ? vscode.Uri.parse(value)
+      : this.resolveWorkspaceUri(value);
   }
 
   private async getWorkspaceInstructions(): Promise<string> {

@@ -1094,7 +1094,7 @@
       <div class="title-wrap">
         <p class="eyebrow">Chat</p>
         <p class="title">ManulAI</p>
-        <p class="subtitle">Local-first coding agent in the right sidebar. Drag files into the composer to attach context.</p>
+        <p class="subtitle">Local-first coding agent in the right sidebar. Click Browse or use Attach to ManulAI Chat from Explorer to add context.</p>
       </div>
       <div id="statusPill" class="status-pill">Ready</div>
     </div>
@@ -1102,8 +1102,16 @@
 
   <section class="workspace">
     <div class="topbar">
-      <div id="dropzone" class="drop-inline" role="button" tabindex="0">Drop files here or click to browse.</div>
+      <div class="context-actions" style="justify-self: flex-start;">
+        <button id="browseFiles" class="ghost-button" type="button" style="display: flex; align-items: center; gap: 6px;">
+          <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M13.5 3l-4 0-1-1-6 0 0 12 11 0 0-11z"/></svg>
+          Browse...
+        </button>
+      </div>
       <div class="controls">
+          <div class="context-actions">
+            <button id="attachActiveFile" class="ghost-button" type="button">Active File</button>
+          </div>
         <label class="toggle-switch" title="Enable Agent Mode so Ollama can call local tools automatically">
           <input type="checkbox" id="agentModeToggle" />
           <span class="toggle-slider"></span>
@@ -1128,7 +1136,7 @@
       <main id="history" class="history">
         <div class="empty">
           <strong>Start with a task.</strong>
-          Ask for a code change, drag files into the composer, or let the model inspect the workspace with tools.
+          Ask for a code change, attach files using Browse, or let the model inspect the workspace with tools.
         </div>
       </main>
     </section>
@@ -1142,13 +1150,13 @@
           <div id="dropOverlay" class="drop-overlay" aria-hidden="true">
             <div class="drop-overlay-inner">
               <div class="drop-overlay-title">Attach files to this prompt</div>
-              <div class="drop-overlay-copy">Drop files from Explorer or your desktop directly into this field. They will be attached to the chat context.</div>
+              <div class="drop-overlay-copy">Use Browse, Active File, or Explorer attach actions to add files to the chat context.</div>
             </div>
           </div>
           <textarea id="input" placeholder="Ask ManulAI to inspect, change, or explain code..."></textarea>
           <div class="composer-actions">
             <div class="composer-hint">
-              <span><strong>Tip:</strong> drag files directly into this field to attach them as context.</span>
+              <span><strong>Tip:</strong> use Browse, Active File, or Explorer attach actions to add context.</span>
             </div>
             <div class="composer-buttons">
               <button id="stop" class="ghost-button danger stop" type="button">Stop</button>
@@ -1176,7 +1184,8 @@
     const dropOverlayEl = document.getElementById('dropOverlay');
     const sendEl = document.getElementById('send');
     const stopEl = document.getElementById('stop');
-    const dropzoneEl = document.getElementById('dropzone');
+    const browseFilesEl = document.getElementById('browseFiles');
+    const attachActiveFileEl = document.getElementById('attachActiveFile');
     const composerShellEl = document.getElementById('composerShell');
     const modelSelectEl = document.getElementById('modelSelect');
     const refreshModelsEl = document.getElementById('refreshModels');
@@ -1223,7 +1232,6 @@
 
     function setDragging(active) {
       document.body.classList.toggle('dragging', active);
-      dropzoneEl.classList.toggle('active', active);
       inputShellEl.classList.toggle('active', active);
       dropOverlayEl.setAttribute('aria-hidden', String(!active));
       document.getElementById('bodyDropOverlay').setAttribute('aria-hidden', String(!active));
@@ -1247,7 +1255,7 @@
       if (messages.length === 0 && attachments.length === 0) {
         const empty = document.createElement('div');
         empty.className = 'empty';
-        empty.innerHTML = '<strong>Start with a task.</strong>Ask for a code change, drag files into the composer, or let the model inspect the workspace with tools.';
+        empty.innerHTML = '<strong>Start with a task.</strong>Ask for a code change, attach files using Browse, or let the model inspect the workspace with tools.';
         historyEl.appendChild(empty);
       } else if (messages.length === 0) {
         // Only context files, no messages yet
@@ -1673,6 +1681,14 @@
       vscode.postMessage({ command: 'clearChat' });
     });
 
+    attachActiveFileEl.addEventListener('click', () => {
+      if (busy) {
+        return;
+      }
+
+      vscode.postMessage({ command: 'attachActiveFile' });
+    });
+
     agentModeToggle.addEventListener('change', () => {
       vscode.postMessage({ command: 'toggleAgentMode', value: agentModeToggle.checked });
     });
@@ -1725,10 +1741,10 @@
       handleDrop(event);
     }, true);
 
-    dropzoneEl.addEventListener('click', () => {
+    browseFilesEl.addEventListener('click', () => {
       vscode.postMessage({ command: 'browseFiles' });
     });
-    dropzoneEl.addEventListener('keydown', event => {
+    browseFilesEl.addEventListener('keydown', event => {
       if (event.key === 'Enter' || event.key === ' ') {
         event.preventDefault();
         vscode.postMessage({ command: 'browseFiles' });

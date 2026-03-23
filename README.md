@@ -10,7 +10,8 @@ The extension runs against a local Ollama instance and is designed for private c
 
 - Activity Bar launcher icon for quick access
 - Right-side chat view in the Secondary Sidebar
-- Webview-based chat UI with drag-and-drop file context
+- Webview-based chat UI with desktop drag-and-drop file context
+- Explorer and editor commands for attaching files to chat context
 - Ollama model picker in the chat UI and command palette
 - In-memory conversation history
 - Native Ollama tool-calling loop
@@ -85,6 +86,7 @@ You can switch the active Ollama model in two ways:
 
 - The chat view is contributed to the Secondary Sidebar, not the standard left sidebar.
 - Attached files are injected into model context before requests are sent to Ollama.
+- Files from the system file manager can be dragged into the webview. Files from the VS Code Explorer should be attached with `Attach to ManulAI Chat`, the Explorer title action `Attach Explorer Selection to ManulAI Chat`, or `ManulAI: Attach Active File to ManulAI Chat`.
 - Tool execution currently uses a basic safety filter for shell commands.
 
 ## License

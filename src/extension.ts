@@ -100,6 +100,20 @@ export function activate(context: vscode.ExtensionContext): void {
   );
 
   context.subscriptions.push(
+    vscode.commands.registerCommand('manulai.attachActiveFile', async () => {
+      await provider.attachActiveEditorFile();
+      await openChat();
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('manulai.attachExplorerSelection', async () => {
+      await provider.attachExplorerSelectionFromClipboard();
+      await openChat();
+    })
+  );
+
+  context.subscriptions.push(
     vscode.commands.registerCommand('manulai.selectModel', async () => {
       await provider.refreshModelCatalog(true);
 
