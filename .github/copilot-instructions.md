@@ -18,6 +18,7 @@ This repository contains a VS Code extension named ManulAI.
 - Use TypeScript with strict typing.
 - Keep edits minimal and focused.
 - Preserve the existing project structure under `src/` and `media/`.
+- NEVER use backslash-quote escaping (`\"` or `\'`) inside JavaScript template literals for inline webview scripts. Template literal evaluation strips backslashes before the HTML reaches the browser, causing syntax errors. Use `String.fromCharCode()` or structured data instead.
 - Add comments only when they clarify non-obvious logic.
 
 ## Product Constraints
@@ -31,3 +32,7 @@ This repository contains a VS Code extension named ManulAI.
 
 - Keep README accurate when behavior or setup changes.
 - Keep wording direct and technical.
+- Keep README tone alpha-stage and avoid marketing fluff.
+- User-facing README should describe ManulAI primarily as a local AI assistant for Ollama inside VS Code.
+- Avoid adding unnecessary installation/setup sections to the user-facing README unless behavior changes require them.
+- Keep the `What's New` section at the bottom of the README, immediately before `License`.

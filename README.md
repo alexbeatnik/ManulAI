@@ -1,93 +1,97 @@
-# ManulAI Local Agent
+# 😼 ManulAI — Native Local Coding Agent for VS Code
 
-Version: 0.0.1
+<p align="center">
+	<img src="icon.png" width="128" alt="ManulAI Logo">
+</p>
 
-ManulAI is a local-first VS Code extension that provides an AI chat assistant powered by Ollama.
-The extension runs against a local Ollama instance and is designed for private code assistance inside VS Code.
-`icon.png` is used as the extension icon bundled inside the VSIX.
+![Alpha](https://img.shields.io/badge/status-alpha-bf5b04)
+![Manul Product Line](https://img.shields.io/badge/product%20line-Manul-111827)
 
-## Current Scope
+ManulAI is a privacy-first local coding agent for Visual Studio Code powered entirely by your own Ollama runtime.
 
-- Activity Bar launcher icon for quick access
-- Right-side chat view in the Secondary Sidebar
-- Webview-based chat UI with desktop drag-and-drop file context
-- Explorer and editor commands for attaching files to chat context
-- Ollama model picker in the chat UI and command palette
-- In-memory conversation history
-- Native Ollama tool-calling loop
-- File reading, file writing, and terminal command execution tools
+It is built for people who want an AI helper directly inside the editor without cloud APIs, remote inference, or account-based workflow. ManulAI keeps the chat interface inside VS Code, forwards workspace context to Ollama, and supports native tool-calling flows for reading files, editing files, and running local commands.
 
-## Project Structure
+> The Manul goes hunting and never returns without its prey.
 
-```text
-.
-├── media/
-│   ├── manulai-icon.svg
-│   └── webview.html
-├── src/
-│   ├── extension.ts
-│   └── ManulAiChatProvider.ts
-├── icon.png
-├── package.json
-└── tsconfig.json
-```
+> **Status: Alpha.**
+> **Developed by a single person.**
+>
+> ManulAI is already useful for real work, but it is still being battle-tested on real-world projects. Bugs, rough edges, and behavioral changes are expected while the product matures. The priority is transparent local behavior, predictable tool execution, and strong Ollama-first integration rather than polished marketing promises.
 
-## Extension Icon
+---
 
-- `icon.png` is used as the extension icon in the VS Code manifest.
-- `media/manulai-icon.svg` is used for the contributed sidebar view container and view icon.
+## Why Use ManulAI
 
-## Requirements
+ManulAI is designed for developers who already want Ollama as the model runtime and need a practical AI assistant inside VS Code:
 
-- VS Code 1.112 or newer
-- Node.js 18+
-- Local Ollama server running at `http://localhost:11434`
-- A locally available Ollama model, for example `llama3.2`
+- local-first by default
+- no cloud AI dependency or remote model API
+- chat and tools stay close to the code you are editing
+- works across any programming language opened in VS Code
+- keeps attached file context and conversation history available during the session
 
-## Installation
+---
 
-```bash
-npm install
-```
+## Extension Features
 
-After installing the extension in VS Code, run the `ManulAI: Open Chat` command.
-The command opens the Secondary Sidebar on the right and reveals the `ManulAI` chat view.
-The `ManulAI` icon is also visible in the left Activity Bar as a launcher.
-If the right panel is hidden, run `ManulAI: Open Secondary Sidebar`.
+> Local Ollama chat, workspace-aware context, native tool execution, and a right-side chat panel designed for day-to-day coding work.
 
-## Development
+### 💬 Native Chat In VS Code
 
-Build the extension:
+- dedicated ManulAI chat view in the Secondary Sidebar
+- right-side layout keeps the main editor and explorer intact
+- in-memory conversation history used as ongoing request context
 
-```bash
-npm run compile
-```
+### 🛠️ Ollama Native Tool Calling
 
-Run in watch mode:
+ManulAI is built around Ollama native tool calling through `/api/chat`.
 
-```bash
-npm run watch
-```
+- reads files from the current workspace
+- edits files directly from approved tool calls
+- runs local terminal commands when needed
+- returns tool results through the native `tool` role flow
 
-## Configuration
+### 📂 File Context Attachment
 
-The extension exposes these settings:
+- attach the active editor file to the chat
+- attach files from the Explorer context menu
+- keep dropped file context visible in the UI
+- forward file content into the model context cleanly
+
+### ⚙️ Focused Local Configuration
+
+The extension exposes local settings for the Ollama workflow:
 
 - `manulai.ollamaBaseUrl`
 - `manulai.ollamaModel`
+- `manulai.agentMode`
+- `manulai.autoApprove`
 - `manulai.systemPrompt`
 
-You can switch the active Ollama model in two ways:
+---
 
-- Use the model selector at the top of the chat view.
-- Run `ManulAI: Select Ollama Model` from the Command Palette.
+## What Makes It Different
+
+- built specifically as an AI assistant for Ollama inside VS Code
+- keeps the chat view in the Secondary Sidebar instead of replacing the main layout
+- stays local-first and avoids cloud-connected AI features
+- works as a coding agent, not just a plain text chatbot
+- supports file context, file editing, and terminal actions in one flow
+
+---
 
 ## Notes
 
-- The chat view is contributed to the Secondary Sidebar, not the standard left sidebar.
-- Attached files are injected into model context before requests are sent to Ollama.
-- Files from the system file manager can be dragged into the webview. Files from the VS Code Explorer should be attached with `Attach to ManulAI Chat`, the Explorer title action `Attach Explorer Selection to ManulAI Chat`, or `ManulAI: Attach Active File to ManulAI Chat`.
-- Tool execution currently uses a basic safety filter for shell commands.
+- the default model is `llama3.2`
+- the default Ollama base URL is `http://localhost:11434`
+- `icon.png` is used as the extension icon in the VS Code manifest
+- `media/manulai-icon.svg` is used for the contributed sidebar container and view icon
+
+---
+
+## What's New
+
+- **0.0.1 (Alpha Release):** Initial public alpha with right-side chat UI, local Ollama integration, workspace file attachments, and native tool-calling support.
 
 ## License
 
