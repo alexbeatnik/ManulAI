@@ -888,19 +888,40 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       }
 
       if (this.agentMode) {
-        // --- Fallback layer 6: nudge the model to use tools if it didn't ---
+        // --- Fallback layer 6a: retry blocked writes ---
+        // If a fallback layer tried to write a file but detectDestructiveWrite blocked it,
+        // nudge the model to use replace_in_file instead of rewriting the whole file.
+        const wasBlocked = /^Blocked write to /i.test(finalContent.trim());
+        if (wasBlocked && retryCount < 2) {
+          messages.push({ role: 'assistant', content: finalContent, hiddenFromTranscript: true });
+          messages.push({
+            role: 'user',
+            content: 'Your file write was blocked because it would overwrite the file with partial content. ' +
+              'Do NOT rewrite the entire file. Instead, use the replace_in_file tool to change ONLY the specific lines that need to change. ' +
+              'First call read_specific_file to see the current content, then call replace_in_file with the exact old_text and new_text.',
+            hiddenFromTranscript: true
+          });
+          this.postStatus('Blocked partial write — nudging model to use replace_in_file...');
+          await this.processOllamaResponse(messages, retryCount + 1);
+          return;
+        }
+
+        // --- Fallback layer 6b: nudge the model to use tools if it didn't ---
         const isLongDump = finalContent.length > 300;
         const hasLargeCodeBlocks = /```[\w]*\n[\s\S]{100,}?```/.test(finalContent);
         const claimsDone = /(?:зробив|замінив|оновив|готово|i've made|i have made|i have updated|summary of the changes)/i.test(finalContent);
         const mentionsChange = /(?:змін|зроби|оновл|replac|chang|updat|modif)/i.test(finalContent);
         const isLazyAcknowledgment = /^(?:understood|sure|ok|okay|got it|i will|let me know|i can help|i'll make sure)\b/i.test(finalContent.trim())
           && finalContent.trim().length < 300;
+        // Detect model asking user to do things manually instead of using tools
+        const isPassingToUser = /(?:please (?:execute|run|proceed|specify|provide|let me know|make sure|save)|you (?:may|can|should|need to) (?:run|execute|save))/i.test(finalContent)
+          && finalContent.trim().length < 500;
 
         // Detect incomplete plan execution: model mentions "Step N/M" but hasn't reached the final step
         const stepMatch = finalContent.match(/step\s+(\d+)\s*[\/of]+\s*(\d+)/i);
         const hasIncompletePlan = stepMatch && parseInt(stepMatch[1], 10) < parseInt(stepMatch[2], 10);
 
-        const shouldNudge = (isLongDump || hasLargeCodeBlocks || claimsDone || mentionsChange || isLazyAcknowledgment || hasIncompletePlan) && retryCount < 2;
+        const shouldNudge = (isLongDump || hasLargeCodeBlocks || claimsDone || mentionsChange || isLazyAcknowledgment || hasIncompletePlan || isPassingToUser) && retryCount < 2;
 
         if (shouldNudge) {
           // Show plan/progress text to the user before nudging
@@ -921,6 +942,8 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           let nudgeMessage = '';
           if (hasIncompletePlan) {
             nudgeMessage = `You are on step ${stepMatch![1]} of ${stepMatch![2]} but stopped. Continue executing your plan. Proceed to the next step now — use the provided tools.`;
+          } else if (isPassingToUser) {
+            nudgeMessage = 'Do not ask the user to run commands or make changes manually. You have tools available. Use execute_terminal_command to run commands and replace_in_file or create_or_edit_file to edit files. Do it yourself now.';
           } else if (isLazyAcknowledgment) {
             nudgeMessage = 'Do not just acknowledge the request. Actually perform the task now. Read the relevant files and make the changes the user asked for. Use the provided tools.';
           } else if (isLongDump || hasLargeCodeBlocks) {
