@@ -672,6 +672,33 @@
       border-color: color-mix(in srgb, var(--vscode-errorForeground, #f44) 28%, var(--border-muted));
     }
 
+    .message-actions {
+      display: flex;
+      justify-content: flex-end;
+      margin-top: 10px;
+    }
+
+    .message-action-button {
+      border-radius: 10px;
+      border: 1px solid var(--border-muted);
+      padding: 7px 11px;
+      font: inherit;
+      cursor: pointer;
+      transition: transform 140ms ease, border-color 140ms ease, background 140ms ease, opacity 140ms ease;
+      background: color-mix(in srgb, var(--panel-strong) 88%, transparent);
+      color: var(--text);
+    }
+
+    .message-action-button:hover:not([disabled]) {
+      transform: translateY(-1px);
+      border-color: color-mix(in srgb, var(--accent) 38%, var(--border-muted));
+    }
+
+    .message-action-button.revert {
+      background: color-mix(in srgb, var(--vscode-errorForeground, #f44) 7%, var(--panel-strong));
+      color: color-mix(in srgb, var(--vscode-errorForeground, #f44) 82%, var(--text) 18%);
+    }
+
     .thinking-card .label {
       font-size: 11px;
       color: var(--text);
@@ -1240,6 +1267,25 @@
           const card = document.createElement('div');
           card.className = 'message-card';
           renderMessageContent(card, message.content);
+
+          if (message.revertAction && Array.isArray(message.revertAction.operationIds) && message.revertAction.operationIds.length > 0) {
+            const actions = document.createElement('div');
+            actions.className = 'message-actions';
+
+            const revertButton = document.createElement('button');
+            revertButton.type = 'button';
+            revertButton.className = 'message-action-button revert';
+            revertButton.textContent = message.revertAction.label || 'Revert changes';
+            if (message.revertAction.details) {
+              revertButton.title = message.revertAction.details;
+            }
+            revertButton.addEventListener('click', () => {
+              vscode.postMessage({ command: 'revertFileChanges', operationIds: message.revertAction.operationIds });
+            });
+
+            actions.appendChild(revertButton);
+            card.appendChild(actions);
+          }
 
           wrapper.append(meta, card);
           historyEl.appendChild(wrapper);

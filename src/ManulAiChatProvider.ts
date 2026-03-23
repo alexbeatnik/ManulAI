@@ -22,6 +22,7 @@ interface OllamaMessage {
   hiddenFromTranscript?: boolean;
   attachmentContext?: boolean;
   activeEditorContext?: boolean;
+  revertOperationIds?: string[];
 }
 
 interface OllamaResponse {
@@ -57,6 +58,7 @@ interface WebviewInboundMessage {
     | 'sendMessage'
     | 'stopRequest'
     | 'clearChat'
+    | 'revertFileChanges'
     | 'approvePendingAction'
     | 'declinePendingAction'
     | 'addFileContext'
@@ -74,6 +76,7 @@ interface WebviewInboundMessage {
   model?: string;
   value?: boolean;
   autoApprove?: boolean;
+  operationIds?: string[];
   filename?: string;
   content?: string;
   attachments?: Array<{ name: string; content: string }>;
@@ -82,6 +85,11 @@ interface WebviewInboundMessage {
 interface WebviewRenderableMessage {
   role: Exclude<ChatRole, 'system'> | 'status';
   content: string;
+  revertAction?: {
+    operationIds: string[];
+    label: string;
+    details?: string;
+  };
 }
 
 interface WebviewActiveFileState {
@@ -99,6 +107,20 @@ interface WebviewPendingApprovalState {
   declineLabel: string;
 }
 
+interface RevertSnapshot {
+  id: string;
+  filepath: string;
+  displayName: string;
+  previousContent: string;
+  updatedContent: string;
+  reverted: boolean;
+}
+
+interface FileWriteSummary {
+  summary: string;
+  revertOperationId?: string;
+}
+
 export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = 'manulai.chatView';
 
@@ -113,6 +135,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   private currentRequestAbortController?: AbortController;
   private pendingApproval?: WebviewPendingApprovalState;
   private pendingApprovalResolver?: (approved: boolean) => void;
+  private readonly revertSnapshots = new Map<string, RevertSnapshot>();
 
   public constructor(private readonly extensionContext: vscode.ExtensionContext) {
     const config = vscode.workspace.getConfiguration('manulai');
@@ -228,6 +251,9 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       case 'clearChat':
         this.clearChat();
         return;
+      case 'revertFileChanges':
+        await this.revertFileChanges(message.operationIds);
+        return;
       case 'approvePendingAction':
         this.resolvePendingApproval(true);
         return;
@@ -338,7 +364,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
 
     const directSummary = await this.tryHandleDirectLicenseAuthorRename(text);
     if (directSummary) {
-      this.messages.push({ role: 'assistant', content: directSummary });
+      this.messages.push(this.createAssistantMessage(directSummary.summary, directSummary.revertOperationId ? [directSummary.revertOperationId] : []));
       this.postStateToWebview();
       return;
     }
@@ -347,7 +373,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     await this.runAgentLoop();
   }
 
-  private async tryHandleDirectLicenseAuthorRename(text: string): Promise<string | undefined> {
+  private async tryHandleDirectLicenseAuthorRename(text: string): Promise<FileWriteSummary | undefined> {
     const match = text.match(/change\s+author\s+name\s+to\s+(.+?)\s+in\s+license\b/i);
     if (!match) {
       return undefined;
@@ -366,7 +392,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     );
 
     if (updatedContent === currentContent) {
-      return 'LICENSE: no changes detected.';
+      return { summary: 'LICENSE: no changes detected.' };
     }
 
     return this.writeFileWithDiff(licenseUri.fsPath, updatedContent);
@@ -483,8 +509,8 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         }
         const summary = await this.writeFileWithDiff(markerWrite.filepath, markerWrite.fileContent);
         const remaining = finalContent.replace(markerWrite.fullMatch, '').trim();
-        finalContent = summary + (remaining ? '\n\n' + this.truncateLongResponse(remaining) : '');
-        messages.push({ role: 'assistant', content: finalContent });
+        finalContent = summary.summary + (remaining ? '\n\n' + this.truncateLongResponse(remaining) : '');
+        messages.push(this.createAssistantMessage(finalContent, summary.revertOperationId ? [summary.revertOperationId] : []));
         return;
       }
 
@@ -500,12 +526,17 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         }
 
         const appliedSummaries: string[] = [];
+        const revertOperationIds: string[] = [];
         for (const block of codeBlockWrites) {
-          appliedSummaries.push(await this.writeFileWithDiff(block.filepath, block.fileContent));
+          const summary = await this.writeFileWithDiff(block.filepath, block.fileContent);
+          appliedSummaries.push(summary.summary);
+          if (summary.revertOperationId) {
+            revertOperationIds.push(summary.revertOperationId);
+          }
           finalContent = finalContent.replace(block.fullMatch, '');
         }
         finalContent = appliedSummaries.join('\n\n') + (finalContent.trim() ? '\n\n' + this.truncateLongResponse(finalContent.trim()) : '');
-        messages.push({ role: 'assistant', content: finalContent });
+        messages.push(this.createAssistantMessage(finalContent, revertOperationIds));
         return;
       }
 
@@ -520,14 +551,19 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           return;
         }
         const appliedSummaries: string[] = [];
+        const revertOperationIds: string[] = [];
         let remaining = finalContent;
         for (const block of inlineFileBlocks) {
-          appliedSummaries.push(await this.writeFileWithDiff(block.filepath, block.fileContent));
+          const summary = await this.writeFileWithDiff(block.filepath, block.fileContent);
+          appliedSummaries.push(summary.summary);
+          if (summary.revertOperationId) {
+            revertOperationIds.push(summary.revertOperationId);
+          }
           remaining = remaining.replace(block.fullMatch, '');
         }
         remaining = remaining.trim();
         finalContent = appliedSummaries.join('\n\n') + (remaining ? '\n\n' + this.truncateLongResponse(remaining) : '');
-        messages.push({ role: 'assistant', content: finalContent });
+        messages.push(this.createAssistantMessage(finalContent, revertOperationIds));
         return;
       }
 
@@ -590,7 +626,8 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
             const diffSummary = this.buildDiffSummary(path.basename(targetFile), originalContent, updatedContent);
             if (diffSummary) {
               const notes = appliedSummaries.filter(summary => !summary.startsWith('Replaced '));
-              messages.push({ role: 'assistant', content: diffSummary + (notes.length > 0 ? '\n\n' + notes.join('\n') : '') });
+              const revertOperationId = this.createRevertSnapshot(targetFile, originalContent, updatedContent);
+              messages.push(this.createAssistantMessage(diffSummary + (notes.length > 0 ? '\n\n' + notes.join('\n') : ''), revertOperationId ? [revertOperationId] : []));
               return;
             }
           }
@@ -611,10 +648,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         }
         const summary = await this.writeFileWithDiff(describedFileDump.filepath, describedFileDump.fileContent);
         const remaining = finalContent.replace(describedFileDump.fullMatch, '').trim();
-        messages.push({
-          role: 'assistant',
-          content: summary + (remaining ? '\n\n' + this.truncateLongResponse(remaining) : '')
-        });
+        messages.push(this.createAssistantMessage(summary.summary + (remaining ? '\n\n' + this.truncateLongResponse(remaining) : ''), summary.revertOperationId ? [summary.revertOperationId] : []));
         return;
       }
 
@@ -631,7 +665,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           return;
         }
         const summary = await this.writeFileWithDiff(matchedFile.filepath, matchedFile.fileContent);
-        messages.push({ role: 'assistant', content: summary });
+        messages.push(this.createAssistantMessage(summary.summary, summary.revertOperationId ? [summary.revertOperationId] : []));
         return;
       }
 
@@ -643,7 +677,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           return;
         }
         const summary = await this.writeFileWithDiff(matchedActiveFile.filepath, matchedActiveFile.fileContent);
-        messages.push({ role: 'assistant', content: summary });
+        messages.push(this.createAssistantMessage(summary.summary, summary.revertOperationId ? [summary.revertOperationId] : []));
         return;
       }
 
@@ -668,7 +702,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
               continue;
             }
             const summary = await this.writeFileWithDiff(fileUri.fsPath, extractedContent);
-            messages.push({ role: 'assistant', content: summary });
+            messages.push(this.createAssistantMessage(summary.summary, summary.revertOperationId ? [summary.revertOperationId] : []));
             return;
           }
         } catch {}
@@ -1841,7 +1875,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     let result = content;
     for (const block of blocks) {
       const summary = await this.writeFileWithDiff(block.filepath, block.fileContent);
-      result = result.replace(block.fullMatch, summary);
+      result = result.replace(block.fullMatch, summary.summary);
     }
 
     return result;
@@ -1959,7 +1993,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  private async writeFileWithDiff(filepath: string, newContent: string): Promise<string> {
+  private async writeFileWithDiff(filepath: string, newContent: string): Promise<FileWriteSummary> {
     const target = this.resolveWorkspaceUri(filepath);
     const displayName = path.basename(target.fsPath);
     const sanitizedContent = this.sanitizeGeneratedFileContent(newContent);
@@ -1976,21 +2010,104 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     const writeResult = await this.createOrEditFile(filepath, sanitizedContent);
     const parsed = JSON.parse(writeResult) as Record<string, unknown>;
     if (parsed.error) {
-      return `Failed to write ${displayName}: ${String(parsed.error)}`;
+      return { summary: `Failed to write ${displayName}: ${String(parsed.error)}` };
     }
 
     // Compute diff
     if (oldContent === undefined) {
       // New file created
       const lineCount = sanitizedContent.split('\n').length;
-      return `Created ${displayName} (${lineCount} lines)`;
+      return { summary: `Created ${displayName} (${lineCount} lines)` };
     }
 
     if (oldContent === sanitizedContent) {
-      return `${displayName}: no changes detected.`;
+      return { summary: `${displayName}: no changes detected.` };
     }
 
-    return this.buildDiffSummary(displayName, oldContent, sanitizedContent) ?? `${displayName}: no changes detected.`;
+    return {
+      summary: this.buildDiffSummary(displayName, oldContent, sanitizedContent) ?? `${displayName}: no changes detected.`,
+      revertOperationId: this.createRevertSnapshot(target.fsPath, oldContent, sanitizedContent)
+    };
+  }
+
+  private createAssistantMessage(content: string, revertOperationIds: string[] = []): OllamaMessage {
+    const uniqueOperationIds = Array.from(new Set(revertOperationIds.filter(operationId => this.revertSnapshots.has(operationId))));
+    if (uniqueOperationIds.length === 0) {
+      return { role: 'assistant', content };
+    }
+
+    return {
+      role: 'assistant',
+      content,
+      revertOperationIds: uniqueOperationIds
+    };
+  }
+
+  private createRevertSnapshot(filepath: string, previousContent: string, updatedContent: string): string | undefined {
+    if (previousContent === updatedContent) {
+      return undefined;
+    }
+
+    const target = this.resolveWorkspaceUri(filepath);
+    const id = `revert:${Date.now().toString(36)}:${Math.random().toString(36).slice(2, 10)}`;
+    this.revertSnapshots.set(id, {
+      id,
+      filepath: target.fsPath,
+      displayName: path.basename(target.fsPath),
+      previousContent,
+      updatedContent,
+      reverted: false
+    });
+    return id;
+  }
+
+  private async revertFileChanges(operationIds: string[] | undefined): Promise<void> {
+    if (this.requestInFlight) {
+      this.postStatus('Cannot revert changes while a request is running. Wait for the current response to finish.');
+      return;
+    }
+
+    const uniqueOperationIds = Array.from(new Set((operationIds ?? []).filter(Boolean)));
+    if (uniqueOperationIds.length === 0) {
+      this.postStatus('No revertable changes were provided.');
+      return;
+    }
+
+    const snapshots: RevertSnapshot[] = [];
+    for (const operationId of uniqueOperationIds) {
+      const snapshot = this.revertSnapshots.get(operationId);
+      if (!snapshot || snapshot.reverted) {
+        continue;
+      }
+
+      snapshots.push(snapshot);
+    }
+
+    if (snapshots.length === 0) {
+      this.postStatus('These changes were already reverted or are no longer available.');
+      this.postStateToWebview();
+      return;
+    }
+
+    for (const snapshot of snapshots) {
+      const currentContent = await this.readWorkspaceText(vscode.Uri.file(snapshot.filepath));
+      if (this.normalizeTextForComparison(currentContent) !== this.normalizeTextForComparison(snapshot.updatedContent)) {
+        this.postStatus(`Cannot revert ${snapshot.displayName}: the file changed after this diff was applied.`);
+        return;
+      }
+    }
+
+    const revertSummaries: string[] = [];
+    for (const snapshot of [...snapshots].reverse()) {
+      await this.writeWorkspaceText(vscode.Uri.file(snapshot.filepath), snapshot.previousContent);
+      snapshot.reverted = true;
+      const revertSummary = this.buildDiffSummary(snapshot.displayName, snapshot.updatedContent, snapshot.previousContent)
+        ?? `${snapshot.displayName}: no changes detected.`;
+      revertSummaries.push(`Reverted ${snapshot.displayName}:\n${revertSummary}`);
+    }
+
+    this.messages.push({ role: 'assistant', content: revertSummaries.join('\n\n') });
+    this.postStateToWebview();
   }
 
   private buildDiffSummary(displayName: string, oldContent: string, newContent: string): string | undefined {
@@ -2587,9 +2704,20 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         return result;
       }
 
+      const availableRevertOperations = (message.revertOperationIds ?? [])
+        .map(operationId => this.revertSnapshots.get(operationId))
+        .filter((snapshot): snapshot is RevertSnapshot => Boolean(snapshot && !snapshot.reverted));
+
       result.push({
         role: message.role,
-        content: message.content
+        content: message.content,
+        revertAction: availableRevertOperations.length > 0
+          ? {
+              operationIds: availableRevertOperations.map(snapshot => snapshot.id),
+              label: availableRevertOperations.length > 1 ? `Revert ${availableRevertOperations.length} changes` : 'Revert changes',
+              details: Array.from(new Set(availableRevertOperations.map(snapshot => snapshot.displayName))).join(', ')
+            }
+          : undefined
       });
       return result;
     }, []);
