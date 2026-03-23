@@ -788,6 +788,18 @@
       content: 'active';
     }
 
+    .chip.folder::before {
+      content: 'folder';
+    }
+
+    .version-badge {
+      font-size: 9px;
+      font-weight: 500;
+      color: var(--muted);
+      letter-spacing: 0.04em;
+      vertical-align: middle;
+    }
+
     .chip span {
       overflow: hidden;
       text-overflow: ellipsis;
@@ -1200,7 +1212,7 @@
     <div class="header-row">
       <div class="title-wrap">
         <p class="eyebrow">Chat</p>
-        <p class="title">ManulAI</p>
+        <p class="title">ManulAI <span id="versionBadge" class="version-badge"></span></p>
         <p class="subtitle">Local-first coding agent in the right sidebar. Click Browse or use Attach to ManulAI Chat from Explorer to add context.</p>
       </div>
       <div id="statusPill" class="status-pill">Ready</div>
@@ -1214,6 +1226,14 @@
           <button id="browseFiles" class="ghost-button" type="button" style="display: flex; align-items: center; gap: 6px;">
             <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M13.5 3l-4 0-1-1-6 0 0 12 11 0 0-11z"/></svg>
             Browse...
+          </button>
+          <button id="browseFolder" class="ghost-button" type="button" style="display: flex; align-items: center; gap: 6px;">
+            <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M14 4H8l-1-1H2v10h12V4zm-1 8H3V5h4l1 1h5v6z"/></svg>
+            Folder
+          </button>
+          <button id="attachProject" class="ghost-button" type="button" style="display: flex; align-items: center; gap: 6px;">
+            <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M1.5 1h13l.5.5v13l-.5.5h-13l-.5-.5v-13l.5-.5zM2 2v12h12V2H2zm2 2h8v1H4V4zm0 3h8v1H4V7zm0 3h5v1H4v-1z"/></svg>
+            Project
           </button>
         </div>
       </div>
@@ -1298,6 +1318,9 @@
     const sendEl = document.getElementById('send');
     const stopEl = document.getElementById('stop');
     const browseFilesEl = document.getElementById('browseFiles');
+    const browseFolderEl = document.getElementById('browseFolder');
+    const attachProjectEl = document.getElementById('attachProject');
+    const versionBadgeEl = document.getElementById('versionBadge');
     const attachActiveFileEl = document.getElementById('attachActiveFile');
     const composerShellEl = document.getElementById('composerShell');
     const modelSelectEl = document.getElementById('modelSelect');
@@ -1482,7 +1505,7 @@
       }
       for (const attachment of attachments) {
         const chip = document.createElement('div');
-        chip.className = 'chip';
+        chip.className = attachment.isFolder ? 'chip folder' : 'chip';
         chip.title = attachment.displayPath || attachment.name;
 
         const label = document.createElement('span');
@@ -1864,6 +1887,14 @@
       }
     });
 
+    browseFolderEl.addEventListener('click', () => {
+      vscode.postMessage({ command: 'browseFolder' });
+    });
+
+    attachProjectEl.addEventListener('click', () => {
+      vscode.postMessage({ command: 'attachProject' });
+    });
+
     window.addEventListener('message', event => {
       const payload = event.data;
 
@@ -1876,6 +1907,9 @@
         autoApprove = payload.autoApprove !== undefined ? payload.autoApprove : autoApprove;
         pendingApproval = payload.pendingApproval || null;
         activeFile = payload.activeFile || null;
+        if (payload.extensionVersion && versionBadgeEl) {
+          versionBadgeEl.textContent = 'v' + payload.extensionVersion;
+        }
         render();
         return;
       }

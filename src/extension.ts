@@ -114,6 +114,19 @@ export function activate(context: vscode.ExtensionContext): void {
   );
 
   context.subscriptions.push(
+    vscode.commands.registerCommand('manulai.attachFolder', async (...args: unknown[]) => {
+      let uri: vscode.Uri | undefined;
+      if (args.length >= 1 && args[0] instanceof vscode.Uri) {
+        uri = args[0];
+      }
+      if (uri) {
+        await provider.attachFolderByUri(uri);
+      }
+      await openChat();
+    })
+  );
+
+  context.subscriptions.push(
     vscode.commands.registerCommand('manulai.selectModel', async () => {
       await provider.refreshModelCatalog(true);
 

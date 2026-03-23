@@ -2,7 +2,7 @@
   "name": "manulai-local-agent",
   "displayName": "ManulAI Local Agent",
   "description": "Privacy-first local AI coding agent for VS Code powered entirely by Ollama.",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "publisher": "manul-engine",
   "icon": "icon.png",
   "license": "Apache-2.0",
@@ -55,6 +55,12 @@
         "title": "Attach Explorer Selection to ManulAI Chat",
         "category": "ManulAI",
         "icon": "$(files)"
+      },
+      {
+        "command": "manulai.attachFolder",
+        "title": "Attach Folder to ManulAI Chat",
+        "category": "ManulAI",
+        "icon": "$(file-directory)"
       }
     ],
     "menus": {
@@ -63,6 +69,11 @@
           "command": "manulai.attachFile",
           "group": "manulai@1",
           "when": "!explorerResourceIsFolder"
+        },
+        {
+          "command": "manulai.attachFolder",
+          "group": "manulai@2",
+          "when": "explorerResourceIsFolder"
         }
       ],
       "view/title": [

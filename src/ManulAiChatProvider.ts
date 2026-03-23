@@ -69,6 +69,8 @@ interface WebviewInboundMessage {
     | 'selectModel'
     | 'refreshModels'
     | 'browseFiles'
+    | 'browseFolder'
+    | 'attachProject'
     | 'toggleAgentMode'
     | 'toggleAutoApprove';
   text?: string;
@@ -252,6 +254,10 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     }
   }
 
+  public async attachFolderByUri(uri: vscode.Uri): Promise<void> {
+    await this.addFolderContext(uri);
+  }
+
   public async attachActiveEditorFile(): Promise<void> {
     const activeUri = vscode.window.activeTextEditor?.document.uri;
     if (!activeUri || activeUri.scheme === 'untitled') {
@@ -367,6 +373,12 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         return;
       case 'browseFiles':
         await this.browseAndAttachFiles();
+        return;
+      case 'browseFolder':
+        await this.browseAndAttachFolder();
+        return;
+      case 'attachProject':
+        await this.attachWorkspaceAsContext();
         return;
       case 'toggleAgentMode':
         await this.setAgentMode(message.value);
@@ -1090,10 +1102,71 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           return false;
         }
 
+        // Strip diff @@ line markers that leaked into content
+        if (/^@@\s+line\s+\d+\s+@@$/i.test(trimmed)) {
+          return false;
+        }
+
         return true;
       });
 
     return sanitizedLines.join('\n').trim();
+  }
+
+  private stripDiffPrefixes(content: string): string {
+    // If content looks like a diff with +/- prefixes on most lines, strip them
+    const lines = content.split('\n');
+    const nonEmptyLines = lines.filter(l => l.trim().length > 0);
+    if (nonEmptyLines.length < 3) {
+      return content;
+    }
+    const prefixedCount = nonEmptyLines.filter(l => /^[+-]\s/.test(l) || /^[+-](?![-+]{2})/.test(l)).length;
+    if (prefixedCount / nonEmptyLines.length < 0.4) {
+      return content;
+    }
+    // Strip leading +/- prefix (keep space lines and context lines)
+    return lines.map(line => {
+      if (/^\+(?!\+\+)/.test(line)) {
+        return line.substring(1);
+      }
+      if (/^-(?!--)/.test(line)) {
+        return ''; // removed line — drop it
+      }
+      return line;
+    }).filter((line, i, arr) => {
+      // Remove consecutive blank lines left by stripped '-' lines
+      if (line === '' && i > 0 && arr[i - 1] === '') {
+        return false;
+      }
+      return true;
+    }).join('\n');
+  }
+
+  private detectDestructiveWrite(displayName: string, content: string): string | undefined {
+    const trimmed = content.trim();
+    const ext = displayName.split('.').pop()?.toLowerCase();
+
+    // Block writing non-JSON content to .json files
+    if (ext === 'json') {
+      try {
+        JSON.parse(trimmed);
+      } catch {
+        return 'Content is not valid JSON.';
+      }
+    }
+
+    // Block writing very short content to known structured files
+    const criticalFiles = ['package.json', 'tsconfig.json', 'package-lock.json'];
+    if (criticalFiles.includes(displayName.toLowerCase()) && trimmed.length < 20) {
+      return 'Content is suspiciously short for a structured project file.';
+    }
+
+    // Block writing content that looks like a shell command rather than file content
+    if (trimmed.split('\n').length <= 2 && /^(?:npm|npx|yarn|pnpm|node|python|pip|cargo|go)\s/i.test(trimmed)) {
+      return 'Content looks like a shell command, not file content.';
+    }
+
+    return undefined;
   }
 
   private looksLikeDiffOutput(content: string): boolean {
@@ -1730,6 +1803,24 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
 
     if (!response.ok) {
       const errorText = await response.text();
+      // If the model does not support tools, retry without tools
+      if (response.status === 400 && /does not support tools/i.test(errorText) && body.tools) {
+        delete body.tools;
+        this.postStatus('Model does not support tools — retrying as plain chat...');
+        const retryController = new AbortController();
+        this.currentRequestAbortController = retryController;
+        const retryResponse = await fetch(`${baseUrl}/api/chat`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+          signal: retryController.signal
+        });
+        if (!retryResponse.ok) {
+          const retryError = await retryResponse.text();
+          throw new Error(`Ollama HTTP ${retryResponse.status}: ${retryError}`);
+        }
+        return (await retryResponse.json()) as OllamaResponse;
+      }
       throw new Error(`Ollama HTTP ${response.status}: ${errorText}`);
     }
 
@@ -2072,9 +2163,11 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     const pattern = /```(\w+)[:\s]+([^\n`]+)\n([\s\S]*?)```/g;
     let match: RegExpExecArray | null;
     while ((match = pattern.exec(content)) !== null) {
+      const lang = (match[1] || '').toLowerCase();
       const filepath = match[2].trim();
       const fileContent = match[3];
-      if (filepath && fileContent && !filepath.includes(' ') && this.isLikelyFileReference(filepath)) {
+      if (lang === 'diff' || lang === 'patch') { continue; }
+      if (filepath && fileContent && !filepath.includes(' ') && this.isLikelyFileReference(filepath) && !this.looksLikeDiffOutput(fileContent)) {
         blocks.push({ fullMatch: match[0], filepath, fileContent });
       }
     }
@@ -2082,9 +2175,11 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     // Match: ```lang\n// filepath: path/to/file\n...
     const commentPathPattern = /```(\w+)\s*\n\s*(?:\/\/|#|--|\/\*)\s*(?:filepath|file|path):\s*([^\n]+)\n([\s\S]*?)```/gi;
     while ((match = commentPathPattern.exec(content)) !== null) {
+      const lang = (match[1] || '').toLowerCase();
       const filepath = match[2].trim();
       const fileContent = match[3];
-      if (filepath && fileContent && this.isLikelyFileReference(filepath) && !blocks.some(b => b.filepath === filepath)) {
+      if (lang === 'diff' || lang === 'patch') { continue; }
+      if (filepath && fileContent && this.isLikelyFileReference(filepath) && !blocks.some(b => b.filepath === filepath) && !this.looksLikeDiffOutput(fileContent)) {
         blocks.push({ fullMatch: match[0], filepath, fileContent });
       }
     }
@@ -2095,7 +2190,10 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       const filepath = match[1].trim();
       const lang = (match[2] || '').toLowerCase();
       const fileContent = match[3];
-      if (lang === 'diff') {
+      if (lang === 'diff' || lang === 'patch') {
+        continue;
+      }
+      if (this.looksLikeDiffOutput(fileContent)) {
         continue;
       }
       if (this.isLikelyFileReference(filepath) && !filepath.includes(' ') && !blocks.some(b => b.filepath === filepath)) {
@@ -2390,7 +2488,18 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   private async writeFileWithDiff(filepath: string, newContent: string): Promise<FileWriteSummary> {
     const target = this.resolveWorkspaceUri(filepath);
     const displayName = path.basename(target.fsPath);
-    const sanitizedContent = this.sanitizeGeneratedFileContent(newContent);
+    let sanitizedContent = this.sanitizeGeneratedFileContent(newContent);
+
+    // Strip diff prefixes that leaked from model output
+    if (this.looksLikeDiffOutput(sanitizedContent)) {
+      sanitizedContent = this.stripDiffPrefixes(sanitizedContent);
+    }
+
+    // Block obviously destructive writes to structured files
+    const destructiveGuard = this.detectDestructiveWrite(displayName, sanitizedContent);
+    if (destructiveGuard) {
+      return { summary: `Blocked write to ${displayName}: ${destructiveGuard}` };
+    }
 
     // Read old content for diff (may not exist yet)
     let oldContent: string | undefined;
@@ -2824,6 +2933,98 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     }
   }
 
+  private async browseAndAttachFolder(): Promise<void> {
+    const uris = await vscode.window.showOpenDialog({
+      canSelectMany: false,
+      canSelectFiles: false,
+      canSelectFolders: true,
+      openLabel: 'Attach Folder',
+      title: 'Attach folder to ManulAI context'
+    });
+
+    if (!uris?.length) {
+      return;
+    }
+
+    await this.addFolderContext(uris[0]);
+  }
+
+  private async attachWorkspaceAsContext(): Promise<void> {
+    const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
+    if (!workspaceFolder) {
+      this.postStatus('No workspace folder open.');
+      return;
+    }
+    await this.addFolderContext(workspaceFolder.uri);
+  }
+
+  private async addFolderContext(folderUri: vscode.Uri): Promise<void> {
+    const maxFiles = 50;
+    const maxFileSize = 100_000; // 100 KB per file
+    const skipDirs = new Set(['.git', 'node_modules', '.next', 'dist', 'out', 'build', '__pycache__', '.venv', 'venv', '.tox', 'coverage', '.nyc_output', '.cache']);
+    const skipExtensions = new Set(['.png', '.jpg', '.jpeg', '.gif', '.bmp', '.ico', '.svg', '.woff', '.woff2', '.ttf', '.eot', '.mp3', '.mp4', '.zip', '.tar', '.gz', '.lock', '.vsix']);
+
+    const collected: string[] = [];
+    const folderName = path.basename(folderUri.fsPath);
+
+    const walk = async (dir: vscode.Uri, depth: number): Promise<void> => {
+      if (depth > 6 || collected.length >= maxFiles) { return; }
+      let entries: [string, vscode.FileType][];
+      try {
+        entries = await vscode.workspace.fs.readDirectory(dir);
+      } catch { return; }
+
+      entries.sort((a, b) => a[0].localeCompare(b[0]));
+
+      for (const [name, type] of entries) {
+        if (collected.length >= maxFiles) { break; }
+        const childUri = vscode.Uri.joinPath(dir, name);
+
+        if (type === vscode.FileType.Directory) {
+          if (!skipDirs.has(name) && !name.startsWith('.')) {
+            await walk(childUri, depth + 1);
+          }
+          continue;
+        }
+
+        if (type !== vscode.FileType.File) { continue; }
+        const ext = path.extname(name).toLowerCase();
+        if (skipExtensions.has(ext)) { continue; }
+
+        try {
+          const stat = await vscode.workspace.fs.stat(childUri);
+          if (stat.size > maxFileSize) { continue; }
+          const bytes = await vscode.workspace.fs.readFile(childUri);
+          const text = Buffer.from(bytes).toString('utf8');
+          const relativePath = path.relative(folderUri.fsPath, childUri.fsPath);
+          collected.push(`--- ${relativePath} ---\n${text}`);
+        } catch { /* skip unreadable files */ }
+      }
+    };
+
+    this.postStatus(`Scanning folder ${folderName}...`);
+    await walk(folderUri, 0);
+
+    if (collected.length === 0) {
+      this.postStatus(`No readable files found in ${folderName}.`);
+      return;
+    }
+
+    const combinedContent = collected.join('\n\n');
+    const truncated = collected.length >= maxFiles ? ` (limited to ${maxFiles} files)` : '';
+
+    this.attachedFiles.set(folderUri.fsPath, {
+      uri: folderUri,
+      name: `${folderName}/${truncated ? ' ...' : ''}`,
+      content: combinedContent,
+      languageId: '__folder__'
+    });
+
+    this.removeAttachmentContextMessages();
+    this.postStateToWebview();
+    this.postStatus(`Attached ${collected.length} files from ${folderName}${truncated} as context.`);
+  }
+
   private async setAgentMode(value: boolean | undefined): Promise<void> {
     this.agentMode = value !== undefined ? value : !this.agentMode;
 
@@ -3183,6 +3384,8 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       return result;
     }, []);
 
+    const extensionVersion = this.extensionContext.extension.packageJSON?.version ?? 'dev';
+
     void this.webviewView.webview.postMessage({
       command: 'state',
       messages: renderableMessages,
@@ -3192,10 +3395,12 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       autoApprove: this.autoApprove,
       pendingApproval: this.pendingApproval,
       activeFile: this.getActiveFileState(),
+      extensionVersion,
       attachments: Array.from(this.attachedFiles.values()).map(file => ({
         path: file.uri.fsPath,
         displayPath: this.getDisplayPath(file),
-        name: file.name
+        name: file.name,
+        isFolder: file.languageId === '__folder__'
       }))
     });
   }
