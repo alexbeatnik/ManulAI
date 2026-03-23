@@ -717,7 +717,8 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         }
 
         // If ALL writes were blocked by destructive write guard, nudge model to use tools properly
-        if (allBlocked && retryCount < 2) {
+        const blockedWriteNudges = messages.filter(m => m.role === 'user' && typeof m.content === 'string' && m.content.includes('Your file write was blocked')).length;
+        if (allBlocked && blockedWriteNudges < 2) {
           this.debugLog('blocked_write_retry', { retryCount, source: 'code_block_extraction', summaries: appliedSummaries });
           messages.push({ role: 'assistant', content: appliedSummaries.join('\n'), hiddenFromTranscript: true });
           messages.push({
@@ -728,7 +729,9 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
             hiddenFromTranscript: true
           });
           this.postStatus('Blocked partial write — nudging model to use replace_in_file...');
-          await this.processOllamaResponse(messages, retryCount + 1);
+          // Don't increment retryCount — blocked-write nudge is structural, not behavioral,
+          // so the downstream nudge layer should still have its full retry budget.
+          await this.processOllamaResponse(messages, retryCount);
           return;
         }
 
@@ -956,7 +959,8 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         // If a fallback layer tried to write a file but detectDestructiveWrite blocked it,
         // nudge the model to use replace_in_file instead of rewriting the whole file.
         const wasBlocked = /^Blocked write to /i.test(finalContent.trim());
-        if (wasBlocked && retryCount < 2) {
+        const blockedWriteNudgeCount = messages.filter(m => m.role === 'user' && typeof m.content === 'string' && m.content.includes('Your file write was blocked')).length;
+        if (wasBlocked && blockedWriteNudgeCount < 2) {
           this.debugLog('blocked_write_retry', { retryCount, content: finalContent.substring(0, 200) });
           messages.push({ role: 'assistant', content: finalContent, hiddenFromTranscript: true });
           messages.push({
@@ -967,7 +971,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
             hiddenFromTranscript: true
           });
           this.postStatus('Blocked partial write — nudging model to use replace_in_file...');
-          await this.processOllamaResponse(messages, retryCount + 1);
+          await this.processOllamaResponse(messages, retryCount);
           return;
         }
 
@@ -2042,7 +2046,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     stripped = stripped.replace(/```(?:json|tool_call|tool)?\s*\n?[\s\S]*?```/g, '');
     stripped = stripped.replace(/<tool_call>\s*[\s\S]*?\s*<\/tool_call>/g, '');
     // Strip plain JSON tool call objects from the text
-    const toolNamePattern = /\{\s*"name"\s*:\s*"/g;
+    const toolNamePattern = /\{\s*"(?:name|function_name)"\s*:\s*"/g;
     let match: RegExpExecArray | null;
     while ((match = toolNamePattern.exec(stripped)) !== null) {
       const jsonStr = this.extractBalancedJson(stripped, match.index);
@@ -2092,7 +2096,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
 
     // Catch-all: extract balanced JSON objects that look like tool calls from plain text.
     // Models like Llama/Qwen/Gemma often output raw JSON tool calls directly.
-    const toolNamePattern = /\{\s*["']name["']\s*:\s*["']/g;
+    const toolNamePattern = /\{\s*["'](?:name|function_name)["']\s*:\s*["']/g;
     while ((match = toolNamePattern.exec(trimmed)) !== null) {
       const jsonStr = this.extractBalancedJson(trimmed, match.index);
       if (jsonStr) { candidates.push(jsonStr); }
@@ -2239,8 +2243,10 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     }
 
     const record = rawValue as Record<string, unknown>;
-    const directName = typeof record.name === 'string' ? record.name.trim() : '';
-    const directArguments = record.arguments;
+    const directName = typeof record.name === 'string' ? record.name.trim()
+      : typeof record.function_name === 'string' ? record.function_name.trim()
+      : '';
+    const directArguments = record.arguments ?? record.parameters;
     const functionRecord = this.toObjectRecord(record.function);
     const normalizedArguments = this.normalizeParsedToolArguments(functionRecord?.arguments ?? directArguments);
 
@@ -2276,7 +2282,25 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     }
 
     if (value && typeof value === 'object' && !Array.isArray(value)) {
-      return value as Record<string, unknown>;
+      const obj = value as Record<string, unknown>;
+      // Map common argument aliases used by weak models
+      const aliasMap: Record<string, string> = {
+        file_path: 'filepath',
+        file_name: 'filename',
+        file: 'filepath',
+        path: 'filepath',
+        old_string: 'old_text',
+        new_string: 'new_text',
+        old_code: 'old_text',
+        new_code: 'new_text',
+        cmd: 'command',
+        dir: 'directory'
+      };
+      const normalized: Record<string, unknown> = {};
+      for (const [key, val] of Object.entries(obj)) {
+        normalized[aliasMap[key] ?? key] = val;
+      }
+      return normalized;
     }
 
     return undefined;
