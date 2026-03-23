@@ -148,15 +148,20 @@
 
     .topbar {
       display: grid;
-      grid-template-columns: 1fr auto;
-      gap: 8px;
-      align-items: center;
+      grid-template-columns: auto minmax(0, 1fr);
+      gap: 10px;
+      align-items: start;
     }
 
     .context-actions {
       display: flex;
       align-items: center;
       gap: 7px;
+      min-width: 0;
+    }
+
+    .topbar-primary,
+    .topbar-secondary {
       min-width: 0;
     }
 
@@ -195,16 +200,32 @@
     }
 
     .controls {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 8px 10px;
+      align-items: start;
+      min-width: 0;
+    }
+
+    .controls > *,
+    .control-group > * {
+      min-width: 0;
+    }
+
+    .control-group {
       display: flex;
+      flex-wrap: wrap;
       gap: 7px;
       align-items: center;
       min-width: 0;
-      flex-wrap: wrap;
-      justify-content: flex-end;
     }
 
-    .controls > * {
-      min-width: 0;
+    .control-group.primary {
+      justify-content: flex-start;
+    }
+
+    .control-group.secondary {
+      justify-content: flex-end;
     }
 
     .model-select,
@@ -1094,13 +1115,17 @@
       color: var(--accent);
     }
 
-    @media (max-width: 720px) {
+    @media (max-width: 920px) {
       .topbar {
         grid-template-columns: 1fr;
         align-items: stretch;
       }
 
       .controls {
+        grid-template-columns: 1fr;
+      }
+
+      .control-group.secondary {
         justify-content: flex-start;
       }
     }
@@ -1116,24 +1141,28 @@
 
       .controls {
         display: grid;
-        grid-template-columns: repeat(2, minmax(0, 1fr));
+        grid-template-columns: 1fr;
         align-items: stretch;
       }
 
-      .controls .context-actions,
-      .controls .model-select {
-        grid-column: 1 / -1;
+      .control-group {
+        display: grid;
+        grid-template-columns: 1fr;
+        align-items: stretch;
       }
 
-      .controls .context-actions,
-      .controls .ghost-button,
-      .controls .toggle-switch,
-      .controls .model-select {
+      .topbar-primary,
+      .topbar-secondary,
+      .context-actions,
+      .control-group,
+      .control-group .ghost-button,
+      .control-group .toggle-switch,
+      .control-group .model-select {
         width: 100%;
       }
 
-      .controls .context-actions .ghost-button,
-      .controls .ghost-button {
+      .context-actions .ghost-button,
+      .control-group .ghost-button {
         justify-content: center;
       }
 
@@ -1180,29 +1209,35 @@
 
   <section class="workspace">
     <div class="topbar">
-      <div class="context-actions" style="justify-self: flex-start;">
-        <button id="browseFiles" class="ghost-button" type="button" style="display: flex; align-items: center; gap: 6px;">
-          <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M13.5 3l-4 0-1-1-6 0 0 12 11 0 0-11z"/></svg>
-          Browse...
-        </button>
+      <div class="topbar-primary">
+        <div class="context-actions" style="justify-self: flex-start;">
+          <button id="browseFiles" class="ghost-button" type="button" style="display: flex; align-items: center; gap: 6px;">
+            <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M13.5 3l-4 0-1-1-6 0 0 12 11 0 0-11z"/></svg>
+            Browse...
+          </button>
+        </div>
       </div>
-      <div class="controls">
-          <div class="context-actions">
+      <div class="topbar-secondary">
+        <div class="controls">
+          <div class="control-group primary">
             <button id="attachActiveFile" class="ghost-button" type="button">Active File</button>
+            <label class="toggle-switch" title="Enable Agent Mode so Ollama can call local tools automatically">
+              <input type="checkbox" id="agentModeToggle" />
+              <span class="toggle-slider"></span>
+              <span id="agentModeLabel" class="toggle-label">Agent Mode</span>
+            </label>
+            <label class="toggle-switch" title="Auto-approve tool execution without asking for confirmation">
+              <input type="checkbox" id="autoApproveToggle" />
+              <span class="toggle-slider"></span>
+              <span id="autoApproveLabel" class="toggle-label">Auto-Approve</span>
+            </label>
           </div>
-        <label class="toggle-switch" title="Enable Agent Mode so Ollama can call local tools automatically">
-          <input type="checkbox" id="agentModeToggle" />
-          <span class="toggle-slider"></span>
-          <span id="agentModeLabel" class="toggle-label">Agent Mode</span>
-        </label>
-        <label class="toggle-switch" title="Auto-approve tool execution without asking for confirmation">
-          <input type="checkbox" id="autoApproveToggle" />
-          <span class="toggle-slider"></span>
-          <span id="autoApproveLabel" class="toggle-label">Auto-Approve</span>
-        </label>
-        <select id="modelSelect" class="model-select" aria-label="Ollama model"></select>
-        <button id="refreshModels" class="ghost-button" type="button">Refresh</button>
-        <button id="clearChat" class="ghost-button danger" type="button">Clear</button>
+          <div class="control-group secondary">
+            <select id="modelSelect" class="model-select" aria-label="Ollama model"></select>
+            <button id="refreshModels" class="ghost-button" type="button">Refresh</button>
+            <button id="clearChat" class="ghost-button danger" type="button">Clear</button>
+          </div>
+        </div>
       </div>
     </div>
 

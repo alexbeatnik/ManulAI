@@ -1,5 +1,5 @@
 {
     "manulai.ollamaModel": "gemma3n:e4b",
     "manulai.agentMode": false,
-    "manulai.autoApprove": false
+    "manulai.autoApprove": true
 }
