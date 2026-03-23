@@ -992,23 +992,28 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           || /no (?:immediate|obvious) (?:file changes|issues|errors|problems)/i.test(finalContent)
           || /further debugging (?:would be|is) needed/i.test(finalContent))
           && finalContent.trim().length < 500;
-        // Detect model asking user to do things manually instead of using tools
-        const isPassingToUser = (/(?:please (?:execute|run|proceed|specify|provide|let me know|make sure|save)|you (?:may|can|should|need to) (?:run|execute|save|choose|pick)|choose one of the (?:options|approaches)|if the .{0,30} persists)/i.test(finalContent))
+        // Detect model asking user to do things manually or announcing actions without executing them
+        const isPassingToUser = (/(?:please (?:execute|run|proceed|specify|provide|let me know|make sure|save)|you (?:may|can|should|need to) (?:run|execute|save|choose|pick)|choose one of the (?:options|approaches)|if the .{0,30} persists|let'?s (?:execute|run|try|start)|let me (?:execute|run|try|start))/i.test(finalContent))
           && finalContent.trim().length < 800;
+
+        // Detect model announcing a step/action but not executing it (ends with colon or ellipsis)
+        const endsWithoutAction = /(?::\s*|\.\.\.)\s*$/.test(finalContent.trim());
+        const announcesToolAction = /(?:execute|run|start|install|create|update|modify|read|check|verify).*(?:command|script|file|terminal|npm|server)/i.test(finalContent);
+        const isAnnouncedButNotExecuted = endsWithoutAction && announcesToolAction;
 
         // Detect incomplete plan execution: model mentions "Step N/M" but hasn't reached the final step
         const stepMatch = finalContent.match(/step\s+(\d+)\s*[\/of]+\s*(\d+)/i);
         const hasIncompletePlan = stepMatch && parseInt(stepMatch[1], 10) < parseInt(stepMatch[2], 10);
 
         const shouldNudge = (
-          isPassingToUser ||
+          isPassingToUser || isAnnouncedButNotExecuted ||
           (!hasRecentToolResults && (isLongDump || hasLargeCodeBlocks || claimsDone || mentionsChange || isLazyAcknowledgment || hasIncompletePlan))
         ) && retryCount < 2;
 
         if (shouldNudge) {
-          this.debugLog('nudge', { retryCount, isLongDump, hasLargeCodeBlocks, claimsDone, mentionsChange, isLazyAcknowledgment, hasIncompletePlan: !!hasIncompletePlan, isPassingToUser, contentPreview: finalContent.substring(0, 200) });
+          this.debugLog('nudge', { retryCount, isLongDump, hasLargeCodeBlocks, claimsDone, mentionsChange, isLazyAcknowledgment, hasIncompletePlan: !!hasIncompletePlan, isPassingToUser, isAnnouncedButNotExecuted, contentPreview: finalContent.substring(0, 200) });
           // Show plan/progress text to the user before nudging
-          if (hasIncompletePlan || claimsDone || mentionsChange || isPassingToUser) {
+          if (hasIncompletePlan || claimsDone || mentionsChange || isPassingToUser || isAnnouncedButNotExecuted) {
             const planText = finalContent.trim();
             if (planText) {
               messages.push({ role: 'assistant', content: planText });
@@ -1025,6 +1030,8 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           let nudgeMessage = '';
           if (hasIncompletePlan) {
             nudgeMessage = `You are on step ${stepMatch![1]} of ${stepMatch![2]} but stopped. Continue executing your plan. Proceed to the next step now — use the provided tools.`;
+          } else if (isAnnouncedButNotExecuted) {
+            nudgeMessage = 'You announced an action but did not execute it. Do not describe what you will do — actually do it now by calling the appropriate tool. Use execute_terminal_command for commands or replace_in_file for edits.';
           } else if (isPassingToUser) {
             nudgeMessage = 'Do not ask the user to run commands or make changes manually. You have tools available. Use execute_terminal_command to run commands and replace_in_file or create_or_edit_file to edit files. Do it yourself now.';
           } else if (isLazyAcknowledgment) {
