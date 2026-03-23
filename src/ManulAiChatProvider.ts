@@ -993,7 +993,8 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           || /further debugging (?:would be|is) needed/i.test(finalContent))
           && finalContent.trim().length < 500;
         // Detect model asking user to do things manually or announcing actions without executing them
-        const isPassingToUser = (/(?:please (?:execute|run|proceed|specify|provide|let me know|make sure|save)|you (?:may|can|should|need to) (?:run|execute|save|choose|pick)|choose one of the (?:options|approaches)|if the .{0,30} persists|let'?s (?:execute|run|try|start)|let me (?:execute|run|try|start))/i.test(finalContent))
+        // NOTE: "let me know" is excluded — it's always a polite closing, not passing work to the user.
+        const isPassingToUser = (/(?:please (?:execute|run|proceed|specify|provide|make sure|save)|you (?:may|can|should|need to) (?:run|execute|save|choose|pick)|choose one of the (?:options|approaches)|if the .{0,30} persists|let'?s (?:execute|run|try|start)|let me (?:execute|run|try|start))/i.test(finalContent))
           && finalContent.trim().length < 800;
 
         // Detect model announcing a step/action but not executing it (ends with colon or ellipsis)
@@ -1881,7 +1882,10 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     if (this.agentMode) {
       const workspaceInstructions = await this.getWorkspaceInstructions();
 
+        const wsRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? '';
         let agentMandate = 'You are ManulAI, a local VS Code coding agent.\n' +
+          (wsRoot ? 'Workspace root: ' + wsRoot + '\n' : '') +
+          'All file paths in tool calls are resolved relative to the workspace root unless absolute.\n' +
           'Use the provided tools when you need to inspect files, edit files, or run commands.\n' +
           'If no tool is needed, answer normally and concisely.\n' +
           'Do not claim that a file was changed unless a tool actually changed it.\n' +
@@ -1893,12 +1897,12 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           'PLANNING AND PROGRESS:\n' +
           '- Before starting any non-trivial task, output a numbered plan in English. Example:\n' +
           '  **Plan:**\n' +
-          '  1. Read project structure\n' +
+          '  1. Read project structure (call list_workspace_files)\n' +
           '  2. Find and read the relevant files\n' +
           '  3. Make the necessary changes\n' +
           '- Then execute each step BY CALLING TOOLS, announcing progress before each one:\n' +
           '  "Step 1/3: Reading project structure..."\n' +
-          '- After completing all steps, give a short summary of what was done.\n' +
+          '- After completing all steps, give a short summary of what was done. Do NOT end with "let me know", "feel free to ask", or similar polite closings — just state what was done and stop.\n' +
           '- Keep all plans, progress messages, and summaries in English.\n' +
           'CRITICAL FILE EDITING RULES:\n' +
           '- When asked to make a small change, change ONLY the specific lines affected. Never rewrite or replace the entire file.\n' +
@@ -1909,6 +1913,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           '- When multiple changes are needed, make them ONE AT A TIME. Call replace_in_file once, wait for the result, then call it again for the next change. Never batch all changes into a single tool call.\n' +
           'TOOL USAGE RULES:\n' +
           '- Always call tools using the native tool-calling mechanism. Never output raw JSON as text.\n' +
+          '- NEVER output code in fenced code blocks as a way to create or modify files. Always use create_or_edit_file or replace_in_file to write code to files.\n' +
           '- After reading a file, analyze the actual content and fix the real problem. Do not add cosmetic changes like borders or colors unless specifically asked.\n' +
           '- Think step by step: first read the file, then identify the issue, then make targeted fixes.\n' +
           '- When you see an error message, diagnose and fix it using tools. Do not just explain the error.\n' +
