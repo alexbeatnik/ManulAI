@@ -54,6 +54,7 @@ interface WebviewInboundMessage {
   command:
     | 'ready'
     | 'sendMessage'
+    | 'clearChat'
     | 'addFileContext'
     | 'addFileContent'
     | 'addFilePathContext'
@@ -196,6 +197,9 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         await this.refreshModelCatalog(false);
         this.postStateToWebview();
         return;
+      case 'clearChat':
+        this.clearChat();
+        return;
       case 'sendMessage':
         if (!message.text?.trim()) {
           return;
@@ -289,6 +293,18 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     await this.runAgentLoop();
   }
 
+  private clearChat(): void {
+    if (this.requestInFlight) {
+      this.postStatus('Cannot clear chat while a request is running. Wait for the current response to finish.');
+      return;
+    }
+
+    this.messages.length = 0;
+    this.attachedFiles.clear();
+    this.postStateToWebview();
+    this.postStatus('Chat history and attached context cleared.');
+  }
+
   private async runAgentLoop(): Promise<void> {
     this.requestInFlight = true;
     this.postBusyState(true);
@@ -365,6 +381,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     let finalContent = assistantMessage.content ?? '';
 
     if (this.agentMode) {
+      this.postStatus('DEBUG: Entered fallback layer 1 (Begin of FILE marker)');
       // --- Fallback layer 1: detect [Begin of FILE]...[End of FILE] markers ---
       const markerWrite = this.extractMarkerFileWrite(finalContent);
       if (markerWrite) {
@@ -380,6 +397,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         return;
       }
 
+      this.postStatus('DEBUG: Entered fallback layer 2 (code blocks with filepath hints)');
       // --- Fallback layer 2: detect code blocks with filepath hints ---
       const codeBlockWrites = this.extractCodeBlockFileWrites(finalContent);
       if (codeBlockWrites.length > 0) {
@@ -400,6 +418,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         return;
       }
 
+      this.postStatus('DEBUG: Entered fallback layer 3 ([FILE:] blocks)');
       // --- Fallback layer 3: apply [FILE:] blocks ---
       const inlineFileBlocks = this.extractInlineFileBlocks(finalContent);
       if (inlineFileBlocks.length > 0) {
@@ -421,6 +440,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         return;
       }
 
+      this.postStatus('DEBUG: Entered fallback layer 4 (described replacements)');
       // --- Fallback layer 4: detect described replacements (old → new code blocks) ---
       const describedReplacements = this.extractDescribedReplacements(finalContent);
       if (describedReplacements.length > 0) {
@@ -465,7 +485,8 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       // --- Fallback layer 4: apply legacy [FILE:] blocks ---
       finalContent = await this.applyInlineFileBlocks(finalContent);
 
-      // --- Fallback layer 5: if response is suspiciously large, try matching to attached or active file ---
+      this.postStatus('DEBUG: Entered fallback layer 5 (file dump match)');
+      // --- Fallback layer 5: if response is suspiciously large, try matching to attached, active, or any workspace file ---
       const matchedFile = this.matchResponseToAttachedFile(finalContent);
       if (matchedFile) {
         const writeApproved = await this.approveFileWrite([matchedFile.filepath]);
@@ -490,24 +511,59 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         return;
       }
 
+      // Universal fallback: match against all workspace files
+      const workspaceFiles = await vscode.workspace.findFiles('**/*', '**/node_modules/**', 100);
+      for (const fileUri of workspaceFiles) {
+        try {
+          const bytes = await vscode.workspace.fs.readFile(fileUri);
+          const fileContent = Buffer.from(bytes).toString('utf8');
+          const originalLines = fileContent.split('\n').filter(l => l.trim().length > 20);
+          if (originalLines.length < 5) continue;
+          let matchCount = 0;
+          for (const line of originalLines) {
+            if (finalContent.includes(line.trim())) {
+              matchCount++;
+            }
+          }
+          const ratio = matchCount / originalLines.length;
+          if (ratio > 0.4) {
+            const summary = await this.writeFileWithDiff(fileUri.fsPath, this.extractLikelyFileContent(finalContent));
+            messages.push({ role: 'assistant', content: summary });
+            return;
+          }
+        } catch {}
+      }
+
+      this.postStatus('DEBUG: Entered fallback layer 6 (nudge model to use tools)');
       // --- Fallback layer 6: nudge the model to use tools if it didn't ---
       const isLongDump = finalContent.length > 300;
-      const hasLargeCodeBlocks = /```[\w]*\n[\s\S]{200,}?```/.test(finalContent);
+      const hasLargeCodeBlocks = /```[\w]*\n[\s\S]{100,}?```/.test(finalContent);
+      const claimsDone = /(?:зробив|замінив|оновив|готово|i've made|i have made|i have updated|summary of the changes)/i.test(finalContent);
       const mentionsChange = /(?:змін|зроби|оновл|replac|chang|updat|modif)/i.test(finalContent);
-      if ((isLongDump || hasLargeCodeBlocks || mentionsChange) && retryCount < 1) {
+      
+      const shouldNudge = (isLongDump || hasLargeCodeBlocks || claimsDone || mentionsChange) && retryCount < 2;
+
+      if (shouldNudge) {
         messages.push({
           role: 'assistant',
           content: finalContent,
           hiddenFromTranscript: true
         });
+        
+        let nudgeMessage = '';
+        if (isLongDump || hasLargeCodeBlocks) {
+          nudgeMessage = 'STOP. You output code without calling a tool. That is WRONG. You MUST use the `replace_in_file` or `write_to_file` tool call to apply the code directly to the disk. Do not just output raw code blocks in chat. Call the tool NOW.';
+        } else {
+          nudgeMessage = 'STOP. You described changes or claimed you made them, but you DID NOT actually call a tool. ' +
+            'You MUST call the `replace_in_file` or `write_to_file` tool to apply your changes. Text in chat does NOT edit files. Call the tool NOW.';
+        }
+
         messages.push({
           role: 'user',
-          content: 'STOP. You printed file content in chat. That is WRONG. You MUST use a tool call to write files. ' +
-            'Call `replace_in_file` to edit part of a file, or `write_to_file` to rewrite a whole file. ' +
-            'DO NOT output any file content in chat. Just call the tool NOW.',
+          content: nudgeMessage,
           hiddenFromTranscript: true
         });
-        this.postStatus('Model did not use tools — retrying...');
+        this.postStatus(`Model did not use tools (attempt ${retryCount + 1}) — retrying...`);
         await this.processOllamaResponse(messages, retryCount + 1);
         return;
       }
@@ -640,7 +696,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   }
 
   private async approveFileWrite(filepaths: string[]): Promise<boolean> {
-    if (this.autoApprove) {
+    if (this.agentMode || this.autoApprove) {
       return true;
     }
     const names = filepaths.map(p => path.basename(p)).join(', ');
@@ -818,20 +874,23 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     if (this.agentMode) {
       const workspaceInstructions = await this.getWorkspaceInstructions();
 
-      let agentMandate = 'You are a VS Code coding agent. You MUST use tool calls to modify files. NEVER describe changes in chat — call a tool instead.\n\n' +
-        'Available tools:\n' +
-        '- replace_in_file(filepath, old_text, new_text) — replace a snippet in a file. ALWAYS use this for edits.\n' +
-        '- write_to_file(filepath, content) — create or fully overwrite a file.\n' +
-        '- read_specific_file(filepath) — read a file.\n' +
-        '- read_active_file() — read the currently open file.\n' +
-        '- execute_terminal_command(command) — run a shell command.\n\n' +
-        'Example — user says "change author to John" in a file with "Copyright 2026 Jane":\n' +
-        'CORRECT: call replace_in_file with filepath="LICENSE", old_text="Copyright 2026 Jane", new_text="Copyright 2026 John"\n' +
-        'WRONG: writing "I changed Jane to John" in chat without calling a tool.\n\n' +
-        'Rules:\n' +
-        '1. ALWAYS call a tool to make file changes. Do not just describe them.\n' +
-        '2. After calling a tool, say briefly what you did (1 sentence). Do not show file content.\n' +
-        '3. If attached file context is provided, you already have the content — call replace_in_file directly, no need to read first.';
+      let agentMandate = 'You are ManulAI, an autonomous VS Code Agent.\n' +
+        'CRITICAL RULES FOR FILE EDITING:\n' +
+        '1. NEVER output modified file content as raw text, diffs, or markdown blocks in your chat response.\n' +
+        '2. You MUST USE the provided tools (`replace_in_file` or `write_to_file`).\n' +
+        '3. To call a tool, you MUST output a JSON block exactly like this:\n' +
+        '```json\n' +
+        '{\n' +
+        '  "name": "replace_in_file",\n' +
+        '  "arguments": {\n' +
+        '    "filepath": "LICENSE",\n' +
+        '    "old_text": "Copyright 2026 Oleksii Poliakov",\n' +
+        '    "new_text": "Copyright 2026 alexbeatnik"\n' +
+        '  }\n' +
+        '}\n' +
+        '```\n' +
+        '4. Output ONLY the JSON tool call block. Do not explain your changes before or after.\n' +
+        '5. If you do not use this JSON format, the file will NOT be saved, and the user will be angry.';
 
       if (workspaceInstructions) {
         agentMandate += '\n\n<workspace_instructions>\n' + workspaceInstructions + '\n</workspace_instructions>';
@@ -848,7 +907,26 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       requestMessages.push({ role: 'system', content: systemPrompt, hiddenFromTranscript: true });
     }
 
-    requestMessages.push(...messages);
+    requestMessages.push(...messages.map(m => ({ ...m })));
+
+    // Apply rigorous tool enforcement
+    if (this.agentMode && requestMessages.length > 0) {
+      // 1. Scrub history: prevent "History Poisoning" by replacing past code blocks
+      for (let i = 0; i < requestMessages.length; i++) {
+        if (requestMessages[i].role === 'assistant' && requestMessages[i].content) {
+          requestMessages[i].content = requestMessages[i].content.replace(/```[a-z]*\n[\s\S]*?\n```/g, '\n[CODE BLOCK REMOVED BY SYSTEM: YOU MUST USE JSON TOOLS TO WRITE CODE]\n');
+          requestMessages[i].content = requestMessages[i].content.replace(/\[FILE:.*?\][\s\S]*?\[\/FILE\]/g, '\n[FILE BLOCK REMOVED BY SYSTEM: USE JSON TOOLS]\n');
+        }
+      }
+
+      // 2. Enforce JSON constraint on the last user message
+      for (let i = requestMessages.length - 1; i >= 0; i--) {
+        if (requestMessages[i].role === 'user') {
+          requestMessages[i].content += '\n\n[SYSTEM ENFORCEMENT]: You are an Agent. You MUST use a tool call (`replace_in_file` or `write_to_file`) to apply your changes. NEVER print the file content, diffs, or code blocks in your response. Output ONLY the ```json ... ``` tool call block. If you output prose or code blocks instead of the JSON tool call, the command will fail.';
+          break;
+        }
+      }
+    }
 
     const body: {
       model: string;
@@ -915,26 +993,26 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       }
     }
 
-    // Regex fallback: extract JSON from markdown code blocks or <tool_call> tags.
-    // Local LLMs (e.g. Qwen) often wrap tool-call JSON in ```json ... ``` blocks.
+    // Regex fallback: extract JSON from markdown code blocks, <tool_call> tags, or plain JSON objects.
     const knownToolNames = new Set(this.getToolDefinitions().map(t => t.function.name));
     const candidates: string[] = [];
 
     const codeBlockPattern = /```(?:json|tool_call|tool)?\s*\n?([\s\S]*?)```/g;
     const tagPattern = /<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/g;
+    // Catch-all for plain JSON objects that define a tool call (Llama / Qwen often hallucinate these directly into content)
+    const jsonBlockPattern = /(\{\s*"name"\s*:\s*"[^"]+"\s*,\s*"arguments"\s*:\s*\{[\s\S]*?\}\s*\})/g;
 
     let match: RegExpExecArray | null;
     while ((match = codeBlockPattern.exec(trimmed)) !== null) {
       const inner = match[1].trim();
-      if (inner.startsWith('{') || inner.startsWith('[')) {
-        candidates.push(inner);
-      }
+      if (inner.startsWith('{') || inner.startsWith('[')) candidates.push(inner);
     }
     while ((match = tagPattern.exec(trimmed)) !== null) {
       const inner = match[1].trim();
-      if (inner.startsWith('{') || inner.startsWith('[')) {
-        candidates.push(inner);
-      }
+      if (inner.startsWith('{') || inner.startsWith('[')) candidates.push(inner);
+    }
+    while ((match = jsonBlockPattern.exec(trimmed)) !== null) {
+      candidates.push(match[1].trim());
     }
 
     for (const candidate of candidates) {
@@ -1083,7 +1161,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         type: 'function',
         function: {
           name: 'write_to_file',
-          description: 'Overwrites or creates a file with new content. Use this IMMEDIATELY when the user asks to change code or update a file.',
+          description: 'Overwrites or creates a file with new content. Mandatory for any file modifications.',
           parameters: {
             type: 'object',
             properties: {
@@ -1096,8 +1174,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
                 description: 'The complete new content for the file.'
               }
             },
-            required: ['filepath', 'content'],
-            additionalProperties: false
+            required: ['filepath', 'content']
           }
         }
       },
@@ -1172,6 +1249,23 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       }
     }
 
+    // Match: mentioning a filename in the text directly preceding the code block.
+    const precedingNamePattern = /(?:in|to|file|updated?|modified)\s+[`"']?([a-zA-Z0-9_\-\.\/]+)[`"']?[^`]{0,80}```(\w*)\n([\s\S]*?)```/gi;
+    while ((match = precedingNamePattern.exec(content)) !== null) {
+      const filepath = match[1].trim();
+      const lang = (match[2] || '').toLowerCase();
+      const fileContent = match[3];
+      if (lang === 'diff') {
+        continue;
+      }
+      // Require filename to have an extension or be explicitly known files like LICENSE, Makefile
+      const isValidFilename = filepath.includes('.') || /^[A-Z][A-Z0-9_]+$/.test(filepath);
+      if (isValidFilename && !filepath.includes(' ') && !blocks.some(b => b.filepath === filepath)) {
+        const fullMatch = match[0].substring(match[0].indexOf('```'));
+        blocks.push({ fullMatch, filepath, fileContent });
+      }
+    }
+
     return blocks;
   }
 
@@ -1190,7 +1284,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
 
   private extractInlineFileBlocks(content: string): Array<{ fullMatch: string; filepath: string; fileContent: string }> {
     const blocks: Array<{ fullMatch: string; filepath: string; fileContent: string }> = [];
-    const pattern = /(?:```[\w]*\s*\n?)?\[FILE:\s*([^\]]+)\]\s*\n([\s\S]*?)\n?\s*\[\/FILE\]\s*(?:\n?```)?/g;
+    const pattern = /(?:```[\w]*\s*\n?)?\[FILE:\s*([^\]]+)\]\s*\n?([\s\S]*?)(?:\s*\[\/FILE\]|\n?```|$)/gi;
     let match: RegExpExecArray | null;
     while ((match = pattern.exec(content)) !== null) {
       blocks.push({
@@ -1303,13 +1397,26 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       return JSON.stringify({ error: 'filename is required.' });
     }
 
-    const target = this.resolveWorkspaceUri(filename);
-
     try {
-      await vscode.workspace.fs.createDirectory(vscode.Uri.file(path.dirname(target.fsPath)));
-      await vscode.workspace.fs.writeFile(target, Buffer.from(content, 'utf8'));
+      const workspaceFolders = vscode.workspace.workspaceFolders;
+      if (!workspaceFolders) throw new Error("No workspace open");
+      
+      // Try to safely resolve the path
+      let targetUri: vscode.Uri;
+      if (path.isAbsolute(filename)) {
+          targetUri = vscode.Uri.file(filename);
+      } else {
+          targetUri = vscode.Uri.joinPath(workspaceFolders[0].uri, filename);
+      }
+      
+      await vscode.workspace.fs.createDirectory(vscode.Uri.file(path.dirname(targetUri.fsPath)));
+      
+      // Write the file
+      const writeData = Buffer.from(content, 'utf8');
+      await vscode.workspace.fs.writeFile(targetUri, writeData);
+
       return JSON.stringify({
-        path: target.fsPath,
+        path: targetUri.fsPath,
         bytesWritten: Buffer.byteLength(content, 'utf8')
       });
     } catch (error) {

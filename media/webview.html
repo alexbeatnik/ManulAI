@@ -235,6 +235,17 @@
       transform: translateY(-1px);
     }
 
+    .ghost-button.danger {
+      color: color-mix(in srgb, var(--vscode-errorForeground, #f44) 88%, var(--text) 12%);
+      border-color: color-mix(in srgb, var(--vscode-errorForeground, #f44) 28%, var(--border-muted));
+      background: color-mix(in srgb, var(--vscode-errorForeground, #f44) 9%, var(--panel-strong));
+    }
+
+    .ghost-button.danger:hover:not([disabled]) {
+      border-color: color-mix(in srgb, var(--vscode-errorForeground, #f44) 48%, var(--border-muted));
+      background: color-mix(in srgb, var(--vscode-errorForeground, #f44) 14%, var(--panel-strong));
+    }
+
     .ghost-button[disabled],
     .send[disabled] {
       opacity: 0.55;
@@ -922,6 +933,7 @@
         </label>
         <select id="modelSelect" class="model-select" aria-label="Ollama model"></select>
         <button id="refreshModels" class="ghost-button" type="button">Refresh</button>
+        <button id="clearChat" class="ghost-button danger" type="button">Clear</button>
       </div>
     </div>
 
@@ -981,6 +993,7 @@
     const composerShellEl = document.getElementById('composerShell');
     const modelSelectEl = document.getElementById('modelSelect');
     const refreshModelsEl = document.getElementById('refreshModels');
+    const clearChatEl = document.getElementById('clearChat');
     const agentModeToggle = document.getElementById('agentModeToggle');
     const agentModeLabel = document.getElementById('agentModeLabel');
     const autoApproveToggle = document.getElementById('autoApproveToggle');
@@ -1132,6 +1145,7 @@
       sendEl.disabled = busy;
       modelSelectEl.disabled = busy;
       refreshModelsEl.disabled = busy;
+      clearChatEl.disabled = busy;
       sendEl.setAttribute('aria-busy', String(busy));
       agentModeToggle.checked = agentMode;
       agentModeLabel.textContent = 'Agent Mode';
@@ -1289,6 +1303,19 @@
       }
 
       vscode.postMessage({ command: 'refreshModels' });
+    });
+
+    clearChatEl.addEventListener('click', () => {
+      if (busy) {
+        return;
+      }
+
+      messages = [];
+      attachments = [];
+      attachedFiles = [];
+      seenMessageKeys.clear();
+      render();
+      vscode.postMessage({ command: 'clearChat' });
     });
 
     agentModeToggle.addEventListener('change', () => {
