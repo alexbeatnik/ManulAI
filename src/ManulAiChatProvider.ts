@@ -73,6 +73,7 @@ interface WebviewInboundMessage {
   paths?: string[];
   model?: string;
   value?: boolean;
+  autoApprove?: boolean;
   filename?: string;
   content?: string;
   attachments?: Array<{ name: string; content: string }>;
@@ -237,7 +238,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         if (!message.text?.trim()) {
           return;
         }
-        await this.sendUserMessage(message.text.trim(), message.attachments);
+        await this.sendUserMessage(message.text.trim(), message.attachments, message.autoApprove);
         return;
       case 'stopRequest':
         this.stopActiveRequest();
@@ -305,10 +306,18 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     }
   }
 
-  private async sendUserMessage(text: string, frontendAttachments?: Array<{ name: string; content: string }>): Promise<void> {
+  private async sendUserMessage(
+    text: string,
+    frontendAttachments?: Array<{ name: string; content: string }>,
+    frontendAutoApprove?: boolean
+  ): Promise<void> {
     if (this.requestInFlight) {
       this.postStatus('A request is already running. Wait for the current response to finish.');
       return;
+    }
+
+    if (typeof frontendAutoApprove === 'boolean') {
+      this.autoApprove = frontendAutoApprove;
     }
 
     this.synchronizeActiveEditorContextMessage();
@@ -357,12 +366,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     );
 
     if (updatedContent === currentContent) {
-      return undefined;
-    }
-
-    const writeApproved = await this.approveFileWrite([licenseUri.fsPath]);
-    if (!writeApproved) {
-      return `[File write denied by user: ${licenseUri.fsPath}]`;
+      return 'LICENSE: no changes detected.';
     }
 
     return this.writeFileWithDiff(licenseUri.fsPath, updatedContent);
@@ -2328,6 +2332,13 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
 
   private async setAutoApprove(value: boolean | undefined): Promise<void> {
     this.autoApprove = value !== undefined ? value : !this.autoApprove;
+
+    if (this.autoApprove && this.pendingApprovalResolver) {
+      this.resolvePendingApproval(true);
+    } else if (!this.autoApprove && this.pendingApproval) {
+      this.pendingApproval = undefined;
+      this.pendingApprovalResolver = undefined;
+    }
 
     const target = vscode.workspace.workspaceFolders?.length
       ? vscode.ConfigurationTarget.Workspace

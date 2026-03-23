@@ -1576,7 +1576,12 @@
 
       inputEl.value = '';
       autoResizeTextarea();
-      const payload = { command: 'sendMessage', text: text, attachments: attachedFiles.slice() };
+      const payload = {
+        command: 'sendMessage',
+        text: text,
+        attachments: attachedFiles.slice(),
+        autoApprove: autoApproveToggle.checked
+      };
       vscode.postMessage(payload);
       attachedFiles = [];
       render();
