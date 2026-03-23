@@ -1,8 +1,4 @@
-# 😼 ManulAI — Native Local Coding Agent for VS Code
-
-<p align="center">
-	<img src="icon.png" width="128" alt="ManulAI Logo">
-</p>
+# ManulAI
 
 ![Alpha](https://img.shields.io/badge/status-alpha-bf5b04)
 ![Manul Product Line](https://img.shields.io/badge/product%20line-Manul-111827)

@@ -462,26 +462,39 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
 
   private async tryHandleDirectTitleRename(text: string): Promise<FileWriteSummary | undefined> {
     // Match patterns like:
-    //   "Зміни тайтл на X" / "Поміняй заголовок на X" / "Change title to X"
+    //   "Зміни тайтл на X" / "Заміни тайтл в README.md на X" / "Change title to X"
     const titleMatch = text.match(
-      /(?:зміни|поміняй|змінити|замін\w*|change|set|update)\s+(?:тайтл|заголовок|title|header|хедер)\s+(?:на|to|:)\s+(.+)/i
+      /(?:зміни|поміняй|змінити|замін\w*|change|set|update)\s+(?:тайтл|заголовок|title|header|хедер)\s+(?:(?:в|in|у)\s+(\S+)\s+)?(?:на|to|:)\s+(.+)/i
     );
     if (!titleMatch) {
       return undefined;
     }
 
-    const newTitle = titleMatch[1].trim();
+    const explicitFile = titleMatch[1]?.trim();
+    const newTitle = titleMatch[2].trim();
     if (!newTitle) {
       return undefined;
     }
 
-    // Look for a markdown file: prefer attached, then active editor, then README.md
+    // Look for a markdown file: prefer explicit mention, then attached, then active editor, then README.md
     let targetPath: string | undefined;
 
-    for (const [fsPath] of this.attachedFiles) {
-      if (fsPath.endsWith('.md')) {
-        targetPath = fsPath;
-        break;
+    if (explicitFile) {
+      const resolvedUri = this.resolveWorkspaceUri(explicitFile);
+      try {
+        await vscode.workspace.fs.stat(resolvedUri);
+        targetPath = resolvedUri.fsPath;
+      } catch {
+        // Explicit file not found, continue with other sources
+      }
+    }
+
+    if (!targetPath) {
+      for (const [fsPath] of this.attachedFiles) {
+        if (fsPath.endsWith('.md')) {
+          targetPath = fsPath;
+          break;
+        }
       }
     }
 
@@ -2007,6 +2020,41 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
             additionalProperties: false
           }
         }
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'delete_file',
+          description: 'Delete a file from the workspace.',
+          parameters: {
+            type: 'object',
+            properties: {
+              filepath: {
+                type: 'string',
+                description: 'Workspace-relative or absolute path to the file to delete.'
+              }
+            },
+            required: ['filepath'],
+            additionalProperties: false
+          }
+        }
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'list_workspace_files',
+          description: 'List files and folders in the workspace or in a specific subdirectory.',
+          parameters: {
+            type: 'object',
+            properties: {
+              directory: {
+                type: 'string',
+                description: 'Optional subdirectory path relative to workspace root. Omit or use empty string for root.'
+              }
+            },
+            additionalProperties: false
+          }
+        }
       }
     ];
   }
@@ -2193,6 +2241,10 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         return this.replaceInFile(String(args.filepath ?? ''), String(args.old_text ?? ''), String(args.new_text ?? ''));
       case 'execute_terminal_command':
         return this.executeTerminalCommand(String(args.command ?? ''));
+      case 'delete_file':
+        return this.deleteFile(String(args.filepath ?? ''));
+      case 'list_workspace_files':
+        return this.listWorkspaceFiles(String(args.directory ?? ''));
       default:
         return JSON.stringify({ error: `Unknown tool: ${name}` });
     }
@@ -2284,6 +2336,47 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     } catch (error) {
       return JSON.stringify({
         error: error instanceof Error ? error.message : 'Failed to write file.'
+      });
+    }
+  }
+
+  private async deleteFile(filepath: string): Promise<string> {
+    if (!filepath.trim()) {
+      return JSON.stringify({ error: 'filepath is required.' });
+    }
+
+    try {
+      const uri = this.resolveWorkspaceUri(filepath);
+      await vscode.workspace.fs.delete(uri);
+      return JSON.stringify({ deleted: uri.fsPath });
+    } catch (error) {
+      return JSON.stringify({
+        error: error instanceof Error ? error.message : 'Failed to delete file.'
+      });
+    }
+  }
+
+  private async listWorkspaceFiles(directory: string): Promise<string> {
+    try {
+      const workspaceFolders = vscode.workspace.workspaceFolders;
+      if (!workspaceFolders) {
+        return JSON.stringify({ error: 'No workspace open.' });
+      }
+
+      const baseUri = directory.trim()
+        ? vscode.Uri.joinPath(workspaceFolders[0].uri, directory)
+        : workspaceFolders[0].uri;
+
+      const entries = await vscode.workspace.fs.readDirectory(baseUri);
+      const items = entries.map(([name, type]) => ({
+        name,
+        type: type === vscode.FileType.Directory ? 'directory' : 'file'
+      }));
+
+      return JSON.stringify({ path: baseUri.fsPath, items });
+    } catch (error) {
+      return JSON.stringify({
+        error: error instanceof Error ? error.message : 'Failed to list directory.'
       });
     }
   }
