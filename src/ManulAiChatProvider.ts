@@ -164,6 +164,15 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       undefined,
       this.extensionContext.subscriptions
     );
+
+    webviewView.onDidChangeVisibility(() => {
+      if (webviewView.visible) {
+        this.postStateToWebview();
+      }
+    });
+
+    // Push initial state once the webview is ready
+    setTimeout(() => this.postStateToWebview(), 100);
   }
 
   public reveal(preserveFocus = false): void {
@@ -401,7 +410,8 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     this.messages.push({ role: 'user', content: text });
 
     if (this.agentMode) {
-      const directSummary = await this.tryHandleDirectLicenseAuthorRename(text);
+      const directSummary = await this.tryHandleDirectLicenseAuthorRename(text)
+        || await this.tryHandleDirectTitleRename(text);
       if (directSummary) {
         this.messages.push(this.createAssistantMessage(directSummary.summary, directSummary.revertOperationId ? [directSummary.revertOperationId] : []));
         this.postStateToWebview();
@@ -450,6 +460,63 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     return this.writeFileWithDiff(licenseUri.fsPath, updatedContent);
   }
 
+  private async tryHandleDirectTitleRename(text: string): Promise<FileWriteSummary | undefined> {
+    // Match patterns like:
+    //   "Зміни тайтл на X" / "Поміняй заголовок на X" / "Change title to X"
+    const titleMatch = text.match(
+      /(?:зміни|поміняй|змінити|замін\w*|change|set|update)\s+(?:тайтл|заголовок|title|header|хедер)\s+(?:на|to|:)\s+(.+)/i
+    );
+    if (!titleMatch) {
+      return undefined;
+    }
+
+    const newTitle = titleMatch[1].trim();
+    if (!newTitle) {
+      return undefined;
+    }
+
+    // Look for a markdown file: prefer attached, then active editor, then README.md
+    let targetPath: string | undefined;
+
+    for (const [fsPath] of this.attachedFiles) {
+      if (fsPath.endsWith('.md')) {
+        targetPath = fsPath;
+        break;
+      }
+    }
+
+    if (!targetPath) {
+      const activeDoc = vscode.window.activeTextEditor?.document;
+      if (activeDoc && !activeDoc.isUntitled && activeDoc.fileName.endsWith('.md')) {
+        targetPath = activeDoc.uri.fsPath;
+      }
+    }
+
+    if (!targetPath) {
+      const readmeUri = this.resolveWorkspaceUri('README.md');
+      try {
+        await vscode.workspace.fs.stat(readmeUri);
+        targetPath = readmeUri.fsPath;
+      } catch {
+        return undefined;
+      }
+    }
+
+    const content = await this.readWorkspaceText(vscode.Uri.file(targetPath));
+    // Replace the first H1 heading
+    const updated = content.replace(/^#\s+.+$/m, `# ${newTitle}`);
+    if (updated === content) {
+      return { summary: `No H1 heading found in ${path.basename(targetPath)} to replace.` };
+    }
+
+    const approved = await this.approveFileWrite([targetPath]);
+    if (!approved) {
+      return { summary: `[File write denied by user: ${path.basename(targetPath)}]` };
+    }
+
+    return this.writeFileWithDiff(targetPath, updated);
+  }
+
   private clearChat(): void {
     if (this.requestInFlight) {
       this.postStatus('Cannot clear chat while a request is running. Wait for the current response to finish.');
@@ -488,6 +555,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
 
   private async processOllamaResponse(messages: OllamaMessage[], retryCount = 0): Promise<void> {
     this.throwIfRequestStopped();
+    this.postStatus(retryCount > 0 ? `Retry ${retryCount}: calling Ollama...` : 'Calling Ollama...');
     const responseData = await this.callOllama(messages);
     this.throwIfRequestStopped();
     const assistantMessage = responseData.message;
@@ -785,7 +853,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         const claimsDone = /(?:зробив|замінив|оновив|готово|i've made|i have made|i have updated|summary of the changes)/i.test(finalContent);
         const mentionsChange = /(?:змін|зроби|оновл|replac|chang|updat|modif)/i.test(finalContent);
         
-        const shouldNudge = (isLongDump || hasLargeCodeBlocks || claimsDone || mentionsChange) && retryCount < 2;
+        const shouldNudge = (isLongDump || hasLargeCodeBlocks || claimsDone || mentionsChange) && retryCount < 1;
 
         if (shouldNudge) {
           messages.push({
