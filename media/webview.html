@@ -506,6 +506,66 @@
       max-width: 100%;
     }
 
+    .message-body {
+      display: grid;
+      gap: 8px;
+    }
+
+    .message-text {
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+
+    .code-block {
+      margin: 0;
+      padding: 10px 11px;
+      overflow-x: auto;
+      border-radius: 12px;
+      border: 1px solid var(--border-muted);
+      background: color-mix(in srgb, var(--panel-strong) 92%, transparent);
+      font-family: var(--vscode-editor-font-family);
+      font-size: 11px;
+      line-height: 1.5;
+      white-space: pre;
+    }
+
+    .diff-block {
+      overflow: hidden;
+      padding: 0;
+    }
+
+    .diff-line {
+      display: block;
+      padding: 2px 10px;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+
+    .diff-line.add {
+      background: color-mix(in srgb, var(--vscode-diffEditor-insertedTextBackground, #17351f) 72%, transparent);
+      color: color-mix(in srgb, var(--vscode-terminal-ansiGreen) 80%, var(--text) 20%);
+    }
+
+    .diff-line.remove {
+      background: color-mix(in srgb, var(--vscode-diffEditor-removedTextBackground, #3b1717) 72%, transparent);
+      color: color-mix(in srgb, var(--vscode-errorForeground, #f44) 78%, var(--text) 22%);
+    }
+
+    .diff-line.hunk {
+      background: color-mix(in srgb, var(--accent) 16%, transparent);
+      color: var(--accent);
+      font-weight: 700;
+    }
+
+    .diff-line.meta {
+      color: var(--muted);
+      background: color-mix(in srgb, var(--panel) 88%, transparent);
+    }
+
+    .diff-line.context {
+      color: var(--text);
+    }
+
     .message.user .message-card {
       background: linear-gradient(180deg, color-mix(in srgb, var(--user) 94%, transparent), color-mix(in srgb, var(--user) 82%, transparent));
       max-width: 92%;
@@ -773,6 +833,13 @@
       padding: 0 10px 10px;
     }
 
+    .composer-buttons {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-shrink: 0;
+    }
+
     .composer-hint {
       min-width: 0;
       display: flex;
@@ -797,6 +864,19 @@
       cursor: pointer;
       min-width: 82px;
       box-shadow: 0 10px 24px color-mix(in srgb, var(--accent-strong) 22%, transparent);
+    }
+
+    .stop {
+      display: none;
+      align-self: end;
+      min-width: 82px;
+      padding: 9px 14px;
+    }
+
+    body.busy .stop {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
     }
 
     .send-label {
@@ -1043,12 +1123,15 @@
             <div class="composer-hint">
               <span><strong>Tip:</strong> drag files directly into this field to attach them as context.</span>
             </div>
-            <button id="send" class="send" type="button">
-              <span class="send-label">
-                <span class="idle-text">Send</span>
-                <span class="dots" aria-hidden="true"><span></span><span></span><span></span></span>
-              </span>
-            </button>
+            <div class="composer-buttons">
+              <button id="stop" class="ghost-button danger stop" type="button">Stop</button>
+              <button id="send" class="send" type="button">
+                <span class="send-label">
+                  <span class="idle-text">Send</span>
+                  <span class="dots" aria-hidden="true"><span></span><span></span><span></span></span>
+                </span>
+              </button>
+            </div>
           </div>
         </div>
       </div>
@@ -1065,6 +1148,7 @@
     const inputShellEl = document.getElementById('inputShell');
     const dropOverlayEl = document.getElementById('dropOverlay');
     const sendEl = document.getElementById('send');
+    const stopEl = document.getElementById('stop');
     const dropzoneEl = document.getElementById('dropzone');
     const composerShellEl = document.getElementById('composerShell');
     const modelSelectEl = document.getElementById('modelSelect');
@@ -1155,7 +1239,7 @@
 
           const card = document.createElement('div');
           card.className = 'message-card';
-          card.textContent = message.content;
+          renderMessageContent(card, message.content);
 
           wrapper.append(meta, card);
           historyEl.appendChild(wrapper);
@@ -1278,6 +1362,7 @@
       }
 
       sendEl.disabled = busy;
+      stopEl.disabled = !busy;
       modelSelectEl.disabled = busy;
       refreshModelsEl.disabled = busy;
       clearChatEl.disabled = busy;
@@ -1289,6 +1374,83 @@
       updateHeaderState();
       autoResizeTextarea();
       historyEl.scrollTop = historyEl.scrollHeight;
+    }
+
+    function renderMessageContent(card, content) {
+      const body = document.createElement('div');
+      body.className = 'message-body';
+
+      const blockPattern = /```([\w.+-]*)\n([\s\S]*?)```/g;
+      let lastIndex = 0;
+      let match;
+
+      while ((match = blockPattern.exec(content)) !== null) {
+        const textBefore = content.slice(lastIndex, match.index);
+        appendTextSegment(body, textBefore);
+
+        const language = (match[1] || '').trim().toLowerCase();
+        const code = match[2] || '';
+        if (language === 'diff') {
+          body.appendChild(createDiffBlock(code));
+        } else {
+          body.appendChild(createCodeBlock(code));
+        }
+
+        lastIndex = match.index + match[0].length;
+      }
+
+      appendTextSegment(body, content.slice(lastIndex));
+      card.appendChild(body);
+    }
+
+    function appendTextSegment(container, text) {
+      if (!text) {
+        return;
+      }
+
+      const normalized = text.replace(/^\n+|\n+$/g, '');
+      if (!normalized) {
+        return;
+      }
+
+      const textEl = document.createElement('div');
+      textEl.className = 'message-text';
+      textEl.textContent = normalized;
+      container.appendChild(textEl);
+    }
+
+    function createCodeBlock(code) {
+      const pre = document.createElement('pre');
+      pre.className = 'code-block';
+      pre.textContent = code.replace(/\n$/, '');
+      return pre;
+    }
+
+    function createDiffBlock(diffText) {
+      const pre = document.createElement('pre');
+      pre.className = 'code-block diff-block';
+
+      for (const line of diffText.replace(/\n$/, '').split('\n')) {
+        const lineEl = document.createElement('div');
+        lineEl.className = 'diff-line';
+        lineEl.textContent = line;
+
+        if (line.startsWith('+')) {
+          lineEl.classList.add('add');
+        } else if (line.startsWith('-')) {
+          lineEl.classList.add('remove');
+        } else if (line.startsWith('@@')) {
+          lineEl.classList.add('hunk');
+        } else if (line.startsWith('... (') || line.startsWith('diff --git') || line.startsWith('index ') || line.startsWith('--- ') || line.startsWith('+++ ')) {
+          lineEl.classList.add('meta');
+        } else {
+          lineEl.classList.add('context');
+        }
+
+        pre.appendChild(lineEl);
+      }
+
+      return pre;
     }
 
     function appendStatus(text) {
@@ -1421,6 +1583,13 @@
     }
 
     sendEl.addEventListener('click', submitMessage);
+    stopEl.addEventListener('click', () => {
+      if (!busy) {
+        return;
+      }
+
+      vscode.postMessage({ command: 'stopRequest' });
+    });
     inputEl.addEventListener('input', autoResizeTextarea);
 
     modelSelectEl.addEventListener('change', () => {

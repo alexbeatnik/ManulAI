@@ -55,6 +55,7 @@ interface WebviewInboundMessage {
   command:
     | 'ready'
     | 'sendMessage'
+    | 'stopRequest'
     | 'clearChat'
     | 'approvePendingAction'
     | 'declinePendingAction'
@@ -107,6 +108,8 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   private agentMode = true;
   private autoApprove = false;
   private requestInFlight = false;
+  private stopRequested = false;
+  private currentRequestAbortController?: AbortController;
   private pendingApproval?: WebviewPendingApprovalState;
   private pendingApprovalResolver?: (approved: boolean) => void;
 
@@ -236,6 +239,9 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         }
         await this.sendUserMessage(message.text.trim(), message.attachments);
         return;
+      case 'stopRequest':
+        this.stopActiveRequest();
+        return;
       case 'addFileContext':
         if (Array.isArray(message.paths) && message.paths.length > 0) {
           for (const pathToAdd of message.paths) {
@@ -338,15 +344,22 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
 
   private async runAgentLoop(): Promise<void> {
     this.requestInFlight = true;
+    this.stopRequested = false;
     this.postBusyState(true);
 
     try {
       await this.processOllamaResponse(this.messages);
       this.postStateToWebview();
     } catch (error) {
+      if (this.isAbortError(error)) {
+        this.postStatus('Request stopped.');
+        return;
+      }
       const message = error instanceof Error ? error.message : 'Unknown error';
       this.postStatus(`Request failed: ${message}`);
     } finally {
+      this.currentRequestAbortController = undefined;
+      this.stopRequested = false;
       this.requestInFlight = false;
       this.postBusyState(false);
       this.postStateToWebview();
@@ -354,7 +367,9 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   }
 
   private async processOllamaResponse(messages: OllamaMessage[], retryCount = 0): Promise<void> {
+    this.throwIfRequestStopped();
     const responseData = await this.callOllama(messages);
+    this.throwIfRequestStopped();
     const assistantMessage = responseData.message;
 
     if (!assistantMessage) {
@@ -396,8 +411,10 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       });
 
       for (const toolCall of resolvedToolCalls) {
+        this.throwIfRequestStopped();
         const toolName = toolCall.function?.name || 'unknown_tool';
         const toolResult = await this.executeToolCall(toolCall);
+        this.throwIfRequestStopped();
         messages.push({
           role: 'tool',
           content: toolResult,
@@ -499,6 +516,9 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
             messages.push({ role: 'assistant', content: `[Replacement denied by user: ${names.join(', ')}]` });
             return;
           }
+
+          const originalBytes = await vscode.workspace.fs.readFile(vscode.Uri.file(targetFile));
+          const originalContent = Buffer.from(originalBytes).toString('utf8');
           const appliedSummaries: string[] = [];
           let hadSuccessfulReplacement = false;
           for (const rep of describedReplacements) {
@@ -524,6 +544,18 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
               appliedSummaries.push(`Replaced ${replacements} occurrence(s) in ${path.basename(targetFile)}.`);
             }
           }
+
+          if (hadSuccessfulReplacement) {
+            const updatedBytes = await vscode.workspace.fs.readFile(vscode.Uri.file(targetFile));
+            const updatedContent = Buffer.from(updatedBytes).toString('utf8');
+            const diffSummary = this.buildDiffSummary(path.basename(targetFile), originalContent, updatedContent);
+            if (diffSummary) {
+              const notes = appliedSummaries.filter(summary => !summary.startsWith('Replaced '));
+              messages.push({ role: 'assistant', content: diffSummary + (notes.length > 0 ? '\n\n' + notes.join('\n') : '') });
+              return;
+            }
+          }
+
           messages.push({ role: 'assistant', content: appliedSummaries.join('\n') });
           return;
         }
@@ -768,7 +800,21 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     }
 
     const originalLength = originalContent.trim().length;
-    if (originalLength > 500 && extracted.length < originalLength * 0.6) {
+    if (originalLength > 500) {
+      const extractedLength = extracted.trim().length;
+      const extractedLines = extracted.split('\n').filter(line => line.trim().length > 0).length;
+      const originalLines = originalContent.split('\n').filter(line => line.trim().length > 0).length;
+
+      if (extractedLength < originalLength * 0.85 || extractedLength > originalLength * 1.2) {
+        return undefined;
+      }
+
+      if (originalLines > 20 && (extractedLines < originalLines * 0.85 || extractedLines > originalLines * 1.2)) {
+        return undefined;
+      }
+    }
+
+    if (this.looksLikeChangeSummary(content)) {
       return undefined;
     }
 
@@ -816,7 +862,15 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       return true;
     }
 
-    if (/^(?:diff\s+--git|index\s+[0-9a-f]+\.\.[0-9a-f]+|---\s+.+|\+\+\+\s+.+|@@\s+[-+,0-9\s]+@@)/m.test(trimmed)) {
+    if (/^(?:diff\s+--git|index\s+[0-9a-f]+\.\.[0-9a-f]+|---\s+.+|\+\+\+\s+.+|@@\s+[-+,0-9\s]+@@|@@\s+line\s+\d+\s+@@)/m.test(trimmed)) {
+      return true;
+    }
+
+    if (/updated\s+\*\*[^*]+\*\*\s+[—-]\s+changed lines:/i.test(trimmed)) {
+      return true;
+    }
+
+    if (/\.\.\.\s*\(\d+\s+more diff lines\)\s*\.\.\./i.test(trimmed)) {
       return true;
     }
 
@@ -834,6 +888,19 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     }).length;
 
     return changedLineCount >= 3 && changedLineCount / lines.length > 0.15;
+  }
+
+  private looksLikeChangeSummary(content: string): boolean {
+    const trimmed = content.trim();
+    if (!trimmed) {
+      return false;
+    }
+
+    if (this.looksLikeDiffOutput(trimmed)) {
+      return true;
+    }
+
+    return /(?:simple\s+find-and-replace|perform\s+a\s+simple\s+find-and-replace|here\s+are\s+the\s+steps|here\s+is\s+the\s+modified\s+content\s+of\s+the\s+`?[^`\n]+`?\s+file:|to\s+change\s+the\s+author\s+name\s+from)/i.test(trimmed);
   }
 
   private extractLikelyFileContent(content: string): string {
@@ -957,6 +1024,21 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
 
     if (replacements.length > 0) {
       return replacements;
+    }
+
+    // Pattern 0b: unquoted rename phrases like "change author name from Oleksii Poliakov to alexbeatnik"
+    const unquotedRenamePattern =
+      /(?:change|replace|rename|update|змін\w*|замін\w*|оновл\w*)[^\n]{0,120}?(?:from|з)\s+([A-Za-zА-Яа-яІіЇїЄєҐґ0-9_. -]{2,80}?)\s+(?:to|на|with)\s+([A-Za-zА-Яа-яІіЇїЄєҐґ0-9_. -]{2,80}?)(?=(?:\s+(?:in|within|inside|у|в)\s+\S+)|[\s.,;!)]|$)/gi;
+    while ((match = unquotedRenamePattern.exec(normalized)) !== null) {
+      const oldText = match[1].trim().replace(/[.,;:]+$/g, '');
+      const newText = match[2].trim().replace(/[.,;:]+$/g, '');
+      if (oldText && newText && oldText !== newText) {
+        replacements.push({ oldText, newText });
+      }
+    }
+
+    if (replacements.length > 0) {
+      return this.normalizeDescribedReplacements(replacements);
     }
 
     // Pattern 1: markdown code blocks with old → new separated by "На:" / "To:" / "→"
@@ -1274,12 +1356,16 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       body.tools = this.getToolDefinitions();
     }
 
+    const abortController = new AbortController();
+    this.currentRequestAbortController = abortController;
+
     const response = await fetch(`${baseUrl}/api/chat`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json'
       },
-      body: JSON.stringify(body)
+      body: JSON.stringify(body),
+      signal: abortController.signal
     });
 
     if (!response.ok) {
@@ -1288,6 +1374,34 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     }
 
     return (await response.json()) as OllamaResponse;
+  }
+
+  private stopActiveRequest(): void {
+    if (!this.requestInFlight) {
+      this.postStatus('No active request to stop.');
+      return;
+    }
+
+    this.stopRequested = true;
+    this.currentRequestAbortController?.abort();
+    if (this.pendingApprovalResolver) {
+      this.resolvePendingApproval(false);
+    }
+    this.postStatus('Stopping request...');
+  }
+
+  private throwIfRequestStopped(): void {
+    if (this.stopRequested) {
+      throw new Error('REQUEST_ABORTED');
+    }
+  }
+
+  private isAbortError(error: unknown): boolean {
+    if (error instanceof Error) {
+      return error.name === 'AbortError' || error.message === 'REQUEST_ABORTED';
+    }
+
+    return false;
   }
 
   private extractToolCalls(message: OllamaMessage): ToolFunctionCall[] {
@@ -1789,7 +1903,11 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       return `${displayName}: no changes detected.`;
     }
 
-    const diffLines = this.computeLineDiff(oldContent, sanitizedContent);
+    return this.buildDiffSummary(displayName, oldContent, sanitizedContent) ?? `${displayName}: no changes detected.`;
+  }
+
+  private buildDiffSummary(displayName: string, oldContent: string, newContent: string): string | undefined {
+    const diffLines = this.computeLineDiff(oldContent, newContent);
     if (diffLines.length === 0) {
       return `Updated ${displayName} (whitespace-only changes)`;
     }
