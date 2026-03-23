@@ -326,8 +326,46 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     }
 
     this.messages.push({ role: 'user', content: text });
+
+    const directSummary = await this.tryHandleDirectLicenseAuthorRename(text);
+    if (directSummary) {
+      this.messages.push({ role: 'assistant', content: directSummary });
+      this.postStateToWebview();
+      return;
+    }
+
     this.postStateToWebview();
     await this.runAgentLoop();
+  }
+
+  private async tryHandleDirectLicenseAuthorRename(text: string): Promise<string | undefined> {
+    const match = text.match(/change\s+author\s+name\s+to\s+(.+?)\s+in\s+license\b/i);
+    if (!match) {
+      return undefined;
+    }
+
+    const requestedAuthor = match[1].trim().replace(/^[`"']+|[`"']+$/g, '');
+    if (!requestedAuthor) {
+      return undefined;
+    }
+
+    const licenseUri = this.resolveWorkspaceUri('LICENSE');
+    const currentContent = await this.readWorkspaceText(licenseUri);
+    const updatedContent = currentContent.replace(
+      /^Copyright(\s+\(c\))?\s+(\d{4})\s+.+$/gm,
+      (_fullMatch, copyrightMarker: string | undefined, year: string) => `Copyright${copyrightMarker ?? ''} ${year} ${requestedAuthor}`
+    );
+
+    if (updatedContent === currentContent) {
+      return undefined;
+    }
+
+    const writeApproved = await this.approveFileWrite([licenseUri.fsPath]);
+    if (!writeApproved) {
+      return `[File write denied by user: ${licenseUri.fsPath}]`;
+    }
+
+    return this.writeFileWithDiff(licenseUri.fsPath, updatedContent);
   }
 
   private clearChat(): void {
@@ -517,8 +555,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
             return;
           }
 
-          const originalBytes = await vscode.workspace.fs.readFile(vscode.Uri.file(targetFile));
-          const originalContent = Buffer.from(originalBytes).toString('utf8');
+          const originalContent = await this.readWorkspaceText(vscode.Uri.file(targetFile));
           const appliedSummaries: string[] = [];
           let hadSuccessfulReplacement = false;
           for (const rep of describedReplacements) {
@@ -530,8 +567,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
             }
             if (parsed.error) {
               if (hadSuccessfulReplacement && typeof parsed.error === 'string' && /old_text not found/i.test(parsed.error)) {
-                const currentBytes = await vscode.workspace.fs.readFile(vscode.Uri.file(targetFile));
-                const currentContent = Buffer.from(currentBytes).toString('utf8');
+                const currentContent = await this.readWorkspaceText(vscode.Uri.file(targetFile));
                 if (currentContent.includes(rep.newText) && !currentContent.includes(rep.oldText)) {
                   appliedSummaries.push(`Skipped overlapping replacement in ${path.basename(targetFile)}.`);
                   continue;
@@ -546,8 +582,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           }
 
           if (hadSuccessfulReplacement) {
-            const updatedBytes = await vscode.workspace.fs.readFile(vscode.Uri.file(targetFile));
-            const updatedContent = Buffer.from(updatedBytes).toString('utf8');
+            const updatedContent = await this.readWorkspaceText(vscode.Uri.file(targetFile));
             const diffSummary = this.buildDiffSummary(path.basename(targetFile), originalContent, updatedContent);
             if (diffSummary) {
               const notes = appliedSummaries.filter(summary => !summary.startsWith('Replaced '));
@@ -1126,7 +1161,57 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       }
     }
 
-    return Array.from(unique.values()).sort((left, right) => right.oldText.length - left.oldText.length);
+    const sorted = Array.from(unique.values()).sort((left, right) => right.oldText.length - left.oldText.length);
+    return sorted.filter((replacement, index) => {
+      return !sorted.slice(0, index).some(previous => {
+        return previous.oldText.includes(replacement.oldText)
+          && previous.newText.includes(replacement.newText);
+      });
+    });
+  }
+
+  private isLikelyFileReference(candidate: string): boolean {
+    const trimmed = candidate.trim().replace(/^[`"']+|[`"'.,;:!?]+$/g, '');
+    if (!trimmed) {
+      return false;
+    }
+
+    const lower = trimmed.toLowerCase();
+    const banned = new Set([
+      'directly',
+      'file',
+      'content',
+      'modified',
+      'updated',
+      'below',
+      'above',
+      'following',
+      'steps',
+      'here',
+      'there'
+    ]);
+    if (banned.has(lower)) {
+      return false;
+    }
+
+    if (/^[A-Z][A-Z0-9_-]*$/.test(trimmed)) {
+      return true;
+    }
+
+    if (trimmed.includes('/')) {
+      return true;
+    }
+
+    if (/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]{1,12}$/.test(trimmed)) {
+      return true;
+    }
+
+    const activeName = vscode.window.activeTextEditor ? path.basename(vscode.window.activeTextEditor.document.fileName) : '';
+    if (activeName && trimmed === activeName) {
+      return true;
+    }
+
+    return Array.from(this.attachedFiles.values()).some(file => trimmed === file.name || trimmed === path.basename(file.uri.fsPath));
   }
 
   private findAttachedFileForReplacements(replacements: Array<{ oldText: string }>): string | undefined {
@@ -1161,7 +1246,9 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     const candidates: string[] = [];
     let match: RegExpExecArray | null;
     while ((match = fileNamePattern.exec(normalized)) !== null) {
-      candidates.push(match[1]);
+      if (this.isLikelyFileReference(match[1])) {
+        candidates.push(match[1]);
+      }
     }
     // Also try bare filenames like LICENSE, README etc.
     const bareNamePattern = /\b(LICENSE|README|CHANGELOG|Makefile|Dockerfile|package\.json|tsconfig\.json)\b/g;
@@ -1196,7 +1283,9 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     const fileNamePattern = /(?:файл[іиеа]?|file|in)\s+([A-Za-z0-9_./-]+(?:\.[A-Za-z0-9_-]+)?)/gi;
     let match: RegExpExecArray | null;
     while ((match = fileNamePattern.exec(normalized)) !== null) {
-      candidates.push(match[1]);
+      if (this.isLikelyFileReference(match[1])) {
+        candidates.push(match[1]);
+      }
     }
 
     const bareNamePattern = /\b(LICENSE|README|CHANGELOG|Makefile|Dockerfile|package\.json|tsconfig\.json)\b/g;
@@ -1679,7 +1768,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     while ((match = pattern.exec(content)) !== null) {
       const filepath = match[2].trim();
       const fileContent = match[3];
-      if (filepath && fileContent && !filepath.includes(' ') && (filepath.includes('/') || filepath.includes('.'))) {
+      if (filepath && fileContent && !filepath.includes(' ') && this.isLikelyFileReference(filepath)) {
         blocks.push({ fullMatch: match[0], filepath, fileContent });
       }
     }
@@ -1689,7 +1778,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     while ((match = commentPathPattern.exec(content)) !== null) {
       const filepath = match[2].trim();
       const fileContent = match[3];
-      if (filepath && fileContent && !blocks.some(b => b.filepath === filepath)) {
+      if (filepath && fileContent && this.isLikelyFileReference(filepath) && !blocks.some(b => b.filepath === filepath)) {
         blocks.push({ fullMatch: match[0], filepath, fileContent });
       }
     }
@@ -1703,9 +1792,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       if (lang === 'diff') {
         continue;
       }
-      // Require filename to have an extension or be explicitly known files like LICENSE, Makefile
-      const isValidFilename = filepath.includes('.') || /^[A-Z][A-Z0-9_]+$/.test(filepath);
-      if (isValidFilename && !filepath.includes(' ') && !blocks.some(b => b.filepath === filepath)) {
+      if (this.isLikelyFileReference(filepath) && !filepath.includes(' ') && !blocks.some(b => b.filepath === filepath)) {
         const fullMatch = match[0].substring(match[0].indexOf('```'));
         blocks.push({ fullMatch, filepath, fileContent });
       }
@@ -1821,8 +1908,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
 
     try {
       const uri = this.resolveWorkspaceUri(filepath);
-      const bytes = await vscode.workspace.fs.readFile(uri);
-      const content = Buffer.from(bytes).toString('utf8');
+      const content = await this.readWorkspaceText(uri);
       const languageId = vscode.workspace.textDocuments.find(doc => doc.uri.toString() === uri.toString())?.languageId ?? 'plaintext';
 
       return JSON.stringify({
@@ -1855,10 +1941,8 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       }
       
       await vscode.workspace.fs.createDirectory(vscode.Uri.file(path.dirname(targetUri.fsPath)));
-      
-      // Write the file
-      const writeData = Buffer.from(content, 'utf8');
-      await vscode.workspace.fs.writeFile(targetUri, writeData);
+
+        await this.writeWorkspaceText(targetUri, content);
 
       return JSON.stringify({
         path: targetUri.fsPath,
@@ -1879,8 +1963,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     // Read old content for diff (may not exist yet)
     let oldContent: string | undefined;
     try {
-      const bytes = await vscode.workspace.fs.readFile(target);
-      oldContent = Buffer.from(bytes).toString('utf8');
+      oldContent = await this.readWorkspaceText(target);
     } catch {
       // File doesn't exist yet — new file
     }
@@ -1915,6 +1998,60 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     const header = `Updated **${displayName}** — changed lines:`;
     const diffBlock = '```diff\n' + diffLines.join('\n') + '\n```';
     return header + '\n' + diffBlock;
+  }
+
+  private getOpenDocument(uri: vscode.Uri): vscode.TextDocument | undefined {
+    return vscode.workspace.textDocuments.find(doc => doc.uri.toString() === uri.toString());
+  }
+
+  private async readWorkspaceText(uri: vscode.Uri): Promise<string> {
+    const openDocument = this.getOpenDocument(uri);
+    if (openDocument) {
+      return openDocument.getText();
+    }
+
+    return this.readDiskText(uri);
+  }
+
+  private async readDiskText(uri: vscode.Uri): Promise<string> {
+    const bytes = await vscode.workspace.fs.readFile(uri);
+    return Buffer.from(bytes).toString('utf8');
+  }
+
+  private normalizeTextForComparison(content: string): string {
+    return content.replace(/\r\n/g, '\n');
+  }
+
+  private async writeWorkspaceText(uri: vscode.Uri, content: string): Promise<void> {
+    const openDocument = this.getOpenDocument(uri);
+    if (openDocument) {
+      const fullRange = new vscode.Range(openDocument.positionAt(0), openDocument.positionAt(openDocument.getText().length));
+      const edit = new vscode.WorkspaceEdit();
+      edit.replace(uri, fullRange, content);
+      const applied = await vscode.workspace.applyEdit(edit);
+      if (!applied) {
+        throw new Error(`Failed to apply editor edit for ${uri.fsPath}.`);
+      }
+
+      const updatedDocument = this.getOpenDocument(uri) ?? await vscode.workspace.openTextDocument(uri);
+      const saved = await updatedDocument.save();
+      if (!saved) {
+        throw new Error(`Failed to save ${uri.fsPath}.`);
+      }
+
+      const diskText = await this.readDiskText(uri);
+      if (this.normalizeTextForComparison(diskText) !== this.normalizeTextForComparison(content)) {
+        throw new Error(`Post-write verification failed for ${uri.fsPath}.`);
+      }
+      return;
+    }
+
+    await vscode.workspace.fs.writeFile(uri, Buffer.from(content, 'utf8'));
+
+    const diskText = await this.readDiskText(uri);
+    if (this.normalizeTextForComparison(diskText) !== this.normalizeTextForComparison(content)) {
+      throw new Error(`Post-write verification failed for ${uri.fsPath}.`);
+    }
   }
 
   private computeLineDiff(oldContent: string, newContent: string): string[] {
@@ -1985,8 +2122,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     const target = this.resolveWorkspaceUri(filepath);
 
     try {
-      const bytes = await vscode.workspace.fs.readFile(target);
-      const original = Buffer.from(bytes).toString('utf8');
+      const original = await this.readWorkspaceText(target);
       const occurrences = original.split(oldText).length - 1;
 
       if (occurrences === 0) {
@@ -1997,7 +2133,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       }
 
       const updated = original.replace(oldText, newText);
-      await vscode.workspace.fs.writeFile(target, Buffer.from(updated, 'utf8'));
+      await this.writeWorkspaceText(target, updated);
 
       return JSON.stringify({
         path: target.fsPath,
@@ -2022,8 +2158,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     const target = this.resolveWorkspaceUri(filepath);
 
     try {
-      const bytes = await vscode.workspace.fs.readFile(target);
-      const original = Buffer.from(bytes).toString('utf8');
+      const original = await this.readWorkspaceText(target);
       const occurrences = original.split(oldText).length - 1;
 
       if (occurrences === 0) {
@@ -2031,7 +2166,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       }
 
       const updated = original.split(oldText).join(newText);
-      await vscode.workspace.fs.writeFile(target, Buffer.from(updated, 'utf8'));
+      await this.writeWorkspaceText(target, updated);
 
       return JSON.stringify({
         path: target.fsPath,
