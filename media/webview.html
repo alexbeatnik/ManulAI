@@ -1348,6 +1348,7 @@
     let dragDepth = 0;
     let agentMode = true;
     let autoApprove = false;
+    let debugMode = false;
     let activeFile = null;
     let pendingApproval = null;
     const seenMessageKeys = new Set();
@@ -1568,9 +1569,7 @@
       agentModeLabel.textContent = 'Agent Mode';
       autoApproveToggle.checked = autoApprove;
       autoApproveLabel.textContent = 'Auto-Approve';
-      if (data.debugMode !== undefined) {
-        debugModeToggle.checked = data.debugMode;
-      }
+      debugModeToggle.checked = debugMode;
       updateHeaderState();
       autoResizeTextarea();
       historyEl.scrollTop = historyEl.scrollHeight;
@@ -1768,6 +1767,14 @@
         return;
       }
 
+      // Path 3: last resort — check dt.files (some browsers populate files but not items)
+      if (dt.files && dt.files.length > 0) {
+        for (const file of Array.from(dt.files)) {
+          readDroppedFile(file);
+        }
+        return;
+      }
+
       appendStatus('Drop did not contain a readable file or URI.');
     }
 
@@ -1922,6 +1929,7 @@
         currentModel = payload.currentModel || '';
         agentMode = payload.agentMode !== undefined ? payload.agentMode : agentMode;
         autoApprove = payload.autoApprove !== undefined ? payload.autoApprove : autoApprove;
+        debugMode = payload.debugMode !== undefined ? payload.debugMode : debugMode;
         pendingApproval = payload.pendingApproval || null;
         activeFile = payload.activeFile || null;
         if (payload.extensionVersion && versionBadgeEl) {
