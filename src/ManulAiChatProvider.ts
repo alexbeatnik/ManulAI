@@ -2410,25 +2410,30 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     const name = toolCall.function?.name ?? '';
     const args = this.normalizeToolArguments(toolCall.function?.arguments);
 
-    switch (name) {
-      case 'read_active_file':
-        return this.readActiveFile();
-      case 'read_specific_file':
-        return this.readSpecificFile(String(args.filepath ?? ''));
-      case 'create_or_edit_file':
-        return this.createOrEditFile(String(args.filename ?? ''), String(args.content ?? ''));
-      case 'write_to_file':
-        return this.createOrEditFile(String(args.filepath ?? ''), String(args.content ?? ''));
-      case 'replace_in_file':
-        return this.replaceInFile(String(args.filepath ?? ''), String(args.old_text ?? ''), String(args.new_text ?? ''));
-      case 'execute_terminal_command':
-        return this.executeTerminalCommand(String(args.command ?? ''));
-      case 'delete_file':
-        return this.deleteFile(String(args.filepath ?? ''));
-      case 'list_workspace_files':
-        return this.listWorkspaceFiles(String(args.directory ?? ''));
-      default:
-        return JSON.stringify({ error: `Unknown tool: ${name}` });
+    try {
+      switch (name) {
+        case 'read_active_file':
+          return await this.readActiveFile();
+        case 'read_specific_file':
+          return await this.readSpecificFile(String(args.filepath ?? ''));
+        case 'create_or_edit_file':
+          return await this.createOrEditFile(String(args.filename ?? ''), String(args.content ?? ''));
+        case 'write_to_file':
+          return await this.createOrEditFile(String(args.filepath ?? ''), String(args.content ?? ''));
+        case 'replace_in_file':
+          return await this.replaceInFile(String(args.filepath ?? ''), String(args.old_text ?? ''), String(args.new_text ?? ''));
+        case 'execute_terminal_command':
+          return await this.executeTerminalCommand(String(args.command ?? ''));
+        case 'delete_file':
+          return await this.deleteFile(String(args.filepath ?? ''));
+        case 'list_workspace_files':
+          return await this.listWorkspaceFiles(String(args.directory ?? ''));
+        default:
+          return JSON.stringify({ error: `Unknown tool: ${name}` });
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Tool execution failed.';
+      return JSON.stringify({ error: message });
     }
   }
 
@@ -2707,6 +2712,19 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   }
 
   private async readWorkspaceText(uri: vscode.Uri): Promise<string> {
+    // Guard against reading directories — they cause EISDIR
+    try {
+      const stat = await vscode.workspace.fs.stat(uri);
+      if (stat.type & vscode.FileType.Directory) {
+        throw new Error(`Cannot read directory as text: ${uri.fsPath}`);
+      }
+    } catch (error) {
+      if (error instanceof Error && error.message.startsWith('Cannot read directory')) {
+        throw error;
+      }
+      // stat failed — let readFile below produce the real error
+    }
+
     const openDocument = this.getOpenDocument(uri);
     if (openDocument) {
       return openDocument.getText();
