@@ -1664,7 +1664,13 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           'Use the provided tools when you need to inspect files, edit files, or run commands.\n' +
           'If no tool is needed, answer normally and concisely.\n' +
           'Do not claim that a file was changed unless a tool actually changed it.\n' +
-          'Avoid dumping full file contents unless the user explicitly asks for them.';
+          'Avoid dumping full file contents unless the user explicitly asks for them.\n' +
+          'CRITICAL FILE EDITING RULES:\n' +
+          '- When asked to make a small change, change ONLY the specific lines affected. Never rewrite or replace the entire file.\n' +
+          '- Never delete content that was not explicitly asked to be removed.\n' +
+          '- Prefer replace_in_file for surgical edits over create_or_edit_file with full file content.\n' +
+          '- Always read the file first before editing to understand its full structure.\n' +
+          '- After editing, the file must keep all original content except the targeted change.';
 
       if (workspaceInstructions) {
         agentMandate += '\n\n<workspace_instructions>\n' + workspaceInstructions + '\n</workspace_instructions>';
