@@ -21,6 +21,7 @@ interface OllamaMessage {
   tool_name?: string;
   hiddenFromTranscript?: boolean;
   attachmentContext?: boolean;
+  activeEditorContext?: boolean;
 }
 
 interface OllamaResponse {
@@ -55,6 +56,8 @@ interface WebviewInboundMessage {
     | 'ready'
     | 'sendMessage'
     | 'clearChat'
+    | 'approvePendingAction'
+    | 'declinePendingAction'
     | 'addFileContext'
     | 'addFileContent'
     | 'addFilePathContext'
@@ -79,6 +82,21 @@ interface WebviewRenderableMessage {
   content: string;
 }
 
+interface WebviewActiveFileState {
+  path: string;
+  name: string;
+  displayPath: string;
+}
+
+interface WebviewPendingApprovalState {
+  kind: 'tool' | 'file-write';
+  title: string;
+  message: string;
+  details?: string;
+  approveLabel: string;
+  declineLabel: string;
+}
+
 export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = 'manulai.chatView';
 
@@ -89,6 +107,8 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   private agentMode = true;
   private autoApprove = false;
   private requestInFlight = false;
+  private pendingApproval?: WebviewPendingApprovalState;
+  private pendingApprovalResolver?: (approved: boolean) => void;
 
   public constructor(private readonly extensionContext: vscode.ExtensionContext) {
     const config = vscode.workspace.getConfiguration('manulai');
@@ -185,6 +205,10 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     this.postStateToWebview();
   }
 
+  public handleActiveEditorChange(): void {
+    this.postStateToWebview();
+  }
+
   public async attachFilesByUri(uris: vscode.Uri[]): Promise<void> {
     for (const uri of uris) {
       await this.addFileContext(uri.fsPath);
@@ -199,6 +223,12 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         return;
       case 'clearChat':
         this.clearChat();
+        return;
+      case 'approvePendingAction':
+        this.resolvePendingApproval(true);
+        return;
+      case 'declinePendingAction':
+        this.resolvePendingApproval(false);
         return;
       case 'sendMessage':
         if (!message.text?.trim()) {
@@ -275,6 +305,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       return;
     }
 
+    this.synchronizeActiveEditorContextMessage();
     this.synchronizeAttachmentContextMessage();
 
     if (frontendAttachments && frontendAttachments.length > 0) {
@@ -340,14 +371,15 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
 
       if (!this.autoApprove) {
         const toolNames = resolvedToolCalls.map(tc => tc.function?.name || 'unknown').join(', ');
-        this.postStatus(`Tool call requested: ${toolNames}. Waiting for approval...`);
-        const choice = await vscode.window.showInformationMessage(
-          `ManulAI wants to call: ${toolNames}`,
-          { modal: false },
-          'Allow',
-          'Deny'
-        );
-        if (choice !== 'Allow') {
+        const approved = await this.requestApproval({
+          kind: 'tool',
+          title: 'Tool Approval Required',
+          message: `ManulAI wants to call: ${toolNames}`,
+          details: visibleContent || undefined,
+          approveLabel: 'Approve',
+          declineLabel: 'Decline'
+        });
+        if (!approved) {
           messages.push({
             role: 'assistant',
             content: visibleContent || `[Tool call denied by user: ${toolNames}]`
@@ -380,7 +412,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
 
     let finalContent = assistantMessage.content ?? '';
 
-    if (this.agentMode) {
+    {
       this.postStatus('DEBUG: Entered fallback layer 1 (Begin of FILE marker)');
       // --- Fallback layer 1: detect [Begin of FILE]...[End of FILE] markers ---
       const markerWrite = this.extractMarkerFileWrite(finalContent);
@@ -469,17 +501,40 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           }
           const appliedSummaries: string[] = [];
           for (const rep of describedReplacements) {
-            const result = await this.replaceInFile(targetFile, rep.oldText, rep.newText);
-            const parsed = JSON.parse(result) as Record<string, unknown>;
+            let result = await this.replaceInFile(targetFile, rep.oldText, rep.newText);
+            let parsed = JSON.parse(result) as Record<string, unknown>;
+            if (typeof parsed.error === 'string' && /matched\s+\d+\s+times/i.test(parsed.error)) {
+              result = await this.replaceAllInFile(targetFile, rep.oldText, rep.newText);
+              parsed = JSON.parse(result) as Record<string, unknown>;
+            }
             if (parsed.error) {
               appliedSummaries.push(`Replace failed in ${path.basename(targetFile)}: ${String(parsed.error)}`);
             } else {
-              appliedSummaries.push(`Replaced in ${path.basename(targetFile)}: "${rep.oldText.slice(0, 50)}..." → "${rep.newText.slice(0, 50)}..."`);
+              const replacements = Number(parsed.replacements ?? 1);
+              appliedSummaries.push(`Replaced ${replacements} occurrence(s) in ${path.basename(targetFile)}.`);
             }
           }
           messages.push({ role: 'assistant', content: appliedSummaries.join('\n') });
           return;
         }
+      }
+
+      this.postStatus('DEBUG: Entered fallback layer 4b (described file dump)');
+      // --- Fallback layer 4b: detect a whole-file dump in a fenced block without [FILE:] markers ---
+      const describedFileDump = await this.extractDescribedFileDump(finalContent);
+      if (describedFileDump) {
+        const writeApproved = await this.approveFileWrite([describedFileDump.filepath]);
+        if (!writeApproved) {
+          messages.push({ role: 'assistant', content: `[File write denied by user: ${describedFileDump.filepath}]` });
+          return;
+        }
+        const summary = await this.writeFileWithDiff(describedFileDump.filepath, describedFileDump.fileContent);
+        const remaining = finalContent.replace(describedFileDump.fullMatch, '').trim();
+        messages.push({
+          role: 'assistant',
+          content: summary + (remaining ? '\n\n' + this.truncateLongResponse(remaining) : '')
+        });
+        return;
       }
 
       // --- Fallback layer 4: apply legacy [FILE:] blocks ---
@@ -534,38 +589,40 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         } catch {}
       }
 
-      this.postStatus('DEBUG: Entered fallback layer 6 (nudge model to use tools)');
-      // --- Fallback layer 6: nudge the model to use tools if it didn't ---
-      const isLongDump = finalContent.length > 300;
-      const hasLargeCodeBlocks = /```[\w]*\n[\s\S]{100,}?```/.test(finalContent);
-      const claimsDone = /(?:зробив|замінив|оновив|готово|i've made|i have made|i have updated|summary of the changes)/i.test(finalContent);
-      const mentionsChange = /(?:змін|зроби|оновл|replac|chang|updat|modif)/i.test(finalContent);
-      
-      const shouldNudge = (isLongDump || hasLargeCodeBlocks || claimsDone || mentionsChange) && retryCount < 2;
-
-      if (shouldNudge) {
-        messages.push({
-          role: 'assistant',
-          content: finalContent,
-          hiddenFromTranscript: true
-        });
+      if (this.agentMode) {
+        this.postStatus('DEBUG: Entered fallback layer 6 (nudge model to use tools)');
+        // --- Fallback layer 6: nudge the model to use tools if it didn't ---
+        const isLongDump = finalContent.length > 300;
+        const hasLargeCodeBlocks = /```[\w]*\n[\s\S]{100,}?```/.test(finalContent);
+        const claimsDone = /(?:зробив|замінив|оновив|готово|i've made|i have made|i have updated|summary of the changes)/i.test(finalContent);
+        const mentionsChange = /(?:змін|зроби|оновл|replac|chang|updat|modif)/i.test(finalContent);
         
-        let nudgeMessage = '';
-        if (isLongDump || hasLargeCodeBlocks) {
-          nudgeMessage = 'STOP. You output code without calling a tool. That is WRONG. You MUST use the `replace_in_file` or `write_to_file` tool call to apply the code directly to the disk. Do not just output raw code blocks in chat. Call the tool NOW.';
-        } else {
-          nudgeMessage = 'STOP. You described changes or claimed you made them, but you DID NOT actually call a tool. ' +
-            'You MUST call the `replace_in_file` or `write_to_file` tool to apply your changes. Text in chat does NOT edit files. Call the tool NOW.';
-        }
+        const shouldNudge = (isLongDump || hasLargeCodeBlocks || claimsDone || mentionsChange) && retryCount < 2;
 
-        messages.push({
-          role: 'user',
-          content: nudgeMessage,
-          hiddenFromTranscript: true
-        });
-        this.postStatus(`Model did not use tools (attempt ${retryCount + 1}) — retrying...`);
-        await this.processOllamaResponse(messages, retryCount + 1);
-        return;
+        if (shouldNudge) {
+          messages.push({
+            role: 'assistant',
+            content: finalContent,
+            hiddenFromTranscript: true
+          });
+          
+          let nudgeMessage = '';
+          if (isLongDump || hasLargeCodeBlocks) {
+            nudgeMessage = 'STOP. You output code without calling a tool. That is WRONG. You MUST use the `replace_in_file` or `write_to_file` tool call to apply the code directly to the disk. Do not just output raw code blocks in chat. Call the tool NOW.';
+          } else {
+            nudgeMessage = 'STOP. You described changes or claimed you made them, but you DID NOT actually call a tool. ' +
+              'You MUST call the `replace_in_file` or `write_to_file` tool to apply your changes. Text in chat does NOT edit files. Call the tool NOW.';
+          }
+
+          messages.push({
+            role: 'user',
+            content: nudgeMessage,
+            hiddenFromTranscript: true
+          });
+          this.postStatus(`Model did not use tools (attempt ${retryCount + 1}) — retrying...`);
+          await this.processOllamaResponse(messages, retryCount + 1);
+          return;
+        }
       }
 
       // Final safety: truncate any remaining large output
@@ -696,18 +753,63 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   }
 
   private async approveFileWrite(filepaths: string[]): Promise<boolean> {
-    if (this.agentMode || this.autoApprove) {
+    const names = filepaths.map(p => path.basename(p)).join(', ');
+    if (this.autoApprove) {
+      this.postStatus(`Applying detected file write: ${names}.`);
       return true;
     }
-    const names = filepaths.map(p => path.basename(p)).join(', ');
-    this.postStatus(`Detected file write in response: ${names}. Waiting for approval...`);
-    const choice = await vscode.window.showInformationMessage(
-      `ManulAI wants to write: ${names}`,
-      { modal: false },
-      'Allow',
-      'Deny'
-    );
-    return choice === 'Allow';
+
+    return this.requestApproval({
+      kind: 'file-write',
+      title: 'File Write Approval Required',
+      message: `ManulAI wants to modify: ${names}`,
+      details: filepaths.join('\n'),
+      approveLabel: 'Approve',
+      declineLabel: 'Decline'
+    });
+  }
+
+  private async requestApproval(state: WebviewPendingApprovalState): Promise<boolean> {
+    if (this.autoApprove) {
+      return true;
+    }
+
+    if (!this.webviewView) {
+      const choice = await vscode.window.showInformationMessage(
+        state.message,
+        { modal: false, detail: state.details },
+        state.approveLabel,
+        state.declineLabel
+      );
+      return choice === state.approveLabel;
+    }
+
+    if (this.pendingApprovalResolver) {
+      this.pendingApprovalResolver(false);
+      this.pendingApprovalResolver = undefined;
+    }
+
+    this.pendingApproval = state;
+    this.postStatus(`${state.message}. Waiting for approval...`);
+    this.postStateToWebview();
+
+    return new Promise(resolve => {
+      this.pendingApprovalResolver = (approved: boolean) => {
+        this.pendingApproval = undefined;
+        this.pendingApprovalResolver = undefined;
+        this.postStateToWebview();
+        resolve(approved);
+      };
+    });
+  }
+
+  private resolvePendingApproval(approved: boolean): void {
+    if (!this.pendingApprovalResolver) {
+      return;
+    }
+
+    const resolver = this.pendingApprovalResolver;
+    resolver(approved);
   }
 
   private truncateLongResponse(content: string): string {
@@ -730,10 +832,25 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       .replace(/[\u2018\u2019\u201A\u201B\u2032\u2035]/g, "'")  // smart single quotes → '
       .replace(/[«»]/g, '"');                                     // guillemets → "
 
+    // Pattern 0: broad natural-language rename instructions where many words appear between the verb and quoted values.
+    const broadInstructionPattern =
+      /(?:replace|replaced|замін\w*|змін\w*|оновл\w*)[^\n]{0,140}?["'`]([^"'`\n]+)["'`][^\n]{0,40}?(?:with|to|на|->|→)[\s:]*["'`]([^"'`\n]+)["'`]/gi;
+    let match: RegExpExecArray | null;
+    while ((match = broadInstructionPattern.exec(normalized)) !== null) {
+      const oldText = match[1].trim();
+      const newText = match[2].trim();
+      if (oldText && newText && oldText !== newText) {
+        replacements.push({ oldText, newText });
+      }
+    }
+
+    if (replacements.length > 0) {
+      return replacements;
+    }
+
     // Pattern 1: markdown code blocks with old → new separated by "На:" / "To:" / "→"
     const codeBlockPairPattern =
       /```[^\n]*\n([\s\S]*?)```\s*(?:\n\s*)?(?:На|на|To|to|→|->|replaced with|замінено на|changed to)[:\s]*\s*```[^\n]*\n([\s\S]*?)```/gi;
-    let match: RegExpExecArray | null;
     while ((match = codeBlockPairPattern.exec(normalized)) !== null) {
       const oldText = match[1].trim();
       const newText = match[2].trim();
@@ -860,6 +977,76 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         // File not found — try next candidate
       }
     }
+    return undefined;
+  }
+
+  private async findMentionedFileInContent(content: string): Promise<string | undefined> {
+    const normalized = content
+      .replace(/[`"']/g, ' ')
+      .replace(/\s+/g, ' ');
+
+    const candidates: string[] = [];
+    const fileNamePattern = /(?:файл[іиеа]?|file|in)\s+([A-Za-z0-9_./-]+(?:\.[A-Za-z0-9_-]+)?)/gi;
+    let match: RegExpExecArray | null;
+    while ((match = fileNamePattern.exec(normalized)) !== null) {
+      candidates.push(match[1]);
+    }
+
+    const bareNamePattern = /\b(LICENSE|README|CHANGELOG|Makefile|Dockerfile|package\.json|tsconfig\.json)\b/g;
+    while ((match = bareNamePattern.exec(content)) !== null) {
+      if (!candidates.includes(match[1])) {
+        candidates.push(match[1]);
+      }
+    }
+
+    for (const candidate of candidates) {
+      try {
+        const uri = this.resolveWorkspaceUri(candidate);
+        await vscode.workspace.fs.stat(uri);
+        return uri.fsPath;
+      } catch {
+        // Ignore unresolved candidate.
+      }
+    }
+
+    return undefined;
+  }
+
+  private async extractDescribedFileDump(content: string): Promise<{ fullMatch: string; filepath: string; fileContent: string } | undefined> {
+    const fencedBlocks = Array.from(content.matchAll(/```(?:[\w.+-]+)?\n([\s\S]*?)```/g));
+    if (fencedBlocks.length === 0) {
+      return undefined;
+    }
+
+    const largestBlock = fencedBlocks.reduce((largest, current) => {
+      const largestContent = (largest[1] ?? '').trim();
+      const currentContent = (current[1] ?? '').trim();
+      return currentContent.length > largestContent.length ? current : largest;
+    });
+
+    const fileContent = (largestBlock[1] ?? '').trim();
+    if (fileContent.length < 200) {
+      return undefined;
+    }
+
+    const mentionedFile = await this.findMentionedFileInContent(content);
+    if (mentionedFile) {
+      return {
+        fullMatch: largestBlock[0],
+        filepath: mentionedFile,
+        fileContent
+      };
+    }
+
+    const activeDoc = vscode.window.activeTextEditor?.document;
+    if (activeDoc && !activeDoc.isUntitled) {
+      return {
+        fullMatch: largestBlock[0],
+        filepath: activeDoc.uri.fsPath,
+        fileContent
+      };
+    }
+
     return undefined;
   }
 
@@ -1561,6 +1748,40 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     }
   }
 
+  private async replaceAllInFile(filepath: string, oldText: string, newText: string): Promise<string> {
+    if (!filepath.trim()) {
+      return JSON.stringify({ error: 'filepath is required.' });
+    }
+    if (!oldText) {
+      return JSON.stringify({ error: 'old_text is required.' });
+    }
+
+    const target = this.resolveWorkspaceUri(filepath);
+
+    try {
+      const bytes = await vscode.workspace.fs.readFile(target);
+      const original = Buffer.from(bytes).toString('utf8');
+      const occurrences = original.split(oldText).length - 1;
+
+      if (occurrences === 0) {
+        return JSON.stringify({ error: 'old_text not found in file. Make sure it matches exactly, including whitespace.' });
+      }
+
+      const updated = original.split(oldText).join(newText);
+      await vscode.workspace.fs.writeFile(target, Buffer.from(updated, 'utf8'));
+
+      return JSON.stringify({
+        path: target.fsPath,
+        replacements: occurrences,
+        bytesWritten: Buffer.byteLength(updated, 'utf8')
+      });
+    } catch (error) {
+      return JSON.stringify({
+        error: error instanceof Error ? error.message : 'Failed to replace text in file.'
+      });
+    }
+  }
+
   private async executeTerminalCommand(command: string): Promise<string> {
     const trimmed = command.trim();
 
@@ -1738,9 +1959,66 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     });
   }
 
+  private synchronizeActiveEditorContextMessage(): void {
+    this.removeActiveEditorContextMessages();
+
+    const activeEditor = vscode.window.activeTextEditor;
+    if (!activeEditor) {
+      return;
+    }
+
+    const { document } = activeEditor;
+    const uri = document.uri;
+    const isRealFile = uri.scheme === 'file';
+    const isUntitled = uri.scheme === 'untitled';
+
+    if (!isRealFile && !isUntitled) {
+      return;
+    }
+
+    if (isRealFile && this.attachedFiles.has(uri.fsPath)) {
+      return;
+    }
+
+    const filePath = isRealFile
+      ? uri.fsPath
+      : (vscode.workspace.workspaceFolders?.[0]?.uri.fsPath
+        ? path.join(vscode.workspace.workspaceFolders[0].uri.fsPath, path.basename(document.fileName || 'untitled'))
+        : (document.fileName || 'untitled'));
+
+    const fileName = path.basename(document.fileName || filePath || 'untitled');
+    const content = document.getText();
+
+    if (!content.trim()) {
+      return;
+    }
+
+    this.messages.push({
+      role: 'user',
+      content: [
+        'The user currently has the following file open in the active editor. Use it as current working context.',
+        'This content reflects the current editor state and may include unsaved changes.',
+        '',
+        `[Active File: ${fileName} | Path: ${filePath}]`,
+        content,
+        '[/Active File]'
+      ].join('\n'),
+      hiddenFromTranscript: true,
+      activeEditorContext: true
+    });
+  }
+
   private removeAttachmentContextMessages(): void {
     for (let index = this.messages.length - 1; index >= 0; index -= 1) {
       if (this.messages[index].attachmentContext) {
+        this.messages.splice(index, 1);
+      }
+    }
+  }
+
+  private removeActiveEditorContextMessages(): void {
+    for (let index = this.messages.length - 1; index >= 0; index -= 1) {
+      if (this.messages[index].activeEditorContext) {
         this.messages.splice(index, 1);
       }
     }
@@ -1845,6 +2123,41 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     return fsPath;
   }
 
+  private getActiveFileState(): WebviewActiveFileState | undefined {
+    const activeEditor = vscode.window.activeTextEditor;
+    if (!activeEditor) {
+      return undefined;
+    }
+
+    const { document } = activeEditor;
+    const uri = document.uri;
+    const isRealFile = uri.scheme === 'file';
+    const isUntitled = uri.scheme === 'untitled';
+
+    if (!isRealFile && !isUntitled) {
+      return undefined;
+    }
+
+    if (isRealFile && this.attachedFiles.has(uri.fsPath)) {
+      return undefined;
+    }
+
+    const displayPath = isRealFile
+      ? this.getDisplayPath({
+          uri,
+          name: path.basename(uri.fsPath),
+          content: '',
+          languageId: document.languageId
+        })
+      : (document.fileName || 'untitled');
+
+    return {
+      path: isRealFile ? uri.fsPath : (document.fileName || 'untitled'),
+      name: path.basename(document.fileName || displayPath || 'untitled'),
+      displayPath
+    };
+  }
+
   private getWebviewHtml(webview: vscode.Webview): string {
     const htmlUri = vscode.Uri.joinPath(this.extensionContext.extensionUri, 'media', 'webview.html');
     const htmlBytes = fs.readFileSync(htmlUri.fsPath);
@@ -1879,6 +2192,8 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       availableModels: this.availableModels,
       agentMode: this.agentMode,
       autoApprove: this.autoApprove,
+      pendingApproval: this.pendingApproval,
+      activeFile: this.getActiveFileState(),
       attachments: Array.from(this.attachedFiles.values()).map(file => ({
         path: file.uri.fsPath,
         displayPath: this.getDisplayPath(file),

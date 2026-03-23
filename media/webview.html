@@ -540,6 +540,78 @@
       box-shadow: var(--shadow-soft);
     }
 
+    .approval-card {
+      display: grid;
+      gap: 10px;
+      padding: 12px;
+      border-radius: 14px;
+      border: 1px solid color-mix(in srgb, var(--accent) 34%, var(--border-muted));
+      background:
+        linear-gradient(135deg, color-mix(in srgb, var(--accent) 12%, transparent), transparent 42%),
+        color-mix(in srgb, var(--panel-soft) 92%, transparent);
+      box-shadow: var(--shadow-soft);
+    }
+
+    .approval-title {
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--accent);
+    }
+
+    .approval-message {
+      font-size: 12px;
+      line-height: 1.5;
+      color: var(--text);
+    }
+
+    .approval-details {
+      font-size: 10px;
+      line-height: 1.4;
+      color: var(--muted);
+      white-space: pre-wrap;
+      word-break: break-word;
+      max-height: 88px;
+      overflow-y: auto;
+      padding: 8px 9px;
+      border-radius: 10px;
+      border: 1px solid var(--border-muted);
+      background: color-mix(in srgb, var(--panel-strong) 88%, transparent);
+    }
+
+    .approval-actions {
+      display: flex;
+      gap: 8px;
+      justify-content: flex-end;
+      flex-wrap: wrap;
+    }
+
+    .approval-button {
+      border-radius: 10px;
+      border: 1px solid var(--border-muted);
+      padding: 8px 12px;
+      font: inherit;
+      cursor: pointer;
+      transition: transform 140ms ease, border-color 140ms ease, background 140ms ease, opacity 140ms ease;
+    }
+
+    .approval-button:hover:not([disabled]) {
+      transform: translateY(-1px);
+    }
+
+    .approval-button.approve {
+      border-color: transparent;
+      background: linear-gradient(180deg, color-mix(in srgb, var(--accent-strong) 86%, white 14%), var(--accent-strong));
+      color: var(--vscode-button-foreground);
+    }
+
+    .approval-button.decline {
+      background: color-mix(in srgb, var(--vscode-errorForeground, #f44) 9%, var(--panel-strong));
+      color: color-mix(in srgb, var(--vscode-errorForeground, #f44) 88%, var(--text) 12%);
+      border-color: color-mix(in srgb, var(--vscode-errorForeground, #f44) 28%, var(--border-muted));
+    }
+
     .thinking-card .label {
       font-size: 11px;
       color: var(--text);
@@ -587,6 +659,10 @@
       letter-spacing: 0.08em;
       text-transform: uppercase;
       color: var(--accent);
+    }
+
+    .chip.active::before {
+      content: 'active';
     }
 
     .chip span {
@@ -1009,6 +1085,8 @@
     let dragDepth = 0;
     let agentMode = true;
     let autoApprove = false;
+    let activeFile = null;
+    let pendingApproval = null;
     const seenMessageKeys = new Set();
 
     function roleLabel(role) {
@@ -1041,7 +1119,8 @@
     }
 
     function updateHeaderState() {
-      const attachmentCount = attachments.length + attachedFiles.length;
+      const activeAttachmentCount = activeFile ? 1 : 0;
+      const attachmentCount = attachments.length + attachedFiles.length + activeAttachmentCount;
       const messageCount = messages.filter(message => message.role !== 'status').length;
       historyCountEl.textContent = String(attachmentCount + messageCount);
       historyStateEl.innerHTML = busy
@@ -1091,9 +1170,65 @@
         historyEl.appendChild(thinking);
       }
 
+      if (pendingApproval) {
+        const approval = document.createElement('div');
+        approval.className = 'approval-card';
+
+        const title = document.createElement('div');
+        title.className = 'approval-title';
+        title.textContent = pendingApproval.title;
+
+        const message = document.createElement('div');
+        message.className = 'approval-message';
+        message.textContent = pendingApproval.message;
+
+        approval.append(title, message);
+
+        if (pendingApproval.details) {
+          const details = document.createElement('div');
+          details.className = 'approval-details';
+          details.textContent = pendingApproval.details;
+          approval.appendChild(details);
+        }
+
+        const actions = document.createElement('div');
+        actions.className = 'approval-actions';
+
+        const declineButton = document.createElement('button');
+        declineButton.type = 'button';
+        declineButton.className = 'approval-button decline';
+        declineButton.textContent = pendingApproval.declineLabel || 'Decline';
+        declineButton.addEventListener('click', () => {
+          vscode.postMessage({ command: 'declinePendingAction' });
+        });
+
+        const approveButton = document.createElement('button');
+        approveButton.type = 'button';
+        approveButton.className = 'approval-button approve';
+        approveButton.textContent = pendingApproval.approveLabel || 'Approve';
+        approveButton.addEventListener('click', () => {
+          vscode.postMessage({ command: 'approvePendingAction' });
+        });
+
+        actions.append(declineButton, approveButton);
+        approval.appendChild(actions);
+        historyEl.appendChild(approval);
+      }
+
       chipsEl.innerHTML = '';
-      const hasChips = attachments.length > 0 || attachedFiles.length > 0;
+      const hasChips = attachments.length > 0 || attachedFiles.length > 0 || Boolean(activeFile);
       chipsEl.style.display = hasChips ? 'flex' : 'none';
+      if (activeFile) {
+        const chip = document.createElement('div');
+        chip.className = 'chip active';
+        chip.title = activeFile.displayPath || activeFile.name;
+
+        const label = document.createElement('span');
+        label.textContent = activeFile.name;
+
+        chip.append(label);
+        chipsEl.appendChild(chip);
+      }
       for (const attachment of attachments) {
         const chip = document.createElement('div');
         chip.className = 'chip';
@@ -1390,6 +1525,8 @@
         currentModel = payload.currentModel || '';
         agentMode = payload.agentMode !== undefined ? payload.agentMode : agentMode;
         autoApprove = payload.autoApprove !== undefined ? payload.autoApprove : autoApprove;
+        pendingApproval = payload.pendingApproval || null;
+        activeFile = payload.activeFile || null;
         render();
         return;
       }

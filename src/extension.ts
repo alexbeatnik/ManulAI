@@ -136,6 +136,18 @@ export function activate(context: vscode.ExtensionContext): void {
     })
   );
 
+  context.subscriptions.push(
+    vscode.window.onDidChangeActiveTextEditor(() => {
+      provider.handleActiveEditorChange();
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.workspace.onDidSaveTextDocument(() => {
+      provider.handleActiveEditorChange();
+    })
+  );
+
   void openChat();
 }
 
