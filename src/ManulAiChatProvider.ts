@@ -400,10 +400,6 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
 
     this.messages.push({ role: 'user', content: text });
 
-    if (!this.agentMode && this.looksLikeFileMutationRequest(text)) {
-      await this.setAgentMode(true);
-    }
-
     if (this.agentMode) {
       const directSummary = await this.tryHandleDirectLicenseAuthorRename(text);
       if (directSummary) {
@@ -552,6 +548,16 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     }
 
     let finalContent = assistantMessage.content ?? '';
+
+    if (!this.agentMode) {
+      // Chat mode: display the model response as-is, no file-write fallback processing.
+      finalContent = this.truncateLargeCodeBlocks(finalContent);
+      if (!finalContent.trim()) {
+        finalContent = 'The model returned an empty response. Try rephrasing your question.';
+      }
+      messages.push({ role: 'assistant', content: finalContent });
+      return;
+    }
 
     {
       // --- Fallback layer 1: detect [Begin of FILE]...[End of FILE] markers ---
@@ -1518,10 +1524,12 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       requestMessages.push({
         role: 'system',
         content:
-          'You are ManulAI in chat-only mode. No tools are available in this mode. ' +
-          'You cannot read files, modify files, or run commands. ' +
-          'Never claim that you updated, created, deleted, or saved a file. ' +
-          'If the user asks for changes, provide a proposed patch or instructions only, and clearly say that no files were changed.',
+          'You are ManulAI in chat-only mode. No tools are available.\n' +
+          'You cannot read, modify, or create files.\n' +
+          'Never claim you changed a file.\n' +
+          'When the user asks for a change, show the EXACT old line(s) and the EXACT new line(s) they should replace.\n' +
+          'Format:\n  Old: `<exact old text>`\n  New: `<exact new text>`\n' +
+          'Keep it short. No full file dumps.',
         hiddenFromTranscript: true
       });
     }
@@ -1550,14 +1558,22 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     const abortController = new AbortController();
     this.currentRequestAbortController = abortController;
 
-    const response = await fetch(`${baseUrl}/api/chat`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify(body),
-      signal: abortController.signal
-    });
+    // Abort after 120 seconds to prevent silent hangs
+    const timeoutId = setTimeout(() => abortController.abort(), 120_000);
+
+    let response: Response;
+    try {
+      response = await fetch(`${baseUrl}/api/chat`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify(body),
+        signal: abortController.signal
+      });
+    } finally {
+      clearTimeout(timeoutId);
+    }
 
     if (!response.ok) {
       const errorText = await response.text();
