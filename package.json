@@ -3,7 +3,7 @@
   "displayName": "ManulAI Local Agent",
   "description": "Privacy-first local AI coding agent for VS Code powered entirely by Ollama.",
   "version": "0.0.1",
-  "publisher": "manulai",
+  "publisher": "manul-engine",
   "icon": "icon.png",
   "license": "Apache-2.0",
   "repository": {
