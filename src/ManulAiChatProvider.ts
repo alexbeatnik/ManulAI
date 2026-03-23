@@ -681,10 +681,13 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           return;
         }
         const summary = await this.writeFileWithDiff(markerWrite.filepath, markerWrite.fileContent);
-        const remaining = finalContent.replace(markerWrite.fullMatch, '').trim();
-        finalContent = summary.summary + (remaining ? '\n\n' + this.truncateLongResponse(remaining) : '');
-        messages.push(this.createAssistantMessage(finalContent, summary.revertOperationId ? [summary.revertOperationId] : []));
-        return;
+        if (!summary.summary.startsWith('Blocked write to ')) {
+          const remaining = finalContent.replace(markerWrite.fullMatch, '').trim();
+          finalContent = summary.summary + (remaining ? '\n\n' + this.truncateLongResponse(remaining) : '');
+          messages.push(this.createAssistantMessage(finalContent, summary.revertOperationId ? [summary.revertOperationId] : []));
+          return;
+        }
+        // Blocked — fall through to nudge layer
       }
 
       // --- Fallback layer 2: detect code blocks with filepath hints ---
@@ -743,9 +746,12 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           return;
         }
         const summary = await this.writeFileWithDiff(unifiedDiffWrite.filepath, unifiedDiffWrite.fileContent);
-        const remaining = finalContent.replace(unifiedDiffWrite.fullMatch, '').trim();
-        messages.push(this.createAssistantMessage(summary.summary + (remaining ? '\n\n' + this.truncateLongResponse(remaining) : ''), summary.revertOperationId ? [summary.revertOperationId] : []));
-        return;
+        if (!summary.summary.startsWith('Blocked write to ')) {
+          const remaining = finalContent.replace(unifiedDiffWrite.fullMatch, '').trim();
+          messages.push(this.createAssistantMessage(summary.summary + (remaining ? '\n\n' + this.truncateLongResponse(remaining) : ''), summary.revertOperationId ? [summary.revertOperationId] : []));
+          return;
+        }
+        // Blocked — fall through to nudge layer
       }
 
       // --- Fallback layer 3: apply [FILE:] blocks ---
@@ -759,6 +765,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         }
         const appliedSummaries: string[] = [];
         const revertOperationIds: string[] = [];
+        let allBlocked3 = true;
         let remaining = finalContent;
         for (const block of inlineFileBlocks) {
           const summary = await this.writeFileWithDiff(block.filepath, block.fileContent);
@@ -766,12 +773,18 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           if (summary.revertOperationId) {
             revertOperationIds.push(summary.revertOperationId);
           }
+          if (!summary.summary.startsWith('Blocked write to ')) {
+            allBlocked3 = false;
+          }
           remaining = remaining.replace(block.fullMatch, '');
         }
-        remaining = remaining.trim();
-        finalContent = appliedSummaries.join('\n\n') + (remaining ? '\n\n' + this.truncateLongResponse(remaining) : '');
-        messages.push(this.createAssistantMessage(finalContent, revertOperationIds));
-        return;
+        if (!allBlocked3) {
+          remaining = remaining.trim();
+          finalContent = appliedSummaries.join('\n\n') + (remaining ? '\n\n' + this.truncateLongResponse(remaining) : '');
+          messages.push(this.createAssistantMessage(finalContent, revertOperationIds));
+          return;
+        }
+        // All blocked — fall through to nudge layer
       }
 
       // --- Fallback layer 4: detect described replacements (old → new code blocks) ---
@@ -852,9 +865,12 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           return;
         }
         const summary = await this.writeFileWithDiff(describedFileDump.filepath, describedFileDump.fileContent);
-        const remaining = finalContent.replace(describedFileDump.fullMatch, '').trim();
-        messages.push(this.createAssistantMessage(summary.summary + (remaining ? '\n\n' + this.truncateLongResponse(remaining) : ''), summary.revertOperationId ? [summary.revertOperationId] : []));
-        return;
+        if (!summary.summary.startsWith('Blocked write to ')) {
+          const remaining = finalContent.replace(describedFileDump.fullMatch, '').trim();
+          messages.push(this.createAssistantMessage(summary.summary + (remaining ? '\n\n' + this.truncateLongResponse(remaining) : ''), summary.revertOperationId ? [summary.revertOperationId] : []));
+          return;
+        }
+        // Blocked — fall through to nudge layer
       }
 
       // --- Fallback layer 4c: detect new file creation from code block + filename mention ---
@@ -866,9 +882,12 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           return;
         }
         const summary = await this.writeFileWithDiff(newFileWrite.filepath, newFileWrite.fileContent);
-        const remaining = finalContent.replace(newFileWrite.fullMatch, '').trim();
-        messages.push(this.createAssistantMessage(summary.summary + (remaining ? '\n\n' + this.truncateLongResponse(remaining) : ''), summary.revertOperationId ? [summary.revertOperationId] : []));
-        return;
+        if (!summary.summary.startsWith('Blocked write to ')) {
+          const remaining = finalContent.replace(newFileWrite.fullMatch, '').trim();
+          messages.push(this.createAssistantMessage(summary.summary + (remaining ? '\n\n' + this.truncateLongResponse(remaining) : ''), summary.revertOperationId ? [summary.revertOperationId] : []));
+          return;
+        }
+        // Blocked — fall through to nudge layer
       }
 
       // --- Fallback layer 4: apply legacy [FILE:] blocks ---
@@ -883,8 +902,11 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           return;
         }
         const summary = await this.writeFileWithDiff(matchedFile.filepath, matchedFile.fileContent);
-        messages.push(this.createAssistantMessage(summary.summary, summary.revertOperationId ? [summary.revertOperationId] : []));
-        return;
+        if (!summary.summary.startsWith('Blocked write to ')) {
+          messages.push(this.createAssistantMessage(summary.summary, summary.revertOperationId ? [summary.revertOperationId] : []));
+          return;
+        }
+        // Blocked — fall through to nudge layer
       }
 
       const matchedActiveFile = this.matchResponseToActiveFile(finalContent);
@@ -895,8 +917,11 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           return;
         }
         const summary = await this.writeFileWithDiff(matchedActiveFile.filepath, matchedActiveFile.fileContent);
-        messages.push(this.createAssistantMessage(summary.summary, summary.revertOperationId ? [summary.revertOperationId] : []));
-        return;
+        if (!summary.summary.startsWith('Blocked write to ')) {
+          messages.push(this.createAssistantMessage(summary.summary, summary.revertOperationId ? [summary.revertOperationId] : []));
+          return;
+        }
+        // Blocked — fall through to nudge layer
       }
 
       // Universal fallback: match against all workspace files
@@ -975,12 +1000,15 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         const stepMatch = finalContent.match(/step\s+(\d+)\s*[\/of]+\s*(\d+)/i);
         const hasIncompletePlan = stepMatch && parseInt(stepMatch[1], 10) < parseInt(stepMatch[2], 10);
 
-        const shouldNudge = !hasRecentToolResults && (isLongDump || hasLargeCodeBlocks || claimsDone || mentionsChange || isLazyAcknowledgment || hasIncompletePlan || isPassingToUser) && retryCount < 2;
+        const shouldNudge = (
+          isPassingToUser ||
+          (!hasRecentToolResults && (isLongDump || hasLargeCodeBlocks || claimsDone || mentionsChange || isLazyAcknowledgment || hasIncompletePlan))
+        ) && retryCount < 2;
 
         if (shouldNudge) {
           this.debugLog('nudge', { retryCount, isLongDump, hasLargeCodeBlocks, claimsDone, mentionsChange, isLazyAcknowledgment, hasIncompletePlan: !!hasIncompletePlan, isPassingToUser, contentPreview: finalContent.substring(0, 200) });
           // Show plan/progress text to the user before nudging
-          if (hasIncompletePlan || claimsDone || mentionsChange) {
+          if (hasIncompletePlan || claimsDone || mentionsChange || isPassingToUser) {
             const planText = finalContent.trim();
             if (planText) {
               messages.push({ role: 'assistant', content: planText });
