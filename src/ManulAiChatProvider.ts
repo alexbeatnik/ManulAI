@@ -539,11 +539,13 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       this.postStateToWebview();
     } catch (error) {
       if (this.isAbortError(error)) {
-        this.postStatus('Request stopped.');
+        this.messages.push({ role: 'assistant', content: 'Request was stopped.' });
+        this.postStateToWebview();
         return;
       }
       const message = error instanceof Error ? error.message : 'Unknown error';
-      this.postStatus(`Request failed: ${message}`);
+      this.messages.push({ role: 'assistant', content: `Request failed: ${message}` });
+      this.postStateToWebview();
     } finally {
       this.currentRequestAbortController = undefined;
       this.stopRequested = false;
@@ -787,6 +789,20 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         }
         const summary = await this.writeFileWithDiff(describedFileDump.filepath, describedFileDump.fileContent);
         const remaining = finalContent.replace(describedFileDump.fullMatch, '').trim();
+        messages.push(this.createAssistantMessage(summary.summary + (remaining ? '\n\n' + this.truncateLongResponse(remaining) : ''), summary.revertOperationId ? [summary.revertOperationId] : []));
+        return;
+      }
+
+      // --- Fallback layer 4c: detect new file creation from code block + filename mention ---
+      const newFileWrite = this.extractNewFileCreation(finalContent);
+      if (newFileWrite) {
+        const writeApproved = await this.approveFileWrite([newFileWrite.filepath]);
+        if (!writeApproved) {
+          messages.push({ role: 'assistant', content: `[File write denied by user: ${newFileWrite.filepath}]` });
+          return;
+        }
+        const summary = await this.writeFileWithDiff(newFileWrite.filepath, newFileWrite.fileContent);
+        const remaining = finalContent.replace(newFileWrite.fullMatch, '').trim();
         messages.push(this.createAssistantMessage(summary.summary + (remaining ? '\n\n' + this.truncateLongResponse(remaining) : ''), summary.revertOperationId ? [summary.revertOperationId] : []));
         return;
       }
@@ -1562,6 +1578,64 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     return undefined;
   }
 
+  private extractNewFileCreation(content: string): { fullMatch: string; filepath: string; fileContent: string } | undefined {
+    // Detect patterns where the model mentions creating/writing a file and provides a code block
+    // e.g. "Here's `1.py`:\n```python\nprint('hello')\n```"
+    // e.g. "Створюю файл 1.py:\n```python\nprint('hello')\n```"
+    const fencedBlocks = Array.from(content.matchAll(/(```(?:[\w.+-]*)\n[\s\S]*?```)/g));
+    if (fencedBlocks.length === 0) {
+      return undefined;
+    }
+
+    // Look for a filename mentioned near a code block
+    const filenamePattern = /[`"']?([a-zA-Z0-9_\-]+\.[a-zA-Z0-9]+)[`"']?/g;
+    const codeBlock = fencedBlocks[0];
+    const blockStart = codeBlock.index ?? 0;
+    const textBeforeBlock = content.substring(Math.max(0, blockStart - 300), blockStart);
+
+    let bestFilename: string | undefined;
+    let fnMatch: RegExpExecArray | null;
+    while ((fnMatch = filenamePattern.exec(textBeforeBlock)) !== null) {
+      const candidate = fnMatch[1];
+      if (this.isLikelyFileReference(candidate)) {
+        bestFilename = candidate;
+      }
+    }
+
+    if (!bestFilename) {
+      // Also check for filename in the text after the code block
+      const textAfterBlock = content.substring(blockStart + codeBlock[0].length, blockStart + codeBlock[0].length + 200);
+      filenamePattern.lastIndex = 0;
+      while ((fnMatch = filenamePattern.exec(textAfterBlock)) !== null) {
+        const candidate = fnMatch[1];
+        if (this.isLikelyFileReference(candidate)) {
+          bestFilename = candidate;
+          break;
+        }
+      }
+    }
+
+    if (!bestFilename) {
+      return undefined;
+    }
+
+    const blockContent = codeBlock[0].replace(/^```[\w.+-]*\n/, '').replace(/\n?```$/, '');
+    if (!blockContent.trim()) {
+      return undefined;
+    }
+
+    // Resolve to workspace path
+    const workspaceFolders = vscode.workspace.workspaceFolders;
+    const wsRoot = workspaceFolders?.[0]?.uri.fsPath;
+    const filepath = wsRoot ? path.join(wsRoot, bestFilename) : bestFilename;
+
+    return {
+      fullMatch: codeBlock[0],
+      filepath,
+      fileContent: blockContent
+    };
+  }
+
   private async callOllama(messages: OllamaMessage[]): Promise<OllamaResponse> {
     const config = vscode.workspace.getConfiguration('manulai');
     const baseUrl = String(config.get('ollamaBaseUrl', 'http://localhost:11434')).replace(/\/$/, '');
@@ -1626,22 +1700,14 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     const abortController = new AbortController();
     this.currentRequestAbortController = abortController;
 
-    // Abort after 120 seconds to prevent silent hangs
-    const timeoutId = setTimeout(() => abortController.abort(), 120_000);
-
-    let response: Response;
-    try {
-      response = await fetch(`${baseUrl}/api/chat`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify(body),
-        signal: abortController.signal
-      });
-    } finally {
-      clearTimeout(timeoutId);
-    }
+    const response = await fetch(`${baseUrl}/api/chat`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(body),
+      signal: abortController.signal
+    });
 
     if (!response.ok) {
       const errorText = await response.text();
@@ -1970,7 +2036,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     }
 
     // Match: mentioning a filename in the text directly preceding the code block.
-    const precedingNamePattern = /(?:in|to|file|updated?|modified)\s+[`"']?([a-zA-Z0-9_\-\.\/]+)[`"']?[^`]{0,80}```(\w*)\n([\s\S]*?)```/gi;
+    const precedingNamePattern = /(?:in|to|for|file|called|named|updated?|modified|created?|створ\w*|файл)\s+[`"']?([a-zA-Z0-9_\-\.\/]+)[`"']?[^`]{0,80}```(\w*)\n([\s\S]*?)```/gi;
     while ((match = precedingNamePattern.exec(content)) !== null) {
       const filepath = match[1].trim();
       const lang = (match[2] || '').toLowerCase();
