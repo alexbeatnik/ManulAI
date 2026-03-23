@@ -153,6 +153,13 @@
       align-items: center;
     }
 
+    .context-actions {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      min-width: 0;
+    }
+
     .drop-inline {
       display: flex;
       align-items: center;
@@ -192,6 +199,12 @@
       gap: 7px;
       align-items: center;
       min-width: 0;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+    }
+
+    .controls > * {
+      min-width: 0;
     }
 
     .model-select,
@@ -205,6 +218,7 @@
     .model-select {
       min-width: 0;
       width: 100%;
+      flex: 1 1 180px;
       border: 1px solid var(--border-muted);
       background: color-mix(in srgb, var(--panel-strong) 88%, transparent);
       color: var(--text);
@@ -228,6 +242,7 @@
       padding: 8px 11px;
       cursor: pointer;
       flex-shrink: 0;
+      white-space: nowrap;
     }
 
     .ghost-button:hover:not([disabled]),
@@ -1077,6 +1092,69 @@
 
     .toggle-switch input:checked ~ .toggle-label {
       color: var(--accent);
+    }
+
+    @media (max-width: 720px) {
+      .topbar {
+        grid-template-columns: 1fr;
+        align-items: stretch;
+      }
+
+      .controls {
+        justify-content: flex-start;
+      }
+    }
+
+    @media (max-width: 520px) {
+      .header-row {
+        flex-wrap: wrap;
+      }
+
+      .status-pill {
+        max-width: 100%;
+      }
+
+      .controls {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        align-items: stretch;
+      }
+
+      .controls .context-actions,
+      .controls .model-select {
+        grid-column: 1 / -1;
+      }
+
+      .controls .context-actions,
+      .controls .ghost-button,
+      .controls .toggle-switch,
+      .controls .model-select {
+        width: 100%;
+      }
+
+      .controls .context-actions .ghost-button,
+      .controls .ghost-button {
+        justify-content: center;
+      }
+
+      .toggle-switch {
+        min-width: 0;
+        justify-content: flex-start;
+      }
+
+      .toggle-label {
+        white-space: normal;
+      }
+
+      .composer-actions {
+        flex-direction: column;
+        align-items: stretch;
+      }
+
+      .composer-buttons {
+        width: 100%;
+        justify-content: flex-end;
+      }
     }
   </style>
 </head>
