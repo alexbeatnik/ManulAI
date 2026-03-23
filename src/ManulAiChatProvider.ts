@@ -500,6 +500,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
             return;
           }
           const appliedSummaries: string[] = [];
+          let hadSuccessfulReplacement = false;
           for (const rep of describedReplacements) {
             let result = await this.replaceInFile(targetFile, rep.oldText, rep.newText);
             let parsed = JSON.parse(result) as Record<string, unknown>;
@@ -508,9 +509,18 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
               parsed = JSON.parse(result) as Record<string, unknown>;
             }
             if (parsed.error) {
+              if (hadSuccessfulReplacement && typeof parsed.error === 'string' && /old_text not found/i.test(parsed.error)) {
+                const currentBytes = await vscode.workspace.fs.readFile(vscode.Uri.file(targetFile));
+                const currentContent = Buffer.from(currentBytes).toString('utf8');
+                if (currentContent.includes(rep.newText) && !currentContent.includes(rep.oldText)) {
+                  appliedSummaries.push(`Skipped overlapping replacement in ${path.basename(targetFile)}.`);
+                  continue;
+                }
+              }
               appliedSummaries.push(`Replace failed in ${path.basename(targetFile)}: ${String(parsed.error)}`);
             } else {
               const replacements = Number(parsed.replacements ?? 1);
+              hadSuccessfulReplacement = true;
               appliedSummaries.push(`Replaced ${replacements} occurrence(s) in ${path.basename(targetFile)}.`);
             }
           }
@@ -919,7 +929,21 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       }
     }
 
-    return replacements;
+    return this.normalizeDescribedReplacements(replacements);
+  }
+
+  private normalizeDescribedReplacements(
+    replacements: Array<{ oldText: string; newText: string }>
+  ): Array<{ oldText: string; newText: string }> {
+    const unique = new Map<string, { oldText: string; newText: string }>();
+    for (const replacement of replacements) {
+      const key = `${replacement.oldText}\u0000${replacement.newText}`;
+      if (!unique.has(key)) {
+        unique.set(key, replacement);
+      }
+    }
+
+    return Array.from(unique.values()).sort((left, right) => right.oldText.length - left.oldText.length);
   }
 
   private findAttachedFileForReplacements(replacements: Array<{ oldText: string }>): string | undefined {
