@@ -911,11 +911,13 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         const hasLargeCodeBlocks = /```[\w]*\n[\s\S]{100,}?```/.test(finalContent);
         const claimsDone = /(?:зробив|замінив|оновив|готово|i've made|i have made|i have updated|summary of the changes)/i.test(finalContent);
         const mentionsChange = /(?:змін|зроби|оновл|replac|chang|updat|modif)/i.test(finalContent);
-        const isLazyAcknowledgment = /^(?:understood|sure|ok|okay|got it|i will|let me know|i can help|i'll make sure)\b/i.test(finalContent.trim())
-          && finalContent.trim().length < 300;
-        // Detect model asking user to do things manually instead of using tools
-        const isPassingToUser = /(?:please (?:execute|run|proceed|specify|provide|let me know|make sure|save)|you (?:may|can|should|need to) (?:run|execute|save))/i.test(finalContent)
+        const isLazyAcknowledgment = (/^(?:understood|sure|ok|okay|got it|i will|let me know|i can help|i'll make sure)\b/i.test(finalContent.trim())
+          || /no (?:immediate|obvious) (?:file changes|issues|errors|problems)/i.test(finalContent)
+          || /further debugging (?:would be|is) needed/i.test(finalContent))
           && finalContent.trim().length < 500;
+        // Detect model asking user to do things manually instead of using tools
+        const isPassingToUser = (/(?:please (?:execute|run|proceed|specify|provide|let me know|make sure|save)|you (?:may|can|should|need to) (?:run|execute|save|choose|pick)|choose one of the (?:options|approaches)|if the .{0,30} persists)/i.test(finalContent))
+          && finalContent.trim().length < 800;
 
         // Detect incomplete plan execution: model mentions "Step N/M" but hasn't reached the final step
         const stepMatch = finalContent.match(/step\s+(\d+)\s*[\/of]+\s*(\d+)/i);
@@ -1198,6 +1200,13 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         }
       } catch {
         return 'Content is not valid JSON.';
+      }
+    }
+
+    // Block writing broken HTML files — must contain basic HTML structure
+    if (ext === 'html' || ext === 'htm') {
+      if (!/<html[\s>]/i.test(trimmed) || !/<head[\s>]/i.test(trimmed) || !/<body[\s>]/i.test(trimmed)) {
+        return 'Content is missing basic HTML structure (html/head/body tags). This looks like a partial snippet, not a complete file.';
       }
     }
 
@@ -1984,7 +1993,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
 
     // Catch-all: extract balanced JSON objects that look like tool calls from plain text.
     // Models like Llama/Qwen/Gemma often output raw JSON tool calls directly.
-    const toolNamePattern = /\{\s*"name"\s*:\s*"/g;
+    const toolNamePattern = /\{\s*["']name["']\s*:\s*["']/g;
     while ((match = toolNamePattern.exec(trimmed)) !== null) {
       const jsonStr = this.extractBalancedJson(trimmed, match.index);
       if (jsonStr) { candidates.push(jsonStr); }
@@ -1999,23 +2008,57 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           return calls;
         }
       } catch {
-        // Try next candidate
+        // JSON.parse failed — try repairing single-quoted JSON (common with weak models)
+        const repaired = this.repairSingleQuotedJson(candidate);
+        if (repaired) {
+          try {
+            const parsed = JSON.parse(repaired) as unknown;
+            const calls = this.normalizeParsedToolCalls(parsed);
+            if (calls.length > 0 && calls.every(c => knownToolNames.has(c.function.name))) {
+              return calls;
+            }
+          } catch {
+            // Give up on this candidate
+          }
+        }
       }
     }
 
     return [];
   }
 
+  /**
+   * Detect content that looks like a raw tool-call JSON definition
+   * (even with malformed quotes). Prevents fallback layers from writing
+   * tool-call JSON as file content.
+   */
+  private looksLikeToolCallContent(content: string): boolean {
+    const trimmed = content.trim();
+    if (!trimmed.startsWith('{')) { return false; }
+    const toolNames = this.getToolDefinitions().map(t => t.function.name);
+    for (const name of toolNames) {
+      // Match both double-quoted and single-quoted key/value patterns
+      if (/["']name["']/.test(trimmed) && trimmed.includes(name) && /["']arguments["']/.test(trimmed)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   /** Extract a balanced JSON object starting at `startIndex` in `text`. */
   private extractBalancedJson(text: string, startIndex: number): string | undefined {
     let depth = 0;
     let inString = false;
+    let stringChar = '';
     let escape = false;
     for (let i = startIndex; i < text.length; i++) {
       const ch = text[i];
       if (escape) { escape = false; continue; }
       if (ch === '\\' && inString) { escape = true; continue; }
-      if (ch === '"') { inString = !inString; continue; }
+      if ((ch === '"' || ch === "'") && (!inString || ch === stringChar)) {
+        if (inString) { inString = false; stringChar = ''; } else { inString = true; stringChar = ch; }
+        continue;
+      }
       if (inString) { continue; }
       if (ch === '{') { depth++; }
       else if (ch === '}') {
@@ -2026,6 +2069,46 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       }
     }
     return undefined;
+  }
+
+  /**
+   * Attempt to repair JSON that uses single quotes instead of double quotes.
+   * Handles cases like: {"name": "tool", "arguments": {"old_text": 'value with "quotes"'}}
+   */
+  private repairSingleQuotedJson(text: string): string | undefined {
+    // Replace single-quoted string values with double-quoted ones,
+    // escaping any inner double quotes.
+    let result = '';
+    let i = 0;
+    while (i < text.length) {
+      if (text[i] === "'") {
+        // Collect the single-quoted string
+        let value = '';
+        i++; // skip opening '
+        while (i < text.length && text[i] !== "'") {
+          if (text[i] === '\\' && i + 1 < text.length) {
+            value += text[i] + text[i + 1];
+            i += 2;
+          } else {
+            value += text[i];
+            i++;
+          }
+        }
+        i++; // skip closing '
+        // Escape inner double quotes and wrap in double quotes
+        result += '"' + value.replace(/"/g, '\\"') + '"';
+      } else {
+        result += text[i];
+        i++;
+      }
+    }
+    // Quick sanity check: is the result parseable?
+    try {
+      JSON.parse(result);
+      return result;
+    } catch {
+      return undefined;
+    }
   }
 
   private normalizeParsedToolCalls(rawValue: unknown): ToolFunctionCall[] {
@@ -2268,6 +2351,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       const filepath = match[2].trim();
       const fileContent = match[3];
       if (lang === 'diff' || lang === 'patch') { continue; }
+      if (this.looksLikeToolCallContent(fileContent)) { continue; }
       if (filepath && fileContent && !filepath.includes(' ') && this.isLikelyFileReference(filepath) && !this.looksLikeDiffOutput(fileContent)) {
         blocks.push({ fullMatch: match[0], filepath, fileContent });
       }
@@ -2280,6 +2364,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       const filepath = match[2].trim();
       const fileContent = match[3];
       if (lang === 'diff' || lang === 'patch') { continue; }
+      if (this.looksLikeToolCallContent(fileContent)) { continue; }
       if (filepath && fileContent && this.isLikelyFileReference(filepath) && !blocks.some(b => b.filepath === filepath) && !this.looksLikeDiffOutput(fileContent)) {
         blocks.push({ fullMatch: match[0], filepath, fileContent });
       }
@@ -2295,6 +2380,9 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         continue;
       }
       if (this.looksLikeDiffOutput(fileContent)) {
+        continue;
+      }
+      if (this.looksLikeToolCallContent(fileContent)) {
         continue;
       }
       if (this.isLikelyFileReference(filepath) && !filepath.includes(' ') && !blocks.some(b => b.filepath === filepath)) {
@@ -2592,6 +2680,11 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   }
 
   private async writeFileWithDiff(filepath: string, newContent: string): Promise<FileWriteSummary> {
+    // Last-resort guard: never write raw tool-call JSON as file content
+    if (this.looksLikeToolCallContent(newContent)) {
+      return { summary: `Blocked write to ${path.basename(filepath)}: content is a tool-call definition, not file content.` };
+    }
+
     const target = this.resolveWorkspaceUri(filepath);
     const displayName = path.basename(target.fsPath);
     let sanitizedContent = this.sanitizeGeneratedFileContent(newContent);
