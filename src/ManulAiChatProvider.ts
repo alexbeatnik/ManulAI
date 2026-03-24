@@ -1157,14 +1157,35 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         const recentMessages = lastUserIdx >= 0 ? messages.slice(lastUserIdx) : messages;
         const hasRecentToolResults = recentMessages.some(m => m.role === 'tool');
         const recentToolMessages = recentMessages.filter((m): m is OllamaMessage & { role: 'tool' } => m.role === 'tool');
-        const recentToolResults = recentToolMessages.map(message => {
+        const recentToolResults = recentToolMessages.map((message, index) => {
           try {
             const parsed = JSON.parse(message.content) as Record<string, unknown>;
-            return { message, parsed };
+            return { message, parsed, index };
           } catch {
-            return { message, parsed: {} as Record<string, unknown> };
+            return { message, parsed: {} as Record<string, unknown>, index };
           }
         });
+        const lastSuccessfulActionIndex = (() => {
+          for (let index = recentToolResults.length - 1; index >= 0; index -= 1) {
+            const { message, parsed } = recentToolResults[index];
+            if (parsed.error) {
+              continue;
+            }
+            if (message.tool_name === 'execute_terminal_command') {
+              if (Number(parsed.exitCode ?? 0) === 0) {
+                return index;
+              }
+              continue;
+            }
+            if (message.tool_name === 'create_or_edit_file'
+              || message.tool_name === 'write_to_file'
+              || message.tool_name === 'replace_in_file'
+              || message.tool_name === 'delete_file') {
+              return index;
+            }
+          }
+          return -1;
+        })();
         const hasRecentSuccessfulAction = recentToolResults.some(({ message, parsed }) => {
           if (parsed.error) {
             return false;
@@ -1178,6 +1199,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
             || message.tool_name === 'delete_file';
         });
         const recentToolErrors = recentToolResults
+          .filter(({ index }) => index > lastSuccessfulActionIndex)
           .map(({ message, parsed }) => ({ toolName: message.tool_name ?? '', error: typeof parsed.error === 'string' ? parsed.error : '' }))
           .filter(item => item.error);
         const hasRecentToolErrors = recentToolErrors.length > 0;
@@ -1237,7 +1259,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         ) && retryCount < 2;
 
         if (shouldNudge) {
-          this.debugLog('nudge', { retryCount, hasRecentToolResults, hasRecentSuccessfulAction, hasRecentToolErrors, hasRecentReplaceNotFound, isLongDump, hasLargeCodeBlocks, claimsDone, mentionsChange, isLazyAcknowledgment, hasIncompletePlan: !!hasIncompletePlan, hasExplicitNextSteps, claimedButUnexecutedCommand, isPassingToUser, isAnnouncedButNotExecuted, contentPreview: finalContent.substring(0, 200) });
+          this.debugLog('nudge', { retryCount, hasRecentToolResults, hasRecentSuccessfulAction, hasRecentToolErrors, hasRecentReplaceNotFound, lastSuccessfulActionIndex, isLongDump, hasLargeCodeBlocks, claimsDone, mentionsChange, isLazyAcknowledgment, hasIncompletePlan: !!hasIncompletePlan, hasExplicitNextSteps, claimedButUnexecutedCommand, isPassingToUser, isAnnouncedButNotExecuted, contentPreview: finalContent.substring(0, 200) });
           // Show plan/progress text to the user before nudging
           if (hasIncompletePlan || hasExplicitNextSteps || claimedButUnexecutedCommand || claimsDone || mentionsChange || isPassingToUser || isAnnouncedButNotExecuted) {
             const planText = finalContent.trim();
@@ -2284,6 +2306,8 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     let stripped = content;
     stripped = stripped.replace(/```(?:json|tool_call|tool)?\s*\n?[\s\S]*?```/g, '');
     stripped = stripped.replace(/<tool_call>\s*[\s\S]*?\s*<\/tool_call>/g, '');
+    stripped = stripped.replace(/<function=[^>]+>\s*[\s\S]*?<\/function>/g, '');
+    stripped = stripped.replace(/<\/?tool_call>/g, '');
     // Strip plain JSON tool call objects from the text
     const toolNamePattern = /\{\s*"(?:name|function_name)"\s*:\s*"/g;
     let match: RegExpExecArray | null;
@@ -2314,6 +2338,11 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       } catch {
         // Fall through to regex extraction
       }
+    }
+
+    const taggedCalls = this.parseTaggedToolCalls(trimmed);
+    if (taggedCalls.length > 0) {
+      return taggedCalls;
     }
 
     // Regex fallback: extract JSON from markdown code blocks, <tool_call> tags, or plain JSON objects.
@@ -2367,6 +2396,37 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     }
 
     return [];
+  }
+
+  private parseTaggedToolCalls(content: string): ToolFunctionCall[] {
+    const knownToolNames = new Set(this.getToolDefinitions().map(t => t.function.name));
+    const calls: ToolFunctionCall[] = [];
+    const functionPattern = /<function=([a-zA-Z0-9_]+)>\s*([\s\S]*?)<\/function>/g;
+    let match: RegExpExecArray | null;
+
+    while ((match = functionPattern.exec(content)) !== null) {
+      const toolName = this.remapWeakModelToolName(match[1].trim());
+      if (!knownToolNames.has(toolName)) {
+        continue;
+      }
+
+      const args: Record<string, unknown> = {};
+      const parameterPattern = /<parameter=([a-zA-Z0-9_]+)>\s*([\s\S]*?)\s*<\/parameter>/g;
+      let parameterMatch: RegExpExecArray | null;
+      while ((parameterMatch = parameterPattern.exec(match[2] ?? '')) !== null) {
+        args[parameterMatch[1].trim()] = parameterMatch[2];
+      }
+
+      calls.push({
+        type: 'function',
+        function: {
+          name: toolName,
+          arguments: this.remapWeakModelArgumentAliases(args)
+        }
+      });
+    }
+
+    return calls;
   }
 
   /**
@@ -2490,7 +2550,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     const normalizedArguments = this.normalizeParsedToolArguments(functionRecord?.arguments ?? directArguments);
 
     const parsedToolCall: ParsedToolCall = {
-      name: typeof functionRecord?.name === 'string' ? functionRecord.name.trim() : directName,
+      name: this.remapWeakModelToolName(typeof functionRecord?.name === 'string' ? functionRecord.name.trim() : directName),
       arguments: normalizedArguments
     };
 
@@ -2880,7 +2940,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   }
 
   private async executeToolCall(toolCall: ToolFunctionCall): Promise<string> {
-    const name = toolCall.function?.name ?? '';
+    const name = this.remapWeakModelToolName(toolCall.function?.name ?? '');
     const args = this.normalizeToolArguments(toolCall.function?.arguments);
 
     try {
@@ -2929,6 +2989,20 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     }
 
     return this.remapWeakModelArgumentAliases(rawArguments);
+  }
+
+  private remapWeakModelToolName(name: string): string {
+    const normalized = name.trim();
+    const aliases: Record<string, string> = {
+      write_file: 'write_to_file',
+      create_file: 'create_or_edit_file',
+      edit_file: 'replace_in_file',
+      replace_content: 'replace_in_file',
+      read_file: 'read_specific_file',
+      run_command: 'execute_terminal_command',
+      terminal_command: 'execute_terminal_command'
+    };
+    return aliases[normalized.toLowerCase()] ?? normalized;
   }
 
   private remapWeakModelArgumentAliases(args: Record<string, unknown>): Record<string, unknown> {
@@ -3465,7 +3539,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       exec(trimmed, { cwd, timeout: 60_000, maxBuffer: 1024 * 1024 }, (error, stdout, stderr) => {
         const exitCode = typeof (error as NodeJS.ErrnoException | null)?.code === 'number'
           ? (error as NodeJS.ErrnoException).code
-          : 0;
+          : (error ? 1 : 0);
 
         resolve(JSON.stringify({
           command: trimmed,
