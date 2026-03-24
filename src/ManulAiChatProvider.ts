@@ -1944,7 +1944,14 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           return !recentExecutedCommands.some(executed => executed.includes(command) || command.includes(executed));
         });
 
-        const maxNudgeRetries = hasRecentReplaceNotFound ? 3 : 2;
+        const hasReadButNoWriteOnLargeRefactor = isLargeRefactorRequest
+          && hasRecentReadOfLargeRefactorTarget
+          && !hasRecentMeaningfulWrite;
+        const maxNudgeRetries = hasRecentReplaceNotFound
+          ? 3
+          : hasReadButNoWriteOnLargeRefactor
+            ? 4
+            : 2;
         const requiresToolContinuation = (
           isPassingToUser
           || isAnnouncedButNotExecuted
@@ -1960,7 +1967,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         const shouldNudge = requiresToolContinuation && retryCount < maxNudgeRetries;
 
         if (shouldNudge) {
-          this.debugLog('nudge', { retryCount, hasRecentToolResults, hasRecentSuccessfulAction, hasRecentMeaningfulWrite, hasRecentReadOfLargeRefactorTarget, hasRecentToolErrors, hasRecentReplaceNotFound, replaceNotFoundFilepath, replaceNotFoundStartLine, replaceNotFoundEndLine, lastSuccessfulActionIndex, isLongDump, hasLargeCodeBlocks, claimsDone, mentionsChange, isLazyAcknowledgment, hasIncompletePlan: !!hasIncompletePlan, hasExplicitNextSteps, isProgressOnlyResponse, claimedButUnexecutedCommand, isPassingToUser, isAnnouncedButNotExecuted, isLargeRefactorRequest, contentPreview: finalContent.substring(0, 200) });
+          this.debugLog('nudge', { retryCount, hasRecentToolResults, hasRecentSuccessfulAction, hasRecentMeaningfulWrite, hasRecentReadOfLargeRefactorTarget, hasReadButNoWriteOnLargeRefactor, hasRecentToolErrors, hasRecentReplaceNotFound, replaceNotFoundFilepath, replaceNotFoundStartLine, replaceNotFoundEndLine, lastSuccessfulActionIndex, isLongDump, hasLargeCodeBlocks, claimsDone, mentionsChange, isLazyAcknowledgment, hasIncompletePlan: !!hasIncompletePlan, hasExplicitNextSteps, isProgressOnlyResponse, claimedButUnexecutedCommand, isPassingToUser, isAnnouncedButNotExecuted, isLargeRefactorRequest, contentPreview: finalContent.substring(0, 200) });
           // Show plan/progress text to the user before nudging
           if (!isProgressOnlyResponse && (hasIncompletePlan || hasExplicitNextSteps || claimedButUnexecutedCommand || claimsDone || mentionsChange || isPassingToUser || isAnnouncedButNotExecuted)) {
             const planText = finalContent.trim();
@@ -1977,7 +1984,10 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           });
           
           let nudgeMessage = '';
-          if (hasIncompletePlan) {
+          if (hasReadButNoWriteOnLargeRefactor) {
+            const primaryTarget = largeRefactorTargets[0] ?? 'the target file';
+            nudgeMessage = `This is a large refactor request for ${primaryTarget}. You already read part of the target file. Do NOT summarize it again, do NOT ask the user for a bounded section, and do NOT ask to read the full file without a tool call. Your next response must call a tool. Either: (1) call create_or_edit_file to extract one concrete bounded unit you already identified into a new module, then call replace_in_file on ${primaryTarget}; or (2) if you truly need more context, call read_file_slice on ${primaryTarget} with explicit startLine and endLine for the next bounded slice. Do one of those now.`;
+          } else if (hasIncompletePlan) {
             nudgeMessage = stepMatch
               ? `You are on step ${stepMatch[1]} of ${stepMatch[2]} but stopped. Continue executing your plan. Proceed to the next step now — use the provided tools.`
               : 'You reported that one step was completed and announced the next step, but you stopped before executing it. Continue now by calling the next tool instead of narrating the plan.';
@@ -2034,6 +2044,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
             hasRecentSuccessfulAction,
             hasRecentMeaningfulWrite,
             hasRecentReadOfLargeRefactorTarget,
+            hasReadButNoWriteOnLargeRefactor,
             hasRecentToolErrors,
             hasRecentReplaceNotFound,
             replaceNotFoundFilepath,
@@ -2046,7 +2057,9 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
             isProgressOnlyResponse,
             contentPreview: finalContent.substring(0, 200)
           });
-          finalContent = isLargeRefactorRequest
+          finalContent = hasReadButNoWriteOnLargeRefactor
+            ? 'The model read a bounded section of the target file but still failed to perform a concrete extraction or edit step. It kept summarizing instead of calling tools. Retry the request or use a stronger tool-calling model for iterative refactors.'
+            : isLargeRefactorRequest
             ? 'The model inspected the code but did not carry out the large refactor step-by-step. Retry the request or use a stronger tool-calling model. For large files, prefer bounded reads and iterative extraction instead of whole-file summaries.'
             : hasRecentReplaceNotFound
             ? `The model stopped after a failed replace_in_file attempt and did not recover.${replaceNotFoundFilepath ? ` The last blocked file was ${replaceNotFoundFilepath}.` : ''} It must re-read the exact current file content before trying the edit again.`
