@@ -3141,10 +3141,30 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       return undefined;
     }
 
+    const normalizedFilename = bestFilename.replace(/\\/g, '/');
+    const isBareFilename = !normalizedFilename.includes('/');
+    const latestVisibleUserRequest = this.getLatestVisibleUserRequest(this.messages);
+    const isLargeRefactorRequest = latestVisibleUserRequest ? this.looksLikeLargeRefactorRequest(latestVisibleUserRequest) : false;
+    const activeEditorPath = vscode.window.activeTextEditor?.document.uri.scheme === 'file'
+      ? vscode.window.activeTextEditor.document.uri.fsPath
+      : undefined;
+
+    if (isLargeRefactorRequest && isBareFilename && activeEditorPath) {
+      if (path.basename(activeEditorPath).toLowerCase() === normalizedFilename.toLowerCase()) {
+        return undefined;
+      }
+
+      return {
+        fullMatch: codeBlock[0],
+        filepath: path.join(path.dirname(activeEditorPath), normalizedFilename),
+        fileContent: blockContent
+      };
+    }
+
     // Resolve to workspace path
     const workspaceFolders = vscode.workspace.workspaceFolders;
     const wsRoot = workspaceFolders?.[0]?.uri.fsPath;
-    const filepath = wsRoot ? path.join(wsRoot, bestFilename) : bestFilename;
+    const filepath = wsRoot ? path.join(wsRoot, normalizedFilename) : normalizedFilename;
 
     return {
       fullMatch: codeBlock[0],
