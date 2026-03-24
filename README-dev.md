@@ -127,6 +127,7 @@ Direct pre-agent handlers also exist for common fast-path edits such as Markdown
 - Recent successful reads are tracked separately from successful fix actions so a model cannot satisfy the loop just by listing files.
 - Replace failures like `old_text not found` are treated as incomplete work and should trigger a read-then-retry path.
 - Responses that claim commands ran, claim fixes were completed, or end on partial plans without executing the work should be nudged back into the tool loop.
+- Raw or malformed tool-call JSON leaked into assistant text must be treated as a failed tool invocation and retried; fallback file-write extractors must never treat that payload as file content.
 - Direct fast paths remain conservative and are limited to narrow cases such as Markdown title rename and LICENSE author rename.
 
 ## Documentation Sync

@@ -104,6 +104,7 @@ The extension now pushes stricter file-editing rules into the agent prompt:
 - do not claim a file changed unless a real tool changed it
 - do not treat a failed replacement or failed terminal command as a completed fix
 - do not stop on partial plans like `Step 1/3` when more reading or fixing is still required
+- do not leak raw or malformed tool-call JSON into fallback file writes; those responses are retried as tool calls instead of being treated as file content
 
 This exists specifically to reduce destructive edits like replacing an entire README when the request was only to remove one line or one image block.
 
@@ -183,7 +184,7 @@ Default values:
 
 ## What's New
 
-- **0.0.2:** Auto-retry without tools when the model does not support tool calling (HTTP 400 fallback). Diff markers no longer leak into written files. Destructive writes to critical files like `package.json` are blocked (invalid JSON, shell commands as content, suspiciously short content). Code block extraction now rejects diff-formatted blocks. Project scan requests can attach a capped workspace snapshot. Tool results are visible in chat with terminal output and file previews. Multi-step actions can print progress while tools run. Edit requests can auto-discover likely files such as `README.md` when they are mentioned but not attached. Publisher ID updated to `manul-engine`.
+- **0.0.2:** Auto-retry without tools when the model does not support tool calling (HTTP 400 fallback). Diff markers no longer leak into written files. Destructive writes to critical files like `package.json` are blocked (invalid JSON, shell commands as content, suspiciously short content). Code block extraction now rejects diff-formatted blocks. Raw or malformed JSON tool-call payloads are now retried as tool executions instead of being mistaken for file content. Project scan requests can attach a capped workspace snapshot. Tool results are visible in chat with terminal output and file previews. Multi-step actions can print progress while tools run. Edit requests can auto-discover likely files such as `README.md` when they are mentioned but not attached. Publisher ID updated to `manul-engine`.
 - **0.0.1 (Alpha Release):** Initial public alpha with right-side chat UI, local Ollama integration, workspace file attachments, native tool-calling support, agent/chat mode separation, approval controls, directory listing and file deletion tools, and stricter prompt rules for safer file edits.
 
 ## License

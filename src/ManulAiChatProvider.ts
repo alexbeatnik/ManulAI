@@ -1045,6 +1045,25 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       return;
     }
 
+    const leakedToolCallNudgeCount = messages.filter(
+      message => message.role === 'user'
+        && typeof message.content === 'string'
+        && message.content.includes('Your last response printed a raw tool call')
+    ).length;
+
+    if (this.containsLeakedToolCallPayload(finalContent) && leakedToolCallNudgeCount < 2) {
+      this.debugLog('tool_call_leak_retry', { retryCount, contentPreview: finalContent.substring(0, 300) });
+      messages.push({ role: 'assistant', content: finalContent, hiddenFromTranscript: true });
+      messages.push({
+        role: 'user',
+        content: 'Your last response printed a raw tool call instead of executing it. Do NOT output JSON or fenced code blocks for tool calls. Call the appropriate tool now using the native tool-calling mechanism. If you need current file content first, call read_specific_file, then continue with replace_in_file or another tool.',
+        hiddenFromTranscript: true
+      });
+      this.postStatus('Raw tool call leaked into the response — nudging model to execute the tool...');
+      await this.processOllamaResponse(messages, retryCount);
+      return;
+    }
+
     {
       // --- Fallback layer 1: detect [Begin of FILE]...[End of FILE] markers ---
       const markerWrite = this.extractMarkerFileWrite(finalContent);
@@ -2770,18 +2789,24 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     if (!trimmed.startsWith('{')) { return false; }
 
     let parsed: unknown;
+    let parseFailed = false;
     try {
       parsed = JSON.parse(trimmed);
     } catch {
       const repaired = this.repairSingleQuotedJson(trimmed);
       if (!repaired) {
-        return false;
+        parseFailed = true;
+      } else {
+        try {
+          parsed = JSON.parse(repaired);
+        } catch {
+          parseFailed = true;
+        }
       }
-      try {
-        parsed = JSON.parse(repaired);
-      } catch {
-        return false;
-      }
+    }
+
+    if (parseFailed) {
+      return this.looksLikeMalformedToolCallContent(trimmed);
     }
 
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
@@ -2815,9 +2840,75 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
 
     const topLevelName = obj.name ?? obj.function_name;
     const topLevelArgs = obj.arguments ?? obj.parameters;
-    return typeof topLevelName === 'string'
+    const parsedMatch = typeof topLevelName === 'string'
       && toolNames.has(this.remapWeakModelToolName(topLevelName))
       && (typeof topLevelArgs === 'string' || (topLevelArgs !== null && typeof topLevelArgs === 'object'));
+
+    if (parsedMatch) {
+      return true;
+    }
+
+    return this.looksLikeMalformedToolCallContent(trimmed);
+  }
+
+  private looksLikeMalformedToolCallContent(content: string): boolean {
+    const trimmed = content.trim();
+    if (!trimmed.startsWith('{')) {
+      return false;
+    }
+
+    const hintedToolName = this.extractToolCallNameHint(trimmed);
+    if (!hintedToolName) {
+      return false;
+    }
+
+    if (!/["'](?:arguments|parameters)["']\s*:/.test(trimmed)) {
+      return false;
+    }
+
+    return /["'](?:filepath|filename|path|content|old_text|new_text|command|directory|text|model)["']\s*:/.test(trimmed);
+  }
+
+  private extractToolCallNameHint(content: string): string | undefined {
+    const toolNames = new Set(this.getToolDefinitions().map(t => t.function.name));
+    const directMatch = content.match(/["'](?:name|function_name|function)["']\s*:\s*["']([a-zA-Z0-9_:-]+)["']/);
+    const nestedMatch = content.match(/["']function["']\s*:\s*\{[\s\S]*?["']name["']\s*:\s*["']([a-zA-Z0-9_:-]+)["']/);
+    const candidate = nestedMatch?.[1] ?? directMatch?.[1];
+    if (!candidate) {
+      return undefined;
+    }
+
+    const normalized = this.remapWeakModelToolName(candidate.trim());
+    return toolNames.has(normalized) ? normalized : undefined;
+  }
+
+  private containsLeakedToolCallPayload(content: string): boolean {
+    const trimmed = content.trim();
+    if (!trimmed) {
+      return false;
+    }
+
+    if (this.looksLikeToolCallContent(trimmed)) {
+      return true;
+    }
+
+    const codeBlockPattern = /```(?:json|tool_call|tool)?\s*\n?([\s\S]*?)```/g;
+    let match: RegExpExecArray | null;
+    while ((match = codeBlockPattern.exec(trimmed)) !== null) {
+      if (this.looksLikeToolCallContent(match[1] ?? '')) {
+        return true;
+      }
+    }
+
+    const toolCallObjectPattern = /\{\s*["'](?:name|function_name|function)["']\s*:/g;
+    while ((match = toolCallObjectPattern.exec(trimmed)) !== null) {
+      const jsonStr = this.extractBalancedJson(trimmed, match.index);
+      if (jsonStr && this.looksLikeToolCallContent(jsonStr)) {
+        return true;
+      }
+    }
+
+    return false;
   }
 
   /** Extract a balanced JSON object starting at `startIndex` in `text`. */

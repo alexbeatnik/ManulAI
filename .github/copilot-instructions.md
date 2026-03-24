@@ -37,6 +37,7 @@ This repository contains a VS Code extension named ManulAI.
 - Tool results must be returned to Ollama using the native `tool` role flow.
 - Agent Mode should continue to support approvals, auto-approve, and fallback handling for weaker local models.
 - Keep direct handlers and fallback layers conservative: fast for common edits, but not destructive.
+- Fallback layers must reject raw or malformed tool-call JSON leaked into assistant text or code blocks and retry via native tool execution instead of treating that payload as file content.
 - Keep tool output visible in the chat transcript, including terminal stdout and stderr and previews for file writes.
 - Keep step-by-step progress messages visible in chat during multi-tool actions, but do not feed those local progress messages back into the next model request.
 - Keep folder snapshot context distinct from file context so directories are never treated as editable files.
