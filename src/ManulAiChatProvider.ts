@@ -1006,7 +1006,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       this.autoApprove = frontendAutoApprove;
     }
 
-    this.synchronizeActiveEditorContextMessage();
+    this.synchronizeActiveEditorContextMessage(text);
 
     if (this.agentMode && this.looksLikeProjectScanRequest(text)) {
       await this.attachWorkspaceAsContext();
@@ -1050,6 +1050,14 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
 
     this.synchronizeAttachmentContextMessage();
 
+    if (this.agentMode && this.looksLikeLargeRefactorRequest(text)) {
+      this.messages.push({
+        role: 'user',
+        content: 'This is a large refactor request. Do NOT try to rewrite or summarize the whole file in one pass. First inspect structure with list_workspace_files and read_file_slice for bounded sections when the file is large. Then create a short module/file split plan with 2-5 concrete steps and immediately execute only the first concrete step using tools. Continue iteratively one file or bounded slice at a time.',
+        hiddenFromTranscript: true
+      });
+    }
+
     if (this.agentMode) {
       const directSummary = await this.tryHandleDirectLicenseAuthorRename(text)
         || await this.tryHandleDirectTitleRename(text);
@@ -1083,6 +1091,21 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     }
 
     return /(?:\b(?:scan|inspect|read|analy[sz]e|understand|index|explore)\s+(?:the\s+|this\s+)?(?:project|workspace|repo|repository|codebase)\b|\b(?:scan|inspect|read|analy[sz]e|understand|index|explore)\s+(?:my\s+)?(?:repo|repository|codebase)\b|\b(?:scan repo|read repo|inspect repo|remember (?:this |the )?(?:project|repo|repository|workspace|codebase)|remember project|remember repo)\b|(?:^|\s)(?:проскануй|скануй|просканировать|просканируй|сканируй|проаналізуй|аналізуй|проанализируй|анализируй|прочитай|зчитай|изучи|запомни|запам'ятай|запамятай)\s+(?:проект|проєкт|репо|репозиторій|репозиторий|воркспейс|workspace|кодовую\s+базу|кодову\s+базу)(?:\s|$)|(?:^|\s)(?:scan|inspect)\s+project(?:\s|$))/i.test(normalized);
+  }
+
+  private looksLikeLargeRefactorRequest(text: string): boolean {
+    const normalized = text.trim().toLowerCase();
+    if (!normalized) {
+      return false;
+    }
+
+    const splitPattern = /\b(split|break\s+up|divide|decompose|modulari[sz]e|extract|separate|refactor)\b|(?:^|\s)(?:розбий|розділи|поділи|рознеси|винеси|декомпоз\w*|рефактор|перероби)(?:\s|$)/i;
+    const targetPattern = /\b(file|class|module|component|service|provider)\b|(?:^|\s)(?:файл|клас|модул|компонент|сервіс|провайдер)(?:\s|$)/i;
+    const multipartPattern = /\b(smaller|small|multiple|modules?|files?|parts?)\b|(?:^|\s)(?:менш\w*|маленьк\w*|декілька|кілька|частин|модулів|файлів)(?:\s|$)/i;
+
+    return splitPattern.test(normalized)
+      && targetPattern.test(normalized)
+      && (multipartPattern.test(normalized) || /\.(?:ts|tsx|js|jsx|py|java|cs|go|rs)\b/i.test(normalized));
   }
 
   private async autoAttachLikelyRequestFiles(text: string): Promise<void> {
@@ -1830,6 +1853,8 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           .map(({ message, parsed }) => ({ toolName: message.tool_name ?? '', error: typeof parsed.error === 'string' ? parsed.error : '' }))
           .filter(item => item.error);
         const hasRecentToolErrors = recentToolErrors.length > 0;
+        const latestVisibleUserRequest = this.getLatestVisibleUserRequest(messages);
+        const isLargeRefactorRequest = this.looksLikeLargeRefactorRequest(latestVisibleUserRequest);
         const replaceNotFoundContext = this.getLatestReplaceNotFoundContext(messages);
         const hasRecentReplaceNotFound = Boolean(replaceNotFoundContext);
         const replaceNotFoundFilepath = replaceNotFoundContext?.filepath;
@@ -1891,6 +1916,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           || hasExplicitNextSteps
           || isProgressOnlyResponse
           || claimedButUnexecutedCommand
+          || (isLargeRefactorRequest && hasRecentToolResults && !hasRecentSuccessfulAction)
           || (hasRecentReplaceNotFound && (mentionsChange || claimsDone || isLazyAcknowledgment || hasIncompletePlan || hasExplicitNextSteps))
           || (hasRecentToolErrors && (claimsDone || mentionsChange || isLazyAcknowledgment))
           || (!hasRecentSuccessfulAction && (isLongDump || hasLargeCodeBlocks || claimsDone || mentionsChange || isLazyAcknowledgment))
@@ -1898,7 +1924,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         const shouldNudge = requiresToolContinuation && retryCount < maxNudgeRetries;
 
         if (shouldNudge) {
-          this.debugLog('nudge', { retryCount, hasRecentToolResults, hasRecentSuccessfulAction, hasRecentToolErrors, hasRecentReplaceNotFound, replaceNotFoundFilepath, lastSuccessfulActionIndex, isLongDump, hasLargeCodeBlocks, claimsDone, mentionsChange, isLazyAcknowledgment, hasIncompletePlan: !!hasIncompletePlan, hasExplicitNextSteps, isProgressOnlyResponse, claimedButUnexecutedCommand, isPassingToUser, isAnnouncedButNotExecuted, contentPreview: finalContent.substring(0, 200) });
+          this.debugLog('nudge', { retryCount, hasRecentToolResults, hasRecentSuccessfulAction, hasRecentToolErrors, hasRecentReplaceNotFound, replaceNotFoundFilepath, lastSuccessfulActionIndex, isLongDump, hasLargeCodeBlocks, claimsDone, mentionsChange, isLazyAcknowledgment, hasIncompletePlan: !!hasIncompletePlan, hasExplicitNextSteps, isProgressOnlyResponse, claimedButUnexecutedCommand, isPassingToUser, isAnnouncedButNotExecuted, isLargeRefactorRequest, contentPreview: finalContent.substring(0, 200) });
           // Show plan/progress text to the user before nudging
           if (!isProgressOnlyResponse && (hasIncompletePlan || hasExplicitNextSteps || claimedButUnexecutedCommand || claimsDone || mentionsChange || isPassingToUser || isAnnouncedButNotExecuted)) {
             const planText = finalContent.trim();
@@ -1917,6 +1943,8 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           let nudgeMessage = '';
           if (hasIncompletePlan) {
             nudgeMessage = `You are on step ${stepMatch![1]} of ${stepMatch![2]} but stopped. Continue executing your plan. Proceed to the next step now — use the provided tools.`;
+          } else if (isLargeRefactorRequest) {
+            nudgeMessage = 'This is a large refactor request. Do not summarize the whole file or stop after inspection. First define a concise module/file split plan, then execute step 1 immediately with tools. Prefer read_file_slice for bounded reads on large files, and continue iteratively one file or one slice at a time.';
           } else if (hasExplicitNextSteps) {
             nudgeMessage = 'You listed next steps but stopped before executing them. Continue now. Do not stop after the first step or the first issue — keep using tools until the scan is complete.';
           } else if (hasRecentReplaceNotFound) {
@@ -1956,6 +1984,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
             hasRecentToolErrors,
             hasRecentReplaceNotFound,
             replaceNotFoundFilepath,
+            isLargeRefactorRequest,
             claimedButUnexecutedCommand,
             isPassingToUser,
             isAnnouncedButNotExecuted,
@@ -1964,7 +1993,9 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
             isProgressOnlyResponse,
             contentPreview: finalContent.substring(0, 200)
           });
-          finalContent = hasRecentReplaceNotFound
+          finalContent = isLargeRefactorRequest
+            ? 'The model inspected the code but did not carry out the large refactor step-by-step. Retry the request or use a stronger tool-calling model. For large files, prefer bounded reads and iterative extraction instead of whole-file summaries.'
+            : hasRecentReplaceNotFound
             ? `The model stopped after a failed replace_in_file attempt and did not recover.${replaceNotFoundFilepath ? ` The last blocked file was ${replaceNotFoundFilepath}.` : ''} It must re-read the exact current file content before trying the edit again.`
             : hasRecentToolErrors
               ? 'The model stopped after tool errors and then switched to descriptive text instead of completing the task. Retry the request or use a stronger tool-calling model.'
@@ -3832,6 +3863,32 @@ If the user asks for a change but provides NO code:
       {
         type: 'function',
         function: {
+          name: 'read_file_slice',
+          description: 'Read only a bounded line range from a file. Prefer this over full-file reads when the file is large.',
+          parameters: {
+            type: 'object',
+            properties: {
+              filepath: {
+                type: 'string',
+                description: 'Absolute or workspace-relative path to read.'
+              },
+              startLine: {
+                type: 'number',
+                description: '1-based inclusive start line.'
+              },
+              endLine: {
+                type: 'number',
+                description: '1-based inclusive end line.'
+              }
+            },
+            required: ['filepath', 'startLine', 'endLine'],
+            additionalProperties: false
+          }
+        }
+      },
+      {
+        type: 'function',
+        function: {
           name: 'create_or_edit_file',
           description: 'Create or overwrite a file in the current workspace.',
           parameters: {
@@ -4149,7 +4206,12 @@ If the user asks for a change but provides NO code:
           }
           return await this.readActiveFile();
         case 'read_specific_file':
+          if (args.startLine !== undefined || args.endLine !== undefined) {
+            return await this.readFileSlice(String(args.filepath ?? ''), args.startLine, args.endLine);
+          }
           return await this.readSpecificFile(String(args.filepath ?? ''));
+        case 'read_file_slice':
+          return await this.readFileSlice(String(args.filepath ?? ''), args.startLine, args.endLine);
         case 'create_or_edit_file':
           return await this.createOrEditFile(String(args.filename ?? args.filepath ?? ''), String(args.content ?? ''));
         case 'write_to_file':
@@ -4202,6 +4264,8 @@ If the user asks for a change but provides NO code:
       edit_file: 'replace_in_file',
       replace_content: 'replace_in_file',
       read_file: 'read_specific_file',
+      read_file_range: 'read_file_slice',
+      read_file_chunk: 'read_file_slice',
       run_command: 'execute_terminal_command',
       terminal_command: 'execute_terminal_command'
     };
@@ -4221,6 +4285,10 @@ If the user asks for a change but provides NO code:
       new_string: 'new_text',
       old_code: 'old_text',
       new_code: 'new_text',
+      start_line: 'startLine',
+      end_line: 'endLine',
+      from_line: 'startLine',
+      to_line: 'endLine',
       cmd: 'command',
       dir: 'directory'
     };
@@ -4295,6 +4363,64 @@ If the user asks for a change but provides NO code:
     } catch (error) {
       return JSON.stringify({
         error: error instanceof Error ? error.message : 'Failed to read file.'
+      });
+    }
+  }
+
+  private async readFileSlice(filepath: string, startLine: unknown, endLine: unknown): Promise<string> {
+    if (!filepath.trim()) {
+      return JSON.stringify({ error: 'filepath is required.' });
+    }
+
+    const normalizedStartLine = Number(startLine);
+    const normalizedEndLine = Number(endLine);
+    if (!Number.isFinite(normalizedStartLine) || !Number.isFinite(normalizedEndLine)) {
+      return JSON.stringify({ error: 'startLine and endLine must be numbers.' });
+    }
+
+    const start = Math.max(1, Math.floor(normalizedStartLine));
+    const end = Math.max(1, Math.floor(normalizedEndLine));
+    if (end < start) {
+      return JSON.stringify({ error: 'endLine must be greater than or equal to startLine.' });
+    }
+
+    try {
+      const uri = await this.resolveWorkspaceUriForOperation(filepath);
+      const content = await this.readWorkspaceText(uri);
+      const languageId = vscode.workspace.textDocuments.find(doc => doc.uri.toString() === uri.toString())?.languageId ?? 'plaintext';
+      const normalizedContent = content.replace(/\r\n/g, '\n');
+      const lines = normalizedContent.length > 0 ? normalizedContent.split('\n') : [];
+      const totalLines = lines.length;
+
+      if (totalLines === 0) {
+        return JSON.stringify({
+          path: uri.fsPath,
+          languageId,
+          startLine: 1,
+          endLine: 0,
+          totalLines: 0,
+          content: ''
+        });
+      }
+
+      if (start > totalLines) {
+        return JSON.stringify({ error: `startLine ${start} exceeds total line count ${totalLines}.` });
+      }
+
+      const clampedEnd = Math.min(end, totalLines);
+      const slice = lines.slice(start - 1, clampedEnd).join('\n');
+
+      return JSON.stringify({
+        path: uri.fsPath,
+        languageId,
+        startLine: start,
+        endLine: clampedEnd,
+        totalLines,
+        content: slice
+      });
+    } catch (error) {
+      return JSON.stringify({
+        error: error instanceof Error ? error.message : 'Failed to read file slice.'
       });
     }
   }
@@ -5203,8 +5329,12 @@ If the user asks for a change but provides NO code:
     });
   }
 
-  private synchronizeActiveEditorContextMessage(): void {
+  private synchronizeActiveEditorContextMessage(userText?: string): void {
     this.removeActiveEditorContextMessages(this.messages);
+
+    if (!this.shouldIncludeActiveEditorContext(userText)) {
+      return;
+    }
 
     const activeEditor = vscode.window.activeTextEditor;
     if (!activeEditor) {
@@ -5250,6 +5380,23 @@ If the user asks for a change but provides NO code:
       hiddenFromTranscript: true,
       activeEditorContext: true
     });
+  }
+
+  private shouldIncludeActiveEditorContext(userText?: string): boolean {
+    const normalized = String(userText ?? '').trim();
+    if (!normalized) {
+      return true;
+    }
+
+    if (this.looksLikeProjectScanRequest(normalized)) {
+      return false;
+    }
+
+    if (this.extractLikelyRequestFileTargets(normalized).length > 0) {
+      return false;
+    }
+
+    return true;
   }
 
   private removeAttachmentContextMessages(messages: OllamaMessage[] = this.messages): void {
@@ -5594,6 +5741,40 @@ If the user asks for a change but provides NO code:
           revertAction: this.buildRevertAction(message.revertOperationIds)
         };
       }
+      case 'read_active_file':
+      case 'read_specific_file':
+      case 'read_file_slice': {
+        const error = parsed?.error ? String(parsed.error) : '';
+        if (error) {
+          return {
+            role: 'tool',
+            content: `Read tool: ${message.tool_name}\n\n${error}`,
+            revertAction: this.buildRevertAction(message.revertOperationIds)
+          };
+        }
+
+        const targetPath = String(parsed?.path ?? '');
+        const languageId = String(parsed?.languageId ?? 'plaintext');
+        const startLine = parsed?.startLine !== undefined ? String(parsed.startLine) : '';
+        const endLine = parsed?.endLine !== undefined ? String(parsed.endLine) : '';
+        const totalLines = parsed?.totalLines !== undefined ? String(parsed.totalLines) : '';
+        const content = this.formatToolTextBlock(parsed?.content);
+        const parts = [
+          `Path: ${targetPath || '(unknown path)'}`,
+          `Language: ${languageId || 'plaintext'}`
+        ];
+        if (startLine || endLine) {
+          parts.push(`Lines: ${startLine || '?'}-${endLine || '?'}${totalLines ? ` of ${totalLines}` : ''}`);
+        }
+        if (content) {
+          parts.push(`Content\n\n\`\`\`text\n${content}\n\`\`\``);
+        }
+        return {
+          role: 'tool',
+          content: parts.join('\n\n'),
+          revertAction: this.buildRevertAction(message.revertOperationIds)
+        };
+      }
       case 'create_or_edit_file':
       case 'write_to_file':
       case 'replace_in_file': {
@@ -5669,6 +5850,19 @@ If the user asks for a change but provides NO code:
     return joined.length > 8000 ? `${joined.slice(0, 7800)}\n... output truncated ...` : joined;
   }
 
+  private getLatestVisibleUserRequest(messages: OllamaMessage[]): string {
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      const message = messages[index];
+      if (message.role !== 'user' || message.hiddenFromTranscript) {
+        continue;
+      }
+
+      return message.content;
+    }
+
+    return '';
+  }
+
   private postProgressStep(text: string): void {
     const normalized = text.trim();
     if (!normalized) {
@@ -5709,6 +5903,14 @@ If the user asks for a change but provides NO code:
     switch (toolName) {
       case 'read_specific_file':
         return `Reading ${formatPath(args.filepath)}`;
+      case 'read_file_slice': {
+        const startLine = Number(args.startLine);
+        const endLine = Number(args.endLine);
+        const lineSuffix = Number.isFinite(startLine) && Number.isFinite(endLine)
+          ? ` (lines ${Math.floor(startLine)}-${Math.floor(endLine)})`
+          : '';
+        return `Reading ${formatPath(args.filepath)}${lineSuffix}`;
+      }
       case 'read_active_file':
         return 'Reading the active file';
       case 'list_workspace_files':

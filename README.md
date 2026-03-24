@@ -87,6 +87,7 @@ Agent Mode currently exposes these tools to Ollama:
 
 - `read_active_file`
 - `read_specific_file`
+- `read_file_slice`
 - `create_or_edit_file`
 - `write_to_file`
 - `replace_in_file`
@@ -97,6 +98,8 @@ Agent Mode currently exposes these tools to Ollama:
 These cover the main local coding tasks: reading files, targeted edits, full rewrites when necessary, file creation, file deletion, listing workspace directories, and running local shell commands.
 
 `list_workspace_files` accepts both workspace-relative directories and absolute paths inside the current machine workspace context.
+
+`read_file_slice` reads only a bounded 1-based line range from a file and is intended for large files where a full-file read would waste context or push a weaker local model into summary-only behavior.
 
 ### Safer Editing Behavior
 
@@ -112,6 +115,8 @@ The extension now pushes stricter file-editing rules into the agent prompt:
 - do not declare success unless all required steps ran and the relevant tool calls succeeded
 - do not modify a file before reading it first
 - if unsure, read more files and gather more context instead of guessing
+- for large refactor requests, inspect structure first, then split the work into small module/file steps instead of attempting a one-shot rewrite
+- prefer `read_file_slice` over whole-file reads when a large file only needs bounded inspection
 - do not leak raw or malformed tool-call JSON into fallback file writes; those responses are retried as tool calls instead of being treated as file content
 - do not treat shell command blocks as file content during fallback file-write extraction
 - reject suspicious pseudo-filenames such as numeric dotted names or names with trailing dots before writing files
@@ -194,7 +199,7 @@ Default values:
 
 ## What's New
 
-- **0.0.4:** Removed the separate Activity Bar launcher badge so ManulAI stays focused on the Secondary Sidebar chat view. The header and chat controls were compacted further, with chat creation and deletion moved next to the chat selector. Empty-model handling is now truthful instead of showing a fake fallback model, and revertable native file-tool transcript entries expose `Revert changes` again. Packaging version updated to `0.0.4`.
+- **0.0.4:** Removed the separate Activity Bar launcher badge so ManulAI stays focused on the Secondary Sidebar chat view. The header and chat controls were compacted further, with chat creation and deletion moved next to the chat selector. Empty-model handling is now truthful instead of showing a fake fallback model, and revertable native file-tool transcript entries expose `Revert changes` again. Large files can now be read with bounded line slices through `read_file_slice`, and large refactor requests are nudged toward step-by-step module/file plans instead of whole-file summaries. Packaging version updated to `0.0.4`.
 - **0.0.3:** Debug JSONL entries now include the ManulAI extension version on every event, making mixed-log debugging across installed builds easier. Debug logs also capture user requests that enter the agent pipeline. The sidebar now supports creating, switching, deleting, and restoring multiple chats. File-backed workspaces persist chat state in `.manulai/chats.json`. Packaging version updated to `0.0.3`.
 - **0.0.2:** Auto-retry without tools when the model does not support tool calling (HTTP 400 fallback). Diff markers no longer leak into written files. Destructive writes to critical files like `package.json` are blocked (invalid JSON, shell commands as content, suspiciously short content). Code block extraction now rejects diff-formatted blocks and shell command blocks during fallback file-write extraction. Raw or malformed JSON tool-call payloads are now retried as tool executions instead of being mistaken for file content. Edit transcripts now prefer diffs for existing-file changes instead of dumping full rewritten content. Project scan requests can attach a capped workspace snapshot. Tool results are visible in chat with terminal output and file previews. Multi-step actions can print progress while tools run. Edit requests can auto-discover likely files such as `README.md` when they are mentioned but not attached. `list_workspace_files` now handles absolute paths correctly. Debug logging uses stable JSONL session files under `.manulai/logs/` for file-backed workspaces. The sidebar UI is compacted further for narrow and low-height screens. Publisher ID updated to `manul-engine`.
 - **0.0.1 (Alpha Release):** Initial public alpha with right-side chat UI, local Ollama integration, workspace file attachments, native tool-calling support, agent/chat mode separation, approval controls, directory listing and file deletion tools, and stricter prompt rules for safer file edits.

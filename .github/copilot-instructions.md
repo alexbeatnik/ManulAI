@@ -49,11 +49,13 @@ This repository contains a VS Code extension named ManulAI.
 - Keep step-by-step progress messages visible in chat during multi-tool actions, but do not feed those local progress messages back into the next model request.
 - Keep folder snapshot context distinct from file context so directories are never treated as editable files.
 - Keep `list_workspace_files` compatible with both workspace-relative and absolute directory paths.
+- Keep bounded file reading available for large files; prefer a line-range reader over full-file reads when only a section is needed.
 - Keep debug JSONL entries attributable to a specific build; include the extension version in the logged session/event payloads.
 - Keep debug logging useful for reproducing issues; log the original user request before local hidden nudges or retries alter the effective agent context.
 - Keep the model selector truthful: when no local model is chosen, the UI and backend state must remain empty rather than showing a fake fallback model.
 - Keep revert metadata attached to revertable native file-tool transcript entries so the webview can surface `Revert changes` directly on those results.
 - If retry exhaustion is reached and the model still returns pseudo-progress or plan text, surface a deterministic backend failure message instead of leaking raw `Step 1/3`-style output.
+- For large refactor requests, nudge the model toward short module/file plans and iterative execution instead of one-shot whole-file rewrites.
 
 ## Documentation
 

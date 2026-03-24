@@ -101,6 +101,7 @@ Agent Mode currently exposes these tools to Ollama:
 
 - `read_active_file`
 - `read_specific_file`
+- `read_file_slice`
 - `create_or_edit_file`
 - `write_to_file`
 - `replace_in_file`
@@ -109,6 +110,8 @@ Agent Mode currently exposes these tools to Ollama:
 - `list_workspace_files`
 
 Direct pre-agent handlers also exist for common fast-path edits such as Markdown title rename and LICENSE author rename.
+
+`read_file_slice` is the bounded-reader path for large files. It accepts a file path plus 1-based inclusive `startLine` and `endLine`, and should be preferred when the model only needs a local section instead of the entire file.
 
 ## Response Pipeline Notes
 
@@ -151,6 +154,8 @@ Direct pre-agent handlers also exist for common fast-path edits such as Markdown
 - Replace failures like `old_text not found` are treated as incomplete work and should trigger a read-then-retry path.
 - Responses that claim commands ran, claim fixes were completed, or end on partial plans without executing the work should be nudged back into the tool loop.
 - If retry exhaustion is reached and the model still returns pseudo-progress or plan text, the backend should surface a deterministic failure message instead of leaking raw `Step 1/3`-style output into the final answer.
+- Large refactor requests should receive hidden guidance to inspect structure first, form a short module/file split plan, and then execute one concrete step at a time instead of attempting a whole-file rewrite.
+- When a file is large, bounded reads through `read_file_slice` are preferred over re-reading the entire file.
 - The system mandate explicitly treats unread files as unknown state: file edits require a prior read, project-structure assumptions require listing, and completion claims require successful tool confirmation.
 - If the task required changes and the model has not used tools, the response is considered wrong and should be nudged back into tool execution.
 - Raw or malformed tool-call JSON leaked into assistant text must be treated as a failed tool invocation and retried; fallback file-write extractors must never treat that payload as file content.
