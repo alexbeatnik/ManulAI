@@ -1798,13 +1798,8 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         // the model's text response is a legitimate summary — don't nudge it.
         // We only check messages after the last user message to avoid stale tool results
         // from previous exchanges disabling the nudge.
-        const lastUserIdx = (() => {
-          for (let i = messages.length - 1; i >= 0; i--) {
-            if (messages[i].role === 'user') { return i; }
-          }
-          return -1;
-        })();
-        const recentMessages = lastUserIdx >= 0 ? messages.slice(lastUserIdx) : messages;
+        const lastVisibleUserIdx = this.getLastVisibleUserMessageIndex(messages);
+        const recentMessages = lastVisibleUserIdx >= 0 ? messages.slice(lastVisibleUserIdx) : messages;
         const hasRecentToolResults = recentMessages.some(m => m.role === 'tool');
         const recentToolMessages = recentMessages.filter((m): m is OllamaMessage & { role: 'tool' } => m.role === 'tool');
         const recentToolResults = recentToolMessages.map((message, index) => {
@@ -1989,11 +1984,15 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           } else if (isLargeRefactorRequest) {
             const primaryTarget = largeRefactorTargets[0];
             if (primaryTarget && !hasRecentReadOfLargeRefactorTarget) {
-              nudgeMessage = `This is a large refactor request. You have not read the main target file yet. First call read_file_slice for ${primaryTarget} to inspect a bounded section of the real file content. Do NOT create placeholder files or stop at a plan. After reading the target file, execute one concrete extraction or replace step with tools.`;
+              nudgeMessage = `This is a large refactor request for ${primaryTarget}. You have not read the main target file yet. First call read_file_slice for ${primaryTarget} to inspect a bounded section of the real file content. Do NOT create placeholder files, do NOT switch to README.md or any other unrelated file, and do NOT stop at a plan. After reading ${primaryTarget}, execute one concrete extraction or replace step with tools.`;
             } else if (!hasRecentMeaningfulWrite) {
-              nudgeMessage = 'This is a large refactor request. A placeholder file or plan is not enough progress. Do not stop after scaffolding. Read the real source file, then perform one concrete extraction or replace step with tools before responding.';
+              nudgeMessage = primaryTarget
+                ? `This is a large refactor request for ${primaryTarget}. A placeholder file or plan is not enough progress. Do not stop after scaffolding and do not inspect or edit unrelated files such as README.md. Keep working on ${primaryTarget}: read the real source file and then perform one concrete extraction or replace step with tools before responding.`
+                : 'This is a large refactor request. A placeholder file or plan is not enough progress. Do not stop after scaffolding. Read the real source file, then perform one concrete extraction or replace step with tools before responding.';
             } else {
-              nudgeMessage = 'This is a large refactor request. Do not summarize the whole file or stop after inspection. First define a concise module/file split plan, then execute step 1 immediately with tools. Prefer read_file_slice for bounded reads on large files, and continue iteratively one file or one slice at a time.';
+              nudgeMessage = primaryTarget
+                ? `This is a large refactor request for ${primaryTarget}. Do not summarize the whole file or stop after inspection. Do not switch to unrelated files like README.md. Define a concise module/file split plan for ${primaryTarget}, then execute step 1 immediately with tools. Prefer read_file_slice for bounded reads on large files, and continue iteratively one file or one slice at a time.`
+                : 'This is a large refactor request. Do not summarize the whole file or stop after inspection. First define a concise module/file split plan, then execute step 1 immediately with tools. Prefer read_file_slice for bounded reads on large files, and continue iteratively one file or one slice at a time.';
             }
           } else if (hasExplicitNextSteps) {
             nudgeMessage = 'You listed next steps but stopped before executing them. Continue now. Do not stop after the first step or the first issue — keep using tools until the scan is complete.';
@@ -5987,16 +5986,25 @@ If the user asks for a change but provides NO code:
   }
 
   private getLatestVisibleUserRequest(messages: OllamaMessage[]): string {
+    const index = this.getLastVisibleUserMessageIndex(messages);
+    if (index < 0) {
+      return '';
+    }
+
+    return messages[index]?.content ?? '';
+  }
+
+  private getLastVisibleUserMessageIndex(messages: OllamaMessage[]): number {
     for (let index = messages.length - 1; index >= 0; index -= 1) {
       const message = messages[index];
       if (message.role !== 'user' || message.hiddenFromTranscript) {
         continue;
       }
 
-      return message.content;
+      return index;
     }
 
-    return '';
+    return -1;
   }
 
   private postProgressStep(text: string): void {
