@@ -2833,13 +2833,16 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     }
 
     if (typeof obj.function === 'string') {
-      const topLevelArgs = obj.arguments ?? obj.parameters;
+      const topLevelArgs = this.inferImplicitToolArguments(this.remapWeakModelToolName(obj.function), obj.arguments ?? obj.parameters, obj as Record<string, unknown>);
       return toolNames.has(this.remapWeakModelToolName(obj.function))
         && (typeof topLevelArgs === 'string' || (topLevelArgs !== null && typeof topLevelArgs === 'object'));
     }
 
     const topLevelName = obj.name ?? obj.function_name;
-    const topLevelArgs = obj.arguments ?? obj.parameters;
+    const normalizedTopLevelName = typeof topLevelName === 'string' ? this.remapWeakModelToolName(topLevelName) : undefined;
+    const topLevelArgs = normalizedTopLevelName
+      ? this.inferImplicitToolArguments(normalizedTopLevelName, obj.arguments ?? obj.parameters, obj as Record<string, unknown>)
+      : (obj.arguments ?? obj.parameters);
     const parsedMatch = typeof topLevelName === 'string'
       && toolNames.has(this.remapWeakModelToolName(topLevelName))
       && (typeof topLevelArgs === 'string' || (topLevelArgs !== null && typeof topLevelArgs === 'object'));
@@ -3010,7 +3013,8 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       : typeof record.function_name === 'string' ? record.function_name.trim()
       : typeof record.function === 'string' ? record.function.trim()
       : '';
-    const directArguments = record.arguments ?? record.parameters;
+    const normalizedToolName = this.remapWeakModelToolName(typeof record.function === 'string' ? record.function.trim() : directName);
+    const directArguments = this.inferImplicitToolArguments(normalizedToolName, record.arguments ?? record.parameters, record);
     const functionRecord = this.toObjectRecord(record.function);
     const normalizedArguments = this.normalizeParsedToolArguments(functionRecord?.arguments ?? directArguments);
 
@@ -3050,6 +3054,62 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     }
 
     return undefined;
+  }
+
+  private inferImplicitToolArguments(
+    toolName: string,
+    explicitArguments: unknown,
+    record: Record<string, unknown>
+  ): unknown {
+    if (explicitArguments !== undefined) {
+      return explicitArguments;
+    }
+
+    const rest = { ...record };
+    delete rest.type;
+    delete rest.name;
+    delete rest.function_name;
+    delete rest.function;
+    delete rest.arguments;
+    delete rest.parameters;
+
+    if (Object.keys(rest).length === 0) {
+      return undefined;
+    }
+
+    if (toolName === 'create_or_edit_file') {
+      const filename = rest.filename ?? rest.filepath ?? rest.path;
+      const content = rest.content;
+      if (typeof filename === 'string' && typeof content === 'string') {
+        return { filename, content };
+      }
+    }
+
+    if (toolName === 'write_to_file') {
+      const filepath = rest.filepath ?? rest.filename ?? rest.path;
+      const content = rest.content;
+      if (typeof filepath === 'string' && typeof content === 'string') {
+        return { filepath, content };
+      }
+    }
+
+    if (toolName === 'replace_in_file') {
+      const filepath = rest.filepath ?? rest.filename ?? rest.path;
+      const oldText = rest.old_text ?? rest.old_content ?? rest.old_string ?? rest.old_code;
+      const newText = rest.new_text ?? rest.new_content ?? rest.new_string ?? rest.new_code;
+      if (typeof filepath === 'string' && typeof oldText === 'string' && typeof newText === 'string') {
+        return { filepath, old_text: oldText, new_text: newText };
+      }
+    }
+
+    if (toolName === 'read_specific_file') {
+      const filepath = rest.filepath ?? rest.filename ?? rest.path;
+      if (typeof filepath === 'string') {
+        return { filepath };
+      }
+    }
+
+    return rest;
   }
 
   private getToolDefinitions(): ToolDefinition[] {
@@ -3397,7 +3457,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         case 'read_specific_file':
           return await this.readSpecificFile(String(args.filepath ?? ''));
         case 'create_or_edit_file':
-          return await this.createOrEditFile(String(args.filename ?? ''), String(args.content ?? ''));
+          return await this.createOrEditFile(String(args.filename ?? args.filepath ?? ''), String(args.content ?? ''));
         case 'write_to_file':
           return await this.createOrEditFile(String(args.filepath ?? ''), String(args.content ?? ''));
         case 'replace_in_file':
@@ -3443,6 +3503,8 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     const aliases: Record<string, string> = {
       write_file: 'write_to_file',
       create_file: 'create_or_edit_file',
+      create_or_replace: 'create_or_edit_file',
+      create_or_overwrite: 'create_or_edit_file',
       edit_file: 'replace_in_file',
       replace_content: 'replace_in_file',
       read_file: 'read_specific_file',
