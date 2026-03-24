@@ -4144,6 +4144,9 @@ If the user asks for a change but provides NO code:
     try {
       switch (name) {
         case 'read_active_file':
+          if (String(args.filepath ?? '').trim()) {
+            return await this.readSpecificFile(String(args.filepath ?? ''));
+          }
           return await this.readActiveFile();
         case 'read_specific_file':
           return await this.readSpecificFile(String(args.filepath ?? ''));
@@ -4208,6 +4211,7 @@ If the user asks for a change but provides NO code:
   private remapWeakModelArgumentAliases(args: Record<string, unknown>): Record<string, unknown> {
     const aliasMap: Record<string, string> = {
       file_path: 'filepath',
+      filePath: 'filepath',
       file_name: 'filename',
       file: 'filepath',
       path: 'filepath',
