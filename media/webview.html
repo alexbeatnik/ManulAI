@@ -147,6 +147,14 @@
       animation: pulse-ring 1.45s ease-out infinite;
     }
 
+    .chat-strip {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto auto;
+      gap: 6px;
+      align-items: center;
+      margin-top: 8px;
+    }
+
     .workspace {
       min-height: 0;
       display: grid;
@@ -239,6 +247,7 @@
     }
 
     .model-select,
+    .chat-select,
     .ghost-button,
     .send {
       border-radius: 9px;
@@ -246,7 +255,8 @@
       transition: transform 140ms ease, border-color 140ms ease, background 140ms ease, opacity 140ms ease;
     }
 
-    .model-select {
+    .model-select,
+    .chat-select {
       min-width: 0;
       width: 100%;
       flex: 1 1 160px;
@@ -259,6 +269,7 @@
     }
 
     .model-select:focus,
+    .chat-select:focus,
     .ghost-button:focus,
     textarea:focus,
     .send:focus {
@@ -1161,6 +1172,10 @@
         padding: 8px 11px 7px;
       }
 
+      .chat-strip {
+        margin-top: 7px;
+      }
+
       .workspace {
         padding: 7px 11px 0;
       }
@@ -1173,6 +1188,14 @@
 
       .status-pill {
         max-width: 100%;
+      }
+
+      .chat-strip {
+        grid-template-columns: 1fr 1fr;
+      }
+
+      .chat-select {
+        grid-column: 1 / -1;
       }
 
       .controls {
@@ -1237,7 +1260,8 @@
       }
 
       .ghost-button,
-      .model-select {
+      .model-select,
+      .chat-select {
         min-height: 34px;
       }
 
@@ -1327,6 +1351,11 @@
         font-size: 12px;
       }
 
+      .chat-strip {
+        margin-top: 6px;
+        gap: 5px;
+      }
+
       .status-pill {
         padding: 4px 7px;
       }
@@ -1345,6 +1374,7 @@
       .drop-inline,
       .ghost-button,
       .model-select,
+      .chat-select,
       .send,
       .stop {
         min-height: 30px;
@@ -1352,7 +1382,8 @@
 
       .drop-inline,
       .ghost-button,
-      .model-select {
+      .model-select,
+      .chat-select {
         padding-top: 5px;
         padding-bottom: 5px;
       }
@@ -1409,6 +1440,11 @@
         <p class="subtitle">Local-first coding agent in the right sidebar. Click Browse or use Attach to ManulAI Chat from Explorer to add context.</p>
       </div>
       <div id="statusPill" class="status-pill">Ready</div>
+    </div>
+    <div class="chat-strip">
+      <select id="chatSelect" class="chat-select" aria-label="Current chat"></select>
+      <button id="newChat" class="ghost-button" type="button">New</button>
+      <button id="deleteChat" class="ghost-button danger" type="button">Delete</button>
     </div>
   </header>
 
@@ -1524,6 +1560,9 @@
     const modelSelectEl = document.getElementById('modelSelect');
     const refreshModelsEl = document.getElementById('refreshModels');
     const clearChatEl = document.getElementById('clearChat');
+    const chatSelectEl = document.getElementById('chatSelect');
+    const newChatEl = document.getElementById('newChat');
+    const deleteChatEl = document.getElementById('deleteChat');
     const agentModeToggle = document.getElementById('agentModeToggle');
     const agentModeLabel = document.getElementById('agentModeLabel');
     const autoApproveToggle = document.getElementById('autoApproveToggle');
@@ -1538,6 +1577,8 @@
     let attachedFiles = [];
     let availableModels = [];
     let currentModel = '';
+    let chats = [];
+    let activeChatId = '';
     let dragDepth = 0;
     let agentMode = true;
     let autoApprove = false;
@@ -1747,6 +1788,17 @@
       }
 
       modelSelectEl.innerHTML = '';
+      chatSelectEl.innerHTML = '';
+
+      const visibleChats = chats.length > 0 ? chats : [{ id: activeChatId || 'default', title: 'Chat 1' }];
+      for (const chat of visibleChats) {
+        const option = document.createElement('option');
+        option.value = chat.id;
+        option.textContent = chat.title;
+        option.selected = chat.id === activeChatId;
+        chatSelectEl.appendChild(option);
+      }
+
       const modelNames = availableModels.length > 0 ? availableModels : [currentModel || 'llama3.2'];
       for (const modelName of modelNames) {
         const option = document.createElement('option');
@@ -1758,6 +1810,9 @@
 
       sendEl.disabled = busy;
       stopEl.disabled = !busy;
+      chatSelectEl.disabled = busy || visibleChats.length <= 1;
+      newChatEl.disabled = busy;
+      deleteChatEl.disabled = busy || visibleChats.length === 0;
       modelSelectEl.disabled = busy;
       refreshModelsEl.disabled = busy;
       clearChatEl.disabled = busy;
@@ -2034,6 +2089,32 @@
       vscode.postMessage({ command: 'clearChat' });
     });
 
+    newChatEl.addEventListener('click', () => {
+      if (busy) {
+        return;
+      }
+
+      vscode.postMessage({ command: 'createChat' });
+    });
+
+    deleteChatEl.addEventListener('click', () => {
+      if (busy) {
+        return;
+      }
+
+      vscode.postMessage({ command: 'deleteChat' });
+    });
+
+    chatSelectEl.addEventListener('change', () => {
+      const chatId = chatSelectEl.value.trim();
+      if (!chatId || chatId === activeChatId || busy) {
+        return;
+      }
+
+      seenMessageKeys.clear();
+      vscode.postMessage({ command: 'switchChat', chatId });
+    });
+
     attachActiveFileEl.addEventListener('click', () => {
       if (busy) {
         return;
@@ -2132,8 +2213,13 @@
       const payload = event.data;
 
       if (payload.command === 'state') {
+        if (payload.activeChatId && payload.activeChatId !== activeChatId) {
+          seenMessageKeys.clear();
+        }
         messages = payload.messages;
         attachments = payload.attachments;
+        chats = payload.chats || [];
+        activeChatId = payload.activeChatId || '';
         availableModels = payload.availableModels || [];
         currentModel = payload.currentModel || '';
         agentMode = payload.agentMode !== undefined ? payload.agentMode : agentMode;

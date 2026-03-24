@@ -34,10 +34,13 @@ This repository contains a VS Code extension named ManulAI.
 
 - The extension must work for any programming language opened in VS Code.
 - Conversation history must remain available in memory for request context.
+- Multiple chats may exist in memory during a session; keep transcript and attached-file context scoped to the active chat.
+- Persist chat sessions for file-backed workspaces under `.manulai/` so they survive VS Code restarts; keep transcript and attached-file context scoped to the active chat.
 - Dropped file context must remain visible in the UI and be forwarded to the model context.
 - Tool results must be returned to Ollama using the native `tool` role flow.
 - Agent Mode should continue to support approvals, auto-approve, and fallback handling for weaker local models.
 - Keep direct handlers and fallback layers conservative: fast for common edits, but not destructive.
+- Treat unread files and unlisted project structure as unknown state; for edit tasks, require real tool-based inspection before claiming or applying a fix.
 - Fallback layers must reject raw or malformed tool-call JSON leaked into assistant text or code blocks and retry via native tool execution instead of treating that payload as file content.
 - Fallback file-write extraction must ignore shell-language fenced code blocks and reject suspicious pseudo-filenames such as numeric dotted names or names with trailing dots.
 - Keep tool output visible in the chat transcript, including terminal stdout and stderr and previews for file writes.
@@ -45,6 +48,8 @@ This repository contains a VS Code extension named ManulAI.
 - Keep step-by-step progress messages visible in chat during multi-tool actions, but do not feed those local progress messages back into the next model request.
 - Keep folder snapshot context distinct from file context so directories are never treated as editable files.
 - Keep `list_workspace_files` compatible with both workspace-relative and absolute directory paths.
+- Keep debug JSONL entries attributable to a specific build; include the extension version in the logged session/event payloads.
+- Keep debug logging useful for reproducing issues; log the original user request before local hidden nudges or retries alter the effective agent context.
 
 ## Documentation
 

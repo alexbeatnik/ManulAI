@@ -60,6 +60,9 @@ interface WebviewInboundMessage {
     | 'sendMessage'
     | 'stopRequest'
     | 'clearChat'
+    | 'createChat'
+    | 'deleteChat'
+    | 'switchChat'
     | 'attachActiveFile'
     | 'revertFileChanges'
     | 'approvePendingAction'
@@ -86,6 +89,7 @@ interface WebviewInboundMessage {
   filename?: string;
   content?: string;
   attachments?: Array<{ name: string; content: string }>;
+  chatId?: string;
 }
 
 interface WebviewRenderableMessage {
@@ -136,6 +140,42 @@ interface ManulAiStoredSettings {
   systemPrompt?: string;
 }
 
+interface ChatSession {
+  id: string;
+  title: string;
+  messages: OllamaMessage[];
+  attachedFiles: Map<string, AttachedFileContext>;
+}
+
+interface WebviewChatSummary {
+  id: string;
+  title: string;
+  messageCount: number;
+  attachmentCount: number;
+}
+
+interface PersistedAttachedFileContext {
+  fsPath: string;
+  name: string;
+  content: string;
+  languageId: string;
+  readOnly?: boolean;
+}
+
+interface PersistedChatSession {
+  id: string;
+  title: string;
+  messages: OllamaMessage[];
+  attachedFiles: PersistedAttachedFileContext[];
+}
+
+interface PersistedChatState {
+  version: number;
+  activeChatId: string;
+  chatCounter: number;
+  chats: PersistedChatSession[];
+}
+
 const DEFAULT_STORED_SETTINGS: Required<ManulAiStoredSettings> = {
   ollamaModel: 'llama3.2',
   ollamaBaseUrl: 'http://localhost:11434',
@@ -149,8 +189,9 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = 'manulai.chatView';
 
   private webviewView?: vscode.WebviewView;
-  private readonly messages: OllamaMessage[] = [];
-  private readonly attachedFiles = new Map<string, AttachedFileContext>();
+  private readonly chats: ChatSession[] = [];
+  private activeChatId = '';
+  private chatCounter = 0;
   private availableModels: string[] = [];
   private agentMode = true;
   private autoApprove = false;
@@ -168,8 +209,14 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   private workspaceSettingsLoaded = false;
   private workspaceSettingsLoadPromise?: Promise<void>;
   private migratingWorkspaceConfiguration = false;
+  private chatStorageLoaded = false;
+  private chatStorageLoadPromise?: Promise<void>;
+  private persistChatsTimeout?: NodeJS.Timeout;
+  private lastPersistedChatState = '';
 
   public constructor(private readonly extensionContext: vscode.ExtensionContext) {
+    this.createChatSession();
+
     if (vscode.workspace.workspaceFolders?.length) {
       this.agentMode = DEFAULT_STORED_SETTINGS.agentMode;
       this.autoApprove = DEFAULT_STORED_SETTINGS.autoApprove;
@@ -183,6 +230,124 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     if (this.debugMode) {
       this.startDebugSession();
     }
+  }
+
+  private get activeChat(): ChatSession {
+    const existingChat = this.chats.find(chat => chat.id === this.activeChatId);
+    if (existingChat) {
+      return existingChat;
+    }
+
+    return this.createChatSession();
+  }
+
+  private get messages(): OllamaMessage[] {
+    return this.activeChat.messages;
+  }
+
+  private get attachedFiles(): Map<string, AttachedFileContext> {
+    return this.activeChat.attachedFiles;
+  }
+
+  private createChatSession(title?: string): ChatSession {
+    const chatNumber = ++this.chatCounter;
+    const chat: ChatSession = {
+      id: `chat-${Date.now()}-${chatNumber}`,
+      title: title?.trim() || `Chat ${chatNumber}`,
+      messages: [],
+      attachedFiles: new Map<string, AttachedFileContext>()
+    };
+
+    this.chats.push(chat);
+    this.activeChatId = chat.id;
+    return chat;
+  }
+
+  private getChatSummary(chat: ChatSession): WebviewChatSummary {
+    return {
+      id: chat.id,
+      title: chat.title,
+      messageCount: chat.messages.filter(message => !message.hiddenFromTranscript && message.role !== 'system').length,
+      attachmentCount: chat.attachedFiles.size
+    };
+  }
+
+  private maybeUpdateActiveChatTitleFromPrompt(text: string): void {
+    const chat = this.activeChat;
+    const visibleMessageCount = chat.messages.filter(message => !message.hiddenFromTranscript && message.role !== 'system').length;
+    if (visibleMessageCount > 0) {
+      return;
+    }
+
+    const normalized = text.trim().replace(/\s+/g, ' ');
+    if (!normalized) {
+      return;
+    }
+
+    chat.title = normalized.length > 40 ? `${normalized.slice(0, 37)}...` : normalized;
+  }
+
+  private createNewChat(): void {
+    if (this.requestInFlight) {
+      this.postStatus('Cannot create a new chat while a request is running. Wait for the current response to finish.');
+      return;
+    }
+
+    const chat = this.createChatSession();
+    this.progressStepCounter = 0;
+    this.debugLog('chat_created', { chatId: chat.id, title: chat.title, chatCount: this.chats.length });
+    this.postStateToWebview();
+    this.postStatus(`Created ${chat.title}.`);
+  }
+
+  private switchChat(chatId: string | undefined): void {
+    const normalizedChatId = String(chatId ?? '').trim();
+    if (!normalizedChatId || normalizedChatId === this.activeChatId) {
+      return;
+    }
+
+    if (this.requestInFlight) {
+      this.postStatus('Cannot switch chats while a request is running. Wait for the current response to finish.');
+      return;
+    }
+
+    const targetChat = this.chats.find(chat => chat.id === normalizedChatId);
+    if (!targetChat) {
+      return;
+    }
+
+    this.activeChatId = targetChat.id;
+    this.progressStepCounter = 0;
+    this.debugLog('chat_switched', { chatId: targetChat.id, title: targetChat.title });
+    this.postStateToWebview();
+    this.postStatus(`Switched to ${targetChat.title}.`);
+  }
+
+  private deleteActiveChat(): void {
+    if (this.requestInFlight) {
+      this.postStatus('Cannot delete a chat while a request is running. Wait for the current response to finish.');
+      return;
+    }
+
+    const currentIndex = this.chats.findIndex(chat => chat.id === this.activeChatId);
+    if (currentIndex < 0) {
+      return;
+    }
+
+    const deletedChat = this.chats[currentIndex];
+    this.chats.splice(currentIndex, 1);
+
+    if (this.chats.length === 0) {
+      this.createChatSession();
+    } else {
+      const nextIndex = Math.max(0, currentIndex - 1);
+      this.activeChatId = this.chats[Math.min(nextIndex, this.chats.length - 1)].id;
+    }
+
+    this.progressStepCounter = 0;
+    this.debugLog('chat_deleted', { chatId: deletedChat.id, title: deletedChat.title, remainingChatCount: this.chats.length });
+    this.postStateToWebview();
+    this.postStatus(`Deleted ${deletedChat.title}.`);
   }
 
   public resolveWebviewView(
@@ -280,6 +445,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   private async initializeSettingsState(): Promise<void> {
     await this.migrateWorkspaceConfigurationToStorage();
     await this.ensureWorkspaceSettingsLoaded();
+    await this.ensureChatStorageLoaded();
 
     const previousDebugMode = this.debugMode;
     this.agentMode = this.getBooleanSetting('agentMode', DEFAULT_STORED_SETTINGS.agentMode);
@@ -343,6 +509,217 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       await this.workspaceSettingsLoadPromise;
     } finally {
       this.workspaceSettingsLoadPromise = undefined;
+    }
+  }
+
+  private getChatStorageDirUri(): vscode.Uri {
+    return this.getWorkspaceSettingsDirUri() ?? this.extensionContext.globalStorageUri;
+  }
+
+  private getChatStorageUri(): vscode.Uri {
+    return vscode.Uri.joinPath(this.getChatStorageDirUri(), 'chats.json');
+  }
+
+  private async ensureChatStorageLoaded(): Promise<void> {
+    if (this.chatStorageLoaded) {
+      return;
+    }
+    if (this.chatStorageLoadPromise) {
+      await this.chatStorageLoadPromise;
+      return;
+    }
+
+    this.chatStorageLoadPromise = (async () => {
+      const storageUri = this.getChatStorageUri();
+
+      try {
+        const bytes = await vscode.workspace.fs.readFile(storageUri);
+        const parsed = JSON.parse(Buffer.from(bytes).toString('utf8')) as unknown;
+        this.restorePersistedChats(parsed);
+      } catch {
+        this.chatStorageLoaded = true;
+      }
+    })();
+
+    try {
+      await this.chatStorageLoadPromise;
+    } finally {
+      this.chatStorageLoadPromise = undefined;
+    }
+  }
+
+  private restorePersistedChats(value: unknown): void {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      this.chatStorageLoaded = true;
+      return;
+    }
+
+    const candidate = value as Partial<PersistedChatState>;
+    const restoredChats = Array.isArray(candidate.chats)
+      ? candidate.chats
+          .map(chat => this.deserializeChatSession(chat))
+          .filter((chat): chat is ChatSession => Boolean(chat))
+      : [];
+
+    if (restoredChats.length > 0) {
+      this.chats.length = 0;
+      this.chats.push(...restoredChats);
+      this.activeChatId = restoredChats.some(chat => chat.id === candidate.activeChatId)
+        ? String(candidate.activeChatId)
+        : restoredChats[0].id;
+      const persistedCounter = typeof candidate.chatCounter === 'number' && Number.isFinite(candidate.chatCounter)
+        ? candidate.chatCounter
+        : restoredChats.length;
+      this.chatCounter = Math.max(persistedCounter, restoredChats.length);
+      for (const chat of this.chats) {
+        this.normalizePersistedChatSession(chat);
+      }
+      this.lastPersistedChatState = JSON.stringify(this.serializeChatState(), null, 2) + '\n';
+    }
+
+    this.chatStorageLoaded = true;
+  }
+
+  private deserializeChatSession(value: unknown): ChatSession | undefined {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      return undefined;
+    }
+
+    const candidate = value as Partial<PersistedChatSession>;
+    const id = String(candidate.id ?? '').trim();
+    if (!id) {
+      return undefined;
+    }
+
+    const title = String(candidate.title ?? '').trim() || 'Chat';
+    const messages = Array.isArray(candidate.messages)
+      ? candidate.messages
+          .map(message => this.deserializeChatMessage(message))
+          .filter((message): message is OllamaMessage => Boolean(message))
+      : [];
+    const attachedFiles = new Map<string, AttachedFileContext>();
+
+    if (Array.isArray(candidate.attachedFiles)) {
+      for (const file of candidate.attachedFiles) {
+        const attached = this.deserializeAttachedFileContext(file);
+        if (!attached) {
+          continue;
+        }
+        attachedFiles.set(attached.uri.fsPath, attached);
+      }
+    }
+
+    return {
+      id,
+      title,
+      messages,
+      attachedFiles
+    };
+  }
+
+  private deserializeChatMessage(value: unknown): OllamaMessage | undefined {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      return undefined;
+    }
+
+    const candidate = value as Partial<OllamaMessage>;
+    const role = candidate.role;
+    if (role !== 'system' && role !== 'user' && role !== 'assistant' && role !== 'tool') {
+      return undefined;
+    }
+
+    return {
+      role,
+      content: typeof candidate.content === 'string' ? candidate.content : '',
+      tool_calls: Array.isArray(candidate.tool_calls) ? candidate.tool_calls : undefined,
+      tool_name: typeof candidate.tool_name === 'string' ? candidate.tool_name : undefined,
+      localOnly: candidate.localOnly === true,
+      hiddenFromTranscript: candidate.hiddenFromTranscript === true,
+      attachmentContext: candidate.attachmentContext === true,
+      activeEditorContext: candidate.activeEditorContext === true,
+      revertOperationIds: Array.isArray(candidate.revertOperationIds)
+        ? candidate.revertOperationIds.filter((id): id is string => typeof id === 'string')
+        : undefined
+    };
+  }
+
+  private deserializeAttachedFileContext(value: unknown): AttachedFileContext | undefined {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      return undefined;
+    }
+
+    const candidate = value as Partial<PersistedAttachedFileContext>;
+    const fsPath = String(candidate.fsPath ?? '').trim();
+    const name = String(candidate.name ?? '').trim();
+    if (!fsPath || !name) {
+      return undefined;
+    }
+
+    return {
+      uri: vscode.Uri.file(fsPath),
+      name,
+      content: typeof candidate.content === 'string' ? candidate.content : '',
+      languageId: typeof candidate.languageId === 'string' ? candidate.languageId : 'plaintext',
+      readOnly: candidate.readOnly === true
+    };
+  }
+
+  private normalizePersistedChatSession(chat: ChatSession): void {
+    this.removeAttachmentContextMessages(chat.messages);
+    this.removeActiveEditorContextMessages(chat.messages);
+
+    if (chat.attachedFiles.size > 0) {
+      chat.messages.push({
+        role: 'user',
+        content: this.renderAttachmentContextMessage(chat.attachedFiles),
+        hiddenFromTranscript: true,
+        attachmentContext: true
+      });
+    }
+  }
+
+  private serializeChatState(): PersistedChatState {
+    return {
+      version: 1,
+      activeChatId: this.activeChatId,
+      chatCounter: this.chatCounter,
+      chats: this.chats.map(chat => ({
+        id: chat.id,
+        title: chat.title,
+        messages: chat.messages.filter(message => !message.activeEditorContext),
+        attachedFiles: Array.from(chat.attachedFiles.values()).map(file => ({
+          fsPath: file.uri.fsPath,
+          name: file.name,
+          content: file.content,
+          languageId: file.languageId,
+          readOnly: file.readOnly
+        }))
+      }))
+    };
+  }
+
+  private schedulePersistedChats(): void {
+    clearTimeout(this.persistChatsTimeout);
+    this.persistChatsTimeout = setTimeout(() => {
+      void this.persistChatState();
+    }, 200);
+  }
+
+  private async persistChatState(): Promise<void> {
+    const storageUri = this.getChatStorageUri();
+    const storageDir = this.getChatStorageDirUri();
+    const serialized = JSON.stringify(this.serializeChatState(), null, 2) + '\n';
+
+    if (serialized === this.lastPersistedChatState) {
+      return;
+    }
+
+    try {
+      await vscode.workspace.fs.createDirectory(storageDir);
+      await vscode.workspace.fs.writeFile(storageUri, Buffer.from(serialized, 'utf8'));
+      this.lastPersistedChatState = serialized;
+    } catch {
+      // Silently fail if chat state cannot be persisted.
     }
   }
 
@@ -507,11 +884,19 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   private async handleWebviewMessage(message: WebviewInboundMessage): Promise<void> {
     switch (message.command) {
       case 'ready':
-        await this.refreshModelCatalog(false);
-        this.postStateToWebview();
+        await this.initializeSettingsState();
         return;
       case 'clearChat':
         this.clearChat();
+        return;
+      case 'createChat':
+        this.createNewChat();
+        return;
+      case 'deleteChat':
+        this.deleteActiveChat();
+        return;
+      case 'switchChat':
+        this.switchChat(message.chatId);
         return;
       case 'attachActiveFile':
         await this.attachActiveEditorFile();
@@ -643,6 +1028,19 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     }
 
     this.progressStepCounter = 0;
+    this.maybeUpdateActiveChatTitleFromPrompt(text);
+    this.debugLog('user_request', {
+      text,
+      chatId: this.activeChat.id,
+      chatTitle: this.activeChat.title,
+      agentMode: this.agentMode,
+      autoApprove: this.autoApprove,
+      attachedContextCount: this.attachedFiles.size,
+      frontendAttachmentCount: frontendAttachments?.length ?? 0,
+      activeEditorPath: vscode.window.activeTextEditor?.document.isUntitled
+        ? undefined
+        : vscode.window.activeTextEditor?.document.uri.fsPath
+    });
     this.messages.push({ role: 'user', content: text });
 
     if (this.agentMode && this.looksLikeFileMutationRequest(text)) {
@@ -935,6 +1333,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     this.messages.length = 0;
     this.attachedFiles.clear();
     this.progressStepCounter = 0;
+    this.debugLog('chat_cleared', { chatId: this.activeChat.id, title: this.activeChat.title });
     this.postStateToWebview();
     this.postStatus('Chat history and attached context cleared.');
   }
@@ -2501,42 +2900,201 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     if (this.agentMode) {
       const workspaceInstructions = await this.getWorkspaceInstructions();
 
-        const wsRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? '';
-        let agentMandate = 'You are ManulAI, a local VS Code coding agent.\n' +
-          (wsRoot ? 'Workspace root: ' + wsRoot + '\n' : '') +
-          'All file paths in tool calls are resolved relative to the workspace root unless absolute.\n' +
-          'Use the provided tools when you need to inspect files, edit files, or run commands.\n' +
-          'If no tool is needed, answer normally and concisely.\n' +
-          'Do not claim that a file was changed unless a tool actually changed it.\n' +
-          'Avoid dumping full file contents unless the user explicitly asks for them.\n' +
-          'ACTION FIRST — DO NOT JUST DESCRIBE:\n' +
-          '- When you identify a problem in a file, fix it IMMEDIATELY by calling a tool. Do not just describe what needs to change — use replace_in_file or create_or_edit_file to make the change right away.\n' +
-          '- When a command needs to be run (install dependencies, build, start a server, run tests, etc.), use execute_terminal_command to run it yourself. NEVER ask the user to run commands manually.\n' +
-          '- If you know what the fix is, apply it. Do not output the fix as text and stop.\n' +
-          'PLANNING AND PROGRESS:\n' +
-          '- Before starting any non-trivial task, output a numbered plan in English. Example:\n' +
-          '  **Plan:**\n' +
-          '  1. Read project structure (call list_workspace_files)\n' +
-          '  2. Find and read the relevant files\n' +
-          '  3. Make the necessary changes\n' +
-          '- Then execute each step BY CALLING TOOLS, announcing progress before each one:\n' +
-          '  "Step 1/3: Reading project structure..."\n' +
-          '- After completing all steps, give a short summary of what was done. Do NOT end with "let me know", "feel free to ask", or similar polite closings — just state what was done and stop.\n' +
-          '- Keep all plans, progress messages, and summaries in English.\n' +
-          'CRITICAL FILE EDITING RULES:\n' +
-          '- When asked to make a small change, change ONLY the specific lines affected. Never rewrite or replace the entire file.\n' +
-          '- Never delete content that was not explicitly asked to be removed.\n' +
-          '- Prefer replace_in_file for surgical edits over create_or_edit_file with full file content.\n' +
-          '- Always read the file first before editing to understand its full structure.\n' +
-          '- After editing, the file must keep all original content except the targeted change.\n' +
-          '- When multiple changes are needed, make them ONE AT A TIME. Call replace_in_file once, wait for the result, then call it again for the next change. Never batch all changes into a single tool call.\n' +
-          'TOOL USAGE RULES:\n' +
-          '- Always call tools using the native tool-calling mechanism. Never output raw JSON as text.\n' +
-          '- NEVER output code in fenced code blocks as a way to create or modify files. Always use create_or_edit_file or replace_in_file to write code to files.\n' +
-          '- After reading a file, analyze the actual content and fix the real problem. Do not add cosmetic changes like borders or colors unless specifically asked.\n' +
-          '- Think step by step: first read the file, then identify the issue, then make targeted fixes.\n' +
-          '- When you see an error message, diagnose and fix it using tools. Do not just explain the error.\n' +
-          '- If dependencies are missing, run the install command with execute_terminal_command.';
+      const wsRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? '';
+    let agentMandate = `[IDENTITY]
+You are ManulAI, a local VS Code coding agent.
+${wsRoot ? `Workspace root: ${wsRoot}\n` : ''}
+All file paths are relative to the workspace root unless absolute.
+
+---
+
+[CORE BEHAVIOR]
+
+- You are an ACTION agent, not a chat assistant.
+- If a task requires file edits or commands, you MUST use tools.
+- Do not describe fixes — APPLY them.
+- Do not ask the user to run commands — run them yourself.
+- If no tools are needed, respond concisely.
+- NEVER claim a file was modified unless a tool succeeded.
+- Avoid dumping full file contents unless explicitly requested.
+
+---
+
+[PRIORITIES]
+
+1. Correctness over speed
+2. Safety over completeness
+3. Tool usage over assumptions
+4. Minimal change over refactoring
+
+---
+
+[FLOW CONTROL]
+
+For SIMPLE tasks:
+→ Act immediately using tools.
+
+For NON-TRIVIAL tasks:
+1. Output a short numbered plan
+2. Execute step-by-step using tools
+3. Announce progress before each step
+4. End with a short factual summary
+
+Example:
+Step 1/3: Reading project structure...
+
+Do NOT:
+- stop after planning
+- output partial plans
+- end with polite phrases
+
+---
+
+[TOOL USAGE RULES]
+
+- ALWAYS use native tool-calling (never raw JSON text)
+- NEVER simulate edits in chat
+- Use:
+  - replace_in_file → for small changes
+  - create_or_edit_file → only if full rewrite is required
+
+When fixing code:
+1. Read file
+2. Identify real issue
+3. Apply minimal fix
+
+If unsure:
+→ read more files, do NOT guess
+
+If a command is needed:
+→ use execute_terminal_command
+
+---
+
+[WHEN NOT TO USE TOOLS]
+
+Do NOT use tools when:
+- answering conceptual questions
+- explaining behavior
+- no file or command interaction is required
+
+In those cases:
+→ respond concisely in plain text
+
+---
+
+[REALITY CHECK]
+
+- You do NOT know file contents unless you read them
+- You do NOT know project structure unless you list it
+- You do NOT know if a fix worked unless a tool confirms it
+- Never assume — always verify
+
+---
+
+[MANDATORY READ BEFORE WRITE]
+
+- You MUST read a file before modifying it
+- If you did not read it, you MUST NOT edit it
+
+---
+
+[FILE EDITING RULES]
+
+- Make ONLY the requested change
+- NEVER remove unrelated content
+- NEVER rewrite entire file unless explicitly required
+- ALWAYS preserve structure
+
+MULTI-STEP EDITS:
+- One tool call per change
+- Wait for result before next change
+
+---
+
+[ANTI-HALLUCINATION]
+
+- If unsure:
+  → read more files
+- NEVER guess
+
+---
+
+[ANTI-LOOP GUARD]
+
+- Do NOT repeat the same failed action more than twice
+- If repeated failure:
+  → change approach OR gather more context
+
+---
+
+[RETRY POLICY]
+
+- Maximum 3 retries per failed action
+- After that:
+  → adjust strategy (do NOT blindly retry)
+
+---
+
+[FAILURE HANDLING]
+
+If a tool fails:
+1. Read error
+2. Adjust approach
+3. Retry
+
+If still failing:
+→ gather more context using tools
+
+---
+
+[ITERATIVE EXECUTION]
+
+- Never solve everything in one step
+- Break tasks into smaller steps
+- Execute sequentially
+
+Bad:
+→ one massive change
+
+Good:
+→ read → fix → verify → continue
+
+---
+
+[MINIMALISM RULE]
+
+- Make the smallest correct change
+- Do not modify unrelated code
+- Avoid unnecessary improvements
+
+---
+
+[TASK COMPLETION]
+
+A task is COMPLETE only if:
+- The requested change is applied
+- All tool calls succeeded
+- No remaining errors are visible
+
+Before finishing:
+- Verify:
+  - Did I use tools if required?
+  - Did they succeed?
+  - Did I complete all steps?
+
+If all checks pass:
+→ output a short factual summary and STOP
+
+---
+
+[OUTPUT RULES]
+
+- Keep responses minimal
+- No unnecessary explanations
+- No polite endings
+- Only facts and progress
+`;
 
       if (workspaceInstructions) {
         agentMandate += '\n\n<workspace_instructions>\n' + workspaceInstructions + '\n</workspace_instructions>';
@@ -2549,16 +3107,88 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       });
     } else {
       requestMessages.push({
-        role: 'system',
-        content:
-          'You are ManulAI in chat-only mode. No tools are available.\n' +
-          'You cannot read, modify, or create files.\n' +
-          'Never claim you changed a file.\n' +
-          'When the user asks for a change, show the EXACT old line(s) and the EXACT new line(s) they should replace.\n' +
-          'Format:\n  Old: `<exact old text>`\n  New: `<exact new text>`\n' +
-          'Keep it short. No full file dumps.',
-        hiddenFromTranscript: true
-      });
+  role: 'system',
+  content:
+`[IDENTITY]
+You are ManulAI in CHAT-ONLY mode.
+
+---
+
+[HARD LIMITATIONS]
+
+- NO tools are available
+- You CANNOT read files
+- You CANNOT modify files
+- You CANNOT execute commands
+- NEVER claim that you changed anything
+
+---
+
+[CORE BEHAVIOR]
+
+- You are a SUGGESTION engine, not an executor
+- Provide exact, minimal changes the user can apply manually
+- Keep responses short and precise
+
+---
+
+[CODE MODIFICATION RULES]
+
+If the user provides code:
+
+- ONLY modify what is visible
+- NEVER invent missing code
+- NEVER assume unseen lines
+- ALWAYS base changes strictly on the provided snippet
+
+Format changes EXACTLY as:
+
+Old: \`<exact old text from user>\`
+New: \`<replacement text>\`
+
+Rules:
+- Old MUST exist in the provided code
+- If you are not sure → DO NOT GUESS
+- Do NOT rewrite entire blocks
+- Do NOT output full files
+
+---
+
+[IF CODE IS MISSING]
+
+If the user asks for a change but provides NO code:
+
+- DO NOT fabricate "Old" lines
+- Instead:
+  - Explain what needs to be changed
+  - Provide a minimal example snippet
+
+---
+
+[ANTI-HALLUCINATION]
+
+- If you cannot see it → you do NOT know it
+- If you are unsure → say so
+- NEVER generate fake exact matches
+
+---
+
+[MINIMALISM]
+
+- Smallest possible change
+- No refactoring
+- No unrelated improvements
+
+---
+
+[OUTPUT RULES]
+
+- No explanations unless necessary
+- No polite endings
+- No full file dumps
+`,
+  hiddenFromTranscript: true
+});
     }
 
     if (systemPrompt) {
@@ -4387,6 +5017,10 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     return path.join(this.extensionContext.globalStorageUri.fsPath, 'logs');
   }
 
+  private getExtensionVersion(): string {
+    return this.extensionContext.extension.packageJSON?.version ?? 'dev';
+  }
+
   private startDebugSession(): void {
     const logDir = this.getDebugLogDir();
     if (!logDir) { return; }
@@ -4399,7 +5033,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       this.debugSessionId = timestamp;
       const logFile = path.join(logDir, `session-${timestamp}.jsonl`);
       this.debugLogFilePath = logFile;
-      this.debugLog('session_start', { version: this.extensionContext.extension.packageJSON?.version, model: this.getSelectedModel(), agentMode: this.agentMode, autoApprove: this.autoApprove });
+      this.debugLog('session_start', { model: this.getSelectedModel(), agentMode: this.agentMode, autoApprove: this.autoApprove });
     } catch {
       // Silently fail if we can't write logs
     }
@@ -4420,7 +5054,13 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
 
     try {
       fs.mkdirSync(path.dirname(this.debugLogFilePath), { recursive: true });
-      const entry = { ts: new Date().toISOString(), event, ...data };
+      const entry = {
+        ts: new Date().toISOString(),
+        event,
+        version: this.getExtensionVersion(),
+        sessionId: this.debugSessionId || undefined,
+        ...data
+      };
       fs.appendFileSync(this.debugLogFilePath, JSON.stringify(entry) + '\n', 'utf8');
     } catch {
       // Silently fail
@@ -4433,26 +5073,28 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   }
 
   public dispose(): void {
+    clearTimeout(this.persistChatsTimeout);
+    void this.persistChatState();
     this.stopDebugSession();
   }
 
-  private synchronizeAttachmentContextMessage(): void {
-    this.removeAttachmentContextMessages();
+  private synchronizeAttachmentContextMessage(chat: ChatSession = this.activeChat): void {
+    this.removeAttachmentContextMessages(chat.messages);
 
-    if (this.attachedFiles.size === 0) {
+    if (chat.attachedFiles.size === 0) {
       return;
     }
 
-    this.messages.push({
+    chat.messages.push({
       role: 'user',
-      content: this.renderAttachmentContextMessage(),
+      content: this.renderAttachmentContextMessage(chat.attachedFiles),
       hiddenFromTranscript: true,
       attachmentContext: true
     });
   }
 
   private synchronizeActiveEditorContextMessage(): void {
-    this.removeActiveEditorContextMessages();
+    this.removeActiveEditorContextMessages(this.messages);
 
     const activeEditor = vscode.window.activeTextEditor;
     if (!activeEditor) {
@@ -4500,24 +5142,24 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     });
   }
 
-  private removeAttachmentContextMessages(): void {
-    for (let index = this.messages.length - 1; index >= 0; index -= 1) {
-      if (this.messages[index].attachmentContext) {
-        this.messages.splice(index, 1);
+  private removeAttachmentContextMessages(messages: OllamaMessage[] = this.messages): void {
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      if (messages[index].attachmentContext) {
+        messages.splice(index, 1);
       }
     }
   }
 
-  private removeActiveEditorContextMessages(): void {
-    for (let index = this.messages.length - 1; index >= 0; index -= 1) {
-      if (this.messages[index].activeEditorContext) {
-        this.messages.splice(index, 1);
+  private removeActiveEditorContextMessages(messages: OllamaMessage[] = this.messages): void {
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      if (messages[index].activeEditorContext) {
+        messages.splice(index, 1);
       }
     }
   }
 
-  private renderAttachmentContextMessage(): string {
-    const renderedFiles = Array.from(this.attachedFiles.values())
+  private renderAttachmentContextMessage(attachedFiles: Map<string, AttachedFileContext> = this.attachedFiles): string {
+    const renderedFiles = Array.from(attachedFiles.values())
       .map(file => {
         const filePath = file.readOnly
           ? `reference-only:${file.name}`
@@ -4740,6 +5382,10 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   }
 
   private postStateToWebview(): void {
+    if (this.chatStorageLoaded) {
+      this.schedulePersistedChats();
+    }
+
     if (!this.webviewView) {
       return;
     }
@@ -4779,11 +5425,13 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       return result;
     }, []);
 
-    const extensionVersion = this.extensionContext.extension.packageJSON?.version ?? 'dev';
+    const extensionVersion = this.getExtensionVersion();
 
     void this.webviewView.webview.postMessage({
       command: 'state',
       messages: renderableMessages,
+      chats: this.chats.map(chat => this.getChatSummary(chat)),
+      activeChatId: this.activeChatId,
       currentModel: this.getSelectedModel(),
       availableModels: this.availableModels,
       agentMode: this.agentMode,
