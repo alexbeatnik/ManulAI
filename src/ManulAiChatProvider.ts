@@ -1416,7 +1416,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
 
         const isLongDump = finalContent.length > 300;
         const hasLargeCodeBlocks = /```[\w]*\n[\s\S]{100,}?```/.test(finalContent);
-        const claimsDone = /(?:зробив|замінив|оновив|готово|i've made|i have made|i have updated|i updated|i fixed|i removed|i verified|i confirmed|i corrected|i aligned|addressed the|fixed the|removed the|updated the|verified the|confirmed the|corrected the|aligned the|summary of the changes|summary:)/i.test(finalContent);
+        const claimsDone = /(?:зробив|замінив|оновив|готово|i've made|i have made|i have updated|i updated|i fixed|i removed|i verified|i confirmed|i corrected|i aligned|successfully applied|successfully saved|has been removed|has been moved|addressed the|fixed the|removed the|updated the|verified the|confirmed the|corrected the|aligned the|summary of the changes|summary:)/i.test(finalContent);
         const mentionsChange = /(?:змін|зроби|оновл|replac|chang|updat|modif|address|fix(?:ed)?|remov(?:e|ed)|verif(?:y|ied)|confirm(?:ed)?|correct(?:ed)?|align(?:ed)?)/i.test(finalContent);
         const isLazyAcknowledgment = (/^(?:understood|sure|ok|okay|got it|i will|let me know|i can help|i'll make sure)\b/i.test(finalContent.trim())
           || /no (?:immediate|obvious) (?:file changes|issues|errors|problems)/i.test(finalContent)
@@ -1735,12 +1735,17 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       const extractedLength = extracted.trim().length;
       const extractedLines = extracted.split('\n').filter(line => line.trim().length > 0).length;
       const originalLines = originalContent.split('\n').filter(line => line.trim().length > 0).length;
+      const hasStrongAnchors = this.hasStrongFullFileAnchors(extracted, originalContent);
+      const minLengthRatio = hasStrongAnchors ? 0.55 : 0.85;
+      const maxLengthRatio = hasStrongAnchors ? 1.35 : 1.2;
+      const minLineRatio = hasStrongAnchors ? 0.5 : 0.85;
+      const maxLineRatio = hasStrongAnchors ? 1.35 : 1.2;
 
-      if (extractedLength < originalLength * 0.85 || extractedLength > originalLength * 1.2) {
+      if (extractedLength < originalLength * minLengthRatio || extractedLength > originalLength * maxLengthRatio) {
         return undefined;
       }
 
-      if (originalLines > 20 && (extractedLines < originalLines * 0.85 || extractedLines > originalLines * 1.2)) {
+      if (originalLines > 20 && (extractedLines < originalLines * minLineRatio || extractedLines > originalLines * maxLineRatio)) {
         return undefined;
       }
     }
@@ -1750,6 +1755,25 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     }
 
     return extracted;
+  }
+
+  private hasStrongFullFileAnchors(extractedContent: string, originalContent: string): boolean {
+    const normalize = (value: string): string => value.trim();
+    const extractedLines = extractedContent.split('\n').map(normalize).filter(Boolean);
+    const originalLines = originalContent.split('\n').map(normalize).filter(Boolean);
+
+    if (extractedLines.length < 8 || originalLines.length < 8) {
+      return false;
+    }
+
+    const headCandidates = originalLines.slice(0, 6).filter(line => line.length > 3);
+    const tailCandidates = originalLines.slice(-6).filter(line => line.length > 3);
+    const extractedSet = new Set(extractedLines);
+
+    const headMatches = headCandidates.filter(line => extractedSet.has(line)).length;
+    const tailMatches = tailCandidates.filter(line => extractedSet.has(line)).length;
+
+    return headMatches >= 3 && tailMatches >= 2;
   }
 
   private sanitizeGeneratedFileContent(content: string): string {
