@@ -1166,6 +1166,9 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     // Try to resolve the marker name to an attached file path
     let filepath = rawName;
     for (const [fsPath, file] of this.attachedFiles) {
+      if (file.languageId === '__folder__') {
+        continue;
+      }
       const baseName = path.basename(fsPath);
       if (baseName.toLowerCase() === rawName.toLowerCase() || file.name.toLowerCase() === rawName.toLowerCase()) {
         filepath = fsPath;
@@ -1744,12 +1747,15 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       return true;
     }
 
-    return Array.from(this.attachedFiles.values()).some(file => trimmed === file.name || trimmed === path.basename(file.uri.fsPath));
+    return Array.from(this.attachedFiles.values()).some(file => file.languageId !== '__folder__' && (trimmed === file.name || trimmed === path.basename(file.uri.fsPath)));
   }
 
   private findAttachedFileForReplacements(replacements: Array<{ oldText: string }>): string | undefined {
     // Find which attached file contains the old_text strings
     for (const [fsPath, file] of this.attachedFiles) {
+      if (file.languageId === '__folder__') {
+        continue;
+      }
       const allFound = replacements.every(rep => file.content.includes(rep.oldText));
       if (allFound) {
         return fsPath;
@@ -1757,6 +1763,9 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     }
     // Partial match: at least one replacement matches
     for (const [fsPath, file] of this.attachedFiles) {
+      if (file.languageId === '__folder__') {
+        continue;
+      }
       const anyFound = replacements.some(rep => file.content.includes(rep.oldText));
       if (anyFound) {
         return fsPath;
