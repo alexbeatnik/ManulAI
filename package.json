@@ -143,7 +143,7 @@
       "properties": {
         "manulai.ollamaModel": {
           "type": "string",
-          "default": "llama3.2",
+          "default": "",
           "description": "Local Ollama model used for chat and tool calling."
         },
         "manulai.ollamaBaseUrl": {

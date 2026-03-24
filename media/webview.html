@@ -33,6 +33,9 @@
       --meta-height: 10px;
       --input-min-height: 88px;
       --input-max-height: 220px;
+      --control-height: 26px;
+      --control-padding-y: 4px;
+      --control-padding-x: 7px;
       font-family: 'Segoe UI Variable Text', 'Inter', var(--vscode-font-family);
     }
 
@@ -149,8 +152,8 @@
 
     .chat-strip {
       display: grid;
-      grid-template-columns: minmax(0, 1fr) auto auto;
-      gap: 6px;
+      grid-template-columns: minmax(0, 1fr) repeat(2, auto);
+      gap: 4px;
       align-items: center;
       margin-top: 8px;
     }
@@ -174,7 +177,8 @@
     .context-actions {
       display: flex;
       align-items: center;
-      gap: 6px;
+      flex-wrap: wrap;
+      gap: 5px;
       min-width: 0;
     }
 
@@ -220,8 +224,8 @@
     .controls {
       display: grid;
       grid-template-columns: minmax(0, 1fr) auto;
-      gap: 6px 8px;
-      align-items: start;
+      gap: 4px 5px;
+      align-items: center;
       min-width: 0;
     }
 
@@ -233,7 +237,7 @@
     .control-group {
       display: flex;
       flex-wrap: wrap;
-      gap: 6px;
+      gap: 4px;
       align-items: center;
       min-width: 0;
     }
@@ -259,13 +263,20 @@
     .chat-select {
       min-width: 0;
       width: 100%;
-      flex: 1 1 160px;
+      flex: 1 1 118px;
       border: 1px solid var(--border-muted);
       background: color-mix(in srgb, var(--panel-strong) 88%, transparent);
       color: var(--text);
-      padding: 7px 10px;
+      min-height: var(--control-height);
+      padding: var(--control-padding-y) var(--control-padding-x);
       outline: none;
       box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.02);
+      font-size: 10px;
+    }
+
+    .model-select option[disabled],
+    .chat-select option[disabled] {
+      color: var(--muted);
     }
 
     .model-select:focus,
@@ -281,12 +292,36 @@
       border: 1px solid var(--border-muted);
       background: color-mix(in srgb, var(--panel-strong) 84%, transparent);
       color: var(--text);
-      padding: 7px 10px;
+      min-height: var(--control-height);
+      padding: var(--control-padding-y) var(--control-padding-x);
       cursor: pointer;
       flex-shrink: 0;
       white-space: nowrap;
-      font-size: 12px;
+      font-size: 10px;
+      font-weight: 500;
       line-height: 1.15;
+    }
+
+    .icon-button {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: var(--control-height);
+      min-width: var(--control-height);
+      padding: 0;
+      border-radius: 8px;
+    }
+
+    .icon-button svg {
+      width: 13px;
+      height: 13px;
+      flex-shrink: 0;
+    }
+
+    .compact-select {
+      flex: 1 1 108px;
+      max-width: 176px;
+      padding-right: 22px;
     }
 
     .ghost-button:hover:not([disabled]),
@@ -939,6 +974,15 @@
       align-items: center;
       gap: 8px;
       flex-shrink: 0;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+    }
+
+    .composer-toggles {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      flex-wrap: wrap;
     }
 
     .composer-hint {
@@ -958,20 +1002,31 @@
 
     .send {
       align-self: end;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
       border: 1px solid transparent;
-      padding: 9px 14px;
+      width: calc(var(--control-height) + 6px);
+      min-width: calc(var(--control-height) + 6px);
+      min-height: calc(var(--control-height) + 6px);
+      padding: 0;
+      border-radius: 10px;
       background: linear-gradient(180deg, color-mix(in srgb, var(--accent-strong) 86%, white 14%), var(--accent-strong));
       color: var(--vscode-button-foreground);
       cursor: pointer;
-      min-width: 82px;
       box-shadow: 0 10px 24px color-mix(in srgb, var(--accent-strong) 22%, transparent);
     }
 
     .stop {
       display: none;
       align-self: end;
-      min-width: 82px;
-      padding: 9px 14px;
+      align-items: center;
+      justify-content: center;
+      width: calc(var(--control-height) + 6px);
+      min-width: calc(var(--control-height) + 6px);
+      min-height: calc(var(--control-height) + 6px);
+      padding: 0;
+      border-radius: 10px;
     }
 
     body.busy .stop {
@@ -983,8 +1038,28 @@
     .send-label {
       display: inline-flex;
       align-items: center;
-      gap: 8px;
+      gap: 0;
       justify-content: center;
+    }
+
+    .send-icon,
+    .stop-icon {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 14px;
+      height: 14px;
+    }
+
+    .send-icon svg,
+    .stop-icon svg {
+      width: 14px;
+      height: 14px;
+      fill: currentColor;
+    }
+
+    body.busy .send-label .send-icon {
+      display: none;
     }
 
     .send-label .dots {
@@ -1088,10 +1163,52 @@
     .toggle-switch {
       display: inline-flex;
       align-items: center;
-      gap: 6px;
+      gap: 5px;
       cursor: pointer;
       flex-shrink: 0;
       user-select: none;
+      min-height: var(--control-height);
+      padding: 0 2px;
+    }
+
+    .toggle-switch.toolbar-toggle {
+      gap: 4px;
+      padding: 0 6px;
+      border: 1px solid var(--border-muted);
+      border-radius: 999px;
+      background: color-mix(in srgb, var(--panel-strong) 84%, transparent);
+    }
+
+    .toggle-switch.icon-toggle {
+      gap: 4px;
+      padding: 0 5px;
+      border: 1px solid var(--border-muted);
+      border-radius: 999px;
+      background: color-mix(in srgb, var(--panel-strong) 84%, transparent);
+    }
+
+    .toggle-switch.icon-toggle .toggle-label {
+      display: none;
+    }
+
+    .toggle-icon {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 13px;
+      height: 13px;
+      color: var(--muted);
+      transition: color 140ms ease;
+    }
+
+    .toggle-icon svg {
+      width: 13px;
+      height: 13px;
+      fill: currentColor;
+    }
+
+    .toggle-switch input:checked ~ .toggle-icon {
+      color: var(--vscode-terminal-ansiGreen, #33a852);
     }
 
     .toggle-switch input {
@@ -1141,7 +1258,7 @@
     }
 
     .toggle-label {
-      font-size: 9px;
+      font-size: 8px;
       font-weight: 600;
       letter-spacing: 0.03em;
       white-space: nowrap;
@@ -1198,6 +1315,10 @@
         grid-column: 1 / -1;
       }
 
+      .compact-select {
+        max-width: none;
+      }
+
       .controls {
         display: grid;
         grid-template-columns: 1fr;
@@ -1216,7 +1337,6 @@
       .context-actions,
       .control-group,
       .control-group .ghost-button,
-      .control-group .toggle-switch,
       .control-group .model-select {
         width: 100%;
       }
@@ -1244,7 +1364,8 @@
         grid-column: 1 / -1;
       }
 
-      .toggle-switch {
+      .toggle-switch,
+      .toggle-switch.toolbar-toggle {
         min-width: 0;
         justify-content: flex-start;
         padding: 5px 8px;
@@ -1272,7 +1393,12 @@
 
       .composer-buttons {
         width: 100%;
-        justify-content: flex-end;
+        justify-content: space-between;
+      }
+
+      .composer-toggles {
+        width: 100%;
+        justify-content: flex-start;
       }
     }
 
@@ -1280,6 +1406,8 @@
       :root {
         --input-min-height: 72px;
         --input-max-height: 160px;
+        --control-height: 24px;
+        --control-padding-y: 4px;
       }
 
       .subtitle {
@@ -1323,8 +1451,6 @@
         padding: 0 8px 8px;
       }
 
-      .ghost-button,
-      .model-select,
       .send,
       .stop {
         padding-top: 6px;
@@ -1336,6 +1462,9 @@
       :root {
         --input-min-height: 56px;
         --input-max-height: 120px;
+        --control-height: 22px;
+        --control-padding-y: 3px;
+        --control-padding-x: 7px;
       }
 
       .eyebrow,
@@ -1377,15 +1506,15 @@
       .chat-select,
       .send,
       .stop {
-        min-height: 30px;
+        min-height: var(--control-height);
       }
 
       .drop-inline,
       .ghost-button,
       .model-select,
       .chat-select {
-        padding-top: 5px;
-        padding-bottom: 5px;
+        padding-top: var(--control-padding-y);
+        padding-bottom: var(--control-padding-y);
       }
 
       .history-shell {
@@ -1442,9 +1571,13 @@
       <div id="statusPill" class="status-pill">Ready</div>
     </div>
     <div class="chat-strip">
-      <select id="chatSelect" class="chat-select" aria-label="Current chat"></select>
-      <button id="newChat" class="ghost-button" type="button">New</button>
-      <button id="deleteChat" class="ghost-button danger" type="button">Delete</button>
+      <select id="chatSelect" class="chat-select compact-select" aria-label="Current chat" title="Select chat"></select>
+      <button id="newChat" class="ghost-button icon-button" type="button" title="Create chat" aria-label="Create chat">
+        <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M7.25 2h1.5v5.25H14v1.5H8.75V14h-1.5V8.75H2v-1.5h5.25V2z"/></svg>
+      </button>
+      <button id="deleteChat" class="ghost-button danger icon-button" type="button" title="Delete current chat" aria-label="Delete current chat">
+        <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M6 2h4l.75 1.25H13v1.5h-1v8.25L11.25 14h-6.5L4 13.25V4.75H3v-1.5h2.25L6 2zm-.5 2.75v7.75h5V4.75h-5zm1.25 1.5h1.5v4.75h-1.5V6.25zm3 0h1.5v4.75h-1.5V6.25z"/></svg>
+      </button>
     </div>
   </header>
 
@@ -1452,44 +1585,40 @@
     <div class="topbar">
       <div class="topbar-primary">
         <div class="context-actions" style="justify-self: flex-start;">
-          <button id="browseFiles" class="ghost-button" type="button" style="display: flex; align-items: center; gap: 6px;">
-            <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M13.5 3l-4 0-1-1-6 0 0 12 11 0 0-11z"/></svg>
-            Browse...
+          <button id="browseFiles" class="ghost-button icon-button" type="button" title="Browse files" aria-label="Browse files">
+            <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M13.5 3l-4 0-1-1-6 0 0 12 11 0 0-11z"/></svg>
           </button>
-          <button id="browseFolder" class="ghost-button" type="button" style="display: flex; align-items: center; gap: 6px;">
-            <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M14 4H8l-1-1H2v10h12V4zm-1 8H3V5h4l1 1h5v6z"/></svg>
-            Folder
+          <button id="browseFolder" class="ghost-button icon-button" type="button" title="Browse folder" aria-label="Browse folder">
+            <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M14 4H8l-1-1H2v10h12V4zm-1 8H3V5h4l1 1h5v6z"/></svg>
           </button>
-          <button id="attachProject" class="ghost-button" type="button" style="display: flex; align-items: center; gap: 6px;">
-            <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M1.5 1h13l.5.5v13l-.5.5h-13l-.5-.5v-13l.5-.5zM2 2v12h12V2H2zm2 2h8v1H4V4zm0 3h8v1H4V7zm0 3h5v1H4v-1z"/></svg>
-            Project
+          <button id="attachProject" class="ghost-button icon-button" type="button" title="Attach workspace snapshot" aria-label="Attach project snapshot">
+            <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M1.5 1h13l.5.5v13l-.5.5h-13l-.5-.5v-13l.5-.5zM2 2v12h12V2H2zm2 2h8v1H4V4zm0 3h8v1H4V7zm0 3h5v1H4v-1z"/></svg>
           </button>
         </div>
       </div>
       <div class="topbar-secondary">
         <div class="controls">
           <div class="control-group primary">
-            <button id="attachActiveFile" class="ghost-button" type="button">Active File</button>
-            <label class="toggle-switch" title="Enable Agent Mode so Ollama can call local tools automatically">
-              <input type="checkbox" id="agentModeToggle" />
-              <span class="toggle-slider"></span>
-              <span id="agentModeLabel" class="toggle-label">Agent Mode</span>
-            </label>
-            <label class="toggle-switch" title="Auto-approve tool execution without asking for confirmation">
-              <input type="checkbox" id="autoApproveToggle" />
-              <span class="toggle-slider"></span>
-              <span id="autoApproveLabel" class="toggle-label">Auto-Approve</span>
-            </label>
-            <label class="toggle-switch" title="Debug Mode — save detailed logs to .manulai/logs/ for file-backed workspaces, or to extension storage otherwise">
+            <button id="attachActiveFile" class="ghost-button icon-button" type="button" title="Attach active editor file" aria-label="Attach active file">
+              <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M3 1.5h7l3 3V14l-.5.5h-9L3 14V1.5zm1.5 1.5v10h7V5h-2.5L8.5 3H4.5zm1 3h5v1.5h-5V6zm0 3h5v1.5h-5V9z"/></svg>
+            </button>
+            <label class="toggle-switch icon-toggle" title="Debug Mode — save detailed logs to .manulai/logs/ for file-backed workspaces, or to extension storage otherwise" aria-label="Toggle debug mode">
               <input type="checkbox" id="debugModeToggle" />
               <span class="toggle-slider"></span>
               <span id="debugModeLabel" class="toggle-label">Debug</span>
+              <span class="toggle-icon" aria-hidden="true">
+                <svg viewBox="0 0 16 16"><path d="M6 1h4v1.5H6V1zm-2 3h8l1 1v4.5a3.5 3.5 0 01-1.362 2.778L12.5 14H10l-.8-1H6.8L6 14H3.5l.862-1.722A3.5 3.5 0 013 9.5V5l1-1zm.5 1.5v4a2 2 0 002 2h3a2 2 0 002-2v-4h-7zm1.25 1.25h1.5v1.5h-1.5v-1.5zm3 0h1.5v1.5h-1.5v-1.5z"/></svg>
+              </span>
             </label>
           </div>
           <div class="control-group secondary">
-            <select id="modelSelect" class="model-select" aria-label="Ollama model"></select>
-            <button id="refreshModels" class="ghost-button" type="button">Refresh</button>
-            <button id="clearChat" class="ghost-button danger" type="button">Clear</button>
+            <select id="modelSelect" class="model-select compact-select" aria-label="Ollama model" title="Select model"></select>
+            <button id="refreshModels" class="ghost-button icon-button" type="button" title="Refresh model list" aria-label="Refresh models">
+              <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 2a6 6 0 015.657 4H12v1.5h3V4.5h-1.5v1.462A7.5 7.5 0 001.5 8h1.5A6 6 0 018 2zm5 6h1.5A6.5 6.5 0 012 10h1.657A6 6 0 0013 8zm.038 2.462V12H11.5v-1.5H15V14h-1.5v-1.462A7.5 7.5 0 011 8h1.5a6 6 0 0010.538 4.462z"/></svg>
+            </button>
+            <button id="clearChat" class="ghost-button danger icon-button" type="button" title="Clear current chat" aria-label="Clear current chat">
+              <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M4 4h8v9.25L11.25 14h-6.5L4 13.25V4zm2-2h4l.75 1.25H13v1.5H3v-1.5h2.25L6 2z"/></svg>
+            </button>
           </div>
         </div>
       </div>
@@ -1526,10 +1655,28 @@
               <span><strong>Tip:</strong> use Browse, Active File, or Explorer attach actions to add context.</span>
             </div>
             <div class="composer-buttons">
-              <button id="stop" class="ghost-button danger stop" type="button">Stop</button>
-              <button id="send" class="send" type="button">
+              <div class="composer-toggles">
+                <label class="toggle-switch toolbar-toggle" title="Enable Agent Mode so Ollama can call local tools automatically">
+                  <input type="checkbox" id="agentModeToggle" />
+                  <span class="toggle-slider"></span>
+                  <span id="agentModeLabel" class="toggle-label">Agent</span>
+                </label>
+                <label class="toggle-switch toolbar-toggle" title="Auto-approve tool execution without asking for confirmation">
+                  <input type="checkbox" id="autoApproveToggle" />
+                  <span class="toggle-slider"></span>
+                  <span id="autoApproveLabel" class="toggle-label">Auto</span>
+                </label>
+              </div>
+              <button id="stop" class="ghost-button danger stop" type="button" title="Stop request" aria-label="Stop request">
+                <span class="stop-icon" aria-hidden="true">
+                  <svg viewBox="0 0 16 16"><path d="M4 4h8v8H4V4z"/></svg>
+                </span>
+              </button>
+              <button id="send" class="send" type="button" title="Send message" aria-label="Send message">
                 <span class="send-label">
-                  <span class="idle-text">Send</span>
+                  <span class="send-icon" aria-hidden="true">
+                    <svg viewBox="0 0 16 16"><path d="M2 13.5l12-5.5L2 2.5v4l6 1.5-6 1.5v4z"/></svg>
+                  </span>
                   <span class="dots" aria-hidden="true"><span></span><span></span><span></span></span>
                 </span>
               </button>
@@ -1576,7 +1723,7 @@
     let attachments = [];
     let attachedFiles = [];
     let availableModels = [];
-    let currentModel = '';
+    let currentModel = null;
     let chats = [];
     let activeChatId = '';
     let dragDepth = 0;
@@ -1627,7 +1774,7 @@
       historyStateEl.innerHTML = busy
         ? '<span class="thinking-inline">Thinking<span class="dots"><span></span><span></span><span></span></span></span>'
         : 'Idle';
-      statusPillEl.textContent = busy ? `Thinking with ${currentModel || 'model'}` : `Model: ${currentModel || 'llama3.2'}`;
+      statusPillEl.textContent = busy ? `Thinking with ${currentModel || 'no model'}` : `Model: ${currentModel || 'none'}`;
       document.body.classList.toggle('busy', busy);
     }
 
@@ -1791,6 +1938,15 @@
       chatSelectEl.innerHTML = '';
 
       const visibleChats = chats.length > 0 ? chats : [{ id: activeChatId || 'default', title: 'Chat 1' }];
+      if (visibleChats.length === 0) {
+        const placeholder = document.createElement('option');
+        placeholder.value = '';
+        placeholder.textContent = 'Select chat';
+        placeholder.disabled = true;
+        placeholder.selected = true;
+        chatSelectEl.appendChild(placeholder);
+      }
+
       for (const chat of visibleChats) {
         const option = document.createElement('option');
         option.value = chat.id;
@@ -1799,7 +1955,18 @@
         chatSelectEl.appendChild(option);
       }
 
-      const modelNames = availableModels.length > 0 ? availableModels : [currentModel || 'llama3.2'];
+      const modelNames = currentModel
+        ? Array.from(new Set([currentModel, ...availableModels].filter(Boolean)))
+        : [...availableModels];
+      if (modelNames.length === 0) {
+        const placeholder = document.createElement('option');
+        placeholder.value = '';
+        placeholder.textContent = 'Select model';
+        placeholder.disabled = true;
+        placeholder.selected = true;
+        modelSelectEl.appendChild(placeholder);
+      }
+
       for (const modelName of modelNames) {
         const option = document.createElement('option');
         option.value = modelName;
@@ -1818,9 +1985,9 @@
       clearChatEl.disabled = busy;
       sendEl.setAttribute('aria-busy', String(busy));
       agentModeToggle.checked = agentMode;
-      agentModeLabel.textContent = 'Agent Mode';
+      agentModeLabel.textContent = 'Agent';
       autoApproveToggle.checked = autoApprove;
-      autoApproveLabel.textContent = 'Auto-Approve';
+      autoApproveLabel.textContent = 'Auto';
       debugModeToggle.checked = debugMode;
       updateHeaderState();
       autoResizeTextarea();
@@ -2221,7 +2388,7 @@
         chats = payload.chats || [];
         activeChatId = payload.activeChatId || '';
         availableModels = payload.availableModels || [];
-        currentModel = payload.currentModel || '';
+        currentModel = payload.currentModel ?? null;
         agentMode = payload.agentMode !== undefined ? payload.agentMode : agentMode;
         autoApprove = payload.autoApprove !== undefined ? payload.autoApprove : autoApprove;
         debugMode = payload.debugMode !== undefined ? payload.debugMode : debugMode;

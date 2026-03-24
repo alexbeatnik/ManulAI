@@ -177,7 +177,7 @@ interface PersistedChatState {
 }
 
 const DEFAULT_STORED_SETTINGS: Required<ManulAiStoredSettings> = {
-  ollamaModel: 'llama3.2',
+  ollamaModel: '',
   ollamaBaseUrl: 'http://localhost:11434',
   agentMode: true,
   autoApprove: false,
@@ -419,7 +419,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   }
 
   public getSelectedModel(): string {
-    return this.getStringSetting('ollamaModel', DEFAULT_STORED_SETTINGS.ollamaModel);
+    return this.getStringSetting('ollamaModel', DEFAULT_STORED_SETTINGS.ollamaModel).trim();
   }
 
   public async setSelectedModel(model: string): Promise<void> {
@@ -2893,6 +2893,9 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   private async callOllama(messages: OllamaMessage[]): Promise<OllamaResponse> {
     const baseUrl = this.getOllamaBaseUrl();
     const model = this.getSelectedModel();
+    if (!model) {
+      throw new Error('No Ollama model selected. Select a local model first.');
+    }
     const systemPrompt = this.getSystemPrompt();
 
     const requestMessages: OllamaMessage[] = [];
@@ -5432,7 +5435,7 @@ If the user asks for a change but provides NO code:
       messages: renderableMessages,
       chats: this.chats.map(chat => this.getChatSummary(chat)),
       activeChatId: this.activeChatId,
-      currentModel: this.getSelectedModel(),
+      currentModel: this.getSelectedModel() || null,
       availableModels: this.availableModels,
       agentMode: this.agentMode,
       autoApprove: this.autoApprove,
