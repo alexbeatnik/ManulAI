@@ -1967,6 +1967,12 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           && !hasRecentReadOfLargeRefactorTarget
           && /(?:specific section|specific function|focus on initially|please wait while i read|reading [`'\w./-]+ file|analyzing [`'\w./-]+ file)/i.test(finalContent)
         );
+        const hasFakePreReadCodeDump = Boolean(
+          isLargeRefactorRequest
+          && !hasRecentReadOfLargeRefactorTarget
+          && hasLargeCodeBlocks
+          && /(?:bounded lines|reading bounded lines|content of [`'\w./-]+|here(?: is| are) the lines|analyzing [`'\w./-]+ file)/i.test(finalContent)
+        );
         const hasReadButNoWriteOnLargeRefactor = isLargeRefactorRequest
           && hasRecentReadOfLargeRefactorTarget
           && !hasRecentMeaningfulWrite;
@@ -1978,7 +1984,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         );
         const maxNudgeRetries = hasRecentReplaceNotFound
           ? 3
-          : hasPreReadLargeRefactorNarration
+          : (hasPreReadLargeRefactorNarration || hasFakePreReadCodeDump)
             ? 4
           : hasReadButNoWriteOnLargeRefactor
             ? 4
@@ -1991,6 +1997,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           || isProgressOnlyResponse
           || claimedButUnexecutedCommand
           || hasPreReadLargeRefactorNarration
+          || hasFakePreReadCodeDump
           || hasPostCreateRefactorNarration
           || (isLargeRefactorRequest && hasRecentToolResults && (!hasRecentSuccessfulAction || !hasRecentReadOfLargeRefactorTarget || !hasRecentMeaningfulWrite))
           || (hasRecentReplaceNotFound && (mentionsChange || claimsDone || isLazyAcknowledgment || hasIncompletePlan || hasExplicitNextSteps))
@@ -2000,7 +2007,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         const shouldNudge = requiresToolContinuation && retryCount < maxNudgeRetries;
 
         if (shouldNudge) {
-          this.debugLog('nudge', { retryCount, hasRecentToolResults, hasRecentSuccessfulAction, hasRecentMeaningfulWrite, latestCreatedFilePath, hasRecentReadOfLargeRefactorTarget, hasPreReadLargeRefactorNarration, hasReadButNoWriteOnLargeRefactor, hasPostCreateRefactorNarration, announcedNewFilePath, hasRecentToolErrors, hasRecentReplaceNotFound, replaceNotFoundFilepath, replaceNotFoundStartLine, replaceNotFoundEndLine, lastSuccessfulActionIndex, isLongDump, hasLargeCodeBlocks, claimsDone, mentionsChange, isLazyAcknowledgment, hasIncompletePlan: !!hasIncompletePlan, hasExplicitNextSteps, isProgressOnlyResponse, claimedButUnexecutedCommand, isPassingToUser, isAnnouncedButNotExecuted, isLargeRefactorRequest, contentPreview: finalContent.substring(0, 200) });
+          this.debugLog('nudge', { retryCount, hasRecentToolResults, hasRecentSuccessfulAction, hasRecentMeaningfulWrite, latestCreatedFilePath, hasRecentReadOfLargeRefactorTarget, hasPreReadLargeRefactorNarration, hasFakePreReadCodeDump, hasReadButNoWriteOnLargeRefactor, hasPostCreateRefactorNarration, announcedNewFilePath, hasRecentToolErrors, hasRecentReplaceNotFound, replaceNotFoundFilepath, replaceNotFoundStartLine, replaceNotFoundEndLine, lastSuccessfulActionIndex, isLongDump, hasLargeCodeBlocks, claimsDone, mentionsChange, isLazyAcknowledgment, hasIncompletePlan: !!hasIncompletePlan, hasExplicitNextSteps, isProgressOnlyResponse, claimedButUnexecutedCommand, isPassingToUser, isAnnouncedButNotExecuted, isLargeRefactorRequest, contentPreview: finalContent.substring(0, 200) });
           // Show plan/progress text to the user before nudging
           if (!isProgressOnlyResponse && (hasIncompletePlan || hasExplicitNextSteps || claimedButUnexecutedCommand || claimsDone || mentionsChange || isPassingToUser || isAnnouncedButNotExecuted)) {
             const planText = finalContent.trim();
@@ -2017,7 +2024,10 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           });
           
           let nudgeMessage = '';
-          if (hasPreReadLargeRefactorNarration) {
+          if (hasFakePreReadCodeDump) {
+            const primaryTarget = largeRefactorTargets[0] ?? 'the target file';
+            nudgeMessage = `This is a large refactor request for ${primaryTarget}. Do NOT paste guessed or remembered code blocks and do NOT claim that you already read bounded lines without a tool call. Your next response must call read_file_slice immediately for ${primaryTarget} with startLine=1 and endLine=120. Use the actual tool result, not a pasted snippet.`;
+          } else if (hasPreReadLargeRefactorNarration) {
             const primaryTarget = largeRefactorTargets[0] ?? 'the target file';
             nudgeMessage = `This is a large refactor request for ${primaryTarget}. Do NOT ask the user which section to start with, and do NOT say that you will read the file later. Your next response must call read_file_slice immediately for ${primaryTarget} with startLine=1 and endLine=120. After that, continue with the next bounded slice or the next small extraction step.`;
           } else if (hasReadButNoWriteOnLargeRefactor) {
@@ -2088,6 +2098,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
             latestCreatedFilePath,
             hasRecentReadOfLargeRefactorTarget,
             hasPreReadLargeRefactorNarration,
+            hasFakePreReadCodeDump,
             hasReadButNoWriteOnLargeRefactor,
             hasPostCreateRefactorNarration,
             hasRecentToolErrors,
