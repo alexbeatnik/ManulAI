@@ -429,8 +429,6 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       });
     }
 
-    this.synchronizeAttachmentContextMessage();
-
     if (frontendAttachments && frontendAttachments.length > 0) {
       const fileBlocks = frontendAttachments
         .map(a => `[FILE: ${a.name}]\n${a.content}\n[/FILE]`)
@@ -444,6 +442,12 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
 
     this.progressStepCounter = 0;
     this.messages.push({ role: 'user', content: text });
+
+    if (this.agentMode && this.looksLikeFileMutationRequest(text)) {
+      await this.autoAttachLikelyRequestFiles(text);
+    }
+
+    this.synchronizeAttachmentContextMessage();
 
     if (this.agentMode) {
       const directSummary = await this.tryHandleDirectLicenseAuthorRename(text)
@@ -478,6 +482,146 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     }
 
     return /(?:\b(?:scan|inspect|read|analy[sz]e|understand|index|explore)\s+(?:the\s+|this\s+)?(?:project|workspace|repo|repository|codebase)\b|\b(?:scan|inspect|read|analy[sz]e|understand|index|explore)\s+(?:my\s+)?(?:repo|repository|codebase)\b|\b(?:scan repo|read repo|inspect repo|remember (?:this |the )?(?:project|repo|repository|workspace|codebase)|remember project|remember repo)\b|(?:^|\s)(?:проскануй|скануй|просканировать|просканируй|сканируй|проаналізуй|аналізуй|проанализируй|анализируй|прочитай|зчитай|изучи|запомни|запам'ятай|запамятай)\s+(?:проект|проєкт|репо|репозиторій|репозиторий|воркспейс|workspace|кодовую\s+базу|кодову\s+базу)(?:\s|$)|(?:^|\s)(?:scan|inspect)\s+project(?:\s|$))/i.test(normalized);
+  }
+
+  private async autoAttachLikelyRequestFiles(text: string): Promise<void> {
+    const targets = this.extractLikelyRequestFileTargets(text);
+    if (targets.length === 0) {
+      return;
+    }
+
+    const autoAttached: string[] = [];
+    for (const target of targets.slice(0, 3)) {
+      const resolvedPath = await this.findBestWorkspaceMatchForRequestTarget(target);
+      if (!resolvedPath || this.attachedFiles.has(resolvedPath)) {
+        continue;
+      }
+
+      const activePath = vscode.window.activeTextEditor?.document.uri.scheme === 'file'
+        ? vscode.window.activeTextEditor.document.uri.fsPath
+        : undefined;
+      if (activePath && activePath === resolvedPath) {
+        continue;
+      }
+
+      const attached = await this.attachFileContextUri(vscode.Uri.file(resolvedPath), true);
+      if (!attached) {
+        continue;
+      }
+
+      const displayPath = this.getDisplayPath(attached);
+      autoAttached.push(displayPath);
+      this.postProgressStep(`Found ${attached.name} at ${displayPath}; using it as context for this request`);
+    }
+
+    if (autoAttached.length > 0) {
+      this.messages.push({
+        role: 'user',
+        content: `Auto-discovered likely target file(s) for this request: ${autoAttached.join(', ')}. Use these exact workspace paths when reading or editing files for this request.`,
+        hiddenFromTranscript: true
+      });
+    }
+  }
+
+  private extractLikelyRequestFileTargets(text: string): string[] {
+    const candidates: string[] = [];
+    const pushCandidate = (value: string | undefined): void => {
+      const trimmed = String(value ?? '').trim().replace(/^[`"']+|[`"'.,;:!?]+$/g, '');
+      if (!trimmed) {
+        return;
+      }
+
+      const key = trimmed.toLowerCase();
+      if (!candidates.some(candidate => candidate.toLowerCase() === key)) {
+        candidates.push(trimmed);
+      }
+    };
+
+    let match: RegExpExecArray | null;
+    const explicitPathPattern = /(?:^|\s)([A-Za-z0-9_./-]+\.(?:ts|tsx|js|jsx|json|md|css|scss|html|py|yml|yaml|xml|txt|sh|toml|ini))(?:\s|$)/gi;
+    while ((match = explicitPathPattern.exec(text)) !== null) {
+      pushCandidate(match[1]);
+    }
+
+    const bareNamePattern = /\b(package\.json|tsconfig\.json|README(?:\.md)?|LICENSE(?:\.txt|\.md)?|CHANGELOG(?:\.md)?|Dockerfile|Makefile|\.env(?:\.[A-Za-z0-9_-]+)?)\b/gi;
+    while ((match = bareNamePattern.exec(text)) !== null) {
+      pushCandidate(match[1]);
+    }
+
+    const normalized = text.toLowerCase();
+    if (/(?:\breadme\b|рідмі|ридми)/i.test(normalized)) {
+      pushCandidate('README.md');
+      pushCandidate('README');
+    }
+    if (/(?:\blicense\b|ліцензі|лиценз)/i.test(normalized)) {
+      pushCandidate('LICENSE');
+    }
+    if (/(?:package\s*json|package\.json)/i.test(normalized)) {
+      pushCandidate('package.json');
+    }
+    if (/(?:tsconfig|tsconfig\.json)/i.test(normalized)) {
+      pushCandidate('tsconfig.json');
+    }
+    if (/(?:changelog|історі[яї]\s+змін|список\s+змін|список\s+изменений)/i.test(normalized)) {
+      pushCandidate('CHANGELOG.md');
+    }
+    if (/\bdockerfile\b/i.test(normalized)) {
+      pushCandidate('Dockerfile');
+    }
+    if (/\bmakefile\b/i.test(normalized)) {
+      pushCandidate('Makefile');
+    }
+
+    return candidates;
+  }
+
+  private async findBestWorkspaceMatchForRequestTarget(target: string): Promise<string | undefined> {
+    const normalizedTarget = target.trim().replace(/^\.\//, '');
+    if (!normalizedTarget) {
+      return undefined;
+    }
+
+    const exactMatch = await this.resolveExistingWorkspacePath(normalizedTarget);
+    if (exactMatch) {
+      return exactMatch;
+    }
+
+    const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    if (!workspaceRoot) {
+      return undefined;
+    }
+
+    const aliasGlobs: string[] = [];
+    const lower = normalizedTarget.toLowerCase();
+    if (lower === 'readme' || lower === 'readme.md') {
+      aliasGlobs.push('**/README.md', '**/README');
+    } else if (lower === 'license' || lower === 'license.txt' || lower === 'license.md') {
+      aliasGlobs.push('**/LICENSE', '**/LICENSE.txt', '**/LICENSE.md');
+    } else if (lower === 'changelog' || lower === 'changelog.md') {
+      aliasGlobs.push('**/CHANGELOG.md', '**/CHANGELOG');
+    } else {
+      aliasGlobs.push(`**/${path.basename(normalizedTarget)}`);
+    }
+
+    let bestMatch: { fsPath: string; score: number } | undefined;
+    for (const pattern of aliasGlobs) {
+      const fileUris = await vscode.workspace.findFiles(pattern, '**/node_modules/**', 50);
+      for (const fileUri of fileUris) {
+        const relativePath = vscode.workspace.asRelativePath(fileUri, false).replace(/\\/g, '/');
+        const depth = relativePath.split('/').length - 1;
+        const basename = path.basename(relativePath).toLowerCase();
+        const basenameTarget = path.basename(normalizedTarget).toLowerCase();
+        const exactBaseBonus = basename === basenameTarget ? 0 : 25;
+        const readmeBonus = relativePath.toLowerCase() === 'readme.md' ? -20 : 0;
+        const score = depth * 10 + exactBaseBonus + readmeBonus;
+
+        if (!bestMatch || score < bestMatch.score) {
+          bestMatch = { fsPath: fileUri.fsPath, score };
+        }
+      }
+    }
+
+    return bestMatch?.fsPath;
   }
 
   private async tryHandleDirectLicenseAuthorRename(text: string): Promise<FileWriteSummary | undefined> {
@@ -3356,20 +3500,10 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         await this.addFolderContext(uri);
         return;
       }
-      const bytes = await vscode.workspace.fs.readFile(uri);
-      const content = Buffer.from(bytes).toString('utf8');
-      const document = await vscode.workspace.openTextDocument(uri);
-
-      this.attachedFiles.set(uri.fsPath, {
-        uri,
-        name: path.basename(uri.fsPath),
-        content,
-        languageId: document.languageId
-      });
-
-      this.removeAttachmentContextMessages();
-      this.postStateToWebview();
-      this.postStatus(`Attached ${path.basename(uri.fsPath)} to the next requests.`);
+      const attached = await this.attachFileContextUri(uri);
+      if (!attached) {
+        throw new Error('Failed to attach file.');
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Failed to attach file.';
       this.postStatus(`Unable to attach dropped file: ${message}`);
@@ -3410,32 +3544,45 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         await this.addFolderContext(uri);
         return;
       }
-      const bytes = await vscode.workspace.fs.readFile(uri);
-      const content = Buffer.from(bytes).toString('utf8');
-      const name = path.basename(uri.fsPath);
-
-      let languageId = 'plaintext';
-      try {
-        const document = await vscode.workspace.openTextDocument(uri);
-        languageId = document.languageId;
-      } catch {
-        // Keep plaintext fallback.
+      const attached = await this.attachFileContextUri(uri);
+      if (!attached) {
+        throw new Error('Failed to attach file.');
       }
-
-      this.attachedFiles.set(uri.fsPath, {
-        uri,
-        name,
-        content,
-        languageId
-      });
-
-      this.removeAttachmentContextMessages();
-      this.postStateToWebview();
-      this.postStatus(`Attached ${name} to the next requests.`);
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Failed to attach file.';
       this.postStatus(`Unable to attach file: ${message}`);
     }
+  }
+
+  private async attachFileContextUri(uri: vscode.Uri, silent = false): Promise<AttachedFileContext | undefined> {
+    const bytes = await vscode.workspace.fs.readFile(uri);
+    const content = Buffer.from(bytes).toString('utf8');
+    const name = path.basename(uri.fsPath);
+
+    let languageId = 'plaintext';
+    try {
+      const document = await vscode.workspace.openTextDocument(uri);
+      languageId = document.languageId;
+    } catch {
+      // Keep plaintext fallback.
+    }
+
+    const attached: AttachedFileContext = {
+      uri,
+      name,
+      content,
+      languageId
+    };
+
+    this.attachedFiles.set(uri.fsPath, attached);
+    this.removeAttachmentContextMessages();
+
+    if (!silent) {
+      this.postStateToWebview();
+      this.postStatus(`Attached ${name} to the next requests.`);
+    }
+
+    return attached;
   }
 
   private async browseAndAttachFiles(): Promise<void> {
