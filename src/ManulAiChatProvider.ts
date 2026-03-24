@@ -1962,6 +1962,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         });
 
         const announcedNewFilePath = this.extractAnnouncedNewFilePath(finalContent);
+        const suggestedNextSlice = this.suggestNextLargeRefactorSlice(recentToolResults, largeRefactorTargets);
         const hasPreReadLargeRefactorNarration = Boolean(
           isLargeRefactorRequest
           && !hasRecentReadOfLargeRefactorTarget
@@ -1976,6 +1977,11 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         const hasReadButNoWriteOnLargeRefactor = isLargeRefactorRequest
           && hasRecentReadOfLargeRefactorTarget
           && !hasRecentMeaningfulWrite;
+        const isAskingUserForExactSlice = Boolean(
+          isLargeRefactorRequest
+          && hasRecentReadOfLargeRefactorTarget
+          && /(?:please provide|provide) the exact startline and endline|exact startline and endline|bounded slice you would like to extract/i.test(finalContent)
+        );
         const hasPostCreateRefactorNarration = Boolean(
           isLargeRefactorRequest
           && latestCreatedFilePath
@@ -1986,6 +1992,8 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           ? 3
           : (hasPreReadLargeRefactorNarration || hasFakePreReadCodeDump)
             ? 4
+          : isAskingUserForExactSlice
+            ? 5
           : hasReadButNoWriteOnLargeRefactor
             ? 4
             : 2;
@@ -1998,6 +2006,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           || claimedButUnexecutedCommand
           || hasPreReadLargeRefactorNarration
           || hasFakePreReadCodeDump
+          || isAskingUserForExactSlice
           || hasPostCreateRefactorNarration
           || (isLargeRefactorRequest && hasRecentToolResults && (!hasRecentSuccessfulAction || !hasRecentReadOfLargeRefactorTarget || !hasRecentMeaningfulWrite))
           || (hasRecentReplaceNotFound && (mentionsChange || claimsDone || isLazyAcknowledgment || hasIncompletePlan || hasExplicitNextSteps))
@@ -2007,7 +2016,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         const shouldNudge = requiresToolContinuation && retryCount < maxNudgeRetries;
 
         if (shouldNudge) {
-          this.debugLog('nudge', { retryCount, hasRecentToolResults, hasRecentSuccessfulAction, hasRecentMeaningfulWrite, latestCreatedFilePath, hasRecentReadOfLargeRefactorTarget, hasPreReadLargeRefactorNarration, hasFakePreReadCodeDump, hasReadButNoWriteOnLargeRefactor, hasPostCreateRefactorNarration, announcedNewFilePath, hasRecentToolErrors, hasRecentReplaceNotFound, replaceNotFoundFilepath, replaceNotFoundStartLine, replaceNotFoundEndLine, lastSuccessfulActionIndex, isLongDump, hasLargeCodeBlocks, claimsDone, mentionsChange, isLazyAcknowledgment, hasIncompletePlan: !!hasIncompletePlan, hasExplicitNextSteps, isProgressOnlyResponse, claimedButUnexecutedCommand, isPassingToUser, isAnnouncedButNotExecuted, isLargeRefactorRequest, contentPreview: finalContent.substring(0, 200) });
+          this.debugLog('nudge', { retryCount, hasRecentToolResults, hasRecentSuccessfulAction, hasRecentMeaningfulWrite, latestCreatedFilePath, hasRecentReadOfLargeRefactorTarget, hasPreReadLargeRefactorNarration, hasFakePreReadCodeDump, isAskingUserForExactSlice, suggestedNextSlice, hasReadButNoWriteOnLargeRefactor, hasPostCreateRefactorNarration, announcedNewFilePath, hasRecentToolErrors, hasRecentReplaceNotFound, replaceNotFoundFilepath, replaceNotFoundStartLine, replaceNotFoundEndLine, lastSuccessfulActionIndex, isLongDump, hasLargeCodeBlocks, claimsDone, mentionsChange, isLazyAcknowledgment, hasIncompletePlan: !!hasIncompletePlan, hasExplicitNextSteps, isProgressOnlyResponse, claimedButUnexecutedCommand, isPassingToUser, isAnnouncedButNotExecuted, isLargeRefactorRequest, contentPreview: finalContent.substring(0, 200) });
           // Show plan/progress text to the user before nudging
           if (!isProgressOnlyResponse && (hasIncompletePlan || hasExplicitNextSteps || claimedButUnexecutedCommand || claimsDone || mentionsChange || isPassingToUser || isAnnouncedButNotExecuted)) {
             const planText = finalContent.trim();
@@ -2024,7 +2033,14 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           });
           
           let nudgeMessage = '';
-          if (hasFakePreReadCodeDump) {
+          if (isAskingUserForExactSlice) {
+            const primaryTarget = largeRefactorTargets[0] ?? 'the target file';
+            if (suggestedNextSlice?.filepath && suggestedNextSlice.startLine && suggestedNextSlice.endLine) {
+              nudgeMessage = `This is a large refactor request for ${primaryTarget}. Do NOT ask the user for exact startLine and endLine. Choose the next bounded slice yourself. Your next response must call read_file_slice for ${suggestedNextSlice.filepath} with startLine=${suggestedNextSlice.startLine} and endLine=${suggestedNextSlice.endLine}. After that, continue with one small extraction step from that slice.`;
+            } else {
+              nudgeMessage = `This is a large refactor request for ${primaryTarget}. Do NOT ask the user for exact startLine and endLine. Choose the next bounded slice yourself and call read_file_slice now. Start with startLine=1 and endLine=120 if you have no better slice yet.`;
+            }
+          } else if (hasFakePreReadCodeDump) {
             const primaryTarget = largeRefactorTargets[0] ?? 'the target file';
             nudgeMessage = `This is a large refactor request for ${primaryTarget}. Do NOT paste guessed or remembered code blocks and do NOT claim that you already read bounded lines without a tool call. Your next response must call read_file_slice immediately for ${primaryTarget} with startLine=1 and endLine=120. Use the actual tool result, not a pasted snippet.`;
           } else if (hasPreReadLargeRefactorNarration) {
@@ -2099,6 +2115,8 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
             hasRecentReadOfLargeRefactorTarget,
             hasPreReadLargeRefactorNarration,
             hasFakePreReadCodeDump,
+            isAskingUserForExactSlice,
+            suggestedNextSlice,
             hasReadButNoWriteOnLargeRefactor,
             hasPostCreateRefactorNarration,
             hasRecentToolErrors,
@@ -5119,6 +5137,41 @@ If the user asks for a change but provides NO code:
     const startLine = Math.max(1, anchorIndex + 1 - 4);
     const endLine = Math.min(originalLines.length, startLine + contextSpan - 1);
     return { startLine, endLine };
+  }
+
+  private suggestNextLargeRefactorSlice(
+    recentToolResults: Array<{ message: OllamaMessage & { role: 'tool' }; parsed: Record<string, unknown>; index: number }>,
+    targetPaths: string[]
+  ): { filepath: string; startLine: number; endLine: number } | undefined {
+    for (let index = recentToolResults.length - 1; index >= 0; index -= 1) {
+      const { message, parsed } = recentToolResults[index];
+      if (parsed.error) {
+        continue;
+      }
+
+      const filepath = typeof parsed.path === 'string' ? parsed.path : '';
+      if (!filepath || (targetPaths.length > 0 && !this.toolResultMatchesAnyTargetPath(filepath, targetPaths))) {
+        continue;
+      }
+
+      if (message.tool_name === 'read_file_slice') {
+        const endLine = Number(parsed.endLine ?? 0);
+        const totalLines = Number(parsed.totalLines ?? 0);
+        if (Number.isFinite(endLine) && endLine > 0 && Number.isFinite(totalLines) && totalLines > 0) {
+          const startLine = Math.min(totalLines, endLine + 1);
+          const suggestedEndLine = Math.min(totalLines, startLine + 119);
+          if (startLine <= suggestedEndLine) {
+            return { filepath, startLine, endLine: suggestedEndLine };
+          }
+        }
+      }
+
+      if (message.tool_name === 'read_specific_file' || message.tool_name === 'read_active_file') {
+        return { filepath, startLine: 1, endLine: 120 };
+      }
+    }
+
+    return undefined;
   }
 
   private async executeTerminalCommand(command: string): Promise<string> {
