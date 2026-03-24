@@ -990,8 +990,8 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
 
         const isLongDump = finalContent.length > 300;
         const hasLargeCodeBlocks = /```[\w]*\n[\s\S]{100,}?```/.test(finalContent);
-        const claimsDone = /(?:зробив|замінив|оновив|готово|i've made|i have made|i have updated|summary of the changes)/i.test(finalContent);
-        const mentionsChange = /(?:змін|зроби|оновл|replac|chang|updat|modif)/i.test(finalContent);
+        const claimsDone = /(?:зробив|замінив|оновив|готово|i've made|i have made|i have updated|i updated|i fixed|i removed|i verified|i confirmed|addressed the|fixed the|removed the|updated the|verified the|confirmed the|summary of the changes)/i.test(finalContent);
+        const mentionsChange = /(?:змін|зроби|оновл|replac|chang|updat|modif|address|fix(?:ed)?|remov(?:e|ed)|verif(?:y|ied)|confirm(?:ed)?)/i.test(finalContent);
         const isLazyAcknowledgment = (/^(?:understood|sure|ok|okay|got it|i will|let me know|i can help|i'll make sure)\b/i.test(finalContent.trim())
           || /no (?:immediate|obvious) (?:file changes|issues|errors|problems)/i.test(finalContent)
           || /further debugging (?:would be|is) needed/i.test(finalContent))
@@ -1016,7 +1016,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         ) && retryCount < 2;
 
         if (shouldNudge) {
-          this.debugLog('nudge', { retryCount, isLongDump, hasLargeCodeBlocks, claimsDone, mentionsChange, isLazyAcknowledgment, hasIncompletePlan: !!hasIncompletePlan, isPassingToUser, isAnnouncedButNotExecuted, contentPreview: finalContent.substring(0, 200) });
+          this.debugLog('nudge', { retryCount, hasRecentToolResults, isLongDump, hasLargeCodeBlocks, claimsDone, mentionsChange, isLazyAcknowledgment, hasIncompletePlan: !!hasIncompletePlan, isPassingToUser, isAnnouncedButNotExecuted, contentPreview: finalContent.substring(0, 200) });
           // Show plan/progress text to the user before nudging
           if (hasIncompletePlan || claimsDone || mentionsChange || isPassingToUser || isAnnouncedButNotExecuted) {
             const planText = finalContent.trim();
@@ -2680,7 +2680,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       try {
         const parsed = JSON.parse(rawArguments) as unknown;
         if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-          return parsed as Record<string, unknown>;
+          return this.remapWeakModelArgumentAliases(parsed as Record<string, unknown>);
         }
       } catch {
         return {};
@@ -2689,7 +2689,60 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       return {};
     }
 
-    return rawArguments;
+    return this.remapWeakModelArgumentAliases(rawArguments);
+  }
+
+  private remapWeakModelArgumentAliases(args: Record<string, unknown>): Record<string, unknown> {
+    const aliasMap: Record<string, string> = {
+      file_path: 'filepath',
+      file_name: 'filename',
+      file: 'filepath',
+      path: 'filepath',
+      old_content: 'old_text',
+      new_content: 'new_text',
+      old_string: 'old_text',
+      new_string: 'new_text',
+      old_code: 'old_text',
+      new_code: 'new_text',
+      cmd: 'command',
+      dir: 'directory'
+    };
+
+    const normalized: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(args)) {
+      normalized[aliasMap[key] ?? key] = value;
+    }
+    return normalized;
+  }
+
+  private async resolveWorkspaceUriForOperation(targetPath: string, allowCreate = false): Promise<vscode.Uri> {
+    const normalizedTarget = targetPath.trim();
+    if (!normalizedTarget) {
+      throw new Error('Path is required.');
+    }
+
+    if (path.isAbsolute(normalizedTarget)) {
+      return vscode.Uri.file(normalizedTarget);
+    }
+
+    const directUri = this.resolveWorkspaceUri(normalizedTarget);
+    try {
+      await vscode.workspace.fs.stat(directUri);
+      return directUri;
+    } catch {
+      // Fall through to existing-file resolution.
+    }
+
+    if (allowCreate) {
+      return directUri;
+    }
+
+    const existingPath = await this.resolveExistingWorkspacePath(normalizedTarget);
+    if (existingPath) {
+      return vscode.Uri.file(existingPath);
+    }
+
+    return directUri;
   }
 
   private async readActiveFile(): Promise<string> {
@@ -2713,7 +2766,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     }
 
     try {
-      const uri = this.resolveWorkspaceUri(filepath);
+      const uri = await this.resolveWorkspaceUriForOperation(filepath);
       const content = await this.readWorkspaceText(uri);
       const languageId = vscode.workspace.textDocuments.find(doc => doc.uri.toString() === uri.toString())?.languageId ?? 'plaintext';
 
@@ -2735,17 +2788,8 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     }
 
     try {
-      const workspaceFolders = vscode.workspace.workspaceFolders;
-      if (!workspaceFolders) throw new Error("No workspace open");
-      
-      // Try to safely resolve the path
-      let targetUri: vscode.Uri;
-      if (path.isAbsolute(filename)) {
-          targetUri = vscode.Uri.file(filename);
-      } else {
-          targetUri = vscode.Uri.joinPath(workspaceFolders[0].uri, filename);
-      }
-      
+      const targetUri = await this.resolveWorkspaceUriForOperation(filename, true);
+
       await vscode.workspace.fs.createDirectory(vscode.Uri.file(path.dirname(targetUri.fsPath)));
 
       // Guard against destructive writes from tool calls
@@ -2760,11 +2804,12 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         return JSON.stringify({ error: `Blocked write to ${displayName}: ${destructiveGuard}` });
       }
 
-        await this.writeWorkspaceText(targetUri, content);
+      await this.writeWorkspaceText(targetUri, content);
 
       return JSON.stringify({
         path: targetUri.fsPath,
-        bytesWritten: Buffer.byteLength(content, 'utf8')
+        bytesWritten: Buffer.byteLength(content, 'utf8'),
+        preview: this.buildPreviewSnippet(content)
       });
     } catch (error) {
       return JSON.stringify({
@@ -2779,7 +2824,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     }
 
     try {
-      const uri = this.resolveWorkspaceUri(filepath);
+      const uri = await this.resolveWorkspaceUriForOperation(filepath);
       await vscode.workspace.fs.delete(uri);
       return JSON.stringify({ deleted: uri.fsPath });
     } catch (error) {
@@ -2820,7 +2865,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       return { summary: `Blocked write to ${path.basename(filepath)}: content is a tool-call definition, not file content.` };
     }
 
-    const target = this.resolveWorkspaceUri(filepath);
+    const target = await this.resolveWorkspaceUriForOperation(filepath, true);
     const displayName = path.basename(target.fsPath);
     let sanitizedContent = this.sanitizeGeneratedFileContent(newContent);
 
@@ -2855,7 +2900,17 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     if (oldContent === undefined) {
       // New file created
       const lineCount = sanitizedContent.split('\n').length;
-      return { summary: `Created ${displayName} (${lineCount} lines)` };
+      const preview = this.buildPreviewSnippet(sanitizedContent);
+      return { summary: `Created ${displayName} (${lineCount} lines)${preview ? `\n\n\`\`\`text\n${preview}\n\`\`\`` : ''}` };
+    }
+
+    if (!oldContent.trim() && sanitizedContent.trim()) {
+      const lineCount = sanitizedContent.split('\n').length;
+      const preview = this.buildPreviewSnippet(sanitizedContent);
+      return {
+        summary: `Filled empty ${displayName} (${lineCount} lines)${preview ? `\n\n\`\`\`text\n${preview}\n\`\`\`` : ''}`,
+        revertOperationId: this.createRevertSnapshot(target.fsPath, oldContent, sanitizedContent)
+      };
     }
 
     if (oldContent === sanitizedContent) {
@@ -3091,9 +3146,8 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       return JSON.stringify({ error: 'old_text is required.' });
     }
 
-    const target = this.resolveWorkspaceUri(filepath);
-
     try {
+      const target = await this.resolveWorkspaceUriForOperation(filepath);
       const original = await this.readWorkspaceText(target);
       const occurrences = original.split(oldText).length - 1;
 
@@ -3110,7 +3164,8 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       return JSON.stringify({
         path: target.fsPath,
         replacements: 1,
-        bytesWritten: Buffer.byteLength(updated, 'utf8')
+        bytesWritten: Buffer.byteLength(updated, 'utf8'),
+        preview: this.buildPreviewSnippet(updated)
       });
     } catch (error) {
       return JSON.stringify({
@@ -3143,7 +3198,8 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       return JSON.stringify({
         path: target.fsPath,
         replacements: occurrences,
-        bytesWritten: Buffer.byteLength(updated, 'utf8')
+        bytesWritten: Buffer.byteLength(updated, 'utf8'),
+        preview: this.buildPreviewSnippet(updated)
       });
     } catch (error) {
       return JSON.stringify({
@@ -3181,6 +3237,20 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         }));
       });
     });
+  }
+
+  private buildPreviewSnippet(content: string): string {
+    const normalized = content.replace(/\r\n/g, '\n').trimEnd();
+    if (!normalized.trim()) {
+      return '';
+    }
+
+    const lines = normalized.split('\n');
+    const previewLines = lines.length > 40
+      ? [...lines.slice(0, 30), `... (${lines.length - 35} more lines omitted) ...`, ...lines.slice(-5)]
+      : lines;
+    const preview = previewLines.join('\n');
+    return preview.length > 5000 ? `${preview.slice(0, 4800)}\n... preview truncated ...` : preview;
   }
 
   private async addFileContext(rawPath: string): Promise<void> {
@@ -3785,7 +3855,19 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     }
 
     const renderableMessages: WebviewRenderableMessage[] = this.messages.reduce<WebviewRenderableMessage[]>((result, message) => {
-      if (message.role === 'system' || message.role === 'tool' || message.hiddenFromTranscript) {
+      if (message.role === 'system') {
+        return result;
+      }
+
+      if (message.role === 'tool') {
+        const formattedToolMessage = this.formatToolMessageForTranscript(message);
+        if (formattedToolMessage) {
+          result.push(formattedToolMessage);
+        }
+        return result;
+      }
+
+      if (message.hiddenFromTranscript) {
         return result;
       }
 
@@ -3827,6 +3909,102 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         isFolder: file.languageId === '__folder__'
       }))
     });
+  }
+
+  private formatToolMessageForTranscript(message: OllamaMessage): WebviewRenderableMessage | undefined {
+    if (message.role !== 'tool' || !message.tool_name) {
+      return undefined;
+    }
+
+    let parsed: Record<string, unknown> | undefined;
+    try {
+      const json = JSON.parse(message.content) as unknown;
+      if (json && typeof json === 'object' && !Array.isArray(json)) {
+        parsed = json as Record<string, unknown>;
+      }
+    } catch {
+      return {
+        role: 'tool',
+        content: `Tool: ${message.tool_name}\n\n${this.truncateLongResponse(message.content)}`
+      };
+    }
+
+    switch (message.tool_name) {
+      case 'execute_terminal_command': {
+        const command = String(parsed?.command ?? '');
+        const exitCode = String(parsed?.exitCode ?? '');
+        const stdout = this.formatToolTextBlock(parsed?.stdout);
+        const stderr = this.formatToolTextBlock(parsed?.stderr);
+        const error = parsed?.error ? String(parsed.error) : '';
+        const parts = [
+          `Command: ${command || '(unknown command)'}`,
+          `Exit code: ${exitCode || '0'}`
+        ];
+        if (stdout) {
+          parts.push(`stdout\n\n\`\`\`text\n${stdout}\n\`\`\``);
+        }
+        if (stderr) {
+          parts.push(`stderr\n\n\`\`\`text\n${stderr}\n\`\`\``);
+        }
+        if (error) {
+          parts.push(`error\n\n\`\`\`text\n${error}\n\`\`\``);
+        }
+        return {
+          role: 'tool',
+          content: parts.join('\n\n')
+        };
+      }
+      case 'create_or_edit_file':
+      case 'write_to_file':
+      case 'replace_in_file': {
+        const error = parsed?.error ? String(parsed.error) : '';
+        if (error) {
+          return {
+            role: 'tool',
+            content: `File tool: ${message.tool_name}\n\n${error}`
+          };
+        }
+
+        const targetPath = String(parsed?.path ?? parsed?.deleted ?? '');
+        const bytesWritten = parsed?.bytesWritten !== undefined ? String(parsed.bytesWritten) : '';
+        const replacements = parsed?.replacements !== undefined ? String(parsed.replacements) : '';
+        const preview = this.formatToolTextBlock(parsed?.preview);
+        const parts = [`Path: ${targetPath || '(unknown path)'}`];
+        if (bytesWritten) {
+          parts.push(`Bytes written: ${bytesWritten}`);
+        }
+        if (replacements) {
+          parts.push(`Replacements: ${replacements}`);
+        }
+        if (preview) {
+          parts.push(`Preview\n\n\`\`\`text\n${preview}\n\`\`\``);
+        }
+        return {
+          role: 'tool',
+          content: parts.join('\n\n')
+        };
+      }
+      default:
+        return undefined;
+    }
+  }
+
+  private formatToolTextBlock(value: unknown): string {
+    if (typeof value !== 'string') {
+      return '';
+    }
+
+    const normalized = value.replace(/\r\n/g, '\n').trim();
+    if (!normalized) {
+      return '';
+    }
+
+    const lines = normalized.split('\n');
+    const limited = lines.length > 80
+      ? [...lines.slice(0, 60), `... (${lines.length - 70} more lines omitted) ...`, ...lines.slice(-10)]
+      : lines;
+    const joined = limited.join('\n');
+    return joined.length > 8000 ? `${joined.slice(0, 7800)}\n... output truncated ...` : joined;
   }
 
   private postStatus(content: string): void {
