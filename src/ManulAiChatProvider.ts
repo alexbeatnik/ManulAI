@@ -42,6 +42,7 @@ interface AttachedFileContext {
   name: string;
   content: string;
   languageId: string;
+  readOnly?: boolean;
 }
 
 interface ToolDefinition {
@@ -1342,7 +1343,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     // Try to resolve the marker name to an attached file path
     let filepath = rawName;
     for (const [fsPath, file] of this.attachedFiles) {
-      if (file.languageId === '__folder__') {
+      if (file.languageId === '__folder__' || file.readOnly) {
         continue;
       }
       const baseName = path.basename(fsPath);
@@ -1373,7 +1374,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
 
     // Check if the response is mostly a reproduction of an attached file
     for (const [fsPath, file] of this.attachedFiles) {
-      if (file.languageId === '__folder__') {
+      if (file.languageId === '__folder__' || file.readOnly) {
         continue;
       }
       // Compare: if >40% of the attached file's lines appear in the response, it's likely a file dump
@@ -1495,7 +1496,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           return false;
         }
 
-        if (/^<\/?manulai_(?:active_editor_context|attached_file)\b.*>$/i.test(trimmed)) {
+        if (/^<\/?manulai_(?:active_editor_context|attached_file|attached_folder)\b.*>$/i.test(trimmed)) {
           return false;
         }
 
@@ -1923,13 +1924,13 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       return true;
     }
 
-    return Array.from(this.attachedFiles.values()).some(file => file.languageId !== '__folder__' && (trimmed === file.name || trimmed === path.basename(file.uri.fsPath)));
+    return Array.from(this.attachedFiles.values()).some(file => file.languageId !== '__folder__' && !file.readOnly && (trimmed === file.name || trimmed === path.basename(file.uri.fsPath)));
   }
 
   private findAttachedFileForReplacements(replacements: Array<{ oldText: string }>): string | undefined {
     // Find which attached file contains the old_text strings
     for (const [fsPath, file] of this.attachedFiles) {
-      if (file.languageId === '__folder__') {
+      if (file.languageId === '__folder__' || file.readOnly) {
         continue;
       }
       const allFound = replacements.every(rep => file.content.includes(rep.oldText));
@@ -1939,7 +1940,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     }
     // Partial match: at least one replacement matches
     for (const [fsPath, file] of this.attachedFiles) {
-      if (file.languageId === '__folder__') {
+      if (file.languageId === '__folder__' || file.readOnly) {
         continue;
       }
       const anyFound = replacements.some(rep => file.content.includes(rep.oldText));
@@ -2447,7 +2448,15 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     try {
       parsed = JSON.parse(trimmed);
     } catch {
-      return false;
+      const repaired = this.repairSingleQuotedJson(trimmed);
+      if (!repaired) {
+        return false;
+      }
+      try {
+        parsed = JSON.parse(repaired);
+      } catch {
+        return false;
+      }
     }
 
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
@@ -3137,24 +3146,29 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
 
       await vscode.workspace.fs.createDirectory(vscode.Uri.file(path.dirname(targetUri.fsPath)));
 
+      let sanitizedContent = this.sanitizeGeneratedFileContent(content);
+      if (this.looksLikeDiffOutput(sanitizedContent)) {
+        sanitizedContent = this.stripDiffPrefixes(sanitizedContent);
+      }
+
       // Guard against destructive writes from tool calls
       const displayName = path.basename(targetUri.fsPath);
       let oldContent: string | undefined;
       try { oldContent = await this.readWorkspaceText(targetUri); } catch { /* new file */ }
-      if (this.looksLikeToolCallContent(content)) {
+      if (this.looksLikeToolCallContent(sanitizedContent)) {
         return JSON.stringify({ error: `Blocked: content is a tool-call definition, not file content.` });
       }
-      const destructiveGuard = this.detectDestructiveWrite(displayName, content, oldContent);
+      const destructiveGuard = this.detectDestructiveWrite(displayName, sanitizedContent, oldContent);
       if (destructiveGuard) {
         return JSON.stringify({ error: `Blocked write to ${displayName}: ${destructiveGuard}` });
       }
 
-      await this.writeWorkspaceText(targetUri, content);
+      await this.writeWorkspaceText(targetUri, sanitizedContent);
 
       return JSON.stringify({
         path: targetUri.fsPath,
-        bytesWritten: Buffer.byteLength(content, 'utf8'),
-        preview: this.buildPreviewSnippet(content)
+        bytesWritten: Buffer.byteLength(sanitizedContent, 'utf8'),
+        preview: this.buildPreviewSnippet(sanitizedContent)
       });
     } catch (error) {
       return JSON.stringify({
@@ -3634,7 +3648,8 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       uri: syntheticUri,
       name: filename,
       content,
-      languageId
+      languageId,
+      readOnly: true
     });
 
     this.removeAttachmentContextMessages();
@@ -3898,11 +3913,6 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     if (!logDir) { return; }
     try {
       fs.mkdirSync(logDir, { recursive: true });
-      // Ensure .manulai is gitignored
-      const gitignorePath = path.join(path.dirname(logDir), '.gitignore');
-      if (!fs.existsSync(gitignorePath)) {
-        fs.writeFileSync(gitignorePath, 'logs/\n', 'utf8');
-      }
       const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
       this.debugSessionId = timestamp;
       const logFile = path.join(logDir, `session-${timestamp}.jsonl`);
@@ -4019,10 +4029,12 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   private renderAttachmentContextMessage(): string {
     const renderedFiles = Array.from(this.attachedFiles.values())
       .map(file => {
-        const filePath = file.uri.fsPath.startsWith('/dropped/') || file.uri.fsPath.startsWith('/attached/')
-          ? (vscode.workspace.workspaceFolders?.[0]?.uri.fsPath
-            ? `${vscode.workspace.workspaceFolders[0].uri.fsPath}/${file.name}`
-            : file.name)
+        const filePath = file.readOnly
+          ? `reference-only:${file.name}`
+          : file.uri.fsPath.startsWith('/dropped/') || file.uri.fsPath.startsWith('/attached/')
+            ? (vscode.workspace.workspaceFolders?.[0]?.uri.fsPath
+              ? `${vscode.workspace.workspaceFolders[0].uri.fsPath}/${file.name}`
+              : file.name)
           : file.uri.fsPath;
 
         if (file.languageId === '__folder__') {
@@ -4034,7 +4046,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         }
 
         return [
-          `<manulai_attached_file file="${file.name}" path="${filePath}">`,
+          `<manulai_attached_file file="${file.name}" path="${filePath}"${file.readOnly ? ' readonly="true"' : ''}>`,
           file.content,
           '</manulai_attached_file>'
         ].join('\n');
