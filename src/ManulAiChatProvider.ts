@@ -1194,6 +1194,9 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
 
     // Check if the response is mostly a reproduction of an attached file
     for (const [fsPath, file] of this.attachedFiles) {
+      if (file.languageId === '__folder__') {
+        continue;
+      }
       // Compare: if >40% of the attached file's lines appear in the response, it's likely a file dump
       const originalLines = file.content.split('\n').filter(l => l.trim().length > 20);
       if (originalLines.length < 5) {
@@ -3745,6 +3748,15 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
             ? `${vscode.workspace.workspaceFolders[0].uri.fsPath}/${file.name}`
             : file.name)
           : file.uri.fsPath;
+
+        if (file.languageId === '__folder__') {
+          return [
+            `<manulai_attached_folder name="${file.name}" path="${filePath}">`,
+            file.content,
+            '</manulai_attached_folder>'
+          ].join('\n');
+        }
+
         return [
           `<manulai_attached_file file="${file.name}" path="${filePath}">`,
           file.content,
