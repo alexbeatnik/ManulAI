@@ -34,7 +34,7 @@ ManulAI is designed for developers who already want Ollama as the model runtime 
 ### Right-Side Chat UI
 
 - dedicated ManulAI chat view in the Secondary Sidebar
-- launcher view in the Activity Bar
+- Activity Bar button opens the ManulAI chat in the Secondary Sidebar
 - chat stays beside the editor instead of replacing the main work area
 - conversation history is kept in memory for follow-up requests
 - multiple chats can be created, switched, cleared, and deleted from the sidebar, and file-backed workspaces persist them under `.manulai/chats.json`

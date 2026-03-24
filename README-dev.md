@@ -68,7 +68,7 @@ Make sure you have Ollama running locally (`http://localhost:11434` by default) 
 
 ## Commands and Views
 
-- **Views:** Contributes the `manulai.chatView` webview to the Secondary Sidebar.
+- **Views:** Contributes the `manulai.chatView` webview to the Secondary Sidebar, while the Activity Bar entry redirects directly into that chat instead of showing a separate launcher screen.
 - **File Context:** Supports dropping files into the UI, or using commands like `manulai.attachActiveFile` and `manulai.attachExplorerSelection` via context menus.
 - **Configuration:** `package.json` still contributes `manulai.ollamaModel`, `manulai.ollamaBaseUrl`, `manulai.agentMode`, `manulai.autoApprove`, `manulai.debugMode`, and `manulai.systemPrompt`, but file-backed workspaces now persist the effective workspace state in `.manulai/settings.json`.
 

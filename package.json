@@ -116,7 +116,7 @@
       "manulai-launcher": [
         {
           "id": "manulai.launcherView",
-          "name": "Launcher",
+          "name": "ManulAI",
           "visibility": "visible",
           "icon": "media/manulai-icon.svg"
         }
@@ -132,12 +132,6 @@
         }
       ]
     },
-    "viewsWelcome": [
-      {
-        "view": "manulai.launcherView",
-        "contents": "Open the chat in the right-side Secondary Sidebar.\n[Open Chat](command:manulai.openChat)\n[Open Secondary Sidebar](command:manulai.openSecondarySidebar)\n[Select Ollama Model](command:manulai.selectModel)"
-      }
-    ],
     "configuration": {
       "title": "ManulAI",
       "properties": {

@@ -210,10 +210,9 @@
     }
 
     .controls {
-      display: grid;
-      grid-template-columns: minmax(0, 1fr) auto;
-      gap: 4px 5px;
+      display: flex;
       align-items: center;
+      gap: 5px;
       min-width: 0;
     }
 
@@ -224,18 +223,27 @@
 
     .control-group {
       display: flex;
-      flex-wrap: wrap;
+      flex-wrap: nowrap;
       gap: 4px;
       align-items: center;
       min-width: 0;
     }
 
     .control-group.primary {
+      flex: 0 1 auto;
       justify-content: flex-start;
     }
 
     .control-group.secondary {
+      flex: 1 1 auto;
       justify-content: flex-end;
+      flex-wrap: nowrap;
+    }
+
+    .control-group.secondary .model-select {
+      flex: 1 1 148px;
+      width: auto;
+      max-width: none;
     }
 
     .model-select,
@@ -283,7 +291,10 @@
       min-height: var(--control-height);
       padding: var(--control-padding-y) var(--control-padding-x);
       cursor: pointer;
-      flex-shrink: 0;
+      flex-shrink: 1;
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
       white-space: nowrap;
       font-size: 10px;
       font-weight: 500;
@@ -296,6 +307,7 @@
       justify-content: center;
       width: var(--control-height);
       min-width: var(--control-height);
+      flex-shrink: 0;
       padding: 0;
       border-radius: 8px;
     }
@@ -961,8 +973,9 @@
       display: flex;
       align-items: flex-end;
       gap: 8px;
-      flex-shrink: 0;
-      flex-wrap: wrap;
+      flex: 1 1 auto;
+      min-width: 0;
+      flex-wrap: nowrap;
       justify-content: flex-start;
     }
 
@@ -970,8 +983,16 @@
       display: inline-flex;
       align-items: flex-end;
       gap: 6px;
-      flex-wrap: wrap;
-      order: 3;
+      flex: 1 1 auto;
+      min-width: 0;
+      flex-wrap: nowrap;
+    }
+
+    .composer-submit-actions {
+      display: inline-flex;
+      align-items: flex-end;
+      flex: 0 0 auto;
+      gap: 8px;
       margin-left: auto;
     }
 
@@ -984,13 +1005,21 @@
     }
 
     .composer-hint {
+      flex: 1 1 auto;
       min-width: 0;
       display: flex;
       align-items: center;
       gap: 10px;
+      overflow: hidden;
       color: var(--muted);
       font-size: 10px;
       line-height: 1.4;
+    }
+
+    .composer-hint span {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
     }
 
     .composer-hint strong {
@@ -1171,6 +1200,7 @@
 
     .toggle-switch.toolbar-toggle {
       gap: 4px;
+      min-width: 0;
       padding: 0 6px;
       border: 1px solid var(--border-muted);
       border-radius: 999px;
@@ -1179,10 +1209,22 @@
 
     .toggle-switch.icon-toggle {
       gap: 4px;
+      min-width: 0;
       padding: 0 5px;
       border: 1px solid var(--border-muted);
       border-radius: 999px;
       background: color-mix(in srgb, var(--panel-strong) 84%, transparent);
+    }
+
+    .composer-toggles .toggle-switch.toolbar-toggle {
+      flex: 1 1 0;
+      max-width: 78px;
+    }
+
+    .composer-toggles .toggle-switch.toolbar-toggle .toggle-label {
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
     }
 
     .toggle-switch.icon-toggle .toggle-label {
@@ -1311,14 +1353,14 @@
 
       .controls {
         display: flex;
-        flex-wrap: wrap;
+        flex-wrap: nowrap;
         align-items: center;
         gap: 4px 5px;
       }
 
       .control-group {
         display: flex;
-        flex-wrap: wrap;
+        flex-wrap: nowrap;
         align-items: center;
         gap: 4px;
       }
@@ -1331,7 +1373,7 @@
 
       .context-actions {
         display: flex;
-        flex-wrap: wrap;
+        flex-wrap: nowrap;
         gap: 4px;
       }
 
@@ -1345,9 +1387,10 @@
       }
 
       .control-group.secondary {
-        flex: 1 1 100%;
-        width: 100%;
-        justify-content: flex-start;
+        flex: 1 1 auto;
+        width: auto;
+        justify-content: flex-end;
+        flex-wrap: nowrap;
       }
 
       .toggle-switch,
@@ -1375,7 +1418,6 @@
         min-height: 34px;
       }
 
-      .model-select,
       .chat-select,
       .compact-select {
         flex: 1 1 156px;
@@ -1383,9 +1425,9 @@
         max-width: none;
       }
 
-      .composer-actions {
-        flex-direction: column;
-        align-items: stretch;
+      .control-group.secondary .model-select {
+        flex: 1 1 118px;
+        width: auto;
       }
 
       .composer-buttons {
@@ -1395,22 +1437,15 @@
 
       .composer-toggles {
         width: auto;
-        justify-content: flex-end;
+        justify-content: flex-start;
+      }
+
+      .composer-submit-actions {
         margin-left: auto;
       }
     }
 
     @media (max-width: 380px) {
-      .topbar {
-        grid-template-columns: 1fr;
-      }
-
-      .topbar-primary,
-      .context-actions,
-      .control-group.primary {
-        width: 100%;
-      }
-
       .header {
         padding: 7px 9px 6px;
       }
@@ -1700,19 +1735,21 @@
                   <span id="autoApproveLabel" class="toggle-label">Auto</span>
                 </label>
               </div>
-              <button id="stop" class="ghost-button danger stop" type="button" title="Stop request" aria-label="Stop request">
-                <span class="stop-icon" aria-hidden="true">
-                  <svg viewBox="0 0 16 16"><path d="M4 4h8v8H4V4z"/></svg>
-                </span>
-              </button>
-              <button id="send" class="send" type="button" title="Send message" aria-label="Send message">
-                <span class="send-label">
-                  <span class="send-icon" aria-hidden="true">
-                    <svg viewBox="0 0 16 16"><path d="M2 13.5l12-5.5L2 2.5v4l6 1.5-6 1.5v4z"/></svg>
+              <div class="composer-submit-actions">
+                <button id="stop" class="ghost-button danger stop" type="button" title="Stop request" aria-label="Stop request">
+                  <span class="stop-icon" aria-hidden="true">
+                    <svg viewBox="0 0 16 16"><path d="M4 4h8v8H4V4z"/></svg>
                   </span>
-                  <span class="dots" aria-hidden="true"><span></span><span></span><span></span></span>
-                </span>
-              </button>
+                </button>
+                <button id="send" class="send" type="button" title="Send message" aria-label="Send message">
+                  <span class="send-label">
+                    <span class="send-icon" aria-hidden="true">
+                      <svg viewBox="0 0 16 16"><path d="M2 13.5l12-5.5L2 2.5v4l6 1.5-6 1.5v4z"/></svg>
+                    </span>
+                    <span class="dots" aria-hidden="true"><span></span><span></span><span></span></span>
+                  </span>
+                </button>
+              </div>
             </div>
           </div>
         </div>
