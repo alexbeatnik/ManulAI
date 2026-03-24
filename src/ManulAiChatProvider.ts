@@ -1982,6 +1982,10 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         const hasReadButNoWriteOnLargeRefactor = isLargeRefactorRequest
           && hasRecentReadOfLargeRefactorTarget
           && !hasRecentMeaningfulWrite;
+        const hasPostReadToolStall = Boolean(
+          hasReadButNoWriteOnLargeRefactor
+          && (isProgressOnlyResponse || isAnnouncedButNotExecuted || !!hasIncompletePlan || hasExplicitNextSteps)
+        );
         const isAskingUserForExactSlice = Boolean(
           isLargeRefactorRequest
           && hasRecentReadOfLargeRefactorTarget
@@ -2022,7 +2026,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         const shouldNudge = requiresToolContinuation && retryCount < maxNudgeRetries;
 
         if (shouldNudge) {
-          this.debugLog('nudge', { retryCount, hasRecentToolResults, hasRecentSuccessfulAction, hasRecentMeaningfulWrite, latestCreatedFilePath, hasRecentReadOfLargeRefactorTarget, hasLargeRefactorShellReadBypass, hasPreReadLargeRefactorNarration, hasFakePreReadCodeDump, isAskingUserForExactSlice, suggestedNextSlice, hasReadButNoWriteOnLargeRefactor, hasPostCreateRefactorNarration, announcedNewFilePath, hasRecentToolErrors, hasRecentReplaceNotFound, replaceNotFoundFilepath, replaceNotFoundStartLine, replaceNotFoundEndLine, lastSuccessfulActionIndex, isLongDump, hasLargeCodeBlocks, claimsDone, mentionsChange, isLazyAcknowledgment, hasIncompletePlan: !!hasIncompletePlan, hasExplicitNextSteps, isProgressOnlyResponse, claimedButUnexecutedCommand, isPassingToUser, isAnnouncedButNotExecuted, isLargeRefactorRequest, contentPreview: finalContent.substring(0, 200) });
+          this.debugLog('nudge', { retryCount, hasRecentToolResults, hasRecentSuccessfulAction, hasRecentMeaningfulWrite, latestCreatedFilePath, hasRecentReadOfLargeRefactorTarget, hasLargeRefactorShellReadBypass, hasPreReadLargeRefactorNarration, hasFakePreReadCodeDump, isAskingUserForExactSlice, suggestedNextSlice, hasReadButNoWriteOnLargeRefactor, hasPostReadToolStall, hasPostCreateRefactorNarration, announcedNewFilePath, hasRecentToolErrors, hasRecentReplaceNotFound, replaceNotFoundFilepath, replaceNotFoundStartLine, replaceNotFoundEndLine, lastSuccessfulActionIndex, isLongDump, hasLargeCodeBlocks, claimsDone, mentionsChange, isLazyAcknowledgment, hasIncompletePlan: !!hasIncompletePlan, hasExplicitNextSteps, isProgressOnlyResponse, claimedButUnexecutedCommand, isPassingToUser, isAnnouncedButNotExecuted, isLargeRefactorRequest, contentPreview: finalContent.substring(0, 200) });
           // Show plan/progress text to the user before nudging
           if (!isProgressOnlyResponse && (hasIncompletePlan || hasExplicitNextSteps || claimedButUnexecutedCommand || claimsDone || mentionsChange || isPassingToUser || isAnnouncedButNotExecuted)) {
             const planText = finalContent.trim();
@@ -2055,11 +2059,22 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           } else if (hasPreReadLargeRefactorNarration) {
             const primaryTarget = largeRefactorTargets[0] ?? 'the target file';
             nudgeMessage = `This is a large refactor request for ${primaryTarget}. Do NOT ask the user which section to start with, and do NOT say that you will read the file later. Your next response must call read_file_slice immediately for ${primaryTarget} with startLine=1 and endLine=120. After that, continue with the next bounded slice or the next small extraction step.`;
+          } else if (hasPostReadToolStall) {
+            const primaryTarget = largeRefactorTargets[0] ?? 'the target file';
+            if (suggestedNextSlice?.filepath && suggestedNextSlice.startLine && suggestedNextSlice.endLine) {
+              nudgeMessage = announcedNewFilePath
+                ? `This is a large refactor request for ${primaryTarget}. You already read a bounded slice and then stalled in progress text. Do NOT print another step summary. Your next response must be tool calls only. First call create_or_edit_file for ${announcedNewFilePath} using only the next self-contained function, type group, or interface block supported by the slices you already read. Then call replace_in_file on ${primaryTarget} to remove that moved block and add any needed import. If the current slice is still insufficient, call read_file_slice for ${suggestedNextSlice.filepath} with startLine=${suggestedNextSlice.startLine} and endLine=${suggestedNextSlice.endLine}. No prose before the tool call.`
+                : `This is a large refactor request for ${primaryTarget}. You already read a bounded slice and then stalled in progress text. Do NOT print another step summary. Your next response must be a tool call, not prose. If you can already extract a self-contained function, type group, or interface block from the current slice, call create_or_edit_file now and then call replace_in_file on ${primaryTarget}. Otherwise call read_file_slice for ${suggestedNextSlice.filepath} with startLine=${suggestedNextSlice.startLine} and endLine=${suggestedNextSlice.endLine}. No prose before the tool call.`;
+            } else {
+              nudgeMessage = announcedNewFilePath
+                ? `This is a large refactor request for ${primaryTarget}. You already read a bounded slice and then stalled in progress text. Do NOT print another step summary. Your next response must be tool calls only. First call create_or_edit_file for ${announcedNewFilePath} using only the next self-contained function, type group, or interface block from the slice you already read. Then call replace_in_file on ${primaryTarget} to remove that moved block and add any needed import. No prose before the tool call.`
+                : `This is a large refactor request for ${primaryTarget}. You already read a bounded slice and then stalled in progress text. Do NOT print another step summary. Your next response must be a tool call, not prose. Either call create_or_edit_file now for one concrete self-contained extraction from the current slice and then call replace_in_file on ${primaryTarget}, or call read_file_slice for the next bounded slice with explicit startLine and endLine. No prose before the tool call.`;
+            }
           } else if (hasReadButNoWriteOnLargeRefactor) {
             const primaryTarget = largeRefactorTargets[0] ?? 'the target file';
             nudgeMessage = announcedNewFilePath
-              ? `This is a large refactor request for ${primaryTarget}. You already identified a concrete extraction target. Do NOT summarize again. Work in very small consecutive edits. Your next response must call tools now: first call create_or_edit_file for ${announcedNewFilePath} with only the next self-contained function, type group, or interface block from the current bounded slice. Do NOT include incomplete blocks or references like vscode.Uri unless you also add the required import. Then call replace_in_file on ${primaryTarget} to remove the moved block and add the import if needed. After that, continue with the next small extraction step in the same task instead of stopping. If you truly need more context before writing, call read_file_slice on ${primaryTarget} with explicit startLine and endLine for just the next bounded slice.`
-              : `This is a large refactor request for ${primaryTarget}. You already read part of the target file. Do NOT summarize it again, do NOT ask the user for a bounded section, and do NOT ask to read the full file without a tool call. Your next response must call a tool. Either: (1) call create_or_edit_file to extract one concrete bounded unit you already identified into a new module, using only the next self-contained function, type group, or interface block from the current slice; then call replace_in_file on ${primaryTarget}; or (2) if you truly need more context, call read_file_slice on ${primaryTarget} with explicit startLine and endLine for the next bounded slice. Keep going in small consecutive steps until the task is complete.`;
+              ? `This is a large refactor request for ${primaryTarget}. You already identified a concrete extraction target. Do NOT summarize again. Work in very small consecutive edits. Your next response must call tools now: first call create_or_edit_file for ${announcedNewFilePath} with only the next self-contained function, type group, or interface block from the current bounded slice. Do NOT include incomplete blocks or references like vscode.Uri unless you also add the required import. Then call replace_in_file on ${primaryTarget} to remove the moved block and add the import if needed. After that, continue with the next small extraction step in the same task instead of stopping. If you truly need more context before writing, ${suggestedNextSlice?.filepath && suggestedNextSlice.startLine && suggestedNextSlice.endLine ? `call read_file_slice for ${suggestedNextSlice.filepath} with startLine=${suggestedNextSlice.startLine} and endLine=${suggestedNextSlice.endLine}` : `call read_file_slice on ${primaryTarget} with explicit startLine and endLine for just the next bounded slice`}.`
+              : `This is a large refactor request for ${primaryTarget}. You already read part of the target file. Do NOT summarize it again, do NOT ask the user for a bounded section, and do NOT ask to read the full file without a tool call. Your next response must call a tool. Either: (1) call create_or_edit_file to extract one concrete bounded unit you already identified into a new module, using only the next self-contained function, type group, or interface block from the current slice; then call replace_in_file on ${primaryTarget}; or (2) if you truly need more context, ${suggestedNextSlice?.filepath && suggestedNextSlice.startLine && suggestedNextSlice.endLine ? `call read_file_slice for ${suggestedNextSlice.filepath} with startLine=${suggestedNextSlice.startLine} and endLine=${suggestedNextSlice.endLine}` : `call read_file_slice on ${primaryTarget} with explicit startLine and endLine for the next bounded slice`}. Keep going in small consecutive steps until the task is complete.`;
           } else if (hasPostCreateRefactorNarration) {
             const primaryTarget = largeRefactorTargets[0] ?? 'the target file';
             const createdFileLabel = latestCreatedFilePath ? path.basename(latestCreatedFilePath) : 'the new file';
@@ -2128,6 +2143,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
             isAskingUserForExactSlice,
             suggestedNextSlice,
             hasReadButNoWriteOnLargeRefactor,
+            hasPostReadToolStall,
             hasPostCreateRefactorNarration,
             hasRecentToolErrors,
             hasRecentReplaceNotFound,
@@ -2141,7 +2157,11 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
             isProgressOnlyResponse,
             contentPreview: finalContent.substring(0, 200)
           });
-          finalContent = hasReadButNoWriteOnLargeRefactor
+          finalContent = hasPostReadToolStall
+            ? suggestedNextSlice?.filepath && suggestedNextSlice.startLine && suggestedNextSlice.endLine
+              ? `The model read a bounded section of the target file but then stalled in progress-only text instead of making the next tool call. The next bounded slice was ${suggestedNextSlice.filepath}:${suggestedNextSlice.startLine}-${suggestedNextSlice.endLine}, but it still did not continue. Retry the request or use a stronger tool-calling model for iterative refactors.`
+              : 'The model read a bounded section of the target file but then stalled in progress-only text instead of making the next tool call. Retry the request or use a stronger tool-calling model for iterative refactors.'
+            : hasReadButNoWriteOnLargeRefactor
             ? 'The model read a bounded section of the target file but still failed to perform a concrete extraction or edit step. It kept summarizing instead of calling tools. Retry the request or use a stronger tool-calling model for iterative refactors.'
             : isLargeRefactorRequest
             ? 'The model inspected the code but did not carry out the large refactor step-by-step. Retry the request or use a stronger tool-calling model. For large files, prefer bounded reads and iterative extraction instead of whole-file summaries.'
