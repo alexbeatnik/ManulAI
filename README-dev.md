@@ -68,7 +68,7 @@ Make sure you have Ollama running locally (`http://localhost:11434` by default) 
 
 ## Commands and Views
 
-- **Views:** Contributes the `manulai.chatView` webview to the Secondary Sidebar, while the Activity Bar entry redirects directly into that chat instead of showing a separate launcher screen.
+- **Views:** Contributes the `manulai.chatView` webview to the Secondary Sidebar. The separate Activity Bar launcher container was removed so the extension stays focused on the right-side chat view.
 - **File Context:** Supports dropping files into the UI, or using commands like `manulai.attachActiveFile` and `manulai.attachExplorerSelection` via context menus.
 - **Configuration:** `package.json` still contributes `manulai.ollamaModel`, `manulai.ollamaBaseUrl`, `manulai.agentMode`, `manulai.autoApprove`, `manulai.debugMode`, and `manulai.systemPrompt`, but file-backed workspaces now persist the effective workspace state in `.manulai/settings.json`.
 
@@ -84,7 +84,7 @@ Reference shape:
 
 ```json
 {
-  "ollamaModel": "llama3.2",
+  "ollamaModel": "",
   "ollamaBaseUrl": "http://localhost:11434",
   "agentMode": true,
   "autoApprove": false,
@@ -126,6 +126,7 @@ Direct pre-agent handlers also exist for common fast-path edits such as Markdown
 - Tool results are rendered back into the chat transcript instead of staying hidden in backend-only messages.
 - Terminal transcripts include command, exit code, stdout, stderr, and execution errors when available.
 - File write results prefer diffs for edits to existing files and previews for newly created content or writes that fill previously empty files.
+- Revertable file tool results carry revert metadata through transcript rendering so the webview can show `Revert changes` directly on those entries.
 - The provider can inject local-only progress messages such as `Step 2: Reading README.md` while tools are executing. These messages are visible in chat but are filtered out from the next model request.
 
 ## Multi-Chat Behavior
@@ -142,12 +143,14 @@ Direct pre-agent handlers also exist for common fast-path edits such as Markdown
 - History needs to keep a visible, scrollable area even when the header, controls, attachments, and composer are present.
 - The composer must not grow enough to push the history fully out of view; textarea growth should stay bounded by viewport-sensitive limits.
 - When vertical space is constrained, non-essential copy such as subtitles, hints, or attachment chip overflow can be reduced before sacrificing message visibility.
+- Chat selection, chat creation, and chat deletion controls should stay grouped together in the header row, with the status pill staying compact enough not to crowd the selector.
 
 ## Agent Reliability Safeguards
 
 - Recent successful reads are tracked separately from successful fix actions so a model cannot satisfy the loop just by listing files.
 - Replace failures like `old_text not found` are treated as incomplete work and should trigger a read-then-retry path.
 - Responses that claim commands ran, claim fixes were completed, or end on partial plans without executing the work should be nudged back into the tool loop.
+- If retry exhaustion is reached and the model still returns pseudo-progress or plan text, the backend should surface a deterministic failure message instead of leaking raw `Step 1/3`-style output into the final answer.
 - The system mandate explicitly treats unread files as unknown state: file edits require a prior read, project-structure assumptions require listing, and completion claims require successful tool confirmation.
 - If the task required changes and the model has not used tools, the response is considered wrong and should be nudged back into tool execution.
 - Raw or malformed tool-call JSON leaked into assistant text must be treated as a failed tool invocation and retried; fallback file-write extractors must never treat that payload as file content.
