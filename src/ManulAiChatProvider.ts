@@ -2058,6 +2058,46 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           || (!hasRecentSuccessfulAction && (isLongDump || hasLargeCodeBlocks || claimsDone || mentionsChange || isLazyAcknowledgment))
         );
         const shouldNudge = requiresToolContinuation && retryCount < maxNudgeRetries;
+        const shouldAutoBootstrapLargeRefactorRead = Boolean(
+          shouldNudge
+          && retryCount >= 1
+          && isLargeRefactorRequest
+          && !hasRecentReadOfLargeRefactorTarget
+          && (hasPreReadLargeRefactorNarration || isProgressOnlyResponse || isAnnouncedButNotExecuted || !!hasIncompletePlan)
+        );
+
+        if (shouldAutoBootstrapLargeRefactorRead) {
+          const preferredTargetPath = await this.findPreferredLargeRefactorTargetPath(latestVisibleUserRequest);
+          if (preferredTargetPath) {
+            this.debugLog('auto_bootstrap_large_refactor_read', {
+              retryCount,
+              targetPath: preferredTargetPath,
+              reason: {
+                hasPreReadLargeRefactorNarration,
+                isProgressOnlyResponse,
+                isAnnouncedButNotExecuted,
+                hasIncompletePlan: !!hasIncompletePlan
+              }
+            });
+            this.postProgressStep(`Reading lines 1-120 of ${path.basename(preferredTargetPath)}`);
+            const toolResult = await this.readFileSlice(preferredTargetPath, 1, 120);
+            this.debugLog('tool_exec_result', { tool: 'read_file_slice', result: toolResult.substring(0, 500), synthetic: true });
+            messages.push({
+              role: 'assistant',
+              content: finalContent,
+              hiddenFromTranscript: true
+            });
+            messages.push({
+              role: 'tool',
+              content: toolResult,
+              tool_name: 'read_file_slice',
+              hiddenFromTranscript: true,
+              revertOperationIds: this.extractToolResultRevertOperationIds(toolResult)
+            });
+            await this.processOllamaResponse(messages, 0);
+            return;
+          }
+        }
 
         if (shouldNudge) {
           this.debugLog('nudge', { retryCount, hasRecentToolResults, hasRecentSuccessfulAction, hasRecentMeaningfulWrite, latestCreatedFilePath, hasRecentReadOfLargeRefactorTarget, hasLargeRefactorShellReadBypass, hasPreReadLargeRefactorNarration, hasFakePreReadCodeDump, hasFakePostReadAnalysisDump, hasAnnouncedExtractionWithoutWrite, isAskingUserForExactSlice, suggestedNextSlice, hasReadButNoWriteOnLargeRefactor, hasPostReadToolStall, hasPostCreateRefactorNarration, announcedNewFilePath, hasRecentToolErrors, hasRecentReplaceNotFound, replaceNotFoundFilepath, replaceNotFoundStartLine, replaceNotFoundEndLine, lastSuccessfulActionIndex, isLongDump, hasLargeCodeBlocks, claimsDone, mentionsChange, isLazyAcknowledgment, hasIncompletePlan: !!hasIncompletePlan, hasExplicitNextSteps, isProgressOnlyResponse, claimedButUnexecutedCommand, isPassingToUser, isAnnouncedButNotExecuted, isLargeRefactorRequest, contentPreview: finalContent.substring(0, 200) });
