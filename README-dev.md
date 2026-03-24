@@ -25,6 +25,14 @@ ManulAI is a local-first, privacy-focused coding agent for VS Code. All intellig
 - **File System:** Uses `vscode.workspace.fs` for file inspection and edits.
 - **State:** Conversation history and file context remain available in memory during the VS Code session. They are not sent to any cloud provider.
 
+## Context And Scan Behavior
+
+- **Attached Files:** Explicitly attached files are serialized into hidden attachment context messages and should not be re-read unless the user asks for fresh disk state.
+- **Workspace Snapshot:** Project scan requests can attach a folder snapshot containing the workspace tree and a capped subset of file contents. This gives weaker local models broader context without trying to inline the entire repository.
+- **Folder Isolation:** Attached folders are marked separately from regular files and must not be treated as editable file targets.
+- **Auto File Discovery:** Edit requests can auto-resolve likely targets such as `README.md`, `LICENSE`, `package.json`, `tsconfig.json`, and explicit file paths before the model starts editing.
+- **Scan Nudges:** Full-project scan requests inject hidden guidance to keep reading relevant files and not stop after the first directory or first detected issue.
+
 ## Product Constraints and Rules
 
 - **Strictly Local-First:** No cloud dependencies, no remote models, no third-party APIs. Only Ollama.
@@ -84,6 +92,20 @@ Direct pre-agent handlers also exist for common fast-path edits such as Markdown
 - Chat Mode bypasses tool fallback write layers and returns plain text only.
 - Agent Mode still includes fallback write extraction layers for weaker models that fail to emit native tool calls reliably.
 - Ollama requests are not hard-timed out by the extension; users can stop them explicitly.
+
+## Transcript And Tool Feedback
+
+- Tool results are rendered back into the chat transcript instead of staying hidden in backend-only messages.
+- Terminal transcripts include command, exit code, stdout, stderr, and execution errors when available.
+- File write results include previews for newly created content and for writes that fill previously empty files.
+- The provider can inject local-only progress messages such as `Step 2: Reading README.md` while tools are executing. These messages are visible in chat but are filtered out from the next model request.
+
+## Agent Reliability Safeguards
+
+- Recent successful reads are tracked separately from successful fix actions so a model cannot satisfy the loop just by listing files.
+- Replace failures like `old_text not found` are treated as incomplete work and should trigger a read-then-retry path.
+- Responses that claim commands ran, claim fixes were completed, or end on partial plans without executing the work should be nudged back into the tool loop.
+- Direct fast paths remain conservative and are limited to narrow cases such as Markdown title rename and LICENSE author rename.
 
 ## Documentation Sync
 

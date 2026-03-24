@@ -16,6 +16,8 @@ This repository contains a VS Code extension named ManulAI.
 - In Chat Mode, never claim that files were created, modified, or deleted.
 - For small edit requests, prefer surgical edits over whole-file rewrites.
 - Never delete unrelated file content when the user asked for a narrow change.
+- Keep project-scan behavior persistent enough that the model can continue across multiple files instead of stopping after the first step.
+- When the user references a likely target file such as `README`, `LICENSE`, `package.json`, or an explicit path, prefer resolving it automatically instead of waiting for manual attachment.
 
 ## Code Style
 
@@ -35,6 +37,9 @@ This repository contains a VS Code extension named ManulAI.
 - Tool results must be returned to Ollama using the native `tool` role flow.
 - Agent Mode should continue to support approvals, auto-approve, and fallback handling for weaker local models.
 - Keep direct handlers and fallback layers conservative: fast for common edits, but not destructive.
+- Keep tool output visible in the chat transcript, including terminal stdout and stderr and previews for file writes.
+- Keep step-by-step progress messages visible in chat during multi-tool actions, but do not feed those local progress messages back into the next model request.
+- Keep folder snapshot context distinct from file context so directories are never treated as editable files.
 
 ## Documentation
 
@@ -46,3 +51,4 @@ This repository contains a VS Code extension named ManulAI.
 - Avoid adding unnecessary installation/setup sections to the user-facing README unless behavior changes require them.
 - Keep the `What's New` section at the bottom of the README, immediately before `License`.
 - When tool lists change, update user-facing docs and developer docs in the same change.
+- When agent reliability or context-handling behavior changes, update README, README-dev, and these instructions in the same change.
