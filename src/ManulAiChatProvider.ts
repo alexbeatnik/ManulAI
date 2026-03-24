@@ -1858,6 +1858,8 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         const replaceNotFoundContext = this.getLatestReplaceNotFoundContext(messages);
         const hasRecentReplaceNotFound = Boolean(replaceNotFoundContext);
         const replaceNotFoundFilepath = replaceNotFoundContext?.filepath;
+        const replaceNotFoundStartLine = replaceNotFoundContext?.startLine;
+        const replaceNotFoundEndLine = replaceNotFoundContext?.endLine;
 
         const isLongDump = finalContent.length > 300;
         const hasLargeCodeBlocks = /```[\w]*\n[\s\S]{100,}?```/.test(finalContent);
@@ -1935,7 +1937,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         const shouldNudge = requiresToolContinuation && retryCount < maxNudgeRetries;
 
         if (shouldNudge) {
-          this.debugLog('nudge', { retryCount, hasRecentToolResults, hasRecentSuccessfulAction, hasRecentToolErrors, hasRecentReplaceNotFound, replaceNotFoundFilepath, lastSuccessfulActionIndex, isLongDump, hasLargeCodeBlocks, claimsDone, mentionsChange, isLazyAcknowledgment, hasIncompletePlan: !!hasIncompletePlan, hasExplicitNextSteps, isProgressOnlyResponse, claimedButUnexecutedCommand, isPassingToUser, isAnnouncedButNotExecuted, isLargeRefactorRequest, contentPreview: finalContent.substring(0, 200) });
+          this.debugLog('nudge', { retryCount, hasRecentToolResults, hasRecentSuccessfulAction, hasRecentToolErrors, hasRecentReplaceNotFound, replaceNotFoundFilepath, replaceNotFoundStartLine, replaceNotFoundEndLine, lastSuccessfulActionIndex, isLongDump, hasLargeCodeBlocks, claimsDone, mentionsChange, isLazyAcknowledgment, hasIncompletePlan: !!hasIncompletePlan, hasExplicitNextSteps, isProgressOnlyResponse, claimedButUnexecutedCommand, isPassingToUser, isAnnouncedButNotExecuted, isLargeRefactorRequest, contentPreview: finalContent.substring(0, 200) });
           // Show plan/progress text to the user before nudging
           if (!isProgressOnlyResponse && (hasIncompletePlan || hasExplicitNextSteps || claimedButUnexecutedCommand || claimsDone || mentionsChange || isPassingToUser || isAnnouncedButNotExecuted)) {
             const planText = finalContent.trim();
@@ -1961,7 +1963,9 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           } else if (hasExplicitNextSteps) {
             nudgeMessage = 'You listed next steps but stopped before executing them. Continue now. Do not stop after the first step or the first issue — keep using tools until the scan is complete.';
           } else if (hasRecentReplaceNotFound) {
-            nudgeMessage = `Your replace_in_file call failed because old_text did not match the real file content.${replaceNotFoundFilepath ? ` First call read_specific_file for ${replaceNotFoundFilepath}.` : ' First call read_specific_file for that file.'} Do NOT guess. Then call replace_in_file again using the exact current text including whitespace.`;
+            nudgeMessage = replaceNotFoundFilepath && replaceNotFoundStartLine && replaceNotFoundEndLine
+              ? `Your replace_in_file call failed because old_text did not match the real file content. First call read_file_slice for ${replaceNotFoundFilepath} with startLine=${replaceNotFoundStartLine} and endLine=${replaceNotFoundEndLine}. Do NOT guess. Then call replace_in_file again using the exact current text including whitespace.`
+              : `Your replace_in_file call failed because old_text did not match the real file content.${replaceNotFoundFilepath ? ` First call read_specific_file for ${replaceNotFoundFilepath}.` : ' First call read_specific_file for that file.'} Do NOT guess. Then call replace_in_file again using the exact current text including whitespace.`;
           } else if (isProgressOnlyResponse) {
             nudgeMessage = 'Do not print progress updates like "Step 3/3" without taking action. Call a tool now. If you need the current file content, use read_specific_file first, then continue with replace_in_file or another appropriate tool.';
           } else if (claimedButUnexecutedCommand) {
@@ -2070,7 +2074,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     };
   }
 
-  private getLatestReplaceNotFoundContext(messages: OllamaMessage[]): { filepath?: string } | undefined {
+  private getLatestReplaceNotFoundContext(messages: OllamaMessage[]): { filepath?: string; startLine?: number; endLine?: number } | undefined {
     for (let index = messages.length - 1; index >= 0; index -= 1) {
       const message = messages[index];
       if (message.role !== 'tool') {
@@ -2102,7 +2106,15 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       }
 
       if (message.tool_name === 'replace_in_file' && /old_text not found/i.test(String(parsed.error))) {
-        return { filepath: this.getReplaceInFilePathForToolMessage(messages, index) };
+        const suggestedReadSlice = parsed.suggestedReadSlice;
+        const slice = suggestedReadSlice && typeof suggestedReadSlice === 'object' && !Array.isArray(suggestedReadSlice)
+          ? suggestedReadSlice as Record<string, unknown>
+          : undefined;
+        return {
+          filepath: this.getReplaceInFilePathForToolMessage(messages, index),
+          startLine: typeof slice?.startLine === 'number' ? slice.startLine : undefined,
+          endLine: typeof slice?.endLine === 'number' ? slice.endLine : undefined
+        };
       }
     }
 
@@ -4874,7 +4886,10 @@ If the user asks for a change but provides NO code:
       const occurrences = original.split(oldText).length - 1;
 
       if (occurrences === 0) {
-        return JSON.stringify({ error: 'old_text not found in file. Make sure it matches exactly, including whitespace.' });
+        return JSON.stringify({
+          error: 'old_text not found in file. Make sure it matches exactly, including whitespace.',
+          suggestedReadSlice: this.suggestReadSliceForReplaceFailure(original, oldText)
+        });
       }
       if (occurrences > 1) {
         return JSON.stringify({ error: `old_text matched ${occurrences} times. Add more surrounding context so it matches exactly once.` });
@@ -4932,6 +4947,36 @@ If the user asks for a change but provides NO code:
         error: error instanceof Error ? error.message : 'Failed to replace text in file.'
       });
     }
+  }
+
+  private suggestReadSliceForReplaceFailure(originalContent: string, attemptedOldText: string): { startLine: number; endLine: number } | undefined {
+    const originalLines = originalContent.replace(/\r\n/g, '\n').split('\n');
+    const attemptedLines = attemptedOldText.replace(/\r\n/g, '\n').split('\n');
+    const anchorCandidates = attemptedLines
+      .map(line => line.trim())
+      .filter(line => line.length >= 8);
+
+    if (originalLines.length === 0 || anchorCandidates.length === 0) {
+      return undefined;
+    }
+
+    let anchorIndex = -1;
+    for (const candidate of anchorCandidates) {
+      anchorIndex = originalLines.findIndex(line => line.includes(candidate));
+      if (anchorIndex >= 0) {
+        break;
+      }
+    }
+
+    if (anchorIndex < 0) {
+      return undefined;
+    }
+
+    const attemptedNonEmptyLineCount = attemptedLines.filter(line => line.trim().length > 0).length;
+    const contextSpan = Math.max(40, attemptedNonEmptyLineCount + 16);
+    const startLine = Math.max(1, anchorIndex + 1 - 4);
+    const endLine = Math.min(originalLines.length, startLine + contextSpan - 1);
+    return { startLine, endLine };
   }
 
   private async executeTerminalCommand(command: string): Promise<string> {
