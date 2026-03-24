@@ -1875,11 +1875,22 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         // Detect model announcing a step/action but not executing it (ends with colon or ellipsis)
         const endsWithoutAction = /(?::\s*|\.\.\.)\s*$/.test(finalContent.trim());
         const announcesToolAction = /(?:execute|run|start|install|create|update|modify|read|check|verify).*(?:command|script|file|terminal|npm|server)/i.test(finalContent);
-        const isAnnouncedButNotExecuted = endsWithoutAction && announcesToolAction;
+        const hasExecutingStepAnnouncement = /\bexecut(?:e|ing)\s+step\s+\d+\b/i.test(finalContent);
+        const hasCompletedStepAnnouncement = /\bstep\s+\d+\s+completed\b/i.test(finalContent);
+        const mentionsConcreteNextFile = /(?:moving|extracting|splitting|writing|editing|creating)\s+.+\s+(?:to|into)\s+`?[\w./-]+`?/i.test(finalContent);
+        const isAnnouncedButNotExecuted = (endsWithoutAction && announcesToolAction)
+          || hasExecutingStepAnnouncement
+          || (hasCompletedStepAnnouncement && mentionsConcreteNextFile);
 
         // Detect incomplete plan execution: model mentions "Step N/M" but hasn't reached the final step
         const stepMatch = finalContent.match(/step\s+(\d+)\s*[\/of]+\s*(\d+)/i);
-        const hasIncompletePlan = stepMatch && parseInt(stepMatch[1], 10) < parseInt(stepMatch[2], 10);
+        const announcedStepNumbers = Array.from(finalContent.matchAll(/\bstep\s+(\d+)\b/gi))
+          .map(match => parseInt(match[1], 10))
+          .filter(Number.isFinite);
+        const hasSequentialStepNarration = announcedStepNumbers.length >= 2
+          && Math.max(...announcedStepNumbers) > Math.min(...announcedStepNumbers);
+        const hasIncompletePlan = (stepMatch && parseInt(stepMatch[1], 10) < parseInt(stepMatch[2], 10))
+          || (hasCompletedStepAnnouncement && hasSequentialStepNarration);
         const hasExplicitNextSteps = /next steps?:/i.test(finalContent) && /\n\s*(?:2|3|4|5)\.\s+/i.test(finalContent);
         const progressLines = finalContent
           .split('\n')
@@ -1887,7 +1898,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           .filter(Boolean);
         const isProgressOnlyResponse = progressLines.length > 0
           && finalContent.trim().length < 220
-          && progressLines.every(line => /^(?:step\s+\d+\s*(?:\/|of)\s*\d+[:\s-].*|reading (?:the )?file first\.{0,3}|reading and modifying .+|i(?:'| a)?ll read the file.*|i apologize for the oversight\.?|sorry for the oversight\.?)$/i.test(line));
+          && progressLines.every(line => /^(?:step\s+\d+\s*(?:\/|of)\s*\d+[:\s-].*|step\s+\d+\s+completed[:\s-].*|execut(?:e|ing)\s+step\s+\d+[:\s-].*|reading (?:the )?file first\.{0,3}|reading and modifying .+|i(?:'| a)?ll read the file.*|i apologize for the oversight\.?|sorry for the oversight\.?)$/i.test(line));
 
         const recentExecutedCommands = recentToolMessages
           .filter(message => message.tool_name === 'execute_terminal_command')
@@ -1942,7 +1953,9 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           
           let nudgeMessage = '';
           if (hasIncompletePlan) {
-            nudgeMessage = `You are on step ${stepMatch![1]} of ${stepMatch![2]} but stopped. Continue executing your plan. Proceed to the next step now — use the provided tools.`;
+            nudgeMessage = stepMatch
+              ? `You are on step ${stepMatch[1]} of ${stepMatch[2]} but stopped. Continue executing your plan. Proceed to the next step now — use the provided tools.`
+              : 'You reported that one step was completed and announced the next step, but you stopped before executing it. Continue now by calling the next tool instead of narrating the plan.';
           } else if (isLargeRefactorRequest) {
             nudgeMessage = 'This is a large refactor request. Do not summarize the whole file or stop after inspection. First define a concise module/file split plan, then execute step 1 immediately with tools. Prefer read_file_slice for bounded reads on large files, and continue iteratively one file or one slice at a time.';
           } else if (hasExplicitNextSteps) {
