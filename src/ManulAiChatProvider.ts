@@ -1815,6 +1815,18 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
             return { message, parsed: {} as Record<string, unknown>, index };
           }
         });
+        const hasRecentMeaningfulWrite = recentToolResults.some(({ message, parsed }) => {
+          if (parsed.error) {
+            return false;
+          }
+          if (message.tool_name === 'replace_in_file' || message.tool_name === 'write_to_file' || message.tool_name === 'delete_file') {
+            return true;
+          }
+          if (message.tool_name !== 'create_or_edit_file') {
+            return false;
+          }
+          return !this.isPlaceholderCreateResult(parsed);
+        });
         const lastSuccessfulActionIndex = (() => {
           for (let index = recentToolResults.length - 1; index >= 0; index -= 1) {
             const { message, parsed } = recentToolResults[index];
@@ -1827,10 +1839,12 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
               }
               continue;
             }
-            if (message.tool_name === 'create_or_edit_file'
-              || message.tool_name === 'write_to_file'
+            if (message.tool_name === 'write_to_file'
               || message.tool_name === 'replace_in_file'
               || message.tool_name === 'delete_file') {
+              return index;
+            }
+            if (message.tool_name === 'create_or_edit_file' && !this.isPlaceholderCreateResult(parsed)) {
               return index;
             }
           }
@@ -1843,8 +1857,10 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           if (message.tool_name === 'execute_terminal_command') {
             return Number(parsed.exitCode ?? 0) === 0;
           }
-          return message.tool_name === 'create_or_edit_file'
-            || message.tool_name === 'write_to_file'
+          if (message.tool_name === 'create_or_edit_file') {
+            return !this.isPlaceholderCreateResult(parsed);
+          }
+          return message.tool_name === 'write_to_file'
             || message.tool_name === 'replace_in_file'
             || message.tool_name === 'delete_file';
         });
@@ -1854,6 +1870,18 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           .filter(item => item.error);
         const hasRecentToolErrors = recentToolErrors.length > 0;
         const latestVisibleUserRequest = this.getLatestVisibleUserRequest(messages);
+        const largeRefactorTargets = this.extractLikelyRequestFileTargets(latestVisibleUserRequest);
+        const hasRecentReadOfLargeRefactorTarget = largeRefactorTargets.length > 0 && recentToolResults.some(({ message, parsed }) => {
+          if (parsed.error) {
+            return false;
+          }
+          if (message.tool_name !== 'read_active_file'
+            && message.tool_name !== 'read_specific_file'
+            && message.tool_name !== 'read_file_slice') {
+            return false;
+          }
+          return this.toolResultMatchesAnyTargetPath(parsed.path, largeRefactorTargets);
+        });
         const isLargeRefactorRequest = this.looksLikeLargeRefactorRequest(latestVisibleUserRequest);
         const replaceNotFoundContext = this.getLatestReplaceNotFoundContext(messages);
         const hasRecentReplaceNotFound = Boolean(replaceNotFoundContext);
@@ -1929,7 +1957,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           || hasExplicitNextSteps
           || isProgressOnlyResponse
           || claimedButUnexecutedCommand
-          || (isLargeRefactorRequest && hasRecentToolResults && !hasRecentSuccessfulAction)
+          || (isLargeRefactorRequest && hasRecentToolResults && (!hasRecentSuccessfulAction || !hasRecentReadOfLargeRefactorTarget || !hasRecentMeaningfulWrite))
           || (hasRecentReplaceNotFound && (mentionsChange || claimsDone || isLazyAcknowledgment || hasIncompletePlan || hasExplicitNextSteps))
           || (hasRecentToolErrors && (claimsDone || mentionsChange || isLazyAcknowledgment))
           || (!hasRecentSuccessfulAction && (isLongDump || hasLargeCodeBlocks || claimsDone || mentionsChange || isLazyAcknowledgment))
@@ -1937,7 +1965,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         const shouldNudge = requiresToolContinuation && retryCount < maxNudgeRetries;
 
         if (shouldNudge) {
-          this.debugLog('nudge', { retryCount, hasRecentToolResults, hasRecentSuccessfulAction, hasRecentToolErrors, hasRecentReplaceNotFound, replaceNotFoundFilepath, replaceNotFoundStartLine, replaceNotFoundEndLine, lastSuccessfulActionIndex, isLongDump, hasLargeCodeBlocks, claimsDone, mentionsChange, isLazyAcknowledgment, hasIncompletePlan: !!hasIncompletePlan, hasExplicitNextSteps, isProgressOnlyResponse, claimedButUnexecutedCommand, isPassingToUser, isAnnouncedButNotExecuted, isLargeRefactorRequest, contentPreview: finalContent.substring(0, 200) });
+          this.debugLog('nudge', { retryCount, hasRecentToolResults, hasRecentSuccessfulAction, hasRecentMeaningfulWrite, hasRecentReadOfLargeRefactorTarget, hasRecentToolErrors, hasRecentReplaceNotFound, replaceNotFoundFilepath, replaceNotFoundStartLine, replaceNotFoundEndLine, lastSuccessfulActionIndex, isLongDump, hasLargeCodeBlocks, claimsDone, mentionsChange, isLazyAcknowledgment, hasIncompletePlan: !!hasIncompletePlan, hasExplicitNextSteps, isProgressOnlyResponse, claimedButUnexecutedCommand, isPassingToUser, isAnnouncedButNotExecuted, isLargeRefactorRequest, contentPreview: finalContent.substring(0, 200) });
           // Show plan/progress text to the user before nudging
           if (!isProgressOnlyResponse && (hasIncompletePlan || hasExplicitNextSteps || claimedButUnexecutedCommand || claimsDone || mentionsChange || isPassingToUser || isAnnouncedButNotExecuted)) {
             const planText = finalContent.trim();
@@ -1959,7 +1987,14 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
               ? `You are on step ${stepMatch[1]} of ${stepMatch[2]} but stopped. Continue executing your plan. Proceed to the next step now — use the provided tools.`
               : 'You reported that one step was completed and announced the next step, but you stopped before executing it. Continue now by calling the next tool instead of narrating the plan.';
           } else if (isLargeRefactorRequest) {
-            nudgeMessage = 'This is a large refactor request. Do not summarize the whole file or stop after inspection. First define a concise module/file split plan, then execute step 1 immediately with tools. Prefer read_file_slice for bounded reads on large files, and continue iteratively one file or one slice at a time.';
+            const primaryTarget = largeRefactorTargets[0];
+            if (primaryTarget && !hasRecentReadOfLargeRefactorTarget) {
+              nudgeMessage = `This is a large refactor request. You have not read the main target file yet. First call read_file_slice for ${primaryTarget} to inspect a bounded section of the real file content. Do NOT create placeholder files or stop at a plan. After reading the target file, execute one concrete extraction or replace step with tools.`;
+            } else if (!hasRecentMeaningfulWrite) {
+              nudgeMessage = 'This is a large refactor request. A placeholder file or plan is not enough progress. Do not stop after scaffolding. Read the real source file, then perform one concrete extraction or replace step with tools before responding.';
+            } else {
+              nudgeMessage = 'This is a large refactor request. Do not summarize the whole file or stop after inspection. First define a concise module/file split plan, then execute step 1 immediately with tools. Prefer read_file_slice for bounded reads on large files, and continue iteratively one file or one slice at a time.';
+            }
           } else if (hasExplicitNextSteps) {
             nudgeMessage = 'You listed next steps but stopped before executing them. Continue now. Do not stop after the first step or the first issue — keep using tools until the scan is complete.';
           } else if (hasRecentReplaceNotFound) {
@@ -1998,6 +2033,8 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
             maxNudgeRetries,
             hasRecentToolResults,
             hasRecentSuccessfulAction,
+            hasRecentMeaningfulWrite,
+            hasRecentReadOfLargeRefactorTarget,
             hasRecentToolErrors,
             hasRecentReplaceNotFound,
             replaceNotFoundFilepath,
@@ -5022,6 +5059,47 @@ If the user asks for a change but provides NO code:
       : lines;
     const preview = previewLines.join('\n');
     return preview.length > 5000 ? `${preview.slice(0, 4800)}\n... preview truncated ...` : preview;
+  }
+
+  private isPlaceholderCreateResult(parsed: Record<string, unknown>): boolean {
+    const preview = typeof parsed.preview === 'string' ? parsed.preview : '';
+    const bytesWritten = Number(parsed.bytesWritten ?? 0);
+    const normalizedLines = preview
+      .replace(/\r\n/g, '\n')
+      .split('\n')
+      .map(line => line.trim())
+      .filter(Boolean);
+
+    if (normalizedLines.length === 0) {
+      return true;
+    }
+
+    const codeLikeLineCount = normalizedLines.filter(line => {
+      if (/^(?:\/\/|\/\*|\*|#)/.test(line)) {
+        return false;
+      }
+      return /(?:^|\s)(?:export|import|const|let|var|function|class|interface|type|enum|async|return)\b/.test(line)
+        || /[{}();=]/.test(line);
+    }).length;
+
+    return codeLikeLineCount === 0 && bytesWritten <= 240;
+  }
+
+  private toolResultMatchesAnyTargetPath(toolPathValue: unknown, targets: string[]): boolean {
+    const toolPath = String(toolPathValue ?? '').replace(/\\/g, '/').toLowerCase();
+    if (!toolPath) {
+      return false;
+    }
+
+    return targets.some(target => {
+      const normalizedTarget = target.replace(/\\/g, '/').replace(/^\.\//, '').toLowerCase();
+      if (!normalizedTarget) {
+        return false;
+      }
+      return toolPath.endsWith(`/${normalizedTarget}`)
+        || toolPath === normalizedTarget
+        || path.basename(toolPath) === path.basename(normalizedTarget);
+    });
   }
 
   private async addFileContext(rawPath: string): Promise<void> {
