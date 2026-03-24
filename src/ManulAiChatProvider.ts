@@ -1053,7 +1053,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     if (this.agentMode && this.looksLikeLargeRefactorRequest(text)) {
       this.messages.push({
         role: 'user',
-        content: 'This is a large refactor request. Do NOT try to rewrite or summarize the whole file in one pass. First inspect structure with list_workspace_files and read_file_slice for bounded sections when the file is large. Then create a short module/file split plan with 2-5 concrete steps and immediately execute only the first concrete step using tools. Continue iteratively one file or bounded slice at a time.',
+        content: 'This is a large refactor request. Do NOT try to rewrite or summarize the whole file in one pass. First inspect structure with list_workspace_files and read_file_slice for bounded sections when the file is large. Then refactor in many small consecutive steps if needed: function-by-function, type-by-type, or one small self-contained block at a time. A long plan is acceptable, but do not stop after planning or after the first step. Keep using tools and continue the refactor across multiple consecutive small edits until the whole task is done or you are genuinely blocked by missing exact file context.',
         hiddenFromTranscript: true
       });
     }
@@ -1829,6 +1829,16 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           }
           return !this.isPlaceholderCreateResult(parsed);
         });
+        const latestCreatedFilePath = (() => {
+          for (let index = recentToolResults.length - 1; index >= 0; index -= 1) {
+            const { message, parsed } = recentToolResults[index];
+            if (parsed.error || message.tool_name !== 'create_or_edit_file' || this.isPlaceholderCreateResult(parsed)) {
+              continue;
+            }
+            return typeof parsed.path === 'string' ? parsed.path : undefined;
+          }
+          return undefined;
+        })();
         const lastSuccessfulActionIndex = (() => {
           for (let index = recentToolResults.length - 1; index >= 0; index -= 1) {
             const { message, parsed } = recentToolResults[index];
@@ -1955,6 +1965,12 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         const hasReadButNoWriteOnLargeRefactor = isLargeRefactorRequest
           && hasRecentReadOfLargeRefactorTarget
           && !hasRecentMeaningfulWrite;
+        const hasPostCreateRefactorNarration = Boolean(
+          isLargeRefactorRequest
+          && latestCreatedFilePath
+          && hasRecentMeaningfulWrite
+          && /(?:update|import|moving more|move more|refactor(?:ing)? methods|use imported types|created and populated)/i.test(finalContent)
+        );
         const maxNudgeRetries = hasRecentReplaceNotFound
           ? 3
           : hasReadButNoWriteOnLargeRefactor
@@ -1967,6 +1983,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           || hasExplicitNextSteps
           || isProgressOnlyResponse
           || claimedButUnexecutedCommand
+          || hasPostCreateRefactorNarration
           || (isLargeRefactorRequest && hasRecentToolResults && (!hasRecentSuccessfulAction || !hasRecentReadOfLargeRefactorTarget || !hasRecentMeaningfulWrite))
           || (hasRecentReplaceNotFound && (mentionsChange || claimsDone || isLazyAcknowledgment || hasIncompletePlan || hasExplicitNextSteps))
           || (hasRecentToolErrors && (claimsDone || mentionsChange || isLazyAcknowledgment))
@@ -1975,7 +1992,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         const shouldNudge = requiresToolContinuation && retryCount < maxNudgeRetries;
 
         if (shouldNudge) {
-          this.debugLog('nudge', { retryCount, hasRecentToolResults, hasRecentSuccessfulAction, hasRecentMeaningfulWrite, hasRecentReadOfLargeRefactorTarget, hasReadButNoWriteOnLargeRefactor, announcedNewFilePath, hasRecentToolErrors, hasRecentReplaceNotFound, replaceNotFoundFilepath, replaceNotFoundStartLine, replaceNotFoundEndLine, lastSuccessfulActionIndex, isLongDump, hasLargeCodeBlocks, claimsDone, mentionsChange, isLazyAcknowledgment, hasIncompletePlan: !!hasIncompletePlan, hasExplicitNextSteps, isProgressOnlyResponse, claimedButUnexecutedCommand, isPassingToUser, isAnnouncedButNotExecuted, isLargeRefactorRequest, contentPreview: finalContent.substring(0, 200) });
+          this.debugLog('nudge', { retryCount, hasRecentToolResults, hasRecentSuccessfulAction, hasRecentMeaningfulWrite, latestCreatedFilePath, hasRecentReadOfLargeRefactorTarget, hasReadButNoWriteOnLargeRefactor, hasPostCreateRefactorNarration, announcedNewFilePath, hasRecentToolErrors, hasRecentReplaceNotFound, replaceNotFoundFilepath, replaceNotFoundStartLine, replaceNotFoundEndLine, lastSuccessfulActionIndex, isLongDump, hasLargeCodeBlocks, claimsDone, mentionsChange, isLazyAcknowledgment, hasIncompletePlan: !!hasIncompletePlan, hasExplicitNextSteps, isProgressOnlyResponse, claimedButUnexecutedCommand, isPassingToUser, isAnnouncedButNotExecuted, isLargeRefactorRequest, contentPreview: finalContent.substring(0, 200) });
           // Show plan/progress text to the user before nudging
           if (!isProgressOnlyResponse && (hasIncompletePlan || hasExplicitNextSteps || claimedButUnexecutedCommand || claimsDone || mentionsChange || isPassingToUser || isAnnouncedButNotExecuted)) {
             const planText = finalContent.trim();
@@ -1995,24 +2012,28 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           if (hasReadButNoWriteOnLargeRefactor) {
             const primaryTarget = largeRefactorTargets[0] ?? 'the target file';
             nudgeMessage = announcedNewFilePath
-              ? `This is a large refactor request for ${primaryTarget}. You already identified a concrete extraction target. Do NOT summarize again. Your next response must call tools now: first call create_or_edit_file for ${announcedNewFilePath} with the extracted types or interfaces, then call replace_in_file on ${primaryTarget} to remove the moved block and add the import if needed. If you truly need more context before writing, call read_file_slice on ${primaryTarget} with explicit startLine and endLine for just the next bounded slice. Do one of those now.`
-              : `This is a large refactor request for ${primaryTarget}. You already read part of the target file. Do NOT summarize it again, do NOT ask the user for a bounded section, and do NOT ask to read the full file without a tool call. Your next response must call a tool. Either: (1) call create_or_edit_file to extract one concrete bounded unit you already identified into a new module, then call replace_in_file on ${primaryTarget}; or (2) if you truly need more context, call read_file_slice on ${primaryTarget} with explicit startLine and endLine for the next bounded slice. Do one of those now.`;
+              ? `This is a large refactor request for ${primaryTarget}. You already identified a concrete extraction target. Do NOT summarize again. Work in very small consecutive edits. Your next response must call tools now: first call create_or_edit_file for ${announcedNewFilePath} with only the next self-contained function, type group, or interface block from the current bounded slice. Do NOT include incomplete blocks or references like vscode.Uri unless you also add the required import. Then call replace_in_file on ${primaryTarget} to remove the moved block and add the import if needed. After that, continue with the next small extraction step in the same task instead of stopping. If you truly need more context before writing, call read_file_slice on ${primaryTarget} with explicit startLine and endLine for just the next bounded slice.`
+              : `This is a large refactor request for ${primaryTarget}. You already read part of the target file. Do NOT summarize it again, do NOT ask the user for a bounded section, and do NOT ask to read the full file without a tool call. Your next response must call a tool. Either: (1) call create_or_edit_file to extract one concrete bounded unit you already identified into a new module, using only the next self-contained function, type group, or interface block from the current slice; then call replace_in_file on ${primaryTarget}; or (2) if you truly need more context, call read_file_slice on ${primaryTarget} with explicit startLine and endLine for the next bounded slice. Keep going in small consecutive steps until the task is complete.`;
+          } else if (hasPostCreateRefactorNarration) {
+            const primaryTarget = largeRefactorTargets[0] ?? 'the target file';
+            const createdFileLabel = latestCreatedFilePath ? path.basename(latestCreatedFilePath) : 'the new file';
+            nudgeMessage = `You already created ${createdFileLabel}. Do NOT keep planning or narrating the next steps. Your next response must call a tool. First fix ${createdFileLabel} with create_or_edit_file if its content is incomplete or references unknown imports. Otherwise call replace_in_file on ${primaryTarget} now to remove only the moved block and add the import from ${createdFileLabel}. After that, continue with the next small function-level or block-level extraction in the same task. Do not try to move the whole file at once.`;
           } else if (hasIncompletePlan) {
             nudgeMessage = stepMatch
-              ? `You are on step ${stepMatch[1]} of ${stepMatch[2]} but stopped. Continue executing your plan. Proceed to the next step now — use the provided tools.`
-              : 'You reported that one step was completed and announced the next step, but you stopped before executing it. Continue now by calling the next tool instead of narrating the plan.';
+              ? `You are on step ${stepMatch[1]} of ${stepMatch[2]} but stopped. Continue executing your plan in small consecutive edits. Proceed to the next step now with tools, and keep going function-by-function or block-by-block instead of stopping after a single step.`
+              : 'You reported that one step was completed and announced the next step, but you stopped before executing it. Continue now by calling the next tool instead of narrating the plan. Keep the next change small and self-contained.';
           } else if (isLargeRefactorRequest) {
             const primaryTarget = largeRefactorTargets[0];
             if (primaryTarget && !hasRecentReadOfLargeRefactorTarget) {
-              nudgeMessage = `This is a large refactor request for ${primaryTarget}. You have not read the main target file yet. First call read_file_slice for ${primaryTarget} to inspect a bounded section of the real file content. Do NOT create placeholder files, do NOT switch to README.md or any other unrelated file, and do NOT stop at a plan. After reading ${primaryTarget}, execute one concrete extraction or replace step with tools.`;
+              nudgeMessage = `This is a large refactor request for ${primaryTarget}. You have not read the main target file yet. First call read_file_slice for ${primaryTarget} to inspect a bounded section of the real file content. Do NOT create placeholder files, do NOT switch to README.md or any other unrelated file, and do NOT stop at a plan. After reading ${primaryTarget}, execute one concrete small extraction or replace step with tools, then continue with the next small step.`;
             } else if (!hasRecentMeaningfulWrite) {
               nudgeMessage = primaryTarget
-                ? `This is a large refactor request for ${primaryTarget}. A placeholder file or plan is not enough progress. Do not stop after scaffolding and do not inspect or edit unrelated files such as README.md. Keep working on ${primaryTarget}: read the real source file and then perform one concrete extraction or replace step with tools before responding.`
-                : 'This is a large refactor request. A placeholder file or plan is not enough progress. Do not stop after scaffolding. Read the real source file, then perform one concrete extraction or replace step with tools before responding.';
+                ? `This is a large refactor request for ${primaryTarget}. A placeholder file or plan is not enough progress. Do not stop after scaffolding and do not inspect or edit unrelated files such as README.md. Keep working on ${primaryTarget}: read the real source file and then perform one concrete small extraction or replace step with tools before responding. Continue function-by-function or block-by-block.`
+                : 'This is a large refactor request. A placeholder file or plan is not enough progress. Do not stop after scaffolding. Read the real source file, then perform one concrete small extraction or replace step with tools before responding. Continue in small blocks.';
             } else {
               nudgeMessage = primaryTarget
-                ? `This is a large refactor request for ${primaryTarget}. Do not summarize the whole file or stop after inspection. Do not switch to unrelated files like README.md. Define a concise module/file split plan for ${primaryTarget}, then execute step 1 immediately with tools. Prefer read_file_slice for bounded reads on large files, and continue iteratively one file or one slice at a time.`
-                : 'This is a large refactor request. Do not summarize the whole file or stop after inspection. First define a concise module/file split plan, then execute step 1 immediately with tools. Prefer read_file_slice for bounded reads on large files, and continue iteratively one file or one slice at a time.';
+                ? `This is a large refactor request for ${primaryTarget}. Do not summarize the whole file or stop after inspection. Do not switch to unrelated files like README.md. A long plan is acceptable, but execute the refactor in many small consecutive tool calls: function-by-function, type-by-type, or one small block at a time. Prefer read_file_slice for bounded reads on large files, and keep going until the whole task is done or you are genuinely blocked.`
+                : 'This is a large refactor request. Do not summarize the whole file or stop after inspection. A long plan is acceptable, but execute the refactor in many small consecutive tool calls. Prefer read_file_slice for bounded reads on large files, and keep going until the whole task is done or you are genuinely blocked.';
             }
           } else if (hasExplicitNextSteps) {
             nudgeMessage = 'You listed next steps but stopped before executing them. Continue now. Do not stop after the first step or the first issue — keep using tools until the scan is complete.';
@@ -2053,8 +2074,10 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
             hasRecentToolResults,
             hasRecentSuccessfulAction,
             hasRecentMeaningfulWrite,
+            latestCreatedFilePath,
             hasRecentReadOfLargeRefactorTarget,
             hasReadButNoWriteOnLargeRefactor,
+            hasPostCreateRefactorNarration,
             hasRecentToolErrors,
             hasRecentReplaceNotFound,
             replaceNotFoundFilepath,
@@ -4556,6 +4579,10 @@ If the user asks for a change but provides NO code:
       if (this.looksLikeDiffOutput(sanitizedContent)) {
         sanitizedContent = this.stripDiffPrefixes(sanitizedContent);
       }
+      const invalidStructuredContent = this.detectInvalidStructuredCreateContent(targetUri.fsPath, sanitizedContent);
+      if (invalidStructuredContent) {
+        return JSON.stringify({ error: invalidStructuredContent });
+      }
 
       // Guard against destructive writes from tool calls
       const displayName = path.basename(targetUri.fsPath);
@@ -5114,6 +5141,130 @@ If the user asks for a change but provides NO code:
       : lines;
     const preview = previewLines.join('\n');
     return preview.length > 5000 ? `${preview.slice(0, 4800)}\n... preview truncated ...` : preview;
+  }
+
+  private detectInvalidStructuredCreateContent(filepath: string, content: string): string | undefined {
+    const extension = path.extname(filepath).toLowerCase();
+    if (!['.ts', '.tsx', '.js', '.jsx', '.json'].includes(extension)) {
+      return undefined;
+    }
+
+    if (['.ts', '.tsx'].includes(extension)
+      && /\bvscode\./.test(content)
+      && !/(?:from\s+['"]vscode['"]|import\s+\*\s+as\s+vscode\s+from\s+['"]vscode['"])/.test(content)) {
+      return 'Blocked write: file references vscode.* but does not import vscode.';
+    }
+
+    const imbalanceReason = this.detectDelimiterImbalance(content);
+    if (imbalanceReason) {
+      return `Blocked write: content appears incomplete (${imbalanceReason}).`;
+    }
+
+    return undefined;
+  }
+
+  private detectDelimiterImbalance(content: string): string | undefined {
+    const stack: string[] = [];
+    let inSingleQuote = false;
+    let inDoubleQuote = false;
+    let inTemplate = false;
+    let inLineComment = false;
+    let inBlockComment = false;
+    let escaped = false;
+
+    for (let index = 0; index < content.length; index += 1) {
+      const char = content[index];
+      const next = content[index + 1];
+
+      if (inLineComment) {
+        if (char === '\n') {
+          inLineComment = false;
+        }
+        continue;
+      }
+
+      if (inBlockComment) {
+        if (char === '*' && next === '/') {
+          inBlockComment = false;
+          index += 1;
+        }
+        continue;
+      }
+
+      if (inSingleQuote || inDoubleQuote || inTemplate) {
+        if (escaped) {
+          escaped = false;
+          continue;
+        }
+        if (char === '\\') {
+          escaped = true;
+          continue;
+        }
+        if (inSingleQuote && char === "'") {
+          inSingleQuote = false;
+        } else if (inDoubleQuote && char === '"') {
+          inDoubleQuote = false;
+        } else if (inTemplate && char === '`') {
+          inTemplate = false;
+        }
+        continue;
+      }
+
+      if (char === '/' && next === '/') {
+        inLineComment = true;
+        index += 1;
+        continue;
+      }
+
+      if (char === '/' && next === '*') {
+        inBlockComment = true;
+        index += 1;
+        continue;
+      }
+
+      if (char === "'") {
+        inSingleQuote = true;
+        continue;
+      }
+      if (char === '"') {
+        inDoubleQuote = true;
+        continue;
+      }
+      if (char === '`') {
+        inTemplate = true;
+        continue;
+      }
+
+      if (char === '{' || char === '[' || char === '(') {
+        stack.push(char);
+        continue;
+      }
+
+      if (char === '}' || char === ']' || char === ')') {
+        const open = stack.pop();
+        if (!open) {
+          return `unexpected closing ${char}`;
+        }
+        if ((open === '{' && char !== '}')
+          || (open === '[' && char !== ']')
+          || (open === '(' && char !== ')')) {
+          return `mismatched ${open} and ${char}`;
+        }
+      }
+    }
+
+    if (inSingleQuote || inDoubleQuote || inTemplate) {
+      return 'unterminated string literal';
+    }
+    if (inBlockComment) {
+      return 'unterminated block comment';
+    }
+    if (stack.length > 0) {
+      const open = stack[stack.length - 1];
+      return `missing closing delimiter for ${open}`;
+    }
+
+    return undefined;
   }
 
   private isPlaceholderCreateResult(parsed: Record<string, unknown>): boolean {
