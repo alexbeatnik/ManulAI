@@ -227,9 +227,6 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       this.autoApprove = Boolean(config.get('autoApprove', DEFAULT_STORED_SETTINGS.autoApprove));
       this.debugMode = Boolean(config.get('debugMode', DEFAULT_STORED_SETTINGS.debugMode));
     }
-    if (this.debugMode) {
-      this.startDebugSession();
-    }
   }
 
   private get activeChat(): ChatSession {
@@ -423,6 +420,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   }
 
   public async setSelectedModel(model: string): Promise<void> {
+    const previousModel = this.getSelectedModel();
     const normalizedModel = model.trim();
     if (!normalizedModel) {
       return;
@@ -430,6 +428,9 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
 
     await this.persistStoredSetting('ollamaModel', normalizedModel);
     await this.refreshModelCatalog(false);
+    if (previousModel !== normalizedModel) {
+      this.debugLog('model_changed', { previousModel: previousModel || null, model: normalizedModel });
+    }
     this.postStateToWebview();
     this.postStatus(`Ollama model set to ${normalizedModel}.`);
   }
@@ -452,7 +453,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     this.autoApprove = this.getBooleanSetting('autoApprove', DEFAULT_STORED_SETTINGS.autoApprove);
     this.debugMode = this.getBooleanSetting('debugMode', DEFAULT_STORED_SETTINGS.debugMode);
 
-    if (this.debugMode && !previousDebugMode) {
+    if (this.debugMode && (!previousDebugMode || !this.debugLogFilePath)) {
       this.startDebugSession();
     } else if (!this.debugMode && previousDebugMode) {
       this.stopDebugSession();
@@ -1423,7 +1424,8 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           role: 'tool',
           content: toolResult,
           tool_name: toolName,
-          hiddenFromTranscript: true
+          hiddenFromTranscript: true,
+          revertOperationIds: this.extractToolResultRevertOperationIds(toolResult)
         });
       }
 
@@ -1882,7 +1884,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         });
 
         const maxNudgeRetries = hasRecentReplaceNotFound ? 3 : 2;
-        const shouldNudge = (
+        const requiresToolContinuation = (
           isPassingToUser
           || isAnnouncedButNotExecuted
           || !!hasIncompletePlan
@@ -1892,7 +1894,8 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           || (hasRecentReplaceNotFound && (mentionsChange || claimsDone || isLazyAcknowledgment || hasIncompletePlan || hasExplicitNextSteps))
           || (hasRecentToolErrors && (claimsDone || mentionsChange || isLazyAcknowledgment))
           || (!hasRecentSuccessfulAction && (isLongDump || hasLargeCodeBlocks || claimsDone || mentionsChange || isLazyAcknowledgment))
-        ) && retryCount < maxNudgeRetries;
+        );
+        const shouldNudge = requiresToolContinuation && retryCount < maxNudgeRetries;
 
         if (shouldNudge) {
           this.debugLog('nudge', { retryCount, hasRecentToolResults, hasRecentSuccessfulAction, hasRecentToolErrors, hasRecentReplaceNotFound, replaceNotFoundFilepath, lastSuccessfulActionIndex, isLongDump, hasLargeCodeBlocks, claimsDone, mentionsChange, isLazyAcknowledgment, hasIncompletePlan: !!hasIncompletePlan, hasExplicitNextSteps, isProgressOnlyResponse, claimedButUnexecutedCommand, isPassingToUser, isAnnouncedButNotExecuted, contentPreview: finalContent.substring(0, 200) });
@@ -1942,6 +1945,30 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           this.postStatus(`Model did not use tools (attempt ${retryCount + 1}) — continuing...`);
           await this.processOllamaResponse(messages, retryCount + 1);
           return;
+        }
+
+        if (requiresToolContinuation && retryCount >= maxNudgeRetries) {
+          this.debugLog('forced_tool_retry_stop', {
+            retryCount,
+            maxNudgeRetries,
+            hasRecentToolResults,
+            hasRecentSuccessfulAction,
+            hasRecentToolErrors,
+            hasRecentReplaceNotFound,
+            replaceNotFoundFilepath,
+            claimedButUnexecutedCommand,
+            isPassingToUser,
+            isAnnouncedButNotExecuted,
+            hasIncompletePlan: !!hasIncompletePlan,
+            hasExplicitNextSteps,
+            isProgressOnlyResponse,
+            contentPreview: finalContent.substring(0, 200)
+          });
+          finalContent = hasRecentReplaceNotFound
+            ? `The model stopped after a failed replace_in_file attempt and did not recover.${replaceNotFoundFilepath ? ` The last blocked file was ${replaceNotFoundFilepath}.` : ''} It must re-read the exact current file content before trying the edit again.`
+            : hasRecentToolErrors
+              ? 'The model stopped after tool errors and then switched to descriptive text instead of completing the task. Retry the request or use a stronger tool-calling model.'
+              : 'The model stopped at a plan/progress response without completing the tool actions. Retry the request or use a stronger tool-calling model.';
         }
       }
 
@@ -4297,6 +4324,9 @@ If the user asks for a change but provides NO code:
 
       await this.writeWorkspaceText(targetUri, sanitizedContent);
 
+      const revertOperationId = oldContent !== undefined && oldContent !== sanitizedContent
+        ? this.createRevertSnapshot(targetUri.fsPath, oldContent, sanitizedContent)
+        : undefined;
       const diff = oldContent !== undefined && oldContent !== sanitizedContent
         ? this.buildDiffSummary(displayName, oldContent, sanitizedContent)
         : undefined;
@@ -4305,7 +4335,8 @@ If the user asks for a change but provides NO code:
         path: targetUri.fsPath,
         bytesWritten: Buffer.byteLength(sanitizedContent, 'utf8'),
         preview: oldContent === undefined || !oldContent.trim() ? this.buildPreviewSnippet(sanitizedContent) : undefined,
-        diff
+        diff,
+        revertOperationId
       });
     } catch (error) {
       return JSON.stringify({
@@ -4435,6 +4466,24 @@ If the user asks for a change but provides NO code:
     };
   }
 
+  private extractToolResultRevertOperationIds(toolResult: string): string[] {
+    try {
+      const parsed = JSON.parse(toolResult) as unknown;
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        return [];
+      }
+
+      const result = parsed as Record<string, unknown>;
+      const operationIds = [
+        ...(typeof result.revertOperationId === 'string' ? [result.revertOperationId] : []),
+        ...(Array.isArray(result.revertOperationIds) ? result.revertOperationIds.filter((value): value is string => typeof value === 'string') : [])
+      ];
+      return Array.from(new Set(operationIds.filter(operationId => this.revertSnapshots.has(operationId))));
+    } catch {
+      return [];
+    }
+  }
+
   private createRevertSnapshot(filepath: string, previousContent: string, updatedContent: string): string | undefined {
     if (previousContent === updatedContent) {
       return undefined;
@@ -4511,6 +4560,37 @@ If the user asks for a change but provides NO code:
     const header = `Updated **${displayName}** — changed lines:`;
     const diffBlock = '```diff\n' + diffLines.join('\n') + '\n```';
     return header + '\n' + diffBlock;
+  }
+
+  private buildReplacementDiffSummary(displayName: string, oldText: string, newText: string): string {
+    const oldPreview = this.buildPreviewSnippet(oldText);
+    const newPreview = this.buildPreviewSnippet(newText);
+    const oldLineCount = oldText.replace(/\r\n/g, '\n').split('\n').length;
+    const newLineCount = newText.replace(/\r\n/g, '\n').split('\n').length;
+
+    return [
+      `Updated **${displayName}** — replaced 1 matched block (${oldLineCount} lines -> ${newLineCount} lines):`,
+      '```diff',
+      ...oldPreview.split('\n').filter(Boolean).map(line => `-${line}`),
+      ...newPreview.split('\n').filter(Boolean).map(line => `+${line}`),
+      '```'
+    ].join('\n');
+  }
+
+  private buildRevertAction(operationIds: string[] | undefined): WebviewRenderableMessage['revertAction'] {
+    const availableRevertOperations = (operationIds ?? [])
+      .map(operationId => this.revertSnapshots.get(operationId))
+      .filter((snapshot): snapshot is RevertSnapshot => Boolean(snapshot && !snapshot.reverted));
+
+    if (availableRevertOperations.length === 0) {
+      return undefined;
+    }
+
+    return {
+      operationIds: availableRevertOperations.map(snapshot => snapshot.id),
+      label: availableRevertOperations.length > 1 ? `Revert ${availableRevertOperations.length} changes` : 'Revert changes',
+      details: Array.from(new Set(availableRevertOperations.map(snapshot => snapshot.displayName))).join(', ')
+    };
   }
 
   private getOpenDocument(uri: vscode.Uri): vscode.TextDocument | undefined {
@@ -4659,13 +4739,15 @@ If the user asks for a change but provides NO code:
 
       const updated = original.replace(oldText, newText);
       await this.writeWorkspaceText(target, updated);
-      const diff = this.buildDiffSummary(path.basename(target.fsPath), original, updated);
+      const revertOperationId = this.createRevertSnapshot(target.fsPath, original, updated);
+      const diff = this.buildReplacementDiffSummary(path.basename(target.fsPath), oldText, newText);
 
       return JSON.stringify({
         path: target.fsPath,
         replacements: 1,
         bytesWritten: Buffer.byteLength(updated, 'utf8'),
-        diff
+        diff,
+        revertOperationId
       });
     } catch (error) {
       return JSON.stringify({
@@ -5431,20 +5513,10 @@ If the user asks for a change but provides NO code:
         return result;
       }
 
-      const availableRevertOperations = (message.revertOperationIds ?? [])
-        .map(operationId => this.revertSnapshots.get(operationId))
-        .filter((snapshot): snapshot is RevertSnapshot => Boolean(snapshot && !snapshot.reverted));
-
       result.push({
         role: message.role,
         content: message.content,
-        revertAction: availableRevertOperations.length > 0
-          ? {
-              operationIds: availableRevertOperations.map(snapshot => snapshot.id),
-              label: availableRevertOperations.length > 1 ? `Revert ${availableRevertOperations.length} changes` : 'Revert changes',
-              details: Array.from(new Set(availableRevertOperations.map(snapshot => snapshot.displayName))).join(', ')
-            }
-          : undefined
+        revertAction: this.buildRevertAction(message.revertOperationIds)
       });
       return result;
     }, []);
@@ -5485,9 +5557,10 @@ If the user asks for a change but provides NO code:
         parsed = json as Record<string, unknown>;
       }
     } catch {
-      return {
+        return {
         role: 'tool',
-        content: `Tool: ${message.tool_name}\n\n${this.truncateLongResponse(message.content)}`
+          content: `Tool: ${message.tool_name}\n\n${this.truncateLongResponse(message.content)}`,
+          revertAction: this.buildRevertAction(message.revertOperationIds)
       };
     }
 
@@ -5513,7 +5586,8 @@ If the user asks for a change but provides NO code:
         }
         return {
           role: 'tool',
-          content: parts.join('\n\n')
+          content: parts.join('\n\n'),
+          revertAction: this.buildRevertAction(message.revertOperationIds)
         };
       }
       case 'create_or_edit_file':
@@ -5523,7 +5597,8 @@ If the user asks for a change but provides NO code:
         if (error) {
           return {
             role: 'tool',
-            content: `File tool: ${message.tool_name}\n\n${error}`
+            content: `File tool: ${message.tool_name}\n\n${error}`,
+            revertAction: this.buildRevertAction(message.revertOperationIds)
           };
         }
 
@@ -5546,7 +5621,8 @@ If the user asks for a change but provides NO code:
         }
         return {
           role: 'tool',
-          content: parts.join('\n\n')
+          content: parts.join('\n\n'),
+          revertAction: this.buildRevertAction(message.revertOperationIds)
         };
       }
       default: {
@@ -5554,7 +5630,8 @@ If the user asks for a change but provides NO code:
         if (error) {
           return {
             role: 'tool',
-            content: `Tool: ${message.tool_name}\n\n${error}`
+            content: `Tool: ${message.tool_name}\n\n${error}`,
+            revertAction: this.buildRevertAction(message.revertOperationIds)
           };
         }
 
@@ -5563,7 +5640,8 @@ If the user asks for a change but provides NO code:
           role: 'tool',
           content: summary
             ? `Tool: ${message.tool_name}\n\nResult\n\n\`\`\`json\n${summary}\n\`\`\``
-            : `Tool: ${message.tool_name}`
+            : `Tool: ${message.tool_name}`,
+          revertAction: this.buildRevertAction(message.revertOperationIds)
         };
       }
     }
