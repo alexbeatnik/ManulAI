@@ -160,10 +160,22 @@
 
     .chat-strip {
       display: grid;
-      grid-template-columns: minmax(0, 1fr) auto auto auto;
+      grid-template-columns: minmax(0, 1fr) auto;
       gap: 4px;
       align-items: center;
       margin-top: 8px;
+    }
+
+    .chat-select-group {
+      min-width: 0;
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+    }
+
+    .chat-select-group .chat-select {
+      flex: 1 1 auto;
+      min-width: 0;
     }
 
     .chat-strip .status-pill {
@@ -1370,7 +1382,7 @@
       }
 
       .chat-strip {
-        grid-template-columns: minmax(0, 1fr) auto auto auto;
+        grid-template-columns: minmax(0, 1fr) auto;
       }
 
       .chat-select {
@@ -1667,13 +1679,15 @@
       </div>
     </div>
     <div class="chat-strip">
-      <select id="chatSelect" class="chat-select compact-select" aria-label="Current chat" title="Select chat"></select>
-      <button id="newChat" class="ghost-button icon-button" type="button" title="Create chat" aria-label="Create chat">
-        <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M7.25 2h1.5v5.25H14v1.5H8.75V14h-1.5V8.75H2v-1.5h5.25V2z"/></svg>
-      </button>
-      <button id="deleteChat" class="ghost-button danger icon-button" type="button" title="Delete current chat" aria-label="Delete current chat">
-        <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M6 2h4l.75 1.25H13v1.5h-1v8.25L11.25 14h-6.5L4 13.25V4.75H3v-1.5h2.25L6 2zm-.5 2.75v7.75h5V4.75h-5zm1.25 1.5h1.5v4.75h-1.5V6.25zm3 0h1.5v4.75h-1.5V6.25z"/></svg>
-      </button>
+      <div class="chat-select-group">
+        <select id="chatSelect" class="chat-select compact-select" aria-label="Current chat" title="Select chat"></select>
+        <button id="newChat" class="ghost-button icon-button" type="button" title="Create chat" aria-label="Create chat">
+          <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M7.25 2h1.5v5.25H14v1.5H8.75V14h-1.5V8.75H2v-1.5h5.25V2z"/></svg>
+        </button>
+        <button id="deleteChat" class="ghost-button danger icon-button" type="button" title="Delete current chat" aria-label="Delete current chat">
+          <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M6 2h4l.75 1.25H13v1.5h-1v8.25L11.25 14h-6.5L4 13.25V4.75H3v-1.5h2.25L6 2zm-.5 2.75v7.75h5V4.75h-5zm1.25 1.5h1.5v4.75h-1.5V6.25zm3 0h1.5v4.75h-1.5V6.25z"/></svg>
+        </button>
+      </div>
       <div id="statusPill" class="status-pill">Ready</div>
     </div>
   </header>
