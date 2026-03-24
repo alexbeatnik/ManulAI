@@ -19,6 +19,7 @@ interface OllamaMessage {
   content: string;
   tool_calls?: ToolFunctionCall[];
   tool_name?: string;
+  localOnly?: boolean;
   hiddenFromTranscript?: boolean;
   attachmentContext?: boolean;
   activeEditorContext?: boolean;
@@ -41,6 +42,7 @@ interface AttachedFileContext {
   name: string;
   content: string;
   languageId: string;
+  readOnly?: boolean;
 }
 
 interface ToolDefinition {
@@ -69,8 +71,11 @@ interface WebviewInboundMessage {
     | 'selectModel'
     | 'refreshModels'
     | 'browseFiles'
+    | 'browseFolder'
+    | 'attachProject'
     | 'toggleAgentMode'
-    | 'toggleAutoApprove';
+    | 'toggleAutoApprove'
+    | 'toggleDebugMode';
   text?: string;
   path?: string;
   paths?: string[];
@@ -122,6 +127,24 @@ interface FileWriteSummary {
   revertOperationId?: string;
 }
 
+interface ManulAiStoredSettings {
+  ollamaModel?: string;
+  ollamaBaseUrl?: string;
+  agentMode?: boolean;
+  autoApprove?: boolean;
+  debugMode?: boolean;
+  systemPrompt?: string;
+}
+
+const DEFAULT_STORED_SETTINGS: Required<ManulAiStoredSettings> = {
+  ollamaModel: 'llama3.2',
+  ollamaBaseUrl: 'http://localhost:11434',
+  agentMode: true,
+  autoApprove: false,
+  debugMode: false,
+  systemPrompt: 'You are ManulAI, a privacy-first local coding assistant running inside VS Code. Work across any programming language. Prefer precise, minimal changes and explain results clearly.'
+};
+
 export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = 'manulai.chatView';
 
@@ -131,17 +154,35 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   private availableModels: string[] = [];
   private agentMode = true;
   private autoApprove = false;
+  private debugMode = false;
   private requestInFlight = false;
   private stopRequested = false;
   private currentRequestAbortController?: AbortController;
   private pendingApproval?: WebviewPendingApprovalState;
   private pendingApprovalResolver?: (approved: boolean) => void;
   private readonly revertSnapshots = new Map<string, RevertSnapshot>();
+  private debugLogFilePath?: string;
+  private debugSessionId = '';
+  private progressStepCounter = 0;
+  private workspaceSettings: Partial<ManulAiStoredSettings> = {};
+  private workspaceSettingsLoaded = false;
+  private workspaceSettingsLoadPromise?: Promise<void>;
+  private migratingWorkspaceConfiguration = false;
 
   public constructor(private readonly extensionContext: vscode.ExtensionContext) {
-    const config = vscode.workspace.getConfiguration('manulai');
-    this.agentMode = Boolean(config.get('agentMode', true));
-    this.autoApprove = Boolean(config.get('autoApprove', false));
+    if (vscode.workspace.workspaceFolders?.length) {
+      this.agentMode = DEFAULT_STORED_SETTINGS.agentMode;
+      this.autoApprove = DEFAULT_STORED_SETTINGS.autoApprove;
+      this.debugMode = DEFAULT_STORED_SETTINGS.debugMode;
+    } else {
+      const config = vscode.workspace.getConfiguration('manulai');
+      this.agentMode = Boolean(config.get('agentMode', DEFAULT_STORED_SETTINGS.agentMode));
+      this.autoApprove = Boolean(config.get('autoApprove', DEFAULT_STORED_SETTINGS.autoApprove));
+      this.debugMode = Boolean(config.get('debugMode', DEFAULT_STORED_SETTINGS.debugMode));
+    }
+    if (this.debugMode) {
+      this.startDebugSession();
+    }
   }
 
   public resolveWebviewView(
@@ -171,8 +212,12 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       }
     });
 
+    void this.initializeSettingsState();
+
     // Push initial state once the webview is ready
-    setTimeout(() => this.postStateToWebview(), 100);
+    setTimeout(() => {
+      void this.initializeSettingsState();
+    }, 100);
   }
 
   public reveal(preserveFocus = false): void {
@@ -183,8 +228,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     const currentModel = this.getSelectedModel();
 
     try {
-      const config = vscode.workspace.getConfiguration('manulai');
-      const baseUrl = String(config.get('ollamaBaseUrl', 'http://localhost:11434')).replace(/\/$/, '');
+      const baseUrl = this.getOllamaBaseUrl();
       const response = await fetch(`${baseUrl}/api/tags`);
 
       if (!response.ok) {
@@ -210,8 +254,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   }
 
   public getSelectedModel(): string {
-    const config = vscode.workspace.getConfiguration('manulai');
-    return String(config.get('ollamaModel', 'llama3.2'));
+    return this.getStringSetting('ollamaModel', DEFAULT_STORED_SETTINGS.ollamaModel);
   }
 
   public async setSelectedModel(model: string): Promise<void> {
@@ -220,11 +263,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       return;
     }
 
-    const target = vscode.workspace.workspaceFolders?.length
-      ? vscode.ConfigurationTarget.Workspace
-      : vscode.ConfigurationTarget.Global;
-
-    await vscode.workspace.getConfiguration('manulai').update('ollamaModel', normalizedModel, target);
+    await this.persistStoredSetting('ollamaModel', normalizedModel);
     await this.refreshModelCatalog(false);
     this.postStateToWebview();
     this.postStatus(`Ollama model set to ${normalizedModel}.`);
@@ -235,11 +274,186 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   }
 
   public async handleConfigurationChange(): Promise<void> {
-    const config = vscode.workspace.getConfiguration('manulai');
-    this.agentMode = Boolean(config.get('agentMode', true));
-    this.autoApprove = Boolean(config.get('autoApprove', false));
+    await this.initializeSettingsState();
+  }
+
+  private async initializeSettingsState(): Promise<void> {
+    await this.migrateWorkspaceConfigurationToStorage();
+    await this.ensureWorkspaceSettingsLoaded();
+
+    const previousDebugMode = this.debugMode;
+    this.agentMode = this.getBooleanSetting('agentMode', DEFAULT_STORED_SETTINGS.agentMode);
+    this.autoApprove = this.getBooleanSetting('autoApprove', DEFAULT_STORED_SETTINGS.autoApprove);
+    this.debugMode = this.getBooleanSetting('debugMode', DEFAULT_STORED_SETTINGS.debugMode);
+
+    if (this.debugMode && !previousDebugMode) {
+      this.startDebugSession();
+    } else if (!this.debugMode && previousDebugMode) {
+      this.stopDebugSession();
+    }
+
     await this.refreshModelCatalog(false);
     this.postStateToWebview();
+  }
+
+  private getWorkspaceSettingsDirUri(): vscode.Uri | undefined {
+    const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri;
+    if (!workspaceRoot) {
+      return undefined;
+    }
+    return vscode.Uri.joinPath(workspaceRoot, '.manulai');
+  }
+
+  private getWorkspaceSettingsUri(): vscode.Uri | undefined {
+    const settingsDir = this.getWorkspaceSettingsDirUri();
+    if (!settingsDir) {
+      return undefined;
+    }
+    return vscode.Uri.joinPath(settingsDir, 'settings.json');
+  }
+
+  private async ensureWorkspaceSettingsLoaded(): Promise<void> {
+    if (this.workspaceSettingsLoaded) {
+      return;
+    }
+    if (this.workspaceSettingsLoadPromise) {
+      await this.workspaceSettingsLoadPromise;
+      return;
+    }
+
+    this.workspaceSettingsLoadPromise = (async () => {
+      const settingsUri = this.getWorkspaceSettingsUri();
+      if (!settingsUri) {
+        this.workspaceSettings = {};
+        this.workspaceSettingsLoaded = true;
+        return;
+      }
+
+      try {
+        const bytes = await vscode.workspace.fs.readFile(settingsUri);
+        const parsed = JSON.parse(Buffer.from(bytes).toString('utf8')) as unknown;
+        this.workspaceSettings = this.normalizeStoredSettings(parsed);
+      } catch {
+        this.workspaceSettings = {};
+      }
+      this.workspaceSettingsLoaded = true;
+    })();
+
+    try {
+      await this.workspaceSettingsLoadPromise;
+    } finally {
+      this.workspaceSettingsLoadPromise = undefined;
+    }
+  }
+
+  private normalizeStoredSettings(value: unknown): Partial<ManulAiStoredSettings> {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      return {};
+    }
+
+    const candidate = value as Record<string, unknown>;
+    const normalized: Partial<ManulAiStoredSettings> = {};
+    if (typeof candidate.ollamaModel === 'string') {
+      normalized.ollamaModel = candidate.ollamaModel;
+    }
+    if (typeof candidate.ollamaBaseUrl === 'string') {
+      normalized.ollamaBaseUrl = candidate.ollamaBaseUrl;
+    }
+    if (typeof candidate.agentMode === 'boolean') {
+      normalized.agentMode = candidate.agentMode;
+    }
+    if (typeof candidate.autoApprove === 'boolean') {
+      normalized.autoApprove = candidate.autoApprove;
+    }
+    if (typeof candidate.debugMode === 'boolean') {
+      normalized.debugMode = candidate.debugMode;
+    }
+    if (typeof candidate.systemPrompt === 'string') {
+      normalized.systemPrompt = candidate.systemPrompt;
+    }
+    return normalized;
+  }
+
+  private getStringSetting(key: keyof ManulAiStoredSettings, fallback: string): string {
+    const storedValue = this.workspaceSettings[key];
+    if (typeof storedValue === 'string') {
+      return storedValue;
+    }
+    if (vscode.workspace.workspaceFolders?.length) {
+      return String(DEFAULT_STORED_SETTINGS[key] ?? fallback);
+    }
+    const config = vscode.workspace.getConfiguration('manulai');
+    return String(config.get(String(key), fallback));
+  }
+
+  private getBooleanSetting(key: keyof ManulAiStoredSettings, fallback: boolean): boolean {
+    const storedValue = this.workspaceSettings[key];
+    if (typeof storedValue === 'boolean') {
+      return storedValue;
+    }
+    if (vscode.workspace.workspaceFolders?.length) {
+      return Boolean(DEFAULT_STORED_SETTINGS[key] ?? fallback);
+    }
+    const config = vscode.workspace.getConfiguration('manulai');
+    return Boolean(config.get(String(key), fallback));
+  }
+
+  private getOllamaBaseUrl(): string {
+    return this.getStringSetting('ollamaBaseUrl', DEFAULT_STORED_SETTINGS.ollamaBaseUrl).replace(/\/$/, '');
+  }
+
+  private getSystemPrompt(): string {
+    return this.getStringSetting('systemPrompt', DEFAULT_STORED_SETTINGS.systemPrompt).trim();
+  }
+
+  private async persistStoredSetting<K extends keyof ManulAiStoredSettings>(key: K, value: NonNullable<ManulAiStoredSettings[K]>): Promise<void> {
+    const settingsUri = this.getWorkspaceSettingsUri();
+    if (!settingsUri) {
+      await vscode.workspace.getConfiguration('manulai').update(String(key), value, vscode.ConfigurationTarget.Global);
+      return;
+    }
+
+    await this.ensureWorkspaceSettingsLoaded();
+    this.workspaceSettings = {
+      ...this.workspaceSettings,
+      [key]: value
+    };
+
+    const settingsDir = this.getWorkspaceSettingsDirUri();
+    if (!settingsDir) {
+      return;
+    }
+    await vscode.workspace.fs.createDirectory(settingsDir);
+    await vscode.workspace.fs.writeFile(settingsUri, Buffer.from(JSON.stringify(this.workspaceSettings, null, 2) + '\n', 'utf8'));
+  }
+
+  private async migrateWorkspaceConfigurationToStorage(): Promise<void> {
+    if (this.migratingWorkspaceConfiguration || !vscode.workspace.workspaceFolders?.length) {
+      return;
+    }
+
+    const config = vscode.workspace.getConfiguration('manulai');
+    const keys: Array<keyof ManulAiStoredSettings> = ['ollamaModel', 'ollamaBaseUrl', 'agentMode', 'autoApprove', 'debugMode', 'systemPrompt'];
+    let migratedAny = false;
+
+    this.migratingWorkspaceConfiguration = true;
+    try {
+      for (const key of keys) {
+        const inspected = config.inspect<unknown>(String(key));
+        if (!inspected || inspected.workspaceValue === undefined) {
+          continue;
+        }
+        await this.persistStoredSetting(key, inspected.workspaceValue as NonNullable<ManulAiStoredSettings[typeof key]>);
+        await config.update(String(key), undefined, vscode.ConfigurationTarget.Workspace);
+        migratedAny = true;
+      }
+    } finally {
+      this.migratingWorkspaceConfiguration = false;
+    }
+
+    if (migratedAny) {
+      this.postStatus('Moved ManulAI workspace settings from .vscode/settings.json to .manulai/settings.json.');
+    }
   }
 
   public handleActiveEditorChange(): void {
@@ -250,6 +464,10 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     for (const uri of uris) {
       await this.addFileContext(uri.toString());
     }
+  }
+
+  public async attachFolderByUri(uri: vscode.Uri): Promise<void> {
+    await this.addFolderContext(uri);
   }
 
   public async attachActiveEditorFile(): Promise<void> {
@@ -368,11 +586,20 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       case 'browseFiles':
         await this.browseAndAttachFiles();
         return;
+      case 'browseFolder':
+        await this.browseAndAttachFolder();
+        return;
+      case 'attachProject':
+        await this.attachWorkspaceAsContext();
+        return;
       case 'toggleAgentMode':
         await this.setAgentMode(message.value);
         return;
       case 'toggleAutoApprove':
         await this.setAutoApprove(message.value);
+        return;
+      case 'toggleDebugMode':
+        await this.setDebugMode(message.value);
         return;
       default:
         return;
@@ -394,7 +621,15 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     }
 
     this.synchronizeActiveEditorContextMessage();
-    this.synchronizeAttachmentContextMessage();
+
+    if (this.agentMode && this.looksLikeProjectScanRequest(text)) {
+      await this.attachWorkspaceAsContext();
+      this.messages.push({
+        role: 'user',
+        content: 'This is a full project scan request. Do NOT stop after reading only the root directory or after fixing one issue. Continue reading relevant files across the project, use tools repeatedly, and either fix all concrete issues you can find or explicitly state that no further actionable issues were found after scanning.',
+        hiddenFromTranscript: true
+      });
+    }
 
     if (frontendAttachments && frontendAttachments.length > 0) {
       const fileBlocks = frontendAttachments
@@ -407,7 +642,14 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       });
     }
 
+    this.progressStepCounter = 0;
     this.messages.push({ role: 'user', content: text });
+
+    if (this.agentMode && this.looksLikeFileMutationRequest(text)) {
+      await this.autoAttachLikelyRequestFiles(text);
+    }
+
+    this.synchronizeAttachmentContextMessage();
 
     if (this.agentMode) {
       const directSummary = await this.tryHandleDirectLicenseAuthorRename(text)
@@ -433,6 +675,160 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     const fileTargetPattern = /\b(file|files|readme|license|package\.json|tsconfig|title|header|line|code|text)\b|(?:^|\s)(?:тайтл|заголовок|хедер|ридми|рідмі|файл|код|текст)(?:\s|$)|(?:^|\s)[.\w\-/]+\.(?:ts|tsx|js|jsx|json|md|css|html|py|yml|yaml)(?:\s|$)/i;
 
     return editVerbPattern.test(normalized) && fileTargetPattern.test(normalized);
+  }
+
+  private looksLikeProjectScanRequest(text: string): boolean {
+    const normalized = text.trim().toLowerCase();
+    if (!normalized) {
+      return false;
+    }
+
+    return /(?:\b(?:scan|inspect|read|analy[sz]e|understand|index|explore)\s+(?:the\s+|this\s+)?(?:project|workspace|repo|repository|codebase)\b|\b(?:scan|inspect|read|analy[sz]e|understand|index|explore)\s+(?:my\s+)?(?:repo|repository|codebase)\b|\b(?:scan repo|read repo|inspect repo|remember (?:this |the )?(?:project|repo|repository|workspace|codebase)|remember project|remember repo)\b|(?:^|\s)(?:проскануй|скануй|просканировать|просканируй|сканируй|проаналізуй|аналізуй|проанализируй|анализируй|прочитай|зчитай|изучи|запомни|запам'ятай|запамятай)\s+(?:проект|проєкт|репо|репозиторій|репозиторий|воркспейс|workspace|кодовую\s+базу|кодову\s+базу)(?:\s|$)|(?:^|\s)(?:scan|inspect)\s+project(?:\s|$))/i.test(normalized);
+  }
+
+  private async autoAttachLikelyRequestFiles(text: string): Promise<void> {
+    const targets = this.extractLikelyRequestFileTargets(text);
+    if (targets.length === 0) {
+      return;
+    }
+
+    const autoAttached: string[] = [];
+    for (const target of targets.slice(0, 3)) {
+      const resolvedPath = await this.findBestWorkspaceMatchForRequestTarget(target);
+      if (!resolvedPath || this.attachedFiles.has(resolvedPath)) {
+        continue;
+      }
+
+      const activePath = vscode.window.activeTextEditor?.document.uri.scheme === 'file'
+        ? vscode.window.activeTextEditor.document.uri.fsPath
+        : undefined;
+      if (activePath && activePath === resolvedPath) {
+        continue;
+      }
+
+      const attached = await this.attachFileContextUri(vscode.Uri.file(resolvedPath), true);
+      if (!attached) {
+        continue;
+      }
+
+      const displayPath = this.getDisplayPath(attached);
+      autoAttached.push(displayPath);
+      this.postProgressStep(`Found ${attached.name} at ${displayPath}; using it as context for this request`);
+    }
+
+    if (autoAttached.length > 0) {
+      this.messages.push({
+        role: 'user',
+        content: `Auto-discovered likely target file(s) for this request: ${autoAttached.join(', ')}. Use these exact workspace paths when reading or editing files for this request.`,
+        hiddenFromTranscript: true
+      });
+    }
+  }
+
+  private extractLikelyRequestFileTargets(text: string): string[] {
+    const candidates: string[] = [];
+    const pushCandidate = (value: string | undefined): void => {
+      const trimmed = String(value ?? '').trim().replace(/^[`"']+|[`"'.,;:!?]+$/g, '');
+      if (!trimmed) {
+        return;
+      }
+
+      const key = trimmed.toLowerCase();
+      if (!candidates.some(candidate => candidate.toLowerCase() === key)) {
+        candidates.push(trimmed);
+      }
+    };
+
+    let match: RegExpExecArray | null;
+    const explicitPathPattern = /(?:^|\s)((?:[A-Za-z]:)?[A-Za-z0-9_./\\-]+\.(?:ts|tsx|js|jsx|json|md|css|scss|html|py|yml|yaml|xml|txt|sh|toml|ini))(?:\s|$)/gi;
+    while ((match = explicitPathPattern.exec(text)) !== null) {
+      pushCandidate(match[1]);
+    }
+
+    const bareNamePattern = /\b(package\.json|tsconfig\.json|README(?:\.md)?|LICENSE(?:\.txt|\.md)?|CHANGELOG(?:\.md)?|Dockerfile|Makefile|\.env(?:\.[A-Za-z0-9_-]+)?)\b/gi;
+    while ((match = bareNamePattern.exec(text)) !== null) {
+      pushCandidate(match[1]);
+    }
+
+    const normalized = text.toLowerCase();
+    if (/(?:\breadme\b|рідмі|ридми)/i.test(normalized)) {
+      pushCandidate('README.md');
+      pushCandidate('README');
+    }
+    if (/(?:\blicense\b|ліцензі|лиценз)/i.test(normalized)) {
+      pushCandidate('LICENSE');
+    }
+    if (/(?:package\s*json|package\.json)/i.test(normalized)) {
+      pushCandidate('package.json');
+    }
+    if (/(?:tsconfig|tsconfig\.json)/i.test(normalized)) {
+      pushCandidate('tsconfig.json');
+    }
+    if (/(?:changelog|історі[яї]\s+змін|список\s+змін|список\s+изменений)/i.test(normalized)) {
+      pushCandidate('CHANGELOG.md');
+    }
+    if (/\bdockerfile\b/i.test(normalized)) {
+      pushCandidate('Dockerfile');
+    }
+    if (/\bmakefile\b/i.test(normalized)) {
+      pushCandidate('Makefile');
+    }
+
+    return candidates;
+  }
+
+  private async findBestWorkspaceMatchForRequestTarget(target: string): Promise<string | undefined> {
+    let normalizedTarget = target.trim().replace(/\\/g, '/');
+    if (!path.isAbsolute(normalizedTarget)) {
+      normalizedTarget = normalizedTarget.replace(/^\.\//, '');
+      normalizedTarget = normalizedTarget.replace(/^\.[/\\]/, '');
+      normalizedTarget = normalizedTarget.replace(/^[/\\]+/, '');
+    }
+    if (!normalizedTarget) {
+      return undefined;
+    }
+
+    const exactMatch = await this.resolveExistingWorkspacePath(normalizedTarget);
+    if (exactMatch) {
+      return exactMatch;
+    }
+
+    const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    if (!workspaceRoot) {
+      return undefined;
+    }
+
+    const aliasGlobs: string[] = [];
+    const lower = normalizedTarget.toLowerCase();
+    if (lower === 'readme' || lower === 'readme.md') {
+      aliasGlobs.push('**/README.md', '**/README');
+    } else if (lower === 'license' || lower === 'license.txt' || lower === 'license.md') {
+      aliasGlobs.push('**/LICENSE', '**/LICENSE.txt', '**/LICENSE.md');
+    } else if (lower === 'changelog' || lower === 'changelog.md') {
+      aliasGlobs.push('**/CHANGELOG.md', '**/CHANGELOG');
+    } else {
+      aliasGlobs.push(`**/${path.basename(normalizedTarget)}`);
+    }
+
+    let bestMatch: { fsPath: string; score: number } | undefined;
+    for (const pattern of aliasGlobs) {
+      const fileUris = await vscode.workspace.findFiles(pattern, '**/node_modules/**', 50);
+      for (const fileUri of fileUris) {
+        const relativePath = vscode.workspace.asRelativePath(fileUri, false).replace(/\\/g, '/');
+        const depth = relativePath.split('/').length - 1;
+        const basename = path.basename(relativePath).toLowerCase();
+        const basenameTarget = path.basename(normalizedTarget).toLowerCase();
+        const exactBaseBonus = basename === basenameTarget ? 0 : 25;
+        const readmeBonus = relativePath.toLowerCase() === 'readme.md' ? -20 : 0;
+        const score = depth * 10 + exactBaseBonus + readmeBonus;
+
+        if (!bestMatch || score < bestMatch.score) {
+          bestMatch = { fsPath: fileUri.fsPath, score };
+        }
+      }
+    }
+
+    return bestMatch?.fsPath;
   }
 
   private async tryHandleDirectLicenseAuthorRename(text: string): Promise<FileWriteSummary | undefined> {
@@ -538,6 +934,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
 
     this.messages.length = 0;
     this.attachedFiles.clear();
+    this.progressStepCounter = 0;
     this.postStateToWebview();
     this.postStatus('Chat history and attached context cleared.');
   }
@@ -571,6 +968,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   private async processOllamaResponse(messages: OllamaMessage[], retryCount = 0): Promise<void> {
     this.throwIfRequestStopped();
     this.postStatus(retryCount > 0 ? `Retry ${retryCount}: calling Ollama...` : 'Calling Ollama...');
+    this.debugLog('ollama_request', { retryCount, messageCount: messages.length, model: this.getSelectedModel() });
     const responseData = await this.callOllama(messages);
     this.throwIfRequestStopped();
     const assistantMessage = responseData.message;
@@ -583,6 +981,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
 
     if (resolvedToolCalls.length > 0) {
       const wasNative = (assistantMessage.tool_calls?.length ?? 0) > 0;
+      this.debugLog('tool_calls_detected', { count: resolvedToolCalls.length, native: wasNative, tools: resolvedToolCalls.map(tc => tc.function?.name) });
       const visibleContent = wasNative
         ? (assistantMessage.content ?? '')
         : this.stripToolCallsFromContent(assistantMessage.content ?? '');
@@ -616,7 +1015,10 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       for (const toolCall of resolvedToolCalls) {
         this.throwIfRequestStopped();
         const toolName = toolCall.function?.name || 'unknown_tool';
+        this.postProgressStep(this.describeToolExecution(toolCall));
+        this.debugLog('tool_exec_start', { tool: toolName, args: toolCall.function?.arguments });
         const toolResult = await this.executeToolCall(toolCall);
+        this.debugLog('tool_exec_result', { tool: toolName, result: toolResult.substring(0, 500) });
         this.throwIfRequestStopped();
         messages.push({
           role: 'tool',
@@ -631,6 +1033,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     }
 
     let finalContent = assistantMessage.content ?? '';
+    this.debugLog('ollama_response', { contentLength: finalContent.length, hasToolCalls: resolvedToolCalls.length > 0, contentPreview: finalContent.substring(0, 300) });
 
     if (!this.agentMode) {
       // Chat mode: display the model response as-is, no file-write fallback processing.
@@ -642,25 +1045,49 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       return;
     }
 
+    const leakedToolCallNudgeCount = messages.filter(
+      message => message.role === 'user'
+        && typeof message.content === 'string'
+        && message.content.includes('Your last response printed a raw tool call')
+    ).length;
+
+    if (this.containsLeakedToolCallPayload(finalContent) && leakedToolCallNudgeCount < 2) {
+      this.debugLog('tool_call_leak_retry', { retryCount, contentPreview: finalContent.substring(0, 300) });
+      messages.push({ role: 'assistant', content: finalContent, hiddenFromTranscript: true });
+      messages.push({
+        role: 'user',
+        content: 'Your last response printed a raw tool call instead of executing it. Do NOT output JSON or fenced code blocks for tool calls. Call the appropriate tool now using the native tool-calling mechanism. If you need current file content first, call read_specific_file, then continue with replace_in_file or another tool.',
+        hiddenFromTranscript: true
+      });
+      this.postStatus('Raw tool call leaked into the response — nudging model to execute the tool...');
+      await this.processOllamaResponse(messages, retryCount);
+      return;
+    }
+
     {
       // --- Fallback layer 1: detect [Begin of FILE]...[End of FILE] markers ---
       const markerWrite = this.extractMarkerFileWrite(finalContent);
       if (markerWrite) {
+        this.debugLog('fallback_layer', { layer: 1, type: 'marker_write', filepath: markerWrite.filepath });
         const writeApproved = await this.approveFileWrite([markerWrite.filepath]);
         if (!writeApproved) {
           messages.push({ role: 'assistant', content: `[File write denied by user: ${markerWrite.filepath}]` });
           return;
         }
         const summary = await this.writeFileWithDiff(markerWrite.filepath, markerWrite.fileContent);
-        const remaining = finalContent.replace(markerWrite.fullMatch, '').trim();
-        finalContent = summary.summary + (remaining ? '\n\n' + this.truncateLongResponse(remaining) : '');
-        messages.push(this.createAssistantMessage(finalContent, summary.revertOperationId ? [summary.revertOperationId] : []));
-        return;
+        if (!summary.summary.startsWith('Blocked write to ')) {
+          const remaining = finalContent.replace(markerWrite.fullMatch, '').trim();
+          finalContent = summary.summary + (remaining ? '\n\n' + this.truncateLongResponse(remaining) : '');
+          messages.push(this.createAssistantMessage(finalContent, summary.revertOperationId ? [summary.revertOperationId] : []));
+          return;
+        }
+        // Blocked — fall through to nudge layer
       }
 
       // --- Fallback layer 2: detect code blocks with filepath hints ---
       const codeBlockWrites = this.extractCodeBlockFileWrites(finalContent);
       if (codeBlockWrites.length > 0) {
+        this.debugLog('fallback_layer', { layer: 2, type: 'code_block_write', files: codeBlockWrites.map(b => b.filepath) });
         const fileNames = codeBlockWrites.map(w => w.filepath);
         const writeApproved = await this.approveFileWrite(fileNames);
         if (!writeApproved) {
@@ -670,14 +1097,38 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
 
         const appliedSummaries: string[] = [];
         const revertOperationIds: string[] = [];
+        let allBlocked = true;
         for (const block of codeBlockWrites) {
           const summary = await this.writeFileWithDiff(block.filepath, block.fileContent);
           appliedSummaries.push(summary.summary);
           if (summary.revertOperationId) {
             revertOperationIds.push(summary.revertOperationId);
           }
+          if (!summary.summary.startsWith('Blocked write to ')) {
+            allBlocked = false;
+          }
           finalContent = finalContent.replace(block.fullMatch, '');
         }
+
+        // If ALL writes were blocked by destructive write guard, nudge model to use tools properly
+        const blockedWriteNudges = messages.filter(m => m.role === 'user' && typeof m.content === 'string' && m.content.includes('Your file write was blocked')).length;
+        if (allBlocked && blockedWriteNudges < 2) {
+          this.debugLog('blocked_write_retry', { retryCount, source: 'code_block_extraction', summaries: appliedSummaries });
+          messages.push({ role: 'assistant', content: appliedSummaries.join('\n'), hiddenFromTranscript: true });
+          messages.push({
+            role: 'user',
+            content: 'Your file write was blocked because you tried to rewrite the entire file with partial content. ' +
+              'Do NOT output the full file in a code block. Instead, use the replace_in_file tool to change ONLY the specific lines that need to change. ' +
+              'First call read_specific_file to see the current content, then call replace_in_file with the exact old_text and new_text.',
+            hiddenFromTranscript: true
+          });
+          this.postStatus('Blocked partial write — nudging model to use replace_in_file...');
+          // Don't increment retryCount — blocked-write nudge is structural, not behavioral,
+          // so the downstream nudge layer should still have its full retry budget.
+          await this.processOllamaResponse(messages, retryCount);
+          return;
+        }
+
         finalContent = appliedSummaries.join('\n\n') + (finalContent.trim() ? '\n\n' + this.truncateLongResponse(finalContent.trim()) : '');
         messages.push(this.createAssistantMessage(finalContent, revertOperationIds));
         return;
@@ -692,9 +1143,12 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           return;
         }
         const summary = await this.writeFileWithDiff(unifiedDiffWrite.filepath, unifiedDiffWrite.fileContent);
-        const remaining = finalContent.replace(unifiedDiffWrite.fullMatch, '').trim();
-        messages.push(this.createAssistantMessage(summary.summary + (remaining ? '\n\n' + this.truncateLongResponse(remaining) : ''), summary.revertOperationId ? [summary.revertOperationId] : []));
-        return;
+        if (!summary.summary.startsWith('Blocked write to ')) {
+          const remaining = finalContent.replace(unifiedDiffWrite.fullMatch, '').trim();
+          messages.push(this.createAssistantMessage(summary.summary + (remaining ? '\n\n' + this.truncateLongResponse(remaining) : ''), summary.revertOperationId ? [summary.revertOperationId] : []));
+          return;
+        }
+        // Blocked — fall through to nudge layer
       }
 
       // --- Fallback layer 3: apply [FILE:] blocks ---
@@ -708,6 +1162,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         }
         const appliedSummaries: string[] = [];
         const revertOperationIds: string[] = [];
+        let allBlocked3 = true;
         let remaining = finalContent;
         for (const block of inlineFileBlocks) {
           const summary = await this.writeFileWithDiff(block.filepath, block.fileContent);
@@ -715,12 +1170,18 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           if (summary.revertOperationId) {
             revertOperationIds.push(summary.revertOperationId);
           }
+          if (!summary.summary.startsWith('Blocked write to ')) {
+            allBlocked3 = false;
+          }
           remaining = remaining.replace(block.fullMatch, '');
         }
-        remaining = remaining.trim();
-        finalContent = appliedSummaries.join('\n\n') + (remaining ? '\n\n' + this.truncateLongResponse(remaining) : '');
-        messages.push(this.createAssistantMessage(finalContent, revertOperationIds));
-        return;
+        if (!allBlocked3) {
+          remaining = remaining.trim();
+          finalContent = appliedSummaries.join('\n\n') + (remaining ? '\n\n' + this.truncateLongResponse(remaining) : '');
+          messages.push(this.createAssistantMessage(finalContent, revertOperationIds));
+          return;
+        }
+        // All blocked — fall through to nudge layer
       }
 
       // --- Fallback layer 4: detect described replacements (old → new code blocks) ---
@@ -801,9 +1262,12 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           return;
         }
         const summary = await this.writeFileWithDiff(describedFileDump.filepath, describedFileDump.fileContent);
-        const remaining = finalContent.replace(describedFileDump.fullMatch, '').trim();
-        messages.push(this.createAssistantMessage(summary.summary + (remaining ? '\n\n' + this.truncateLongResponse(remaining) : ''), summary.revertOperationId ? [summary.revertOperationId] : []));
-        return;
+        if (!summary.summary.startsWith('Blocked write to ')) {
+          const remaining = finalContent.replace(describedFileDump.fullMatch, '').trim();
+          messages.push(this.createAssistantMessage(summary.summary + (remaining ? '\n\n' + this.truncateLongResponse(remaining) : ''), summary.revertOperationId ? [summary.revertOperationId] : []));
+          return;
+        }
+        // Blocked — fall through to nudge layer
       }
 
       // --- Fallback layer 4c: detect new file creation from code block + filename mention ---
@@ -815,9 +1279,12 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           return;
         }
         const summary = await this.writeFileWithDiff(newFileWrite.filepath, newFileWrite.fileContent);
-        const remaining = finalContent.replace(newFileWrite.fullMatch, '').trim();
-        messages.push(this.createAssistantMessage(summary.summary + (remaining ? '\n\n' + this.truncateLongResponse(remaining) : ''), summary.revertOperationId ? [summary.revertOperationId] : []));
-        return;
+        if (!summary.summary.startsWith('Blocked write to ')) {
+          const remaining = finalContent.replace(newFileWrite.fullMatch, '').trim();
+          messages.push(this.createAssistantMessage(summary.summary + (remaining ? '\n\n' + this.truncateLongResponse(remaining) : ''), summary.revertOperationId ? [summary.revertOperationId] : []));
+          return;
+        }
+        // Blocked — fall through to nudge layer
       }
 
       // --- Fallback layer 4: apply legacy [FILE:] blocks ---
@@ -832,8 +1299,11 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           return;
         }
         const summary = await this.writeFileWithDiff(matchedFile.filepath, matchedFile.fileContent);
-        messages.push(this.createAssistantMessage(summary.summary, summary.revertOperationId ? [summary.revertOperationId] : []));
-        return;
+        if (!summary.summary.startsWith('Blocked write to ')) {
+          messages.push(this.createAssistantMessage(summary.summary, summary.revertOperationId ? [summary.revertOperationId] : []));
+          return;
+        }
+        // Blocked — fall through to nudge layer
       }
 
       const matchedActiveFile = this.matchResponseToActiveFile(finalContent);
@@ -844,8 +1314,11 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           return;
         }
         const summary = await this.writeFileWithDiff(matchedActiveFile.filepath, matchedActiveFile.fileContent);
-        messages.push(this.createAssistantMessage(summary.summary, summary.revertOperationId ? [summary.revertOperationId] : []));
-        return;
+        if (!summary.summary.startsWith('Blocked write to ')) {
+          messages.push(this.createAssistantMessage(summary.summary, summary.revertOperationId ? [summary.revertOperationId] : []));
+          return;
+        }
+        // Blocked — fall through to nudge layer
       }
 
       // Universal fallback: match against all workspace files
@@ -876,15 +1349,163 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       }
 
       if (this.agentMode) {
-        // --- Fallback layer 6: nudge the model to use tools if it didn't ---
+        // --- Fallback layer 6a: retry blocked writes ---
+        // If a fallback layer tried to write a file but detectDestructiveWrite blocked it,
+        // nudge the model to use replace_in_file instead of rewriting the whole file.
+        const wasBlocked = /^Blocked write to /i.test(finalContent.trim());
+        const blockedWriteNudgeCount = messages.filter(m => m.role === 'user' && typeof m.content === 'string' && m.content.includes('Your file write was blocked')).length;
+        if (wasBlocked && blockedWriteNudgeCount < 2) {
+          this.debugLog('blocked_write_retry', { retryCount, content: finalContent.substring(0, 200) });
+          messages.push({ role: 'assistant', content: finalContent, hiddenFromTranscript: true });
+          messages.push({
+            role: 'user',
+            content: 'Your file write was blocked because it would overwrite the file with partial content. ' +
+              'Do NOT rewrite the entire file. Instead, use the replace_in_file tool to change ONLY the specific lines that need to change. ' +
+              'First call read_specific_file to see the current content, then call replace_in_file with the exact old_text and new_text.',
+            hiddenFromTranscript: true
+          });
+          this.postStatus('Blocked partial write — nudging model to use replace_in_file...');
+          await this.processOllamaResponse(messages, retryCount);
+          return;
+        }
+
+        // --- Fallback layer 6b: nudge the model to use tools if it didn't ---
+        // If tools were already used in the CURRENT exchange (after the last user message),
+        // the model's text response is a legitimate summary — don't nudge it.
+        // We only check messages after the last user message to avoid stale tool results
+        // from previous exchanges disabling the nudge.
+        const lastUserIdx = (() => {
+          for (let i = messages.length - 1; i >= 0; i--) {
+            if (messages[i].role === 'user') { return i; }
+          }
+          return -1;
+        })();
+        const recentMessages = lastUserIdx >= 0 ? messages.slice(lastUserIdx) : messages;
+        const hasRecentToolResults = recentMessages.some(m => m.role === 'tool');
+        const recentToolMessages = recentMessages.filter((m): m is OllamaMessage & { role: 'tool' } => m.role === 'tool');
+        const recentToolResults = recentToolMessages.map((message, index) => {
+          try {
+            const parsed = JSON.parse(message.content) as Record<string, unknown>;
+            return { message, parsed, index };
+          } catch {
+            return { message, parsed: {} as Record<string, unknown>, index };
+          }
+        });
+        const lastSuccessfulActionIndex = (() => {
+          for (let index = recentToolResults.length - 1; index >= 0; index -= 1) {
+            const { message, parsed } = recentToolResults[index];
+            if (parsed.error) {
+              continue;
+            }
+            if (message.tool_name === 'execute_terminal_command') {
+              if (Number(parsed.exitCode ?? 0) === 0) {
+                return index;
+              }
+              continue;
+            }
+            if (message.tool_name === 'create_or_edit_file'
+              || message.tool_name === 'write_to_file'
+              || message.tool_name === 'replace_in_file'
+              || message.tool_name === 'delete_file') {
+              return index;
+            }
+          }
+          return -1;
+        })();
+        const hasRecentSuccessfulAction = recentToolResults.some(({ message, parsed }) => {
+          if (parsed.error) {
+            return false;
+          }
+          if (message.tool_name === 'execute_terminal_command') {
+            return Number(parsed.exitCode ?? 0) === 0;
+          }
+          return message.tool_name === 'create_or_edit_file'
+            || message.tool_name === 'write_to_file'
+            || message.tool_name === 'replace_in_file'
+            || message.tool_name === 'delete_file';
+        });
+        const recentToolErrors = recentToolResults
+          .filter(({ index }) => index > lastSuccessfulActionIndex)
+          .map(({ message, parsed }) => ({ toolName: message.tool_name ?? '', error: typeof parsed.error === 'string' ? parsed.error : '' }))
+          .filter(item => item.error);
+        const hasRecentToolErrors = recentToolErrors.length > 0;
+        const replaceNotFoundContext = this.getLatestReplaceNotFoundContext(messages);
+        const hasRecentReplaceNotFound = Boolean(replaceNotFoundContext);
+        const replaceNotFoundFilepath = replaceNotFoundContext?.filepath;
+
         const isLongDump = finalContent.length > 300;
         const hasLargeCodeBlocks = /```[\w]*\n[\s\S]{100,}?```/.test(finalContent);
-        const claimsDone = /(?:зробив|замінив|оновив|готово|i've made|i have made|i have updated|summary of the changes)/i.test(finalContent);
-        const mentionsChange = /(?:змін|зроби|оновл|replac|chang|updat|modif)/i.test(finalContent);
-        
-        const shouldNudge = (isLongDump || hasLargeCodeBlocks || claimsDone || mentionsChange) && retryCount < 1;
+        const claimsDone = /(?:зробив|замінив|оновив|готово|i've made|i have made|i have updated|i updated|i fixed|i removed|i verified|i confirmed|i corrected|i aligned|successfully applied|successfully saved|has been removed|has been moved|addressed the|fixed the|removed the|updated the|verified the|confirmed the|corrected the|aligned the|summary of the changes|summary:)/i.test(finalContent);
+        const mentionsChange = /(?:змін|зроби|оновл|replac|chang|updat|modif|address|fix(?:ed)?|remov(?:e|ed)|verif(?:y|ied)|confirm(?:ed)?|correct(?:ed)?|align(?:ed)?)/i.test(finalContent);
+        const isLazyAcknowledgment = (/^(?:understood|sure|ok|okay|got it|i will|let me know|i can help|i'll make sure)\b/i.test(finalContent.trim())
+          || /no (?:immediate|obvious) (?:file changes|issues|errors|problems)/i.test(finalContent)
+          || /further debugging (?:would be|is) needed/i.test(finalContent))
+          && finalContent.trim().length < 500;
+        // Detect model asking user to do things manually or announcing actions without executing them
+        // NOTE: "let me know" is excluded — it's always a polite closing, not passing work to the user.
+        const isPassingToUser = (/(?:please (?:execute|run|proceed|specify|provide|make sure|save)|you (?:may|can|should|need to) (?:run|execute|save|choose|pick)|choose one of the (?:options|approaches)|if the .{0,30} persists|let'?s (?:execute|run|try|start)|let me (?:execute|run|try|start))/i.test(finalContent))
+          && finalContent.trim().length < 800;
+
+        // Detect model announcing a step/action but not executing it (ends with colon or ellipsis)
+        const endsWithoutAction = /(?::\s*|\.\.\.)\s*$/.test(finalContent.trim());
+        const announcesToolAction = /(?:execute|run|start|install|create|update|modify|read|check|verify).*(?:command|script|file|terminal|npm|server)/i.test(finalContent);
+        const isAnnouncedButNotExecuted = endsWithoutAction && announcesToolAction;
+
+        // Detect incomplete plan execution: model mentions "Step N/M" but hasn't reached the final step
+        const stepMatch = finalContent.match(/step\s+(\d+)\s*[\/of]+\s*(\d+)/i);
+        const hasIncompletePlan = stepMatch && parseInt(stepMatch[1], 10) < parseInt(stepMatch[2], 10);
+        const hasExplicitNextSteps = /next steps?:/i.test(finalContent) && /\n\s*(?:2|3|4|5)\.\s+/i.test(finalContent);
+        const progressLines = finalContent
+          .split('\n')
+          .map(line => line.trim())
+          .filter(Boolean);
+        const isProgressOnlyResponse = progressLines.length > 0
+          && finalContent.trim().length < 220
+          && progressLines.every(line => /^(?:step\s+\d+\s*(?:\/|of)\s*\d+[:\s-].*|reading (?:the )?file first\.{0,3}|reading and modifying .+|i(?:'| a)?ll read the file.*|i apologize for the oversight\.?|sorry for the oversight\.?)$/i.test(line));
+
+        const recentExecutedCommands = recentToolMessages
+          .filter(message => message.tool_name === 'execute_terminal_command')
+          .map(message => {
+            try {
+              const parsed = JSON.parse(message.content) as Record<string, unknown>;
+              return String(parsed.command ?? '').toLowerCase();
+            } catch {
+              return '';
+            }
+          })
+          .filter(Boolean);
+        const claimedCommands = Array.from(finalContent.matchAll(/`([^`]+)`/g)).map(match => match[1].trim().toLowerCase());
+        const claimedButUnexecutedCommand = claimedCommands.some(command => {
+          if (!/(?:^|\s)(?:npm|pnpm|yarn|bun|node|npx|python|pytest|pip|cargo|go|dotnet|gradle|mvn)\b/i.test(command)) {
+            return false;
+          }
+          return !recentExecutedCommands.some(executed => executed.includes(command) || command.includes(executed));
+        });
+
+        const maxNudgeRetries = hasRecentReplaceNotFound ? 3 : 2;
+        const shouldNudge = (
+          isPassingToUser
+          || isAnnouncedButNotExecuted
+          || !!hasIncompletePlan
+          || hasExplicitNextSteps
+          || isProgressOnlyResponse
+          || claimedButUnexecutedCommand
+          || (hasRecentReplaceNotFound && (mentionsChange || claimsDone || isLazyAcknowledgment || hasIncompletePlan || hasExplicitNextSteps))
+          || (hasRecentToolErrors && (claimsDone || mentionsChange || isLazyAcknowledgment))
+          || (!hasRecentSuccessfulAction && (isLongDump || hasLargeCodeBlocks || claimsDone || mentionsChange || isLazyAcknowledgment))
+        ) && retryCount < maxNudgeRetries;
 
         if (shouldNudge) {
+          this.debugLog('nudge', { retryCount, hasRecentToolResults, hasRecentSuccessfulAction, hasRecentToolErrors, hasRecentReplaceNotFound, replaceNotFoundFilepath, lastSuccessfulActionIndex, isLongDump, hasLargeCodeBlocks, claimsDone, mentionsChange, isLazyAcknowledgment, hasIncompletePlan: !!hasIncompletePlan, hasExplicitNextSteps, isProgressOnlyResponse, claimedButUnexecutedCommand, isPassingToUser, isAnnouncedButNotExecuted, contentPreview: finalContent.substring(0, 200) });
+          // Show plan/progress text to the user before nudging
+          if (!isProgressOnlyResponse && (hasIncompletePlan || hasExplicitNextSteps || claimedButUnexecutedCommand || claimsDone || mentionsChange || isPassingToUser || isAnnouncedButNotExecuted)) {
+            const planText = finalContent.trim();
+            if (planText) {
+              messages.push({ role: 'assistant', content: planText });
+              this.postStateToWebview();
+            }
+          }
+
           messages.push({
             role: 'assistant',
             content: finalContent,
@@ -892,7 +1513,23 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           });
           
           let nudgeMessage = '';
-          if (isLongDump || hasLargeCodeBlocks) {
+          if (hasIncompletePlan) {
+            nudgeMessage = `You are on step ${stepMatch![1]} of ${stepMatch![2]} but stopped. Continue executing your plan. Proceed to the next step now — use the provided tools.`;
+          } else if (hasExplicitNextSteps) {
+            nudgeMessage = 'You listed next steps but stopped before executing them. Continue now. Do not stop after the first step or the first issue — keep using tools until the scan is complete.';
+          } else if (hasRecentReplaceNotFound) {
+            nudgeMessage = `Your replace_in_file call failed because old_text did not match the real file content.${replaceNotFoundFilepath ? ` First call read_specific_file for ${replaceNotFoundFilepath}.` : ' First call read_specific_file for that file.'} Do NOT guess. Then call replace_in_file again using the exact current text including whitespace.`;
+          } else if (isProgressOnlyResponse) {
+            nudgeMessage = 'Do not print progress updates like "Step 3/3" without taking action. Call a tool now. If you need the current file content, use read_specific_file first, then continue with replace_in_file or another appropriate tool.';
+          } else if (claimedButUnexecutedCommand) {
+            nudgeMessage = 'You claimed that a command or action was completed, but there is no matching tool execution in this exchange. Do not claim completion without actually running the command. Execute it now with execute_terminal_command or continue the remaining scan steps.';
+          } else if (isAnnouncedButNotExecuted) {
+            nudgeMessage = 'You announced an action but did not execute it. Do not describe what you will do — actually do it now by calling the appropriate tool. Use execute_terminal_command for commands or replace_in_file for edits.';
+          } else if (isPassingToUser) {
+            nudgeMessage = 'Do not ask the user to run commands or make changes manually. You have tools available. Use execute_terminal_command to run commands and replace_in_file or create_or_edit_file to edit files. Do it yourself now.';
+          } else if (isLazyAcknowledgment) {
+            nudgeMessage = 'Do not just acknowledge the request. Actually perform the task now. Read the relevant files and make the changes the user asked for. Use the provided tools.';
+          } else if (isLongDump || hasLargeCodeBlocks) {
             nudgeMessage = 'You returned code or a large file dump without using a tool. If you need to inspect or modify files, call one of the provided tools directly. If no tool is needed, answer briefly without dumping full file contents.';
           } else {
             nudgeMessage = 'You described changes but did not call a tool. If you need to modify files, use one of the provided tools. If no file change is needed, answer normally.';
@@ -903,7 +1540,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
             content: nudgeMessage,
             hiddenFromTranscript: true
           });
-          this.postStatus(`Model did not use tools (attempt ${retryCount + 1}) — retrying...`);
+          this.postStatus(`Model did not use tools (attempt ${retryCount + 1}) — continuing...`);
           await this.processOllamaResponse(messages, retryCount + 1);
           return;
         }
@@ -939,6 +1576,9 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     // Try to resolve the marker name to an attached file path
     let filepath = rawName;
     for (const [fsPath, file] of this.attachedFiles) {
+      if (file.languageId === '__folder__' || file.readOnly) {
+        continue;
+      }
       const baseName = path.basename(fsPath);
       if (baseName.toLowerCase() === rawName.toLowerCase() || file.name.toLowerCase() === rawName.toLowerCase()) {
         filepath = fsPath;
@@ -960,6 +1600,69 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     };
   }
 
+  private getLatestReplaceNotFoundContext(messages: OllamaMessage[]): { filepath?: string } | undefined {
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      const message = messages[index];
+      if (message.role !== 'tool') {
+        continue;
+      }
+
+      let parsed: Record<string, unknown> = {};
+      try {
+        parsed = JSON.parse(message.content) as Record<string, unknown>;
+      } catch {
+        parsed = {};
+      }
+
+      if (!parsed.error) {
+        if (message.tool_name === 'execute_terminal_command') {
+          if (Number(parsed.exitCode ?? 0) === 0) {
+            return undefined;
+          }
+          continue;
+        }
+
+        if (message.tool_name === 'create_or_edit_file'
+          || message.tool_name === 'write_to_file'
+          || message.tool_name === 'replace_in_file'
+          || message.tool_name === 'delete_file') {
+          return undefined;
+        }
+        continue;
+      }
+
+      if (message.tool_name === 'replace_in_file' && /old_text not found/i.test(String(parsed.error))) {
+        return { filepath: this.getReplaceInFilePathForToolMessage(messages, index) };
+      }
+    }
+
+    return undefined;
+  }
+
+  private getReplaceInFilePathForToolMessage(messages: OllamaMessage[], toolMessageIndex: number): string | undefined {
+    for (let index = toolMessageIndex - 1; index >= 0; index -= 1) {
+      const message = messages[index];
+      if (message.role !== 'assistant' || !message.tool_calls?.length) {
+        continue;
+      }
+
+      for (let toolIndex = message.tool_calls.length - 1; toolIndex >= 0; toolIndex -= 1) {
+        const toolCall = message.tool_calls[toolIndex];
+        if (this.remapWeakModelToolName(toolCall.function?.name ?? '') !== 'replace_in_file') {
+          continue;
+        }
+
+        const args = this.normalizeToolArguments(toolCall.function?.arguments);
+        const filepath = String(args.filepath ?? '').trim();
+        if (filepath) {
+          return filepath;
+        }
+      }
+    }
+
+    return undefined;
+  }
+
   private matchResponseToAttachedFile(content: string): { filepath: string; fileContent: string } | undefined {
     if (this.attachedFiles.size === 0 || content.length < 500) {
       return undefined;
@@ -967,6 +1670,9 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
 
     // Check if the response is mostly a reproduction of an attached file
     for (const [fsPath, file] of this.attachedFiles) {
+      if (file.languageId === '__folder__' || file.readOnly) {
+        continue;
+      }
       // Compare: if >40% of the attached file's lines appear in the response, it's likely a file dump
       const originalLines = file.content.split('\n').filter(l => l.trim().length > 20);
       if (originalLines.length < 5) {
@@ -1048,12 +1754,17 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       const extractedLength = extracted.trim().length;
       const extractedLines = extracted.split('\n').filter(line => line.trim().length > 0).length;
       const originalLines = originalContent.split('\n').filter(line => line.trim().length > 0).length;
+      const hasStrongAnchors = this.hasStrongFullFileAnchors(extracted, originalContent);
+      const minLengthRatio = hasStrongAnchors ? 0.55 : 0.85;
+      const maxLengthRatio = hasStrongAnchors ? 1.35 : 1.2;
+      const minLineRatio = hasStrongAnchors ? 0.5 : 0.85;
+      const maxLineRatio = hasStrongAnchors ? 1.35 : 1.2;
 
-      if (extractedLength < originalLength * 0.85 || extractedLength > originalLength * 1.2) {
+      if (extractedLength < originalLength * minLengthRatio || extractedLength > originalLength * maxLengthRatio) {
         return undefined;
       }
 
-      if (originalLines > 20 && (extractedLines < originalLines * 0.85 || extractedLines > originalLines * 1.2)) {
+      if (originalLines > 20 && (extractedLines < originalLines * minLineRatio || extractedLines > originalLines * maxLineRatio)) {
         return undefined;
       }
     }
@@ -1063,6 +1774,25 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     }
 
     return extracted;
+  }
+
+  private hasStrongFullFileAnchors(extractedContent: string, originalContent: string): boolean {
+    const normalize = (value: string): string => value.trim();
+    const extractedLines = extractedContent.split('\n').map(normalize).filter(Boolean);
+    const originalLines = originalContent.split('\n').map(normalize).filter(Boolean);
+
+    if (extractedLines.length < 8 || originalLines.length < 8) {
+      return false;
+    }
+
+    const headCandidates = originalLines.slice(0, 6).filter(line => line.length > 3);
+    const tailCandidates = originalLines.slice(-6).filter(line => line.length > 3);
+    const extractedSet = new Set(extractedLines);
+
+    const headMatches = headCandidates.filter(line => extractedSet.has(line)).length;
+    const tailMatches = tailCandidates.filter(line => extractedSet.has(line)).length;
+
+    return headMatches >= 3 && tailMatches >= 2;
   }
 
   private sanitizeGeneratedFileContent(content: string): string {
@@ -1086,7 +1816,12 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           return false;
         }
 
-        if (/^<\/?manulai_(?:active_editor_context|attached_file)\b.*>$/i.test(trimmed)) {
+        if (/^<\/?manulai_(?:active_editor_context|attached_file|attached_folder)\b.*>$/i.test(trimmed)) {
+          return false;
+        }
+
+        // Strip diff @@ line markers that leaked into content
+        if (/^@@\s+line\s+\d+\s+@@$/i.test(trimmed)) {
           return false;
         }
 
@@ -1094,6 +1829,99 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       });
 
     return sanitizedLines.join('\n').trim();
+  }
+
+  private stripDiffPrefixes(content: string): string {
+    // Only strip unified diff content. This avoids corrupting normal text such as Markdown lists.
+    const lines = content.split('\n');
+    const nonEmptyLines = lines.filter(l => l.trim().length > 0);
+    if (nonEmptyLines.length < 3) {
+      return content;
+    }
+
+    const isMetadataLine = (line: string): boolean => {
+      const trimmed = line.trim();
+      return /^diff --git\s+/.test(trimmed)
+        || /^index\s+[0-9a-f]+\.\.[0-9a-f]+/.test(trimmed)
+        || /^@@\s+.+\s+@@/.test(trimmed)
+        || /^---(\s|$)/.test(trimmed)
+        || /^\+\+\+(\s|$)/.test(trimmed)
+        || /^\\ No newline at end of file$/.test(trimmed);
+    };
+
+    const hasUnifiedDiffMarkers = nonEmptyLines.some(line => isMetadataLine(line));
+    if (!hasUnifiedDiffMarkers) {
+      return content;
+    }
+
+    const prefixedCount = nonEmptyLines.filter(l => /^[+-]\s/.test(l) || /^[+-](?![-+]{2})/.test(l)).length;
+    if (prefixedCount / nonEmptyLines.length < 0.4) {
+      return content;
+    }
+
+    return lines.map(line => {
+      if (isMetadataLine(line)) {
+        return '';
+      }
+      if (/^\+(?!\+\+)/.test(line)) {
+        return line.substring(1);
+      }
+      if (/^-(?!--)/.test(line)) {
+        return '';
+      }
+      if (/^ /.test(line)) {
+        return line.substring(1);
+      }
+      return line;
+    }).filter((line, i, arr) => {
+      if (line === '' && i > 0 && arr[i - 1] === '') {
+        return false;
+      }
+      return true;
+    }).join('\n');
+  }
+
+  private detectDestructiveWrite(displayName: string, content: string, oldContent?: string): string | undefined {
+    const trimmed = content.trim();
+    const ext = displayName.split('.').pop()?.toLowerCase();
+
+    // Block writing non-JSON content to .json files
+    if (ext === 'json') {
+      try {
+        const parsed = JSON.parse(trimmed) as unknown;
+        // package.json must have a "name" field — partial JSON dumps are destructive
+        if (displayName.toLowerCase() === 'package.json' && typeof parsed === 'object' && parsed !== null && !('name' in parsed)) {
+          return 'Content is missing required "name" field for package.json. This looks like a partial write.';
+        }
+      } catch {
+        return 'Content is not valid JSON.';
+      }
+    }
+
+    // Block writing broken HTML files — must contain basic HTML structure
+    if (ext === 'html' || ext === 'htm') {
+      if (!/<html[\s>]/i.test(trimmed) || !/<head[\s>]/i.test(trimmed) || !/<body[\s>]/i.test(trimmed)) {
+        return 'Content is missing basic HTML structure (html/head/body tags). This looks like a partial snippet, not a complete file.';
+      }
+    }
+
+    // Block writing very short content to known structured files
+    const criticalFiles = ['package.json', 'tsconfig.json', 'package-lock.json'];
+    if (criticalFiles.includes(displayName.toLowerCase()) && trimmed.length < 20) {
+      return 'Content is suspiciously short for a structured project file.';
+    }
+
+    // Block writes that lose >60% of the original file's content (likely partial/truncated)
+    if (oldContent && oldContent.length > 100 && trimmed.length < oldContent.length * 0.4) {
+      return `Content is ${trimmed.length} bytes vs original ${oldContent.length} bytes — too much content lost. This looks like a partial write.`;
+    }
+
+    // Block writing content that looks like a shell command rather than file content
+    if (trimmed.split('\n').length <= 2 && /^(?:npm|npx|yarn|pnpm|node|python|pip|cargo|go)\s/i.test(trimmed)) {
+      return 'Content looks like a shell command, not file content.';
+    }
+
+    return undefined;
   }
 
   private looksLikeDiffOutput(content: string): boolean {
@@ -1402,6 +2230,10 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       return false;
     }
 
+    if (/^\d+(?:\.\d+)+$/.test(trimmed)) {
+      return false;
+    }
+
     const lower = trimmed.toLowerCase();
     const banned = new Set([
       'directly',
@@ -1428,7 +2260,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       return true;
     }
 
-    if (/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]{1,12}$/.test(trimmed)) {
+    if (/^[A-Za-z0-9_-]+\.[A-Za-z][A-Za-z0-9_-]{0,11}$/.test(trimmed)) {
       return true;
     }
 
@@ -1437,12 +2269,15 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       return true;
     }
 
-    return Array.from(this.attachedFiles.values()).some(file => trimmed === file.name || trimmed === path.basename(file.uri.fsPath));
+    return Array.from(this.attachedFiles.values()).some(file => file.languageId !== '__folder__' && !file.readOnly && (trimmed === file.name || trimmed === path.basename(file.uri.fsPath)));
   }
 
   private findAttachedFileForReplacements(replacements: Array<{ oldText: string }>): string | undefined {
     // Find which attached file contains the old_text strings
     for (const [fsPath, file] of this.attachedFiles) {
+      if (file.languageId === '__folder__' || file.readOnly) {
+        continue;
+      }
       const allFound = replacements.every(rep => file.content.includes(rep.oldText));
       if (allFound) {
         return fsPath;
@@ -1450,6 +2285,9 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     }
     // Partial match: at least one replacement matches
     for (const [fsPath, file] of this.attachedFiles) {
+      if (file.languageId === '__folder__' || file.readOnly) {
+        continue;
+      }
       const anyFound = replacements.some(rep => file.content.includes(rep.oldText));
       if (anyFound) {
         return fsPath;
@@ -1650,27 +2488,51 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   }
 
   private async callOllama(messages: OllamaMessage[]): Promise<OllamaResponse> {
-    const config = vscode.workspace.getConfiguration('manulai');
-    const baseUrl = String(config.get('ollamaBaseUrl', 'http://localhost:11434')).replace(/\/$/, '');
+    const baseUrl = this.getOllamaBaseUrl();
     const model = this.getSelectedModel();
-    const systemPrompt = String(config.get('systemPrompt', '')).trim();
+    const systemPrompt = this.getSystemPrompt();
 
     const requestMessages: OllamaMessage[] = [];
 
     if (this.agentMode) {
       const workspaceInstructions = await this.getWorkspaceInstructions();
 
+        const wsRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? '';
         let agentMandate = 'You are ManulAI, a local VS Code coding agent.\n' +
+          (wsRoot ? 'Workspace root: ' + wsRoot + '\n' : '') +
+          'All file paths in tool calls are resolved relative to the workspace root unless absolute.\n' +
           'Use the provided tools when you need to inspect files, edit files, or run commands.\n' +
           'If no tool is needed, answer normally and concisely.\n' +
           'Do not claim that a file was changed unless a tool actually changed it.\n' +
           'Avoid dumping full file contents unless the user explicitly asks for them.\n' +
+          'ACTION FIRST — DO NOT JUST DESCRIBE:\n' +
+          '- When you identify a problem in a file, fix it IMMEDIATELY by calling a tool. Do not just describe what needs to change — use replace_in_file or create_or_edit_file to make the change right away.\n' +
+          '- When a command needs to be run (install dependencies, build, start a server, run tests, etc.), use execute_terminal_command to run it yourself. NEVER ask the user to run commands manually.\n' +
+          '- If you know what the fix is, apply it. Do not output the fix as text and stop.\n' +
+          'PLANNING AND PROGRESS:\n' +
+          '- Before starting any non-trivial task, output a numbered plan in English. Example:\n' +
+          '  **Plan:**\n' +
+          '  1. Read project structure (call list_workspace_files)\n' +
+          '  2. Find and read the relevant files\n' +
+          '  3. Make the necessary changes\n' +
+          '- Then execute each step BY CALLING TOOLS, announcing progress before each one:\n' +
+          '  "Step 1/3: Reading project structure..."\n' +
+          '- After completing all steps, give a short summary of what was done. Do NOT end with "let me know", "feel free to ask", or similar polite closings — just state what was done and stop.\n' +
+          '- Keep all plans, progress messages, and summaries in English.\n' +
           'CRITICAL FILE EDITING RULES:\n' +
           '- When asked to make a small change, change ONLY the specific lines affected. Never rewrite or replace the entire file.\n' +
           '- Never delete content that was not explicitly asked to be removed.\n' +
           '- Prefer replace_in_file for surgical edits over create_or_edit_file with full file content.\n' +
           '- Always read the file first before editing to understand its full structure.\n' +
-          '- After editing, the file must keep all original content except the targeted change.';
+          '- After editing, the file must keep all original content except the targeted change.\n' +
+          '- When multiple changes are needed, make them ONE AT A TIME. Call replace_in_file once, wait for the result, then call it again for the next change. Never batch all changes into a single tool call.\n' +
+          'TOOL USAGE RULES:\n' +
+          '- Always call tools using the native tool-calling mechanism. Never output raw JSON as text.\n' +
+          '- NEVER output code in fenced code blocks as a way to create or modify files. Always use create_or_edit_file or replace_in_file to write code to files.\n' +
+          '- After reading a file, analyze the actual content and fix the real problem. Do not add cosmetic changes like borders or colors unless specifically asked.\n' +
+          '- Think step by step: first read the file, then identify the issue, then make targeted fixes.\n' +
+          '- When you see an error message, diagnose and fix it using tools. Do not just explain the error.\n' +
+          '- If dependencies are missing, run the install command with execute_terminal_command.';
 
       if (workspaceInstructions) {
         agentMandate += '\n\n<workspace_instructions>\n' + workspaceInstructions + '\n</workspace_instructions>';
@@ -1699,7 +2561,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       requestMessages.push({ role: 'system', content: systemPrompt, hiddenFromTranscript: true });
     }
 
-    requestMessages.push(...messages.map(m => ({ ...m })));
+    requestMessages.push(...messages.filter(m => !m.localOnly).map(m => ({ ...m })));
 
     const body: {
       model: string;
@@ -1730,6 +2592,24 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
 
     if (!response.ok) {
       const errorText = await response.text();
+      // If the model does not support tools, retry without tools
+      if (response.status === 400 && /does not support tools/i.test(errorText) && body.tools) {
+        delete body.tools;
+        this.postStatus('Model does not support tools — retrying as plain chat...');
+        const retryController = new AbortController();
+        this.currentRequestAbortController = retryController;
+        const retryResponse = await fetch(`${baseUrl}/api/chat`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+          signal: retryController.signal
+        });
+        if (!retryResponse.ok) {
+          const retryError = await retryResponse.text();
+          throw new Error(`Ollama HTTP ${retryResponse.status}: ${retryError}`);
+        }
+        return (await retryResponse.json()) as OllamaResponse;
+      }
       throw new Error(`Ollama HTTP ${response.status}: ${errorText}`);
     }
 
@@ -1776,6 +2656,18 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     let stripped = content;
     stripped = stripped.replace(/```(?:json|tool_call|tool)?\s*\n?[\s\S]*?```/g, '');
     stripped = stripped.replace(/<tool_call>\s*[\s\S]*?\s*<\/tool_call>/g, '');
+    stripped = stripped.replace(/<function=[^>]+>\s*[\s\S]*?<\/function>/g, '');
+    stripped = stripped.replace(/<\/?tool_call>/g, '');
+    // Strip plain JSON tool call objects from the text
+    const toolNamePattern = /\{\s*"(?:name|function_name|function)"\s*:\s*"/g;
+    let match: RegExpExecArray | null;
+    while ((match = toolNamePattern.exec(stripped)) !== null) {
+      const jsonStr = this.extractBalancedJson(stripped, match.index);
+      if (jsonStr) {
+        stripped = stripped.slice(0, match.index) + stripped.slice(match.index + jsonStr.length);
+        toolNamePattern.lastIndex = match.index;
+      }
+    }
     return stripped.trim();
   }
 
@@ -1798,14 +2690,17 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       }
     }
 
+    const taggedCalls = this.parseTaggedToolCalls(trimmed);
+    if (taggedCalls.length > 0) {
+      return taggedCalls;
+    }
+
     // Regex fallback: extract JSON from markdown code blocks, <tool_call> tags, or plain JSON objects.
     const knownToolNames = new Set(this.getToolDefinitions().map(t => t.function.name));
     const candidates: string[] = [];
 
     const codeBlockPattern = /```(?:json|tool_call|tool)?\s*\n?([\s\S]*?)```/g;
     const tagPattern = /<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/g;
-    // Catch-all for plain JSON objects that define a tool call (Llama / Qwen often hallucinate these directly into content)
-    const jsonBlockPattern = /(\{\s*"name"\s*:\s*"[^"]+"\s*,\s*"arguments"\s*:\s*\{[\s\S]*?\}\s*\})/g;
 
     let match: RegExpExecArray | null;
     while ((match = codeBlockPattern.exec(trimmed)) !== null) {
@@ -1816,8 +2711,13 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       const inner = match[1].trim();
       if (inner.startsWith('{') || inner.startsWith('[')) candidates.push(inner);
     }
-    while ((match = jsonBlockPattern.exec(trimmed)) !== null) {
-      candidates.push(match[1].trim());
+
+    // Catch-all: extract balanced JSON objects that look like tool calls from plain text.
+    // Models like Llama/Qwen/Gemma often output raw JSON tool calls directly.
+    const toolNamePattern = /\{\s*["'](?:name|function_name|function)["']\s*:\s*["']/g;
+    while ((match = toolNamePattern.exec(trimmed)) !== null) {
+      const jsonStr = this.extractBalancedJson(trimmed, match.index);
+      if (jsonStr) { candidates.push(jsonStr); }
     }
 
     for (const candidate of candidates) {
@@ -1829,11 +2729,255 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           return calls;
         }
       } catch {
-        // Try next candidate
+        // JSON.parse failed — try repairing single-quoted JSON (common with weak models)
+        const repaired = this.repairSingleQuotedJson(candidate);
+        if (repaired) {
+          try {
+            const parsed = JSON.parse(repaired) as unknown;
+            const calls = this.normalizeParsedToolCalls(parsed);
+            if (calls.length > 0 && calls.every(c => knownToolNames.has(c.function.name))) {
+              return calls;
+            }
+          } catch {
+            // Give up on this candidate
+          }
+        }
       }
     }
 
     return [];
+  }
+
+  private parseTaggedToolCalls(content: string): ToolFunctionCall[] {
+    const knownToolNames = new Set(this.getToolDefinitions().map(t => t.function.name));
+    const calls: ToolFunctionCall[] = [];
+    const functionPattern = /<function=([a-zA-Z0-9_]+)>\s*([\s\S]*?)<\/function>/g;
+    let match: RegExpExecArray | null;
+
+    while ((match = functionPattern.exec(content)) !== null) {
+      const toolName = this.remapWeakModelToolName(match[1].trim());
+      if (!knownToolNames.has(toolName)) {
+        continue;
+      }
+
+      const args: Record<string, unknown> = {};
+      const parameterPattern = /<parameter=([a-zA-Z0-9_]+)>\s*([\s\S]*?)\s*<\/parameter>/g;
+      let parameterMatch: RegExpExecArray | null;
+      while ((parameterMatch = parameterPattern.exec(match[2] ?? '')) !== null) {
+        args[parameterMatch[1].trim()] = parameterMatch[2];
+      }
+
+      calls.push({
+        type: 'function',
+        function: {
+          name: toolName,
+          arguments: this.remapWeakModelArgumentAliases(args)
+        }
+      });
+    }
+
+    return calls;
+  }
+
+  /**
+   * Detect content that looks like a raw tool-call JSON definition
+   * (even with malformed quotes). Prevents fallback layers from writing
+   * tool-call JSON as file content.
+   */
+  private looksLikeToolCallContent(content: string): boolean {
+    const trimmed = content.trim();
+    if (!trimmed.startsWith('{')) { return false; }
+
+    let parsed: unknown;
+    let parseFailed = false;
+    try {
+      parsed = JSON.parse(trimmed);
+    } catch {
+      const repaired = this.repairSingleQuotedJson(trimmed);
+      if (!repaired) {
+        parseFailed = true;
+      } else {
+        try {
+          parsed = JSON.parse(repaired);
+        } catch {
+          parseFailed = true;
+        }
+      }
+    }
+
+    if (parseFailed) {
+      return this.looksLikeMalformedToolCallContent(trimmed);
+    }
+
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return false;
+    }
+
+    const toolNames = new Set(this.getToolDefinitions().map(t => t.function.name));
+    const obj = parsed as {
+      type?: unknown;
+      function?: { name?: unknown; arguments?: unknown };
+      functionName?: unknown;
+      name?: unknown;
+      function_name?: unknown;
+      arguments?: unknown;
+      parameters?: unknown;
+    };
+
+    if (obj.type === 'function' && obj.function && typeof obj.function === 'object') {
+      const functionName = obj.function.name;
+      const functionArguments = obj.function.arguments;
+      return typeof functionName === 'string'
+        && toolNames.has(functionName)
+        && (functionArguments === undefined || typeof functionArguments === 'string' || (functionArguments !== null && typeof functionArguments === 'object'));
+    }
+
+    if (typeof obj.function === 'string') {
+      const topLevelArgs = this.inferImplicitToolArguments(this.remapWeakModelToolName(obj.function), obj.arguments ?? obj.parameters, obj as Record<string, unknown>);
+      return toolNames.has(this.remapWeakModelToolName(obj.function))
+        && (typeof topLevelArgs === 'string' || (topLevelArgs !== null && typeof topLevelArgs === 'object'));
+    }
+
+    const topLevelName = obj.name ?? obj.function_name;
+    const normalizedTopLevelName = typeof topLevelName === 'string' ? this.remapWeakModelToolName(topLevelName) : undefined;
+    const topLevelArgs = normalizedTopLevelName
+      ? this.inferImplicitToolArguments(normalizedTopLevelName, obj.arguments ?? obj.parameters, obj as Record<string, unknown>)
+      : (obj.arguments ?? obj.parameters);
+    const parsedMatch = typeof topLevelName === 'string'
+      && toolNames.has(this.remapWeakModelToolName(topLevelName))
+      && (typeof topLevelArgs === 'string' || (topLevelArgs !== null && typeof topLevelArgs === 'object'));
+
+    if (parsedMatch) {
+      return true;
+    }
+
+    return this.looksLikeMalformedToolCallContent(trimmed);
+  }
+
+  private looksLikeMalformedToolCallContent(content: string): boolean {
+    const trimmed = content.trim();
+    if (!trimmed.startsWith('{')) {
+      return false;
+    }
+
+    const hintedToolName = this.extractToolCallNameHint(trimmed);
+    if (!hintedToolName) {
+      return false;
+    }
+
+    if (!/["'](?:arguments|parameters)["']\s*:/.test(trimmed)) {
+      return false;
+    }
+
+    return /["'](?:filepath|filename|path|content|old_text|new_text|command|directory|text|model)["']\s*:/.test(trimmed);
+  }
+
+  private extractToolCallNameHint(content: string): string | undefined {
+    const toolNames = new Set(this.getToolDefinitions().map(t => t.function.name));
+    const directMatch = content.match(/["'](?:name|function_name|function)["']\s*:\s*["']([a-zA-Z0-9_:-]+)["']/);
+    const nestedMatch = content.match(/["']function["']\s*:\s*\{[\s\S]*?["']name["']\s*:\s*["']([a-zA-Z0-9_:-]+)["']/);
+    const candidate = nestedMatch?.[1] ?? directMatch?.[1];
+    if (!candidate) {
+      return undefined;
+    }
+
+    const normalized = this.remapWeakModelToolName(candidate.trim());
+    return toolNames.has(normalized) ? normalized : undefined;
+  }
+
+  private containsLeakedToolCallPayload(content: string): boolean {
+    const trimmed = content.trim();
+    if (!trimmed) {
+      return false;
+    }
+
+    if (this.looksLikeToolCallContent(trimmed)) {
+      return true;
+    }
+
+    const codeBlockPattern = /```(?:json|tool_call|tool)?\s*\n?([\s\S]*?)```/g;
+    let match: RegExpExecArray | null;
+    while ((match = codeBlockPattern.exec(trimmed)) !== null) {
+      if (this.looksLikeToolCallContent(match[1] ?? '')) {
+        return true;
+      }
+    }
+
+    const toolCallObjectPattern = /\{\s*["'](?:name|function_name|function)["']\s*:/g;
+    while ((match = toolCallObjectPattern.exec(trimmed)) !== null) {
+      const jsonStr = this.extractBalancedJson(trimmed, match.index);
+      if (jsonStr && this.looksLikeToolCallContent(jsonStr)) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  /** Extract a balanced JSON object starting at `startIndex` in `text`. */
+  private extractBalancedJson(text: string, startIndex: number): string | undefined {
+    let depth = 0;
+    let inString = false;
+    let stringChar = '';
+    let escape = false;
+    for (let i = startIndex; i < text.length; i++) {
+      const ch = text[i];
+      if (escape) { escape = false; continue; }
+      if (ch === '\\' && inString) { escape = true; continue; }
+      if ((ch === '"' || ch === "'") && (!inString || ch === stringChar)) {
+        if (inString) { inString = false; stringChar = ''; } else { inString = true; stringChar = ch; }
+        continue;
+      }
+      if (inString) { continue; }
+      if (ch === '{') { depth++; }
+      else if (ch === '}') {
+        depth--;
+        if (depth === 0) {
+          return text.slice(startIndex, i + 1);
+        }
+      }
+    }
+    return undefined;
+  }
+
+  /**
+   * Attempt to repair JSON that uses single quotes instead of double quotes.
+   * Handles cases like: {"name": "tool", "arguments": {"old_text": 'value with "quotes"'}}
+   */
+  private repairSingleQuotedJson(text: string): string | undefined {
+    // Replace single-quoted string values with double-quoted ones,
+    // escaping any inner double quotes.
+    let result = '';
+    let i = 0;
+    while (i < text.length) {
+      if (text[i] === "'") {
+        // Collect the single-quoted string
+        let value = '';
+        i++; // skip opening '
+        while (i < text.length && text[i] !== "'") {
+          if (text[i] === '\\' && i + 1 < text.length) {
+            value += text[i] + text[i + 1];
+            i += 2;
+          } else {
+            value += text[i];
+            i++;
+          }
+        }
+        i++; // skip closing '
+        // Escape inner double quotes and wrap in double quotes
+        result += '"' + value.replace(/"/g, '\\"') + '"';
+      } else {
+        result += text[i];
+        i++;
+      }
+    }
+    // Quick sanity check: is the result parseable?
+    try {
+      JSON.parse(result);
+      return result;
+    } catch {
+      return undefined;
+    }
   }
 
   private normalizeParsedToolCalls(rawValue: unknown): ToolFunctionCall[] {
@@ -1865,13 +3009,17 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     }
 
     const record = rawValue as Record<string, unknown>;
-    const directName = typeof record.name === 'string' ? record.name.trim() : '';
-    const directArguments = record.arguments;
+    const directName = typeof record.name === 'string' ? record.name.trim()
+      : typeof record.function_name === 'string' ? record.function_name.trim()
+      : typeof record.function === 'string' ? record.function.trim()
+      : '';
+    const normalizedToolName = this.remapWeakModelToolName(typeof record.function === 'string' ? record.function.trim() : directName);
+    const directArguments = this.inferImplicitToolArguments(normalizedToolName, record.arguments ?? record.parameters, record);
     const functionRecord = this.toObjectRecord(record.function);
     const normalizedArguments = this.normalizeParsedToolArguments(functionRecord?.arguments ?? directArguments);
 
     const parsedToolCall: ParsedToolCall = {
-      name: typeof functionRecord?.name === 'string' ? functionRecord.name.trim() : directName,
+      name: this.remapWeakModelToolName(typeof functionRecord?.name === 'string' ? functionRecord.name.trim() : directName),
       arguments: normalizedArguments
     };
 
@@ -1902,10 +3050,66 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     }
 
     if (value && typeof value === 'object' && !Array.isArray(value)) {
-      return value as Record<string, unknown>;
+      return this.remapWeakModelArgumentAliases(value as Record<string, unknown>);
     }
 
     return undefined;
+  }
+
+  private inferImplicitToolArguments(
+    toolName: string,
+    explicitArguments: unknown,
+    record: Record<string, unknown>
+  ): unknown {
+    if (explicitArguments !== undefined) {
+      return explicitArguments;
+    }
+
+    const rest = { ...record };
+    delete rest.type;
+    delete rest.name;
+    delete rest.function_name;
+    delete rest.function;
+    delete rest.arguments;
+    delete rest.parameters;
+
+    if (Object.keys(rest).length === 0) {
+      return undefined;
+    }
+
+    if (toolName === 'create_or_edit_file') {
+      const filename = rest.filename ?? rest.filepath ?? rest.path;
+      const content = rest.content;
+      if (typeof filename === 'string' && typeof content === 'string') {
+        return { filename, content };
+      }
+    }
+
+    if (toolName === 'write_to_file') {
+      const filepath = rest.filepath ?? rest.filename ?? rest.path;
+      const content = rest.content;
+      if (typeof filepath === 'string' && typeof content === 'string') {
+        return { filepath, content };
+      }
+    }
+
+    if (toolName === 'replace_in_file') {
+      const filepath = rest.filepath ?? rest.filename ?? rest.path;
+      const oldText = rest.old_text ?? rest.old_content ?? rest.old_string ?? rest.old_code;
+      const newText = rest.new_text ?? rest.new_content ?? rest.new_string ?? rest.new_code;
+      if (typeof filepath === 'string' && typeof oldText === 'string' && typeof newText === 'string') {
+        return { filepath, old_text: oldText, new_text: newText };
+      }
+    }
+
+    if (toolName === 'read_specific_file') {
+      const filepath = rest.filepath ?? rest.filename ?? rest.path;
+      if (typeof filepath === 'string') {
+        return { filepath };
+      }
+    }
+
+    return rest;
   }
 
   private getToolDefinitions(): ToolDefinition[] {
@@ -2072,9 +3276,12 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     const pattern = /```(\w+)[:\s]+([^\n`]+)\n([\s\S]*?)```/g;
     let match: RegExpExecArray | null;
     while ((match = pattern.exec(content)) !== null) {
+      const lang = (match[1] || '').toLowerCase();
       const filepath = match[2].trim();
       const fileContent = match[3];
-      if (filepath && fileContent && !filepath.includes(' ') && this.isLikelyFileReference(filepath)) {
+      if (lang === 'diff' || lang === 'patch') { continue; }
+      if (this.looksLikeToolCallContent(fileContent)) { continue; }
+      if (filepath && fileContent && !filepath.includes(' ') && this.isLikelyFileReference(filepath) && !this.looksLikeDiffOutput(fileContent)) {
         blocks.push({ fullMatch: match[0], filepath, fileContent });
       }
     }
@@ -2082,9 +3289,12 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     // Match: ```lang\n// filepath: path/to/file\n...
     const commentPathPattern = /```(\w+)\s*\n\s*(?:\/\/|#|--|\/\*)\s*(?:filepath|file|path):\s*([^\n]+)\n([\s\S]*?)```/gi;
     while ((match = commentPathPattern.exec(content)) !== null) {
+      const lang = (match[1] || '').toLowerCase();
       const filepath = match[2].trim();
       const fileContent = match[3];
-      if (filepath && fileContent && this.isLikelyFileReference(filepath) && !blocks.some(b => b.filepath === filepath)) {
+      if (lang === 'diff' || lang === 'patch') { continue; }
+      if (this.looksLikeToolCallContent(fileContent)) { continue; }
+      if (filepath && fileContent && this.isLikelyFileReference(filepath) && !blocks.some(b => b.filepath === filepath) && !this.looksLikeDiffOutput(fileContent)) {
         blocks.push({ fullMatch: match[0], filepath, fileContent });
       }
     }
@@ -2095,7 +3305,13 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       const filepath = match[1].trim();
       const lang = (match[2] || '').toLowerCase();
       const fileContent = match[3];
-      if (lang === 'diff') {
+      if (lang === 'diff' || lang === 'patch') {
+        continue;
+      }
+      if (this.looksLikeDiffOutput(fileContent)) {
+        continue;
+      }
+      if (this.looksLikeToolCallContent(fileContent)) {
         continue;
       }
       if (this.isLikelyFileReference(filepath) && !filepath.includes(' ') && !blocks.some(b => b.filepath === filepath)) {
@@ -2231,28 +3447,33 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   }
 
   private async executeToolCall(toolCall: ToolFunctionCall): Promise<string> {
-    const name = toolCall.function?.name ?? '';
+    const name = this.remapWeakModelToolName(toolCall.function?.name ?? '');
     const args = this.normalizeToolArguments(toolCall.function?.arguments);
 
-    switch (name) {
-      case 'read_active_file':
-        return this.readActiveFile();
-      case 'read_specific_file':
-        return this.readSpecificFile(String(args.filepath ?? ''));
-      case 'create_or_edit_file':
-        return this.createOrEditFile(String(args.filename ?? ''), String(args.content ?? ''));
-      case 'write_to_file':
-        return this.createOrEditFile(String(args.filepath ?? ''), String(args.content ?? ''));
-      case 'replace_in_file':
-        return this.replaceInFile(String(args.filepath ?? ''), String(args.old_text ?? ''), String(args.new_text ?? ''));
-      case 'execute_terminal_command':
-        return this.executeTerminalCommand(String(args.command ?? ''));
-      case 'delete_file':
-        return this.deleteFile(String(args.filepath ?? ''));
-      case 'list_workspace_files':
-        return this.listWorkspaceFiles(String(args.directory ?? ''));
-      default:
-        return JSON.stringify({ error: `Unknown tool: ${name}` });
+    try {
+      switch (name) {
+        case 'read_active_file':
+          return await this.readActiveFile();
+        case 'read_specific_file':
+          return await this.readSpecificFile(String(args.filepath ?? ''));
+        case 'create_or_edit_file':
+          return await this.createOrEditFile(String(args.filename ?? args.filepath ?? ''), String(args.content ?? ''));
+        case 'write_to_file':
+          return await this.createOrEditFile(String(args.filepath ?? ''), String(args.content ?? ''));
+        case 'replace_in_file':
+          return await this.replaceInFile(String(args.filepath ?? ''), String(args.old_text ?? ''), String(args.new_text ?? ''));
+        case 'execute_terminal_command':
+          return await this.executeTerminalCommand(String(args.command ?? ''));
+        case 'delete_file':
+          return await this.deleteFile(String(args.filepath ?? ''));
+        case 'list_workspace_files':
+          return await this.listWorkspaceFiles(String(args.directory ?? ''));
+        default:
+          return JSON.stringify({ error: `Unknown tool: ${name}` });
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Tool execution failed.';
+      return JSON.stringify({ error: message });
     }
   }
 
@@ -2265,7 +3486,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       try {
         const parsed = JSON.parse(rawArguments) as unknown;
         if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-          return parsed as Record<string, unknown>;
+          return this.remapWeakModelArgumentAliases(parsed as Record<string, unknown>);
         }
       } catch {
         return {};
@@ -2274,7 +3495,76 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       return {};
     }
 
-    return rawArguments;
+    return this.remapWeakModelArgumentAliases(rawArguments);
+  }
+
+  private remapWeakModelToolName(name: string): string {
+    const normalized = name.trim();
+    const aliases: Record<string, string> = {
+      write_file: 'write_to_file',
+      create_file: 'create_or_edit_file',
+      create_or_replace: 'create_or_edit_file',
+      create_or_overwrite: 'create_or_edit_file',
+      edit_file: 'replace_in_file',
+      replace_content: 'replace_in_file',
+      read_file: 'read_specific_file',
+      run_command: 'execute_terminal_command',
+      terminal_command: 'execute_terminal_command'
+    };
+    return aliases[normalized.toLowerCase()] ?? normalized;
+  }
+
+  private remapWeakModelArgumentAliases(args: Record<string, unknown>): Record<string, unknown> {
+    const aliasMap: Record<string, string> = {
+      file_path: 'filepath',
+      file_name: 'filename',
+      file: 'filepath',
+      path: 'filepath',
+      old_content: 'old_text',
+      new_content: 'new_text',
+      old_string: 'old_text',
+      new_string: 'new_text',
+      old_code: 'old_text',
+      new_code: 'new_text',
+      cmd: 'command',
+      dir: 'directory'
+    };
+
+    const normalized: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(args)) {
+      normalized[aliasMap[key] ?? key] = value;
+    }
+    return normalized;
+  }
+
+  private async resolveWorkspaceUriForOperation(targetPath: string, allowCreate = false): Promise<vscode.Uri> {
+    const normalizedTarget = targetPath.trim();
+    if (!normalizedTarget) {
+      throw new Error('Path is required.');
+    }
+
+    if (path.isAbsolute(normalizedTarget)) {
+      return vscode.Uri.file(normalizedTarget);
+    }
+
+    const directUri = this.resolveWorkspaceUri(normalizedTarget);
+    try {
+      await vscode.workspace.fs.stat(directUri);
+      return directUri;
+    } catch {
+      // Fall through to existing-file resolution.
+    }
+
+    if (allowCreate) {
+      return directUri;
+    }
+
+    const existingPath = await this.resolveExistingWorkspacePath(normalizedTarget);
+    if (existingPath) {
+      return vscode.Uri.file(existingPath);
+    }
+
+    return directUri;
   }
 
   private async readActiveFile(): Promise<string> {
@@ -2298,7 +3588,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     }
 
     try {
-      const uri = this.resolveWorkspaceUri(filepath);
+      const uri = await this.resolveWorkspaceUriForOperation(filepath);
       const content = await this.readWorkspaceText(uri);
       const languageId = vscode.workspace.textDocuments.find(doc => doc.uri.toString() === uri.toString())?.languageId ?? 'plaintext';
 
@@ -2320,24 +3610,38 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     }
 
     try {
-      const workspaceFolders = vscode.workspace.workspaceFolders;
-      if (!workspaceFolders) throw new Error("No workspace open");
-      
-      // Try to safely resolve the path
-      let targetUri: vscode.Uri;
-      if (path.isAbsolute(filename)) {
-          targetUri = vscode.Uri.file(filename);
-      } else {
-          targetUri = vscode.Uri.joinPath(workspaceFolders[0].uri, filename);
-      }
-      
+      const targetUri = await this.resolveWorkspaceUriForOperation(filename, true);
+
       await vscode.workspace.fs.createDirectory(vscode.Uri.file(path.dirname(targetUri.fsPath)));
 
-        await this.writeWorkspaceText(targetUri, content);
+      let sanitizedContent = this.sanitizeGeneratedFileContent(content);
+      if (this.looksLikeDiffOutput(sanitizedContent)) {
+        sanitizedContent = this.stripDiffPrefixes(sanitizedContent);
+      }
+
+      // Guard against destructive writes from tool calls
+      const displayName = path.basename(targetUri.fsPath);
+      let oldContent: string | undefined;
+      try { oldContent = await this.readWorkspaceText(targetUri); } catch { /* new file */ }
+      if (this.looksLikeToolCallContent(sanitizedContent)) {
+        return JSON.stringify({ error: `Blocked: content is a tool-call definition, not file content.` });
+      }
+      const destructiveGuard = this.detectDestructiveWrite(displayName, sanitizedContent, oldContent);
+      if (destructiveGuard) {
+        return JSON.stringify({ error: `Blocked write to ${displayName}: ${destructiveGuard}` });
+      }
+
+      await this.writeWorkspaceText(targetUri, sanitizedContent);
+
+      const diff = oldContent !== undefined && oldContent !== sanitizedContent
+        ? this.buildDiffSummary(displayName, oldContent, sanitizedContent)
+        : undefined;
 
       return JSON.stringify({
         path: targetUri.fsPath,
-        bytesWritten: Buffer.byteLength(content, 'utf8')
+        bytesWritten: Buffer.byteLength(sanitizedContent, 'utf8'),
+        preview: oldContent === undefined || !oldContent.trim() ? this.buildPreviewSnippet(sanitizedContent) : undefined,
+        diff
       });
     } catch (error) {
       return JSON.stringify({
@@ -2352,7 +3656,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     }
 
     try {
-      const uri = this.resolveWorkspaceUri(filepath);
+      const uri = await this.resolveWorkspaceUriForOperation(filepath);
       await vscode.workspace.fs.delete(uri);
       return JSON.stringify({ deleted: uri.fsPath });
     } catch (error) {
@@ -2388,16 +3692,33 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   }
 
   private async writeFileWithDiff(filepath: string, newContent: string): Promise<FileWriteSummary> {
-    const target = this.resolveWorkspaceUri(filepath);
-    const displayName = path.basename(target.fsPath);
-    const sanitizedContent = this.sanitizeGeneratedFileContent(newContent);
+    // Last-resort guard: never write raw tool-call JSON as file content
+    if (this.looksLikeToolCallContent(newContent)) {
+      return { summary: `Blocked write to ${path.basename(filepath)}: content is a tool-call definition, not file content.` };
+    }
 
-    // Read old content for diff (may not exist yet)
+    const target = await this.resolveWorkspaceUriForOperation(filepath, true);
+    const displayName = path.basename(target.fsPath);
+    let sanitizedContent = this.sanitizeGeneratedFileContent(newContent);
+
+    // Strip diff prefixes that leaked from model output
+    if (this.looksLikeDiffOutput(sanitizedContent)) {
+      sanitizedContent = this.stripDiffPrefixes(sanitizedContent);
+    }
+
+    // Read old content early so we can compare sizes for destructive write detection
     let oldContent: string | undefined;
     try {
       oldContent = await this.readWorkspaceText(target);
     } catch {
       // File doesn't exist yet — new file
+    }
+
+    // Block obviously destructive writes to structured files
+    const destructiveGuard = this.detectDestructiveWrite(displayName, sanitizedContent, oldContent);
+    if (destructiveGuard) {
+      this.debugLog('destructive_write_blocked', { filepath, reason: destructiveGuard, contentLength: sanitizedContent.length, oldContentLength: oldContent?.length });
+      return { summary: `Blocked write to ${displayName}: ${destructiveGuard}` };
     }
 
     // Write the file
@@ -2411,7 +3732,17 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     if (oldContent === undefined) {
       // New file created
       const lineCount = sanitizedContent.split('\n').length;
-      return { summary: `Created ${displayName} (${lineCount} lines)` };
+      const preview = this.buildPreviewSnippet(sanitizedContent);
+      return { summary: `Created ${displayName} (${lineCount} lines)${preview ? `\n\n\`\`\`text\n${preview}\n\`\`\`` : ''}` };
+    }
+
+    if (!oldContent.trim() && sanitizedContent.trim()) {
+      const lineCount = sanitizedContent.split('\n').length;
+      const preview = this.buildPreviewSnippet(sanitizedContent);
+      return {
+        summary: `Filled empty ${displayName} (${lineCount} lines)${preview ? `\n\n\`\`\`text\n${preview}\n\`\`\`` : ''}`,
+        revertOperationId: this.createRevertSnapshot(target.fsPath, oldContent, sanitizedContent)
+      };
     }
 
     if (oldContent === sanitizedContent) {
@@ -2520,6 +3851,19 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   }
 
   private async readWorkspaceText(uri: vscode.Uri): Promise<string> {
+    // Guard against reading directories — they cause EISDIR
+    try {
+      const stat = await vscode.workspace.fs.stat(uri);
+      if (stat.type & vscode.FileType.Directory) {
+        throw new Error(`Cannot read directory as text: ${uri.fsPath}`);
+      }
+    } catch (error) {
+      if (error instanceof Error && error.message.startsWith('Cannot read directory')) {
+        throw error;
+      }
+      // stat failed — let readFile below produce the real error
+    }
+
     const openDocument = this.getOpenDocument(uri);
     if (openDocument) {
       return openDocument.getText();
@@ -2634,9 +3978,8 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       return JSON.stringify({ error: 'old_text is required.' });
     }
 
-    const target = this.resolveWorkspaceUri(filepath);
-
     try {
+      const target = await this.resolveWorkspaceUriForOperation(filepath);
       const original = await this.readWorkspaceText(target);
       const occurrences = original.split(oldText).length - 1;
 
@@ -2649,11 +3992,13 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
 
       const updated = original.replace(oldText, newText);
       await this.writeWorkspaceText(target, updated);
+      const diff = this.buildDiffSummary(path.basename(target.fsPath), original, updated);
 
       return JSON.stringify({
         path: target.fsPath,
         replacements: 1,
-        bytesWritten: Buffer.byteLength(updated, 'utf8')
+        bytesWritten: Buffer.byteLength(updated, 'utf8'),
+        diff
       });
     } catch (error) {
       return JSON.stringify({
@@ -2682,11 +4027,13 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
 
       const updated = original.split(oldText).join(newText);
       await this.writeWorkspaceText(target, updated);
+      const diff = this.buildDiffSummary(path.basename(target.fsPath), original, updated);
 
       return JSON.stringify({
         path: target.fsPath,
         replacements: occurrences,
-        bytesWritten: Buffer.byteLength(updated, 'utf8')
+        bytesWritten: Buffer.byteLength(updated, 'utf8'),
+        diff
       });
     } catch (error) {
       return JSON.stringify({
@@ -2713,7 +4060,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       exec(trimmed, { cwd, timeout: 60_000, maxBuffer: 1024 * 1024 }, (error, stdout, stderr) => {
         const exitCode = typeof (error as NodeJS.ErrnoException | null)?.code === 'number'
           ? (error as NodeJS.ErrnoException).code
-          : 0;
+          : (error ? 1 : 0);
 
         resolve(JSON.stringify({
           command: trimmed,
@@ -2726,23 +4073,32 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     });
   }
 
+  private buildPreviewSnippet(content: string): string {
+    const normalized = content.replace(/\r\n/g, '\n').trimEnd();
+    if (!normalized.trim()) {
+      return '';
+    }
+
+    const lines = normalized.split('\n');
+    const previewLines = lines.length > 40
+      ? [...lines.slice(0, 30), `... (${lines.length - 35} more lines omitted) ...`, ...lines.slice(-5)]
+      : lines;
+    const preview = previewLines.join('\n');
+    return preview.length > 5000 ? `${preview.slice(0, 4800)}\n... preview truncated ...` : preview;
+  }
+
   private async addFileContext(rawPath: string): Promise<void> {
     try {
       const uri = this.parseDroppedUri(rawPath);
-      const bytes = await vscode.workspace.fs.readFile(uri);
-      const content = Buffer.from(bytes).toString('utf8');
-      const document = await vscode.workspace.openTextDocument(uri);
-
-      this.attachedFiles.set(uri.fsPath, {
-        uri,
-        name: path.basename(uri.fsPath),
-        content,
-        languageId: document.languageId
-      });
-
-      this.removeAttachmentContextMessages();
-      this.postStateToWebview();
-      this.postStatus(`Attached ${path.basename(uri.fsPath)} to the next requests.`);
+      const stat = await vscode.workspace.fs.stat(uri);
+      if (stat.type === vscode.FileType.Directory || stat.type === (vscode.FileType.Directory | vscode.FileType.SymbolicLink)) {
+        await this.addFolderContext(uri);
+        return;
+      }
+      const attached = await this.attachFileContextUri(uri);
+      if (!attached) {
+        throw new Error('Failed to attach file.');
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Failed to attach file.';
       this.postStatus(`Unable to attach dropped file: ${message}`);
@@ -2767,7 +4123,8 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       uri: syntheticUri,
       name: filename,
       content,
-      languageId
+      languageId,
+      readOnly: true
     });
 
     this.removeAttachmentContextMessages();
@@ -2778,32 +4135,50 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   private async addFilePathContext(rawUri: string): Promise<void> {
     try {
       const uri = this.parseDroppedUri(rawUri);
-      const bytes = await vscode.workspace.fs.readFile(uri);
-      const content = Buffer.from(bytes).toString('utf8');
-      const name = path.basename(uri.fsPath);
-
-      let languageId = 'plaintext';
-      try {
-        const document = await vscode.workspace.openTextDocument(uri);
-        languageId = document.languageId;
-      } catch {
-        // Keep plaintext fallback.
+      const stat = await vscode.workspace.fs.stat(uri);
+      if (stat.type === vscode.FileType.Directory || stat.type === (vscode.FileType.Directory | vscode.FileType.SymbolicLink)) {
+        await this.addFolderContext(uri);
+        return;
       }
-
-      this.attachedFiles.set(uri.fsPath, {
-        uri,
-        name,
-        content,
-        languageId
-      });
-
-      this.removeAttachmentContextMessages();
-      this.postStateToWebview();
-      this.postStatus(`Attached ${name} to the next requests.`);
+      const attached = await this.attachFileContextUri(uri);
+      if (!attached) {
+        throw new Error('Failed to attach file.');
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Failed to attach file.';
       this.postStatus(`Unable to attach file: ${message}`);
     }
+  }
+
+  private async attachFileContextUri(uri: vscode.Uri, silent = false): Promise<AttachedFileContext | undefined> {
+    const bytes = await vscode.workspace.fs.readFile(uri);
+    const content = Buffer.from(bytes).toString('utf8');
+    const name = path.basename(uri.fsPath);
+
+    let languageId = 'plaintext';
+    try {
+      const document = await vscode.workspace.openTextDocument(uri);
+      languageId = document.languageId;
+    } catch {
+      // Keep plaintext fallback.
+    }
+
+    const attached: AttachedFileContext = {
+      uri,
+      name,
+      content,
+      languageId
+    };
+
+    this.attachedFiles.set(uri.fsPath, attached);
+    this.removeAttachmentContextMessages();
+
+    if (!silent) {
+      this.postStateToWebview();
+      this.postStatus(`Attached ${name} to the next requests.`);
+    }
+
+    return attached;
   }
 
   private async browseAndAttachFiles(): Promise<void> {
@@ -2824,14 +4199,128 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     }
   }
 
+  private async browseAndAttachFolder(): Promise<void> {
+    const uris = await vscode.window.showOpenDialog({
+      canSelectMany: false,
+      canSelectFiles: false,
+      canSelectFolders: true,
+      openLabel: 'Attach Folder',
+      title: 'Attach folder to ManulAI context'
+    });
+
+    if (!uris?.length) {
+      return;
+    }
+
+    await this.addFolderContext(uris[0]);
+  }
+
+  private async attachWorkspaceAsContext(): Promise<void> {
+    const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
+    if (!workspaceFolder) {
+      this.postStatus('No workspace folder open.');
+      return;
+    }
+    await this.addFolderContext(workspaceFolder.uri);
+  }
+
+  private async addFolderContext(folderUri: vscode.Uri): Promise<void> {
+    const maxFilesWithContent = 80;
+    const maxListedFiles = 2000;
+    const maxFileSize = 80_000;
+    const maxContentChars = 220_000;
+    const skipDirs = new Set(['.git', 'node_modules', '.next', 'dist', 'out', 'build', '__pycache__', '.venv', 'venv', '.tox', 'coverage', '.nyc_output', '.cache']);
+    const skipExtensions = new Set(['.png', '.jpg', '.jpeg', '.gif', '.bmp', '.ico', '.svg', '.woff', '.woff2', '.ttf', '.eot', '.mp3', '.mp4', '.zip', '.tar', '.gz', '.lock', '.vsix']);
+    const allowedHiddenDirs = new Set(['.github', '.vscode']);
+    const skipFileNames = new Set(['.env', 'id_rsa', 'id_dsa', 'id_ecdsa', 'id_ed25519']);
+    const skipFilePatterns = [/^\.env\./i, /\.(?:pem|key|p12|pfx|crt|cer|der)$/i];
+
+    const collected: string[] = [];
+    const listedFiles: string[] = [];
+    const folderName = path.basename(folderUri.fsPath);
+    let totalContentChars = 0;
+    let eligibleFileCount = 0;
+
+    const walk = async (dir: vscode.Uri, depth: number): Promise<void> => {
+      if (depth > 8 || listedFiles.length >= maxListedFiles) { return; }
+      let entries: [string, vscode.FileType][];
+      try {
+        entries = await vscode.workspace.fs.readDirectory(dir);
+      } catch { return; }
+
+      entries.sort((a, b) => a[0].localeCompare(b[0]));
+
+      for (const [name, type] of entries) {
+        if (listedFiles.length >= maxListedFiles) { break; }
+        const childUri = vscode.Uri.joinPath(dir, name);
+
+        if (type & vscode.FileType.Directory) {
+          if (!skipDirs.has(name) && (!name.startsWith('.') || allowedHiddenDirs.has(name))) {
+            await walk(childUri, depth + 1);
+          }
+          continue;
+        }
+
+        if (!(type & vscode.FileType.File)) { continue; }
+        if (skipFileNames.has(name) || skipFilePatterns.some(pattern => pattern.test(name))) { continue; }
+        const ext = path.extname(name).toLowerCase();
+        if (skipExtensions.has(ext)) { continue; }
+
+        const relativePath = path.relative(folderUri.fsPath, childUri.fsPath).replace(/\\/g, '/');
+        listedFiles.push(relativePath);
+        eligibleFileCount += 1;
+
+        try {
+          const stat = await vscode.workspace.fs.stat(childUri);
+          if (stat.type & vscode.FileType.Directory) { continue; }
+          if (stat.size > maxFileSize) { continue; }
+          if (collected.length >= maxFilesWithContent) { continue; }
+          const bytes = await vscode.workspace.fs.readFile(childUri);
+          const text = Buffer.from(bytes).toString('utf8');
+          if (totalContentChars + text.length > maxContentChars) { continue; }
+          collected.push(`--- ${relativePath} ---\n${text}`);
+          totalContentChars += text.length;
+        } catch { /* skip unreadable files */ }
+      }
+    };
+
+    this.postStatus(`Scanning folder ${folderName}...`);
+    await walk(folderUri, 0);
+
+    if (listedFiles.length === 0) {
+      this.postStatus(`No readable files found in ${folderName}.`);
+      return;
+    }
+
+    const treeText = listedFiles.join('\n');
+    const omittedContentFiles = Math.max(eligibleFileCount - collected.length, 0);
+    const combinedContent = [
+      `Workspace root: ${folderUri.fsPath}`,
+      '',
+      `Project file tree (${listedFiles.length} files):`,
+      treeText,
+      '',
+      `Included full contents for ${collected.length} file(s).${omittedContentFiles > 0 ? ` Omitted ${omittedContentFiles} file(s) from full content to stay within context budget; use read_specific_file for any omitted file.` : ''}`,
+      '',
+      collected.join('\n\n')
+    ].join('\n');
+    const truncated = omittedContentFiles > 0 || listedFiles.length >= maxListedFiles ? ' (snapshot)' : '';
+
+    this.attachedFiles.set(folderUri.fsPath, {
+      uri: folderUri,
+      name: `${folderName}${truncated}`,
+      content: combinedContent,
+      languageId: '__folder__'
+    });
+
+    this.removeAttachmentContextMessages();
+    this.postStateToWebview();
+    this.postStatus(`Scanned ${listedFiles.length} project files and attached ${collected.length} full file contents from ${folderName} as persistent context.`);
+  }
+
   private async setAgentMode(value: boolean | undefined): Promise<void> {
     this.agentMode = value !== undefined ? value : !this.agentMode;
-
-    const target = vscode.workspace.workspaceFolders?.length
-      ? vscode.ConfigurationTarget.Workspace
-      : vscode.ConfigurationTarget.Global;
-
-    await vscode.workspace.getConfiguration('manulai').update('agentMode', this.agentMode, target);
+    await this.persistStoredSetting('agentMode', this.agentMode);
     this.postStateToWebview();
     this.postStatus(
       this.agentMode
@@ -2850,17 +4339,88 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       this.pendingApprovalResolver = undefined;
     }
 
-    const target = vscode.workspace.workspaceFolders?.length
-      ? vscode.ConfigurationTarget.Workspace
-      : vscode.ConfigurationTarget.Global;
-
-    await vscode.workspace.getConfiguration('manulai').update('autoApprove', this.autoApprove, target);
+    await this.persistStoredSetting('autoApprove', this.autoApprove);
     this.postStateToWebview();
     this.postStatus(
       this.autoApprove
         ? 'Auto-Approve enabled. Tools will execute without asking.'
         : 'Auto-Approve disabled. You will be asked before each tool execution.'
     );
+  }
+
+  private async setDebugMode(value: boolean | undefined): Promise<void> {
+    this.debugMode = value !== undefined ? value : !this.debugMode;
+    await this.persistStoredSetting('debugMode', this.debugMode);
+
+    if (this.debugMode) {
+      this.startDebugSession();
+      const folders = vscode.workspace.workspaceFolders;
+      const usingWorkspaceLogs = Boolean(folders?.length && folders[0].uri.scheme === 'file');
+      this.postStatus(usingWorkspaceLogs
+        ? 'Debug Mode enabled. Logs are saved to .manulai/ folder.'
+        : 'Debug Mode enabled. Logs are saved to extension storage for this workspace.');
+    } else {
+      this.stopDebugSession();
+      this.postStatus('Debug Mode disabled.');
+    }
+    this.postStateToWebview();
+  }
+
+  private getDebugLogDir(): string | undefined {
+    const folders = vscode.workspace.workspaceFolders;
+    if (folders?.length && folders[0].uri.scheme === 'file') {
+      return path.join(folders[0].uri.fsPath, '.manulai', 'logs');
+    }
+    return path.join(this.extensionContext.globalStorageUri.fsPath, 'logs');
+  }
+
+  private startDebugSession(): void {
+    const logDir = this.getDebugLogDir();
+    if (!logDir) { return; }
+    try {
+      if (this.debugLogFilePath) {
+        this.stopDebugSession();
+      }
+      fs.mkdirSync(logDir, { recursive: true });
+      const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+      this.debugSessionId = timestamp;
+      const logFile = path.join(logDir, `session-${timestamp}.jsonl`);
+      this.debugLogFilePath = logFile;
+      this.debugLog('session_start', { version: this.extensionContext.extension.packageJSON?.version, model: this.getSelectedModel(), agentMode: this.agentMode, autoApprove: this.autoApprove });
+    } catch {
+      // Silently fail if we can't write logs
+    }
+  }
+
+  private stopDebugSession(): void {
+    if (this.debugLogFilePath) {
+      this.writeDebugEntry('session_end', {});
+      this.debugLogFilePath = undefined;
+    }
+    this.debugSessionId = '';
+  }
+
+  private writeDebugEntry(event: string, data: Record<string, unknown>): void {
+    if (!this.debugLogFilePath) {
+      return;
+    }
+
+    try {
+      fs.mkdirSync(path.dirname(this.debugLogFilePath), { recursive: true });
+      const entry = { ts: new Date().toISOString(), event, ...data };
+      fs.appendFileSync(this.debugLogFilePath, JSON.stringify(entry) + '\n', 'utf8');
+    } catch {
+      // Silently fail
+    }
+  }
+
+  private debugLog(event: string, data: Record<string, unknown>): void {
+    if (!this.debugMode || !this.debugLogFilePath) { return; }
+    this.writeDebugEntry(event, data);
+  }
+
+  public dispose(): void {
+    this.stopDebugSession();
   }
 
   private synchronizeAttachmentContextMessage(): void {
@@ -2946,13 +4506,24 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   private renderAttachmentContextMessage(): string {
     const renderedFiles = Array.from(this.attachedFiles.values())
       .map(file => {
-        const filePath = file.uri.fsPath.startsWith('/dropped/') || file.uri.fsPath.startsWith('/attached/')
-          ? (vscode.workspace.workspaceFolders?.[0]?.uri.fsPath
-            ? `${vscode.workspace.workspaceFolders[0].uri.fsPath}/${file.name}`
-            : file.name)
+        const filePath = file.readOnly
+          ? `reference-only:${file.name}`
+          : file.uri.fsPath.startsWith('/dropped/') || file.uri.fsPath.startsWith('/attached/')
+            ? (vscode.workspace.workspaceFolders?.[0]?.uri.fsPath
+              ? `${vscode.workspace.workspaceFolders[0].uri.fsPath}/${file.name}`
+              : file.name)
           : file.uri.fsPath;
+
+        if (file.languageId === '__folder__') {
+          return [
+            `<manulai_attached_folder name="${file.name}" path="${filePath}">`,
+            file.content,
+            '</manulai_attached_folder>'
+          ].join('\n');
+        }
+
         return [
-          `<manulai_attached_file file="${file.name}" path="${filePath}">`,
+          `<manulai_attached_file file="${file.name}" path="${filePath}"${file.readOnly ? ' readonly="true"' : ''}>`,
           file.content,
           '</manulai_attached_file>'
         ].join('\n');
@@ -3161,7 +4732,19 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     }
 
     const renderableMessages: WebviewRenderableMessage[] = this.messages.reduce<WebviewRenderableMessage[]>((result, message) => {
-      if (message.role === 'system' || message.role === 'tool' || message.hiddenFromTranscript) {
+      if (message.role === 'system') {
+        return result;
+      }
+
+      if (message.role === 'tool') {
+        const formattedToolMessage = this.formatToolMessageForTranscript(message);
+        if (formattedToolMessage) {
+          result.push(formattedToolMessage);
+        }
+        return result;
+      }
+
+      if (message.hiddenFromTranscript) {
         return result;
       }
 
@@ -3183,6 +4766,8 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       return result;
     }, []);
 
+    const extensionVersion = this.extensionContext.extension.packageJSON?.version ?? 'dev';
+
     void this.webviewView.webview.postMessage({
       command: 'state',
       messages: renderableMessages,
@@ -3190,14 +4775,190 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       availableModels: this.availableModels,
       agentMode: this.agentMode,
       autoApprove: this.autoApprove,
+      debugMode: this.debugMode,
       pendingApproval: this.pendingApproval,
       activeFile: this.getActiveFileState(),
+      extensionVersion,
       attachments: Array.from(this.attachedFiles.values()).map(file => ({
         path: file.uri.fsPath,
         displayPath: this.getDisplayPath(file),
-        name: file.name
+        name: file.name,
+        isFolder: file.languageId === '__folder__'
       }))
     });
+  }
+
+  private formatToolMessageForTranscript(message: OllamaMessage): WebviewRenderableMessage | undefined {
+    if (message.role !== 'tool' || !message.tool_name) {
+      return undefined;
+    }
+
+    let parsed: Record<string, unknown> | undefined;
+    try {
+      const json = JSON.parse(message.content) as unknown;
+      if (json && typeof json === 'object' && !Array.isArray(json)) {
+        parsed = json as Record<string, unknown>;
+      }
+    } catch {
+      return {
+        role: 'tool',
+        content: `Tool: ${message.tool_name}\n\n${this.truncateLongResponse(message.content)}`
+      };
+    }
+
+    switch (message.tool_name) {
+      case 'execute_terminal_command': {
+        const command = String(parsed?.command ?? '');
+        const exitCode = String(parsed?.exitCode ?? '');
+        const stdout = this.formatToolTextBlock(parsed?.stdout);
+        const stderr = this.formatToolTextBlock(parsed?.stderr);
+        const error = parsed?.error ? String(parsed.error) : '';
+        const parts = [
+          `Command: ${command || '(unknown command)'}`,
+          `Exit code: ${exitCode || '0'}`
+        ];
+        if (stdout) {
+          parts.push(`stdout\n\n\`\`\`text\n${stdout}\n\`\`\``);
+        }
+        if (stderr) {
+          parts.push(`stderr\n\n\`\`\`text\n${stderr}\n\`\`\``);
+        }
+        if (error) {
+          parts.push(`error\n\n\`\`\`text\n${error}\n\`\`\``);
+        }
+        return {
+          role: 'tool',
+          content: parts.join('\n\n')
+        };
+      }
+      case 'create_or_edit_file':
+      case 'write_to_file':
+      case 'replace_in_file': {
+        const error = parsed?.error ? String(parsed.error) : '';
+        if (error) {
+          return {
+            role: 'tool',
+            content: `File tool: ${message.tool_name}\n\n${error}`
+          };
+        }
+
+        const targetPath = String(parsed?.path ?? parsed?.deleted ?? '');
+        const bytesWritten = parsed?.bytesWritten !== undefined ? String(parsed.bytesWritten) : '';
+        const replacements = parsed?.replacements !== undefined ? String(parsed.replacements) : '';
+        const diff = this.formatToolTextBlock(parsed?.diff);
+        const preview = this.formatToolTextBlock(parsed?.preview);
+        const parts = [`Path: ${targetPath || '(unknown path)'}`];
+        if (bytesWritten) {
+          parts.push(`Bytes written: ${bytesWritten}`);
+        }
+        if (replacements) {
+          parts.push(`Replacements: ${replacements}`);
+        }
+        if (diff) {
+          parts.push(diff);
+        } else if (preview) {
+          parts.push(`Preview\n\n\`\`\`text\n${preview}\n\`\`\``);
+        }
+        return {
+          role: 'tool',
+          content: parts.join('\n\n')
+        };
+      }
+      default: {
+        const error = parsed?.error ? String(parsed.error) : '';
+        if (error) {
+          return {
+            role: 'tool',
+            content: `Tool: ${message.tool_name}\n\n${error}`
+          };
+        }
+
+        const summary = this.formatToolTextBlock(JSON.stringify(parsed, null, 2));
+        return {
+          role: 'tool',
+          content: summary
+            ? `Tool: ${message.tool_name}\n\nResult\n\n\`\`\`json\n${summary}\n\`\`\``
+            : `Tool: ${message.tool_name}`
+        };
+      }
+    }
+  }
+
+  private formatToolTextBlock(value: unknown): string {
+    if (typeof value !== 'string') {
+      return '';
+    }
+
+    const normalized = value.replace(/\r\n/g, '\n').trim();
+    if (!normalized) {
+      return '';
+    }
+
+    const lines = normalized.split('\n');
+    const limited = lines.length > 80
+      ? [...lines.slice(0, 60), `... (${lines.length - 70} more lines omitted) ...`, ...lines.slice(-10)]
+      : lines;
+    const joined = limited.join('\n');
+    return joined.length > 8000 ? `${joined.slice(0, 7800)}\n... output truncated ...` : joined;
+  }
+
+  private postProgressStep(text: string): void {
+    const normalized = text.trim();
+    if (!normalized) {
+      return;
+    }
+
+    const content = `Step ${++this.progressStepCounter}: ${normalized}`;
+    const lastMessage = this.messages[this.messages.length - 1];
+    if (lastMessage?.localOnly && lastMessage.content === content) {
+      return;
+    }
+
+    this.messages.push({
+      role: 'assistant',
+      content,
+      localOnly: true
+    });
+    this.postStateToWebview();
+  }
+
+  private describeToolExecution(toolCall: ToolFunctionCall): string {
+    const toolName = toolCall.function?.name || 'unknown_tool';
+    const args = this.normalizeToolArguments(toolCall.function?.arguments);
+    const formatPath = (value: unknown): string => {
+      const text = String(value ?? '').trim();
+      if (!text) {
+        return 'target file';
+      }
+
+      const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+      if (workspaceRoot && text.startsWith(workspaceRoot + path.sep)) {
+        return text.slice(workspaceRoot.length + 1).replace(/\\/g, '/');
+      }
+
+      return text.replace(/\\/g, '/');
+    };
+
+    switch (toolName) {
+      case 'read_specific_file':
+        return `Reading ${formatPath(args.filepath)}`;
+      case 'read_active_file':
+        return 'Reading the active file';
+      case 'list_workspace_files':
+        return args.directory ? `Scanning project structure in ${formatPath(args.directory)}` : 'Scanning project structure';
+      case 'replace_in_file':
+        return `Editing ${formatPath(args.filepath)}`;
+      case 'create_or_edit_file':
+        return `Writing ${formatPath(args.filename)}`;
+      case 'write_to_file':
+        return `Writing ${formatPath(args.filepath)}`;
+      case 'delete_file':
+        return `Deleting ${formatPath(args.filepath)}`;
+      case 'execute_terminal_command':
+        return `Running ${String(args.command ?? '').trim() || 'terminal command'}`;
+      default:
+        return `Executing ${toolName}`;
+    }
   }
 
   private postStatus(content: string): void {

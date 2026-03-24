@@ -59,8 +59,24 @@ ManulAI has two working modes:
 - attach the active editor file to the chat
 - attach files from the Explorer context menu
 - browse and attach files from disk
+- attach the whole workspace as a scan snapshot when the user asks to scan or remember the project
 - keep attached file context visible in the UI
 - forward attached content into the model context for the next requests
+
+### Project Scan And File Discovery
+
+- project scan requests can attach a workspace snapshot with the file tree and a capped set of file contents
+- scan triggers work across English, Ukrainian, and Russian phrasing such as `scan project`, `проскануй проект`, and `просканируй репо`
+- scan requests push the agent to keep reading and fixing instead of stopping after the first directory or first issue
+- edit requests can auto-discover likely targets such as `README.md`, `LICENSE`, `package.json`, `tsconfig.json`, and explicit file paths even if those files were not attached first
+- when a likely target file is auto-discovered, the chat prints that discovery as a visible progress step before the next tool actions
+
+### Visible Tool Transcript
+
+- tool execution results are rendered in the chat with compact summaries, previews, or full terminal output as appropriate
+- terminal actions show the command, exit code, stdout, stderr, and tool error text when present
+- file creation and rewrite actions show a preview, including when an empty file was filled for the first time
+- multi-step actions can print progress step-by-step while tools are running
 
 ### Built-In Workspace Tools
 
@@ -86,6 +102,9 @@ The extension now pushes stricter file-editing rules into the agent prompt:
 - prefer targeted replacement over full-file overwrite when possible
 - read the file before editing so the model has the full structure
 - do not claim a file changed unless a real tool changed it
+- do not treat a failed replacement or failed terminal command as a completed fix
+- do not stop on partial plans like `Step 1/3` when more reading or fixing is still required
+- do not leak raw or malformed tool-call JSON into fallback file writes; those responses are retried as tool calls instead of being treated as file content
 
 This exists specifically to reduce destructive edits like replacing an entire README when the request was only to remove one line or one image block.
 
@@ -121,7 +140,27 @@ The extension exposes these settings:
 - `manulai.ollamaBaseUrl` — base URL for the local Ollama server
 - `manulai.agentMode` — turns tool-enabled agent behavior on or off
 - `manulai.autoApprove` — skips approval prompts for tool execution when enabled
+- `manulai.debugMode` — saves detailed local debug logs when enabled
 - `manulai.systemPrompt` — extra system prompt text prepended to each Ollama request
+
+When a file-backed workspace is open, ManulAI treats `.manulai/settings.json` as the only workspace-level source of truth for these values. It does not keep workspace state in `.vscode/settings.json` anymore.
+
+That file is created on first write and stores the settings that the ManulAI UI manages inside the workspace.
+
+Example `.manulai/settings.json`:
+
+```json
+{
+	"ollamaModel": "llama3.2",
+	"ollamaBaseUrl": "http://localhost:11434",
+	"agentMode": true,
+	"autoApprove": false,
+	"debugMode": false,
+	"systemPrompt": "You are ManulAI, a privacy-first local coding assistant running inside VS Code. Work across any programming language. Prefer precise, minimal changes and explain results clearly."
+}
+```
+
+If an older workspace still has `manulai.*` values in `.vscode/settings.json`, ManulAI migrates those workspace values into `.manulai/settings.json` and clears the old workspace entries.
 
 Default values:
 
@@ -129,6 +168,7 @@ Default values:
 - Ollama base URL: `http://localhost:11434`
 - agent mode: `true`
 - auto-approve: `false`
+- debug mode: `false`
 
 ---
 
@@ -137,12 +177,14 @@ Default values:
 - `icon.png` is used as the extension icon in the VS Code manifest
 - `media/manulai-icon.svg` is used for the contributed sidebar container and view icon
 - the project is intentionally Ollama-only and local-first
+- workspace-owned ManulAI state lives under `.manulai/`; debug logs use `.manulai/logs/` when the workspace is file-backed
 - the README describes current behavior and avoids cloud-oriented setup or product marketing fluff
 
 ---
 
 ## What's New
 
+- **0.0.2:** Auto-retry without tools when the model does not support tool calling (HTTP 400 fallback). Diff markers no longer leak into written files. Destructive writes to critical files like `package.json` are blocked (invalid JSON, shell commands as content, suspiciously short content). Code block extraction now rejects diff-formatted blocks. Raw or malformed JSON tool-call payloads are now retried as tool executions instead of being mistaken for file content. Project scan requests can attach a capped workspace snapshot. Tool results are visible in chat with terminal output and file previews. Multi-step actions can print progress while tools run. Edit requests can auto-discover likely files such as `README.md` when they are mentioned but not attached. Publisher ID updated to `manul-engine`.
 - **0.0.1 (Alpha Release):** Initial public alpha with right-side chat UI, local Ollama integration, workspace file attachments, native tool-calling support, agent/chat mode separation, approval controls, directory listing and file deletion tools, and stricter prompt rules for safer file edits.
 
 ## License

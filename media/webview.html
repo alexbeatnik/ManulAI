@@ -64,7 +64,7 @@
     }
 
     .header {
-      padding: 12px 14px 10px;
+      padding: 9px 12px 8px;
       border-bottom: 1px solid var(--border-muted);
       background: linear-gradient(180deg, color-mix(in srgb, var(--panel-soft) 70%, transparent), transparent);
       backdrop-filter: blur(8px);
@@ -74,7 +74,7 @@
       display: flex;
       align-items: flex-start;
       justify-content: space-between;
-      gap: 12px;
+      gap: 10px;
     }
 
     .title-wrap {
@@ -82,7 +82,7 @@
     }
 
     .eyebrow {
-      margin: 0 0 4px;
+      margin: 0 0 2px;
       font-size: 9px;
       font-weight: 700;
       letter-spacing: 0.16em;
@@ -98,23 +98,28 @@
     }
 
     .subtitle {
-      margin: 3px 0 0;
-      font-size: 11px;
+      margin: 2px 0 0;
+      font-size: 10px;
       color: var(--muted);
-      line-height: 1.4;
+      line-height: 1.3;
+      line-clamp: 2;
+      display: -webkit-box;
+      -webkit-line-clamp: 2;
+      -webkit-box-orient: vertical;
+      overflow: hidden;
     }
 
     .status-pill {
       flex-shrink: 0;
       display: inline-flex;
       align-items: center;
-      gap: 8px;
-      padding: 7px 10px;
+      gap: 6px;
+      padding: 5px 8px;
       border-radius: 999px;
       border: 1px solid var(--border-muted);
       background: color-mix(in srgb, var(--panel) 82%, transparent);
       color: var(--muted);
-      font-size: 10px;
+      font-size: 9px;
       white-space: nowrap;
     }
 
@@ -142,21 +147,21 @@
       min-height: 0;
       display: grid;
       grid-template-rows: auto 1fr;
-      gap: 10px;
-      padding: 10px 14px 0;
+      gap: 8px;
+      padding: 8px 12px 0;
     }
 
     .topbar {
       display: grid;
       grid-template-columns: auto minmax(0, 1fr);
-      gap: 10px;
+      gap: 8px;
       align-items: start;
     }
 
     .context-actions {
       display: flex;
       align-items: center;
-      gap: 7px;
+      gap: 6px;
       min-width: 0;
     }
 
@@ -202,7 +207,7 @@
     .controls {
       display: grid;
       grid-template-columns: minmax(0, 1fr) auto;
-      gap: 8px 10px;
+      gap: 6px 8px;
       align-items: start;
       min-width: 0;
     }
@@ -215,7 +220,7 @@
     .control-group {
       display: flex;
       flex-wrap: wrap;
-      gap: 7px;
+      gap: 6px;
       align-items: center;
       min-width: 0;
     }
@@ -231,7 +236,7 @@
     .model-select,
     .ghost-button,
     .send {
-      border-radius: 10px;
+      border-radius: 9px;
       font: inherit;
       transition: transform 140ms ease, border-color 140ms ease, background 140ms ease, opacity 140ms ease;
     }
@@ -239,11 +244,11 @@
     .model-select {
       min-width: 0;
       width: 100%;
-      flex: 1 1 180px;
+      flex: 1 1 160px;
       border: 1px solid var(--border-muted);
       background: color-mix(in srgb, var(--panel-strong) 88%, transparent);
       color: var(--text);
-      padding: 8px 11px;
+      padding: 7px 10px;
       outline: none;
       box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.02);
     }
@@ -260,10 +265,12 @@
       border: 1px solid var(--border-muted);
       background: color-mix(in srgb, var(--panel-strong) 84%, transparent);
       color: var(--text);
-      padding: 8px 11px;
+      padding: 7px 10px;
       cursor: pointer;
       flex-shrink: 0;
       white-space: nowrap;
+      font-size: 12px;
+      line-height: 1.15;
     }
 
     .ghost-button:hover:not([disabled]),
@@ -788,6 +795,18 @@
       content: 'active';
     }
 
+    .chip.folder::before {
+      content: 'folder';
+    }
+
+    .version-badge {
+      font-size: 9px;
+      font-weight: 500;
+      color: var(--muted);
+      letter-spacing: 0.04em;
+      vertical-align: middle;
+    }
+
     .chip span {
       overflow: hidden;
       text-overflow: ellipsis;
@@ -1050,7 +1069,7 @@
     .toggle-switch {
       display: inline-flex;
       align-items: center;
-      gap: 8px;
+      gap: 6px;
       cursor: pointer;
       flex-shrink: 0;
       user-select: none;
@@ -1066,11 +1085,11 @@
 
     .toggle-slider {
       position: relative;
-      width: 32px;
-      height: 18px;
+      width: 28px;
+      height: 16px;
       border-radius: 999px;
-      background: color-mix(in srgb, var(--muted) 30%, transparent);
-      border: 1px solid var(--border-muted);
+      background: color-mix(in srgb, var(--vscode-errorForeground, #d14b4b) 24%, transparent);
+      border: 1px solid color-mix(in srgb, var(--vscode-errorForeground, #d14b4b) 45%, var(--border-muted));
       transition: background 160ms ease, border-color 160ms ease;
       flex-shrink: 0;
     }
@@ -1078,23 +1097,23 @@
     .toggle-slider::after {
       content: '';
       position: absolute;
-      top: 2px;
-      left: 2px;
+      top: 1px;
+      left: 1px;
       width: 12px;
       height: 12px;
       border-radius: 999px;
-      background: var(--muted);
+      background: var(--vscode-errorForeground, #d14b4b);
       transition: transform 160ms ease, background 160ms ease;
     }
 
     .toggle-switch input:checked + .toggle-slider {
-      background: color-mix(in srgb, var(--accent) 28%, transparent);
-      border-color: color-mix(in srgb, var(--accent) 50%, var(--border-muted));
+      background: color-mix(in srgb, var(--vscode-terminal-ansiGreen, #33a852) 28%, transparent);
+      border-color: color-mix(in srgb, var(--vscode-terminal-ansiGreen, #33a852) 52%, var(--border-muted));
     }
 
     .toggle-switch input:checked + .toggle-slider::after {
-      transform: translateX(14px);
-      background: var(--accent);
+      transform: translateX(12px);
+      background: var(--vscode-terminal-ansiGreen, #33a852);
     }
 
     .toggle-switch input:focus-visible + .toggle-slider {
@@ -1103,16 +1122,16 @@
     }
 
     .toggle-label {
-      font-size: 10px;
+      font-size: 9px;
       font-weight: 600;
-      letter-spacing: 0.04em;
+      letter-spacing: 0.03em;
       white-space: nowrap;
-      color: var(--muted);
+      color: color-mix(in srgb, var(--vscode-errorForeground, #d14b4b) 78%, var(--text) 22%);
       transition: color 140ms ease;
     }
 
     .toggle-switch input:checked ~ .toggle-label {
-      color: var(--accent);
+      color: color-mix(in srgb, var(--vscode-terminal-ansiGreen, #33a852) 82%, var(--text) 18%);
     }
 
     @media (max-width: 920px) {
@@ -1123,10 +1142,19 @@
 
       .controls {
         grid-template-columns: 1fr;
+        gap: 6px;
       }
 
       .control-group.secondary {
         justify-content: flex-start;
+      }
+
+      .header {
+        padding: 8px 11px 7px;
+      }
+
+      .workspace {
+        padding: 7px 11px 0;
       }
     }
 
@@ -1147,8 +1175,9 @@
 
       .control-group {
         display: grid;
-        grid-template-columns: 1fr;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
         align-items: stretch;
+        gap: 6px;
       }
 
       .topbar-primary,
@@ -1166,13 +1195,42 @@
         justify-content: center;
       }
 
+      .context-actions {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+      }
+
+      .control-group.primary > :first-child,
+      .control-group.secondary > :first-child {
+        grid-column: 1 / -1;
+      }
+
+      .control-group.secondary {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+
+      .control-group.secondary .model-select {
+        grid-column: 1 / -1;
+      }
+
       .toggle-switch {
         min-width: 0;
         justify-content: flex-start;
+        padding: 5px 8px;
+        border: 1px solid var(--border-muted);
+        border-radius: 9px;
+        background: color-mix(in srgb, var(--panel-strong) 84%, transparent);
       }
 
       .toggle-label {
-        white-space: normal;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+
+      .ghost-button,
+      .model-select {
+        min-height: 34px;
       }
 
       .composer-actions {
@@ -1191,8 +1249,8 @@
   <div id="bodyDropOverlay" class="body-drop-overlay" aria-hidden="true">
     <div class="body-drop-overlay-inner">
       <div class="body-drop-overlay-icon">+</div>
-      <div class="body-drop-overlay-title">Drop files to attach</div>
-      <div class="body-drop-overlay-copy">Files will be added as context for your next message.</div>
+      <div class="body-drop-overlay-title">Drop files from VS Code Explorer</div>
+      <div class="body-drop-overlay-copy">Drag files from the VS Code sidebar. For system files, use the Browse button.</div>
     </div>
   </div>
 
@@ -1200,7 +1258,7 @@
     <div class="header-row">
       <div class="title-wrap">
         <p class="eyebrow">Chat</p>
-        <p class="title">ManulAI</p>
+        <p class="title">ManulAI <span id="versionBadge" class="version-badge"></span></p>
         <p class="subtitle">Local-first coding agent in the right sidebar. Click Browse or use Attach to ManulAI Chat from Explorer to add context.</p>
       </div>
       <div id="statusPill" class="status-pill">Ready</div>
@@ -1214,6 +1272,14 @@
           <button id="browseFiles" class="ghost-button" type="button" style="display: flex; align-items: center; gap: 6px;">
             <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M13.5 3l-4 0-1-1-6 0 0 12 11 0 0-11z"/></svg>
             Browse...
+          </button>
+          <button id="browseFolder" class="ghost-button" type="button" style="display: flex; align-items: center; gap: 6px;">
+            <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M14 4H8l-1-1H2v10h12V4zm-1 8H3V5h4l1 1h5v6z"/></svg>
+            Folder
+          </button>
+          <button id="attachProject" class="ghost-button" type="button" style="display: flex; align-items: center; gap: 6px;">
+            <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M1.5 1h13l.5.5v13l-.5.5h-13l-.5-.5v-13l.5-.5zM2 2v12h12V2H2zm2 2h8v1H4V4zm0 3h8v1H4V7zm0 3h5v1H4v-1z"/></svg>
+            Project
           </button>
         </div>
       </div>
@@ -1230,6 +1296,11 @@
               <input type="checkbox" id="autoApproveToggle" />
               <span class="toggle-slider"></span>
               <span id="autoApproveLabel" class="toggle-label">Auto-Approve</span>
+            </label>
+            <label class="toggle-switch" title="Debug Mode — save detailed logs to .manulai/logs/ for file-backed workspaces, or to extension storage otherwise">
+              <input type="checkbox" id="debugModeToggle" />
+              <span class="toggle-slider"></span>
+              <span id="debugModeLabel" class="toggle-label">Debug</span>
             </label>
           </div>
           <div class="control-group secondary">
@@ -1262,8 +1333,8 @@
         <div id="inputShell" class="input-shell">
           <div id="dropOverlay" class="drop-overlay" aria-hidden="true">
             <div class="drop-overlay-inner">
-              <div class="drop-overlay-title">Attach files to this prompt</div>
-              <div class="drop-overlay-copy">Use Browse, Active File, or Explorer attach actions to add files to the chat context.</div>
+              <div class="drop-overlay-title">Drop files from VS Code Explorer</div>
+              <div class="drop-overlay-copy">For system files, use the Browse button below.</div>
             </div>
           </div>
           <textarea id="input" placeholder="Ask ManulAI to inspect, change, or explain code..."></textarea>
@@ -1298,6 +1369,9 @@
     const sendEl = document.getElementById('send');
     const stopEl = document.getElementById('stop');
     const browseFilesEl = document.getElementById('browseFiles');
+    const browseFolderEl = document.getElementById('browseFolder');
+    const attachProjectEl = document.getElementById('attachProject');
+    const versionBadgeEl = document.getElementById('versionBadge');
     const attachActiveFileEl = document.getElementById('attachActiveFile');
     const composerShellEl = document.getElementById('composerShell');
     const modelSelectEl = document.getElementById('modelSelect');
@@ -1307,6 +1381,8 @@
     const agentModeLabel = document.getElementById('agentModeLabel');
     const autoApproveToggle = document.getElementById('autoApproveToggle');
     const autoApproveLabel = document.getElementById('autoApproveLabel');
+    const debugModeToggle = document.getElementById('debugModeToggle');
+    const debugModeLabel = document.getElementById('debugModeLabel');
     const statusPillEl = document.getElementById('statusPill');
 
     let busy = false;
@@ -1318,6 +1394,7 @@
     let dragDepth = 0;
     let agentMode = true;
     let autoApprove = false;
+    let debugMode = false;
     let activeFile = null;
     let pendingApproval = null;
     const seenMessageKeys = new Set();
@@ -1482,7 +1559,7 @@
       }
       for (const attachment of attachments) {
         const chip = document.createElement('div');
-        chip.className = 'chip';
+        chip.className = attachment.isFolder ? 'chip folder' : 'chip';
         chip.title = attachment.displayPath || attachment.name;
 
         const label = document.createElement('span');
@@ -1538,6 +1615,7 @@
       agentModeLabel.textContent = 'Agent Mode';
       autoApproveToggle.checked = autoApprove;
       autoApproveLabel.textContent = 'Auto-Approve';
+      debugModeToggle.checked = debugMode;
       updateHeaderState();
       autoResizeTextarea();
       historyEl.scrollTop = historyEl.scrollHeight;
@@ -1687,6 +1765,8 @@
         const content = reader.result;
         if (typeof content === 'string') {
           attachedFiles.push({ name: file.name, content: content });
+          // Also register with the extension backend so the file persists across re-renders
+          vscode.postMessage({ command: 'addFileContent', filename: file.name, content: content });
           render();
         }
       };
@@ -1708,14 +1788,8 @@
         return;
       }
 
-      // Path 1: VS Code internal drops from Explorer/editors/tree views.
-      const uriPaths = collectUriPaths(dt);
-      if (uriPaths.length > 0) {
-        vscode.postMessage({ command: 'addFilePathContext', paths: uriPaths });
-        return;
-      }
-
-      // Path 2: System file drops (desktop/file manager) — read content via FileReader.
+      // Path 1: System file drops (desktop/file manager) — read content via FileReader.
+      // Prioritize this over URI paths since FileReader works reliably in the webview sandbox.
       let fileItemsFound = false;
       if (dt.items && dt.items.length > 0) {
         for (const item of Array.from(dt.items)) {
@@ -1729,6 +1803,21 @@
         }
       }
       if (fileItemsFound) {
+        return;
+      }
+
+      // Path 2: VS Code internal drops from Explorer/editors/tree views (no File objects available).
+      const uriPaths = collectUriPaths(dt);
+      if (uriPaths.length > 0) {
+        vscode.postMessage({ command: 'addFilePathContext', paths: uriPaths });
+        return;
+      }
+
+      // Path 3: last resort — check dt.files (some browsers populate files but not items)
+      if (dt.files && dt.files.length > 0) {
+        for (const file of Array.from(dt.files)) {
+          readDroppedFile(file);
+        }
         return;
       }
 
@@ -1810,6 +1899,10 @@
       vscode.postMessage({ command: 'toggleAutoApprove', value: autoApproveToggle.checked });
     });
 
+    debugModeToggle.addEventListener('change', () => {
+      vscode.postMessage({ command: 'toggleDebugMode', value: debugModeToggle.checked });
+    });
+
     inputEl.addEventListener('keydown', event => {
       if (event.key === 'Enter' && !event.shiftKey) {
         event.preventDefault();
@@ -1817,11 +1910,22 @@
       }
     });
 
+    let dragDismissTimeout = 0;
+
     document.addEventListener('dragenter', event => {
       event.preventDefault();
       event.stopPropagation();
       dragDepth += 1;
       setDragging(true);
+      // Auto-dismiss dragging state after 3s in case VS Code intercepts the drop
+      // and our drop/dragleave/dragend handlers never fire.
+      clearTimeout(dragDismissTimeout);
+      dragDismissTimeout = setTimeout(() => {
+        if (dragDepth > 0) {
+          dragDepth = 0;
+          setDragging(false);
+        }
+      }, 3000);
     }, true);
 
     document.addEventListener('dragover', event => {
@@ -1851,6 +1955,7 @@
     document.addEventListener('drop', event => {
       event.preventDefault();
       event.stopPropagation();
+      clearTimeout(dragDismissTimeout);
       handleDrop(event);
     }, true);
 
@@ -1864,6 +1969,14 @@
       }
     });
 
+    browseFolderEl.addEventListener('click', () => {
+      vscode.postMessage({ command: 'browseFolder' });
+    });
+
+    attachProjectEl.addEventListener('click', () => {
+      vscode.postMessage({ command: 'attachProject' });
+    });
+
     window.addEventListener('message', event => {
       const payload = event.data;
 
@@ -1874,8 +1987,12 @@
         currentModel = payload.currentModel || '';
         agentMode = payload.agentMode !== undefined ? payload.agentMode : agentMode;
         autoApprove = payload.autoApprove !== undefined ? payload.autoApprove : autoApprove;
+        debugMode = payload.debugMode !== undefined ? payload.debugMode : debugMode;
         pendingApproval = payload.pendingApproval || null;
         activeFile = payload.activeFile || null;
+        if (payload.extensionVersion && versionBadgeEl) {
+          versionBadgeEl.textContent = 'v' + payload.extensionVersion;
+        }
         render();
         return;
       }

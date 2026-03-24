@@ -19,6 +19,8 @@ export function activate(context: vscode.ExtensionContext): void {
   const provider = new ManulAiChatProvider(context);
   const launcherProvider = new ManulAiLauncherProvider();
 
+  context.subscriptions.push(provider);
+
   const openSecondarySidebar = async (): Promise<void> => {
     const commandsToTry = [
       'workbench.action.focusAuxiliaryBar',
@@ -114,6 +116,29 @@ export function activate(context: vscode.ExtensionContext): void {
   );
 
   context.subscriptions.push(
+    vscode.commands.registerCommand('manulai.attachFolder', async (...args: unknown[]) => {
+      let uri: vscode.Uri | undefined;
+      if (args.length >= 1 && args[0] instanceof vscode.Uri) {
+        uri = args[0];
+      }
+      if (!uri) {
+        const selection = await vscode.window.showOpenDialog({
+          canSelectMany: false,
+          canSelectFiles: false,
+          canSelectFolders: true,
+          openLabel: 'Attach folder',
+          title: 'Attach folder to ManulAI context'
+        });
+        uri = selection?.[0];
+      }
+      if (uri) {
+        await provider.attachFolderByUri(uri);
+      }
+      await openChat();
+    })
+  );
+
+  context.subscriptions.push(
     vscode.commands.registerCommand('manulai.selectModel', async () => {
       await provider.refreshModelCatalog(true);
 
@@ -144,7 +169,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
   context.subscriptions.push(
     vscode.workspace.onDidChangeConfiguration(async event => {
-      if (event.affectsConfiguration('manulai.ollamaBaseUrl') || event.affectsConfiguration('manulai.ollamaModel') || event.affectsConfiguration('manulai.agentMode') || event.affectsConfiguration('manulai.autoApprove')) {
+      if (event.affectsConfiguration('manulai')) {
         await provider.handleConfigurationChange();
       }
     })
