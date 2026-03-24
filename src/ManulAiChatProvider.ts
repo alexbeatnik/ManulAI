@@ -19,6 +19,7 @@ interface OllamaMessage {
   content: string;
   tool_calls?: ToolFunctionCall[];
   tool_name?: string;
+  localOnly?: boolean;
   hiddenFromTranscript?: boolean;
   attachmentContext?: boolean;
   activeEditorContext?: boolean;
@@ -143,6 +144,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   private readonly revertSnapshots = new Map<string, RevertSnapshot>();
   private debugLogStream?: fs.WriteStream;
   private debugSessionId = '';
+  private progressStepCounter = 0;
 
   public constructor(private readonly extensionContext: vscode.ExtensionContext) {
     const config = vscode.workspace.getConfiguration('manulai');
@@ -440,6 +442,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       });
     }
 
+    this.progressStepCounter = 0;
     this.messages.push({ role: 'user', content: text });
 
     if (this.agentMode) {
@@ -580,6 +583,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
 
     this.messages.length = 0;
     this.attachedFiles.clear();
+    this.progressStepCounter = 0;
     this.postStateToWebview();
     this.postStatus('Chat history and attached context cleared.');
   }
@@ -660,6 +664,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       for (const toolCall of resolvedToolCalls) {
         this.throwIfRequestStopped();
         const toolName = toolCall.function?.name || 'unknown_tool';
+        this.postProgressStep(this.describeToolExecution(toolCall));
         this.debugLog('tool_exec_start', { tool: toolName, args: toolCall.function?.arguments });
         const toolResult = await this.executeToolCall(toolCall);
         this.debugLog('tool_exec_result', { tool: toolName, result: toolResult.substring(0, 500) });
@@ -2040,7 +2045,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       requestMessages.push({ role: 'system', content: systemPrompt, hiddenFromTranscript: true });
     }
 
-    requestMessages.push(...messages.map(m => ({ ...m })));
+    requestMessages.push(...messages.filter(m => !m.localOnly).map(m => ({ ...m })));
 
     const body: {
       model: string;
@@ -4126,6 +4131,65 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       : lines;
     const joined = limited.join('\n');
     return joined.length > 8000 ? `${joined.slice(0, 7800)}\n... output truncated ...` : joined;
+  }
+
+  private postProgressStep(text: string): void {
+    const normalized = text.trim();
+    if (!normalized) {
+      return;
+    }
+
+    const content = `Step ${++this.progressStepCounter}: ${normalized}`;
+    const lastMessage = this.messages[this.messages.length - 1];
+    if (lastMessage?.localOnly && lastMessage.content === content) {
+      return;
+    }
+
+    this.messages.push({
+      role: 'assistant',
+      content,
+      localOnly: true
+    });
+    this.postStateToWebview();
+  }
+
+  private describeToolExecution(toolCall: ToolFunctionCall): string {
+    const toolName = toolCall.function?.name || 'unknown_tool';
+    const args = this.normalizeToolArguments(toolCall.function?.arguments);
+    const formatPath = (value: unknown): string => {
+      const text = String(value ?? '').trim();
+      if (!text) {
+        return 'target file';
+      }
+
+      const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+      if (workspaceRoot && text.startsWith(workspaceRoot + path.sep)) {
+        return text.slice(workspaceRoot.length + 1).replace(/\\/g, '/');
+      }
+
+      return text.replace(/\\/g, '/');
+    };
+
+    switch (toolName) {
+      case 'read_specific_file':
+        return `Reading ${formatPath(args.filepath)}`;
+      case 'read_active_file':
+        return 'Reading the active file';
+      case 'list_workspace_files':
+        return args.directory ? `Scanning project structure in ${formatPath(args.directory)}` : 'Scanning project structure';
+      case 'replace_in_file':
+        return `Editing ${formatPath(args.filepath)}`;
+      case 'create_or_edit_file':
+        return `Writing ${formatPath(args.filename)}`;
+      case 'write_to_file':
+        return `Writing ${formatPath(args.filepath)}`;
+      case 'delete_file':
+        return `Deleting ${formatPath(args.filepath)}`;
+      case 'execute_terminal_command':
+        return `Running ${String(args.command ?? '').trim() || 'terminal command'}`;
+      default:
+        return `Executing ${toolName}`;
+    }
   }
 
   private postStatus(content: string): void {
