@@ -1944,7 +1944,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           && finalContent.trim().length < 500;
         // Detect model asking user to do things manually or announcing actions without executing them
         // NOTE: "let me know" is excluded — it's always a polite closing, not passing work to the user.
-        const isPassingToUser = (/(?:please (?:execute|run|proceed|specify|provide|make sure|save)|you (?:may|can|should|need to) (?:run|execute|save|choose|pick)|choose one of the (?:options|approaches)|if the .{0,30} persists|let'?s (?:execute|run|try|start)|let me (?:execute|run|try|start)|do you have a specific (?:section|function|module)|which (?:section|function|module) (?:should|would) .{0,40}(?:focus|start))/i.test(finalContent))
+        const isPassingToUser = (/(?:please (?:execute|run|proceed|specify|provide|make sure|save|confirm)|you (?:may|can|should|need to) (?:run|execute|save|choose|pick)|choose one of the (?:options|approaches)|if the .{0,30} persists|let'?s (?:execute|run|try|start)|let me (?:execute|run|try|start)|do you have a specific (?:section|function|module)|which (?:section|function|module) (?:should|would) .{0,40}(?:focus|start)|please confirm if you would like|would you like me to (?:read|display|show|proceed)|shall i (?:read|display|proceed|continue))/i.test(finalContent))
           && finalContent.trim().length < 800;
 
         // Detect model announcing a step/action but not executing it (ends with colon or ellipsis)
@@ -2014,6 +2014,12 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         const hasReadButNoWriteOnLargeRefactor = isLargeRefactorRequest
           && hasRecentReadOfLargeRefactorTarget
           && !hasRecentMeaningfulWrite;
+        const hasModelRefusalResponse = Boolean(
+          isLargeRefactorRequest
+          && hasRecentReadOfLargeRefactorTarget
+          && !hasRecentMeaningfulWrite
+          && /(?:i(?:'m|\s+am) sorry,? but i (?:can(?:'t|not)|am unable to) (?:assist|help)|i(?:'m|\s+am) unable to (?:assist|help|proceed)|i (?:cannot|can't) (?:assist|help|process|complete) (?:with )?(?:that|this)|this (?:request|task) (?:violates?|contains?)|```json\s*\{[^}]*"response"\s*:\s*"[^"]*(?:sorry|unable|cannot|can't)[^"]*")/i.test(finalContent)
+        );
         const hasFakePostReadAnalysisDump = Boolean(
           hasReadButNoWriteOnLargeRefactor
           && (isLongDump || hasLargeCodeBlocks)
@@ -2050,7 +2056,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
             ? 4
           : isAskingUserForExactSlice
             ? 5
-          : hasFakePostReadAnalysisDump || hasAnnouncedExtractionWithoutWrite || hasReadButNoWriteOnLargeRefactor || hasLazyRefusalOnLargeRefactor
+          : hasFakePostReadAnalysisDump || hasAnnouncedExtractionWithoutWrite || hasReadButNoWriteOnLargeRefactor || hasLazyRefusalOnLargeRefactor || hasModelRefusalResponse
             ? 4
             : 2;
         const requiresToolContinuation = (
@@ -2066,10 +2072,11 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           || isAskingUserForExactSlice
           || hasFakePostReadAnalysisDump
           || hasAnnouncedExtractionWithoutWrite
+          || hasModelRefusalResponse
           || hasLazyRefusalOnLargeRefactor
           || hasPostCreateRefactorNarration
           || (isLargeRefactorRequest && hasRecentToolResults && (!hasRecentSuccessfulAction || !hasRecentReadOfLargeRefactorTarget || !hasRecentMeaningfulWrite))
-          || (hasRecentReplaceNotFound && (mentionsChange || claimsDone || isLazyAcknowledgment || hasIncompletePlan || hasExplicitNextSteps))
+          || (hasRecentReplaceNotFound && (mentionsChange || claimsDone || isLazyAcknowledgment || hasIncompletePlan || hasExplicitNextSteps || isPassingToUser || isProgressOnlyResponse))
           || (hasRecentToolErrors && (claimsDone || mentionsChange || isLazyAcknowledgment))
           || (!hasRecentSuccessfulAction && (isLongDump || hasLargeCodeBlocks || claimsDone || mentionsChange || isLazyAcknowledgment))
         );
@@ -2116,7 +2123,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         }
 
         if (shouldNudge) {
-          this.debugLog('nudge', { retryCount, hasRecentToolResults, hasRecentSuccessfulAction, hasRecentMeaningfulWrite, latestCreatedFilePath, hasRecentReadOfLargeRefactorTarget, hasLargeRefactorShellReadBypass, hasPreReadLargeRefactorNarration, hasFakePreReadCodeDump, hasFakePostReadAnalysisDump, hasAnnouncedExtractionWithoutWrite, hasLazyRefusalOnLargeRefactor, isAskingUserForExactSlice, suggestedNextSlice, hasReadButNoWriteOnLargeRefactor, hasPostReadToolStall, hasPostCreateRefactorNarration, announcedNewFilePath, hasRecentToolErrors, hasRecentReplaceNotFound, replaceNotFoundFilepath, replaceNotFoundStartLine, replaceNotFoundEndLine, lastSuccessfulActionIndex, isLongDump, hasLargeCodeBlocks, claimsDone, mentionsChange, isLazyAcknowledgment, hasIncompletePlan: !!hasIncompletePlan, hasExplicitNextSteps, isProgressOnlyResponse, claimedButUnexecutedCommand, isPassingToUser, isAnnouncedButNotExecuted, isLargeRefactorRequest, contentPreview: finalContent.substring(0, 200) });
+          this.debugLog('nudge', { retryCount, hasRecentToolResults, hasRecentSuccessfulAction, hasRecentMeaningfulWrite, latestCreatedFilePath, hasRecentReadOfLargeRefactorTarget, hasLargeRefactorShellReadBypass, hasPreReadLargeRefactorNarration, hasFakePreReadCodeDump, hasFakePostReadAnalysisDump, hasModelRefusalResponse, hasAnnouncedExtractionWithoutWrite, hasLazyRefusalOnLargeRefactor, isAskingUserForExactSlice, suggestedNextSlice, hasReadButNoWriteOnLargeRefactor, hasPostReadToolStall, hasPostCreateRefactorNarration, announcedNewFilePath, hasRecentToolErrors, hasRecentReplaceNotFound, replaceNotFoundFilepath, replaceNotFoundStartLine, replaceNotFoundEndLine, lastSuccessfulActionIndex, isLongDump, hasLargeCodeBlocks, claimsDone, mentionsChange, isLazyAcknowledgment, hasIncompletePlan: !!hasIncompletePlan, hasExplicitNextSteps, isProgressOnlyResponse, claimedButUnexecutedCommand, isPassingToUser, isAnnouncedButNotExecuted, isLargeRefactorRequest, contentPreview: finalContent.substring(0, 200) });
           // Show plan/progress text to the user before nudging
           if (!isProgressOnlyResponse
             && !hasFakePreReadCodeDump
@@ -2154,6 +2161,11 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           } else if (hasPreReadLargeRefactorNarration) {
             const primaryTarget = largeRefactorTargets[0] ?? 'the target file';
             nudgeMessage = `This is a large refactor request for ${primaryTarget}. Do NOT ask the user which section to start with, and do NOT say that you will read the file later. Your next response must call read_file_slice immediately for ${primaryTarget} with startLine=1 and endLine=120. After that, continue with the next bounded slice or the next small extraction step.`;
+          } else if (hasModelRefusalResponse) {
+            const primaryTarget = largeRefactorTargets[0] ?? 'the target file';
+            nudgeMessage = suggestedNextSlice?.filepath && suggestedNextSlice.startLine && suggestedNextSlice.endLine
+              ? `You are performing a REFACTOR task: splitting ${primaryTarget} into smaller modules. You responded with a refusal ("I'm sorry, but I can't assist") which is incorrect — this is a legitimate code refactoring request. Do NOT read the entire file at once. ONLY read small bounded sections using read_file_slice. Your next response must call read_file_slice for ${suggestedNextSlice.filepath} with startLine=${suggestedNextSlice.startLine} and endLine=${suggestedNextSlice.endLine}. Then immediately call create_or_edit_file to extract one self-contained group into a new module, and call replace_in_file on ${primaryTarget} to remove it. No prose. Tool calls only.`
+              : `You are performing a REFACTOR task: splitting ${primaryTarget} into smaller modules. You responded with a refusal ("I'm sorry, but I can't assist") which is incorrect — this is a legitimate code refactoring request. Do NOT read the entire file at once. ONLY use read_file_slice with bounded line ranges. Your next response must call read_file_slice for ${primaryTarget} with startLine=1 and endLine=120. Then call create_or_edit_file to extract one self-contained group and call replace_in_file on ${primaryTarget}. No prose. Tool calls only.`;
           } else if (hasFakePostReadAnalysisDump) {
             const primaryTarget = largeRefactorTargets[0] ?? 'the target file';
             nudgeMessage = announcedNewFilePath
@@ -2211,7 +2223,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           } else if (hasRecentReplaceNotFound) {
             nudgeMessage = replaceNotFoundFilepath && replaceNotFoundStartLine && replaceNotFoundEndLine
               ? `Your replace_in_file call failed because old_text did not match the real file content. First call read_file_slice for ${replaceNotFoundFilepath} with startLine=${replaceNotFoundStartLine} and endLine=${replaceNotFoundEndLine}. Do NOT guess. Then call replace_in_file again using the exact current text including whitespace.`
-              : `Your replace_in_file call failed because old_text did not match the real file content.${replaceNotFoundFilepath ? ` First call read_specific_file for ${replaceNotFoundFilepath}.` : ' First call read_specific_file for that file.'} Do NOT guess. Then call replace_in_file again using the exact current text including whitespace.`;
+              : `Your replace_in_file call failed because old_text did not match the real file content.${replaceNotFoundFilepath ? ` First call read_file_slice for ${replaceNotFoundFilepath} with startLine=1 and endLine=120 (or the section containing your target text).` : ' First call read_file_slice for that file with a bounded line range containing the section you want to edit.'} Do NOT guess. Do NOT ask the user to confirm. Read the slice now, then call replace_in_file again using the exact current text including whitespace and indentation.`;
           } else if (isProgressOnlyResponse) {
             nudgeMessage = 'Do not print progress updates like "Step 3/3" without taking action. Call a tool now. If you need the current file content, use read_specific_file first, then continue with replace_in_file or another appropriate tool.';
           } else if (claimedButUnexecutedCommand) {
@@ -2252,6 +2264,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
             hasFakePreReadCodeDump,
             hasFakePostReadAnalysisDump,
             hasAnnouncedExtractionWithoutWrite,
+            hasModelRefusalResponse,
             hasLazyRefusalOnLargeRefactor,
             isAskingUserForExactSlice,
             suggestedNextSlice,
@@ -2276,6 +2289,8 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
             ? `The model announced an extraction${announcedNewFilePath ? ` to ${announcedNewFilePath}` : ''} but never executed the required file tools. It must call create_or_edit_file and replace_in_file instead of narrating the extraction.`
             : hasLazyRefusalOnLargeRefactor
             ? 'The model responded with "no changes needed" to a refactoring request. It is treating the task as a code review instead of a file-splitting task. Retry the request with a more explicit prompt, or use a stronger tool-calling model.'
+            : hasModelRefusalResponse
+            ? 'The model produced a safety refusal ("I\'m sorry, but I can\'t assist") when asked to refactor the file, likely because too much file content was loaded into context at once. Use read_file_slice with small bounded ranges instead of read_specific_file on large files. Retry the request.'
             : hasPostReadToolStall
             ? suggestedNextSlice?.filepath && suggestedNextSlice.startLine && suggestedNextSlice.endLine
               ? `The model read a bounded section of the target file but then stalled in progress-only text instead of making the next tool call. The next bounded slice was ${suggestedNextSlice.filepath}:${suggestedNextSlice.startLine}-${suggestedNextSlice.endLine}, but it still did not continue. Retry the request or use a stronger tool-calling model for iterative refactors.`
@@ -4522,11 +4537,21 @@ If the user asks for a change but provides NO code:
             return await this.readSpecificFile(String(args.filepath ?? ''));
           }
           return await this.readActiveFile();
-        case 'read_specific_file':
+        case 'read_specific_file': {
           if (args.startLine !== undefined || args.endLine !== undefined) {
             return await this.readFileSlice(String(args.filepath ?? ''), args.startLine, args.endLine);
           }
-          return await this.readSpecificFile(String(args.filepath ?? ''));
+          // During a large refactor, cap full-file reads to 200 lines to avoid flooding context
+          // and triggering model safety refusals on large source files.
+          const readFilepath = String(args.filepath ?? '');
+          if (this.isLargeRefactorScenario()) {
+            const cappedResult = await this.readSpecificFileCapped(readFilepath, 200);
+            if (cappedResult !== null) {
+              return cappedResult;
+            }
+          }
+          return await this.readSpecificFile(readFilepath);
+        }
         case 'read_file_slice':
           return await this.readFileSlice(String(args.filepath ?? ''), args.startLine, args.endLine);
         case 'create_or_edit_file':
@@ -4693,6 +4718,44 @@ If the user asks for a change but provides NO code:
       languageId: document.languageId,
       content: document.getText()
     });
+  }
+
+  private isLargeRefactorScenario(): boolean {
+    const latestUserRequest = this.getLatestVisibleUserRequest(this.messages);
+    if (!latestUserRequest) {
+      return false;
+    }
+    return this.looksLikeLargeRefactorRequest(latestUserRequest);
+  }
+
+  // Returns a capped read result if the file exceeds maxLines, null otherwise (caller should do full read).
+  private async readSpecificFileCapped(filepath: string, maxLines: number): Promise<string | null> {
+    if (!filepath.trim()) {
+      return null;
+    }
+    try {
+      const uri = await this.resolveWorkspaceUriForOperation(filepath);
+      const content = await this.readWorkspaceText(uri);
+      const normalized = content.replace(/\r\n/g, '\n');
+      const lines = normalized.length > 0 ? normalized.split('\n') : [];
+      if (lines.length <= maxLines) {
+        return null; // small enough, let the normal handler do it
+      }
+      const languageId = vscode.workspace.textDocuments.find(doc => doc.uri.toString() === uri.toString())?.languageId ?? 'plaintext';
+      const cappedContent = lines.slice(0, maxLines).join('\n');
+      this.debugLog('read_specific_file_capped', { path: uri.fsPath, totalLines: lines.length, cappedTo: maxLines });
+      return JSON.stringify({
+        path: uri.fsPath,
+        languageId,
+        startLine: 1,
+        endLine: maxLines,
+        totalLines: lines.length,
+        content: cappedContent,
+        warning: `File has ${lines.length} lines. Only lines 1-${maxLines} are shown. Use read_file_slice with explicit startLine and endLine to read the rest in bounded sections.`
+      });
+    } catch {
+      return null;
+    }
   }
 
   private async readSpecificFile(filepath: string): Promise<string> {
