@@ -19,6 +19,7 @@ This repository contains a VS Code extension named ManulAI.
 - Keep project-scan behavior persistent enough that the model can continue across multiple files instead of stopping after the first step.
 - When the user references a likely target file such as `README`, `LICENSE`, `package.json`, or an explicit path, prefer resolving it automatically instead of waiting for manual attachment.
 - Keep the sidebar usable on narrow widths and low-height laptop screens; preserve a visible scrollable chat history above the composer.
+- Do not reintroduce a separate Activity Bar launcher container; keep ManulAI focused on the Secondary Sidebar chat view.
 
 ## Code Style
 
@@ -50,6 +51,9 @@ This repository contains a VS Code extension named ManulAI.
 - Keep `list_workspace_files` compatible with both workspace-relative and absolute directory paths.
 - Keep debug JSONL entries attributable to a specific build; include the extension version in the logged session/event payloads.
 - Keep debug logging useful for reproducing issues; log the original user request before local hidden nudges or retries alter the effective agent context.
+- Keep the model selector truthful: when no local model is chosen, the UI and backend state must remain empty rather than showing a fake fallback model.
+- Keep revert metadata attached to revertable native file-tool transcript entries so the webview can surface `Revert changes` directly on those results.
+- If retry exhaustion is reached and the model still returns pseudo-progress or plan text, surface a deterministic backend failure message instead of leaking raw `Step 1/3`-style output.
 
 ## Documentation
 
@@ -63,3 +67,4 @@ This repository contains a VS Code extension named ManulAI.
 - When tool lists change, update user-facing docs and developer docs in the same change.
 - When agent reliability or context-handling behavior changes, update README, README-dev, and these instructions in the same change.
 - When responsive chat layout behavior changes, update the docs if the change affects visible UX constraints or implementation rules.
+- When sidebar navigation or transcript revert behavior changes, update these instructions in the same change so workspace guidance stays aligned with the implemented UX.
