@@ -417,6 +417,11 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     }
 
     this.synchronizeActiveEditorContextMessage();
+
+    if (this.agentMode && this.looksLikeProjectScanRequest(text)) {
+      await this.attachWorkspaceAsContext();
+    }
+
     this.synchronizeAttachmentContextMessage();
 
     if (frontendAttachments && frontendAttachments.length > 0) {
@@ -456,6 +461,15 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     const fileTargetPattern = /\b(file|files|readme|license|package\.json|tsconfig|title|header|line|code|text)\b|(?:^|\s)(?:тайтл|заголовок|хедер|ридми|рідмі|файл|код|текст)(?:\s|$)|(?:^|\s)[.\w\-/]+\.(?:ts|tsx|js|jsx|json|md|css|html|py|yml|yaml)(?:\s|$)/i;
 
     return editVerbPattern.test(normalized) && fileTargetPattern.test(normalized);
+  }
+
+  private looksLikeProjectScanRequest(text: string): boolean {
+    const normalized = text.trim().toLowerCase();
+    if (!normalized) {
+      return false;
+    }
+
+    return /(?:\b(?:scan|inspect|read|analy[sz]e|understand|index|explore)\s+(?:the\s+|this\s+)?(?:project|workspace|repo|repository|codebase)\b|\b(?:scan|inspect|read|analy[sz]e|understand|index|explore)\s+(?:my\s+)?(?:repo|repository|codebase)\b|\b(?:scan repo|read repo|inspect repo|remember (?:this |the )?(?:project|repo|repository|workspace|codebase)|remember project|remember repo)\b|(?:^|\s)(?:проскануй|скануй|просканировать|просканируй|сканируй|проаналізуй|аналізуй|проанализируй|анализируй|прочитай|зчитай|изучи|запомни|запам'ятай|запамятай)\s+(?:проект|проєкт|репо|репозиторій|репозиторий|воркспейс|workspace|кодовую\s+базу|кодову\s+базу)(?:\s|$)|(?:^|\s)(?:scan|inspect)\s+project(?:\s|$))/i.test(normalized);
   }
 
   private async tryHandleDirectLicenseAuthorRename(text: string): Promise<FileWriteSummary | undefined> {
@@ -3387,16 +3401,21 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   }
 
   private async addFolderContext(folderUri: vscode.Uri): Promise<void> {
-    const maxFiles = 50;
-    const maxFileSize = 100_000; // 100 KB per file
+    const maxFilesWithContent = 80;
+    const maxListedFiles = 2000;
+    const maxFileSize = 80_000;
+    const maxContentChars = 220_000;
     const skipDirs = new Set(['.git', 'node_modules', '.next', 'dist', 'out', 'build', '__pycache__', '.venv', 'venv', '.tox', 'coverage', '.nyc_output', '.cache']);
     const skipExtensions = new Set(['.png', '.jpg', '.jpeg', '.gif', '.bmp', '.ico', '.svg', '.woff', '.woff2', '.ttf', '.eot', '.mp3', '.mp4', '.zip', '.tar', '.gz', '.lock', '.vsix']);
 
     const collected: string[] = [];
+    const listedFiles: string[] = [];
     const folderName = path.basename(folderUri.fsPath);
+    let totalContentChars = 0;
+    let eligibleFileCount = 0;
 
     const walk = async (dir: vscode.Uri, depth: number): Promise<void> => {
-      if (depth > 6 || collected.length >= maxFiles) { return; }
+      if (depth > 8 || listedFiles.length >= maxListedFiles) { return; }
       let entries: [string, vscode.FileType][];
       try {
         entries = await vscode.workspace.fs.readDirectory(dir);
@@ -3405,7 +3424,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       entries.sort((a, b) => a[0].localeCompare(b[0]));
 
       for (const [name, type] of entries) {
-        if (collected.length >= maxFiles) { break; }
+        if (listedFiles.length >= maxListedFiles) { break; }
         const childUri = vscode.Uri.joinPath(dir, name);
 
         if (type & vscode.FileType.Directory) {
@@ -3419,14 +3438,20 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         const ext = path.extname(name).toLowerCase();
         if (skipExtensions.has(ext)) { continue; }
 
+        const relativePath = path.relative(folderUri.fsPath, childUri.fsPath).replace(/\\/g, '/');
+        listedFiles.push(relativePath);
+        eligibleFileCount += 1;
+
         try {
           const stat = await vscode.workspace.fs.stat(childUri);
           if (stat.type & vscode.FileType.Directory) { continue; }
           if (stat.size > maxFileSize) { continue; }
+          if (collected.length >= maxFilesWithContent) { continue; }
           const bytes = await vscode.workspace.fs.readFile(childUri);
           const text = Buffer.from(bytes).toString('utf8');
-          const relativePath = path.relative(folderUri.fsPath, childUri.fsPath);
+          if (totalContentChars + text.length > maxContentChars) { continue; }
           collected.push(`--- ${relativePath} ---\n${text}`);
+          totalContentChars += text.length;
         } catch { /* skip unreadable files */ }
       }
     };
@@ -3434,24 +3459,35 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     this.postStatus(`Scanning folder ${folderName}...`);
     await walk(folderUri, 0);
 
-    if (collected.length === 0) {
+    if (listedFiles.length === 0) {
       this.postStatus(`No readable files found in ${folderName}.`);
       return;
     }
 
-    const combinedContent = collected.join('\n\n');
-    const truncated = collected.length >= maxFiles ? ` (limited to ${maxFiles} files)` : '';
+    const treeText = listedFiles.join('\n');
+    const omittedContentFiles = Math.max(eligibleFileCount - collected.length, 0);
+    const combinedContent = [
+      `Workspace root: ${folderUri.fsPath}`,
+      '',
+      `Project file tree (${listedFiles.length} files):`,
+      treeText,
+      '',
+      `Included full contents for ${collected.length} file(s).${omittedContentFiles > 0 ? ` Omitted ${omittedContentFiles} file(s) from full content to stay within context budget; use read_specific_file for any omitted file.` : ''}`,
+      '',
+      collected.join('\n\n')
+    ].join('\n');
+    const truncated = omittedContentFiles > 0 || listedFiles.length >= maxListedFiles ? ' (snapshot)' : '';
 
     this.attachedFiles.set(folderUri.fsPath, {
       uri: folderUri,
-      name: `${folderName}/${truncated ? ' ...' : ''}`,
+      name: `${folderName}${truncated}`,
       content: combinedContent,
       languageId: '__folder__'
     });
 
     this.removeAttachmentContextMessages();
     this.postStateToWebview();
-    this.postStatus(`Attached ${collected.length} files from ${folderName}${truncated} as context.`);
+    this.postStatus(`Scanned ${listedFiles.length} project files and attached ${collected.length} full file contents from ${folderName} as persistent context.`);
   }
 
   private async setAgentMode(value: boolean | undefined): Promise<void> {
