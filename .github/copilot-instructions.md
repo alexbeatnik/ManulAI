@@ -18,6 +18,7 @@ This repository contains a VS Code extension named ManulAI.
 - Never delete unrelated file content when the user asked for a narrow change.
 - Keep project-scan behavior persistent enough that the model can continue across multiple files instead of stopping after the first step.
 - When the user references a likely target file such as `README`, `LICENSE`, `package.json`, or an explicit path, prefer resolving it automatically instead of waiting for manual attachment.
+- Keep the sidebar usable on narrow widths and low-height laptop screens; preserve a visible scrollable chat history above the composer.
 
 ## Code Style
 
@@ -33,14 +34,22 @@ This repository contains a VS Code extension named ManulAI.
 
 - The extension must work for any programming language opened in VS Code.
 - Conversation history must remain available in memory for request context.
+- Multiple chats may exist in memory during a session; keep transcript and attached-file context scoped to the active chat.
+- Persist chat sessions for file-backed workspaces under `.manulai/` so they survive VS Code restarts; keep transcript and attached-file context scoped to the active chat.
 - Dropped file context must remain visible in the UI and be forwarded to the model context.
 - Tool results must be returned to Ollama using the native `tool` role flow.
 - Agent Mode should continue to support approvals, auto-approve, and fallback handling for weaker local models.
 - Keep direct handlers and fallback layers conservative: fast for common edits, but not destructive.
+- Treat unread files and unlisted project structure as unknown state; for edit tasks, require real tool-based inspection before claiming or applying a fix.
 - Fallback layers must reject raw or malformed tool-call JSON leaked into assistant text or code blocks and retry via native tool execution instead of treating that payload as file content.
+- Fallback file-write extraction must ignore shell-language fenced code blocks and reject suspicious pseudo-filenames such as numeric dotted names or names with trailing dots.
 - Keep tool output visible in the chat transcript, including terminal stdout and stderr and previews for file writes.
+- Prefer diff-style transcript output for existing-file edits; reserve full previews mainly for new files or initially empty files.
 - Keep step-by-step progress messages visible in chat during multi-tool actions, but do not feed those local progress messages back into the next model request.
 - Keep folder snapshot context distinct from file context so directories are never treated as editable files.
+- Keep `list_workspace_files` compatible with both workspace-relative and absolute directory paths.
+- Keep debug JSONL entries attributable to a specific build; include the extension version in the logged session/event payloads.
+- Keep debug logging useful for reproducing issues; log the original user request before local hidden nudges or retries alter the effective agent context.
 
 ## Documentation
 
@@ -53,3 +62,4 @@ This repository contains a VS Code extension named ManulAI.
 - Keep the `What's New` section at the bottom of the README, immediately before `License`.
 - When tool lists change, update user-facing docs and developer docs in the same change.
 - When agent reliability or context-handling behavior changes, update README, README-dev, and these instructions in the same change.
+- When responsive chat layout behavior changes, update the docs if the change affects visible UX constraints or implementation rules.

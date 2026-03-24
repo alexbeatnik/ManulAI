@@ -2,9 +2,7 @@ import * as vscode from 'vscode';
 import { ManulAiChatProvider } from './ManulAiChatProvider';
 
 class ManulAiLauncherProvider implements vscode.TreeDataProvider<string> {
-  private readonly onDidChangeTreeDataEmitter = new vscode.EventEmitter<string | undefined>();
-
-  public readonly onDidChangeTreeData = this.onDidChangeTreeDataEmitter.event;
+  public readonly onDidChangeTreeData = new vscode.EventEmitter<string | undefined>().event;
 
   public getTreeItem(element: string): vscode.TreeItem {
     return new vscode.TreeItem(element);
@@ -48,6 +46,16 @@ export function activate(context: vscode.ExtensionContext): void {
     provider.reveal(false);
   };
 
+  const redirectLauncherToChat = async (): Promise<void> => {
+    await openChat();
+
+    try {
+      await vscode.commands.executeCommand('workbench.action.closeSidebar');
+    } catch {
+      // Ignore unavailable close command. The chat is already open in the auxiliary bar.
+    }
+  };
+
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider(ManulAiChatProvider.viewType, provider, {
       webviewOptions: {
@@ -56,7 +64,21 @@ export function activate(context: vscode.ExtensionContext): void {
     })
   );
 
-  context.subscriptions.push(vscode.window.registerTreeDataProvider('manulai.launcherView', launcherProvider));
+  const launcherView = vscode.window.createTreeView('manulai.launcherView', {
+    treeDataProvider: launcherProvider,
+    showCollapseAll: false
+  });
+
+  context.subscriptions.push(launcherView);
+  context.subscriptions.push(
+    launcherView.onDidChangeVisibility(() => {
+      if (!launcherView.visible) {
+        return;
+      }
+
+      void redirectLauncherToChat();
+    })
+  );
 
   context.subscriptions.push(
     vscode.commands.registerCommand('manulai.openChat', async () => {

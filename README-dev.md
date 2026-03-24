@@ -24,6 +24,7 @@ ManulAI is a local-first, privacy-focused coding agent for VS Code. All intellig
 - **Modes:** The extension supports tool-enabled Agent Mode and plain Chat Mode with separate system prompts.
 - **File System:** Uses `vscode.workspace.fs` for file inspection and edits.
 - **State:** Conversation history and file context remain available in memory during the VS Code session. They are not sent to any cloud provider.
+- **Chat Sessions:** The provider maintains multiple chat sessions; each chat owns its own transcript and attached file context while sharing the same workspace settings and tool/runtime layer. File-backed workspaces persist this state under `.manulai/chats.json`, with extension-storage fallback when no file-backed workspace exists.
 
 ## Context And Scan Behavior
 
@@ -32,6 +33,7 @@ ManulAI is a local-first, privacy-focused coding agent for VS Code. All intellig
 - **Folder Isolation:** Attached folders are marked separately from regular files and must not be treated as editable file targets.
 - **Auto File Discovery:** Edit requests can auto-resolve likely targets such as `README.md`, `LICENSE`, `package.json`, `tsconfig.json`, and explicit file paths before the model starts editing.
 - **Scan Nudges:** Full-project scan requests inject hidden guidance to keep reading relevant files and not stop after the first directory or first detected issue.
+- **Workspace Listing:** `list_workspace_files` must accept both workspace-relative directories and absolute paths without incorrectly re-rooting absolute paths under the workspace.
 
 ## Product Constraints and Rules
 
@@ -66,7 +68,7 @@ Make sure you have Ollama running locally (`http://localhost:11434` by default) 
 
 ## Commands and Views
 
-- **Views:** Contributes the `manulai.chatView` webview to the Secondary Sidebar.
+- **Views:** Contributes the `manulai.chatView` webview to the Secondary Sidebar, while the Activity Bar entry redirects directly into that chat instead of showing a separate launcher screen.
 - **File Context:** Supports dropping files into the UI, or using commands like `manulai.attachActiveFile` and `manulai.attachExplorerSelection` via context menus.
 - **Configuration:** `package.json` still contributes `manulai.ollamaModel`, `manulai.ollamaBaseUrl`, `manulai.agentMode`, `manulai.autoApprove`, `manulai.debugMode`, and `manulai.systemPrompt`, but file-backed workspaces now persist the effective workspace state in `.manulai/settings.json`.
 
@@ -76,6 +78,7 @@ Make sure you have Ollama running locally (`http://localhost:11434` by default) 
 - **No `.vscode/settings.json` Runtime Dependency:** The provider no longer uses workspace `manulai.*` entries from `.vscode/settings.json` as its runtime fallback. Missing values fall back to built-in defaults.
 - **Migration Path:** On initialization, existing workspace-level `manulai.*` values are migrated from `.vscode/settings.json` into `.manulai/settings.json`, then the old workspace entries are cleared.
 - **No-Workspace Case:** When no file-backed workspace exists, global VS Code settings still act as the fallback store because there is no `.manulai/` folder to write into.
+- **Chat Storage:** Chat session state is stored separately from settings in `.manulai/chats.json` for file-backed workspaces, or under extension storage when there is no file-backed workspace.
 
 Reference shape:
 
@@ -90,7 +93,7 @@ Reference shape:
 }
 ```
 
-`debugMode` logs go to `.manulai/logs/` for file-backed workspaces, or to extension storage when the workspace is not file-backed.
+`debugMode` logs go to `.manulai/logs/` for file-backed workspaces, or to extension storage when the workspace is not file-backed. Each JSONL entry includes the extension version and session identifier so logs can be matched back to a specific build. Incoming user requests are also logged before they enter the agent loop.
 
 ## Current Workspace Tools
 
@@ -114,20 +117,41 @@ Direct pre-agent handlers also exist for common fast-path edits such as Markdown
 - Chat Mode bypasses tool fallback write layers and returns plain text only.
 - Agent Mode still includes fallback write extraction layers for weaker models that fail to emit native tool calls reliably.
 - Ollama requests are not hard-timed out by the extension; users can stop them explicitly.
+- Debug sessions append to stable JSONL files so live debugging does not depend on a long-lived writable stream.
+- Every debug event includes the extension version and session identifier, not only the session-start record.
+- User prompts are logged as explicit debug events before hidden scan nudges, auto-attachments, or tool-loop retries modify the request context.
 
 ## Transcript And Tool Feedback
 
 - Tool results are rendered back into the chat transcript instead of staying hidden in backend-only messages.
 - Terminal transcripts include command, exit code, stdout, stderr, and execution errors when available.
-- File write results include previews for newly created content and for writes that fill previously empty files.
+- File write results prefer diffs for edits to existing files and previews for newly created content or writes that fill previously empty files.
 - The provider can inject local-only progress messages such as `Step 2: Reading README.md` while tools are executing. These messages are visible in chat but are filtered out from the next model request.
+
+## Multi-Chat Behavior
+
+- The webview can create, switch, clear, and delete multiple chats during one VS Code session.
+- Each chat keeps its own `messages` collection and attached file context.
+- Chat switching is blocked while a request is in flight so a running tool loop cannot drift into a different transcript.
+- Chat session state is persisted and restored across extension-host restarts.
+- Persistence writes are debounced and stored in `.manulai/chats.json` for file-backed workspaces.
+
+## Webview Layout Constraints
+
+- The Secondary Sidebar UI must remain usable on narrow widths and low-height laptop screens.
+- History needs to keep a visible, scrollable area even when the header, controls, attachments, and composer are present.
+- The composer must not grow enough to push the history fully out of view; textarea growth should stay bounded by viewport-sensitive limits.
+- When vertical space is constrained, non-essential copy such as subtitles, hints, or attachment chip overflow can be reduced before sacrificing message visibility.
 
 ## Agent Reliability Safeguards
 
 - Recent successful reads are tracked separately from successful fix actions so a model cannot satisfy the loop just by listing files.
 - Replace failures like `old_text not found` are treated as incomplete work and should trigger a read-then-retry path.
 - Responses that claim commands ran, claim fixes were completed, or end on partial plans without executing the work should be nudged back into the tool loop.
+- The system mandate explicitly treats unread files as unknown state: file edits require a prior read, project-structure assumptions require listing, and completion claims require successful tool confirmation.
+- If the task required changes and the model has not used tools, the response is considered wrong and should be nudged back into tool execution.
 - Raw or malformed tool-call JSON leaked into assistant text must be treated as a failed tool invocation and retried; fallback file-write extractors must never treat that payload as file content.
+- Fallback file-write extraction must ignore shell-language fenced blocks and reject suspicious pseudo-filenames such as numeric dotted names or names with trailing dots.
 - Direct fast paths remain conservative and are limited to narrow cases such as Markdown title rename and LICENSE author rename.
 
 ## Documentation Sync
