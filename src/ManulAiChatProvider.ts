@@ -1210,6 +1210,13 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       return undefined;
     }
 
+    const activeEditorPath = vscode.window.activeTextEditor?.document.uri.scheme === 'file'
+      ? vscode.window.activeTextEditor.document.uri.fsPath
+      : undefined;
+    if (activeEditorPath && path.basename(activeEditorPath).toLowerCase() === path.basename(normalizedTarget).toLowerCase()) {
+      return activeEditorPath;
+    }
+
     const exactMatch = await this.resolveExistingWorkspacePath(normalizedTarget);
     if (exactMatch) {
       return exactMatch;
@@ -1944,6 +1951,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           return !recentExecutedCommands.some(executed => executed.includes(command) || command.includes(executed));
         });
 
+        const announcedNewFilePath = this.extractAnnouncedNewFilePath(finalContent);
         const hasReadButNoWriteOnLargeRefactor = isLargeRefactorRequest
           && hasRecentReadOfLargeRefactorTarget
           && !hasRecentMeaningfulWrite;
@@ -1967,7 +1975,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         const shouldNudge = requiresToolContinuation && retryCount < maxNudgeRetries;
 
         if (shouldNudge) {
-          this.debugLog('nudge', { retryCount, hasRecentToolResults, hasRecentSuccessfulAction, hasRecentMeaningfulWrite, hasRecentReadOfLargeRefactorTarget, hasReadButNoWriteOnLargeRefactor, hasRecentToolErrors, hasRecentReplaceNotFound, replaceNotFoundFilepath, replaceNotFoundStartLine, replaceNotFoundEndLine, lastSuccessfulActionIndex, isLongDump, hasLargeCodeBlocks, claimsDone, mentionsChange, isLazyAcknowledgment, hasIncompletePlan: !!hasIncompletePlan, hasExplicitNextSteps, isProgressOnlyResponse, claimedButUnexecutedCommand, isPassingToUser, isAnnouncedButNotExecuted, isLargeRefactorRequest, contentPreview: finalContent.substring(0, 200) });
+          this.debugLog('nudge', { retryCount, hasRecentToolResults, hasRecentSuccessfulAction, hasRecentMeaningfulWrite, hasRecentReadOfLargeRefactorTarget, hasReadButNoWriteOnLargeRefactor, announcedNewFilePath, hasRecentToolErrors, hasRecentReplaceNotFound, replaceNotFoundFilepath, replaceNotFoundStartLine, replaceNotFoundEndLine, lastSuccessfulActionIndex, isLongDump, hasLargeCodeBlocks, claimsDone, mentionsChange, isLazyAcknowledgment, hasIncompletePlan: !!hasIncompletePlan, hasExplicitNextSteps, isProgressOnlyResponse, claimedButUnexecutedCommand, isPassingToUser, isAnnouncedButNotExecuted, isLargeRefactorRequest, contentPreview: finalContent.substring(0, 200) });
           // Show plan/progress text to the user before nudging
           if (!isProgressOnlyResponse && (hasIncompletePlan || hasExplicitNextSteps || claimedButUnexecutedCommand || claimsDone || mentionsChange || isPassingToUser || isAnnouncedButNotExecuted)) {
             const planText = finalContent.trim();
@@ -1986,7 +1994,9 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           let nudgeMessage = '';
           if (hasReadButNoWriteOnLargeRefactor) {
             const primaryTarget = largeRefactorTargets[0] ?? 'the target file';
-            nudgeMessage = `This is a large refactor request for ${primaryTarget}. You already read part of the target file. Do NOT summarize it again, do NOT ask the user for a bounded section, and do NOT ask to read the full file without a tool call. Your next response must call a tool. Either: (1) call create_or_edit_file to extract one concrete bounded unit you already identified into a new module, then call replace_in_file on ${primaryTarget}; or (2) if you truly need more context, call read_file_slice on ${primaryTarget} with explicit startLine and endLine for the next bounded slice. Do one of those now.`;
+            nudgeMessage = announcedNewFilePath
+              ? `This is a large refactor request for ${primaryTarget}. You already identified a concrete extraction target. Do NOT summarize again. Your next response must call tools now: first call create_or_edit_file for ${announcedNewFilePath} with the extracted types or interfaces, then call replace_in_file on ${primaryTarget} to remove the moved block and add the import if needed. If you truly need more context before writing, call read_file_slice on ${primaryTarget} with explicit startLine and endLine for just the next bounded slice. Do one of those now.`
+              : `This is a large refactor request for ${primaryTarget}. You already read part of the target file. Do NOT summarize it again, do NOT ask the user for a bounded section, and do NOT ask to read the full file without a tool call. Your next response must call a tool. Either: (1) call create_or_edit_file to extract one concrete bounded unit you already identified into a new module, then call replace_in_file on ${primaryTarget}; or (2) if you truly need more context, call read_file_slice on ${primaryTarget} with explicit startLine and endLine for the next bounded slice. Do one of those now.`;
           } else if (hasIncompletePlan) {
             nudgeMessage = stepMatch
               ? `You are on step ${stepMatch[1]} of ${stepMatch[2]} but stopped. Continue executing your plan. Proceed to the next step now — use the provided tools.`
@@ -5694,6 +5704,13 @@ If the user asks for a change but provides NO code:
       return undefined;
     }
 
+    const activeEditorPath = vscode.window.activeTextEditor?.document.uri.scheme === 'file'
+      ? vscode.window.activeTextEditor.document.uri.fsPath
+      : undefined;
+    if (activeEditorPath && path.basename(activeEditorPath).toLowerCase() === path.basename(normalizedTarget).toLowerCase()) {
+      return activeEditorPath;
+    }
+
     try {
       const exactUri = this.resolveWorkspaceUri(normalizedTarget);
       await vscode.workspace.fs.stat(exactUri);
@@ -5747,6 +5764,21 @@ If the user asks for a change but provides NO code:
     }
 
     return matrix[rows - 1][cols - 1];
+  }
+
+  private extractAnnouncedNewFilePath(content: string): string | undefined {
+    const normalized = content.replace(/\r\n/g, '\n');
+    const explicitSrcMatch = normalized.match(/`((?:src|media)\/[^`]+\.(?:ts|tsx|js|jsx|json|md|css|html))`/i);
+    if (explicitSrcMatch) {
+      return explicitSrcMatch[1];
+    }
+
+    const namedFileMatch = normalized.match(/create\s+(?:a\s+)?new\s+file\s+(?:named\s+)?`?([A-Za-z0-9_.-]+\.(?:ts|tsx|js|jsx))`?.{0,120}?\b(?:in|under)\s+the\s+`?(src|media)`?\s+directory/i);
+    if (namedFileMatch) {
+      return `${namedFileMatch[2]}/${namedFileMatch[1]}`;
+    }
+
+    return undefined;
   }
 
   private resolveWorkspaceUri(targetPath: string): vscode.Uri {
