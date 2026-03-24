@@ -2242,10 +2242,13 @@
     }
 
     function appendStatus(text) {
-      messages = [...messages, { role: 'status', content: text }];
       if (busy) {
         liveThinkingText = String(text || '').trim();
+        render();
+        return;
       }
+
+      messages = [...messages, { role: 'status', content: text }];
       render();
     }
 
