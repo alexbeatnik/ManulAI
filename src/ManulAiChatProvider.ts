@@ -420,6 +420,11 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
 
     if (this.agentMode && this.looksLikeProjectScanRequest(text)) {
       await this.attachWorkspaceAsContext();
+      this.messages.push({
+        role: 'user',
+        content: 'This is a full project scan request. Do NOT stop after reading only the root directory or after fixing one issue. Continue reading relevant files across the project, use tools repeatedly, and either fix all concrete issues you can find or explicitly state that no further actionable issues were found after scanning.',
+        hiddenFromTranscript: true
+      });
     }
 
     this.synchronizeAttachmentContextMessage();
@@ -1000,12 +1005,39 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           }
           return -1;
         })();
-        const hasRecentToolResults = lastUserIdx >= 0 && messages.slice(lastUserIdx).some(m => m.role === 'tool');
+        const recentMessages = lastUserIdx >= 0 ? messages.slice(lastUserIdx) : messages;
+        const hasRecentToolResults = recentMessages.some(m => m.role === 'tool');
+        const recentToolMessages = recentMessages.filter((m): m is OllamaMessage & { role: 'tool' } => m.role === 'tool');
+        const recentToolResults = recentToolMessages.map(message => {
+          try {
+            const parsed = JSON.parse(message.content) as Record<string, unknown>;
+            return { message, parsed };
+          } catch {
+            return { message, parsed: {} as Record<string, unknown> };
+          }
+        });
+        const hasRecentSuccessfulAction = recentToolResults.some(({ message, parsed }) => {
+          if (parsed.error) {
+            return false;
+          }
+          if (message.tool_name === 'execute_terminal_command') {
+            return Number(parsed.exitCode ?? 0) === 0;
+          }
+          return message.tool_name === 'create_or_edit_file'
+            || message.tool_name === 'write_to_file'
+            || message.tool_name === 'replace_in_file'
+            || message.tool_name === 'delete_file';
+        });
+        const recentToolErrors = recentToolResults
+          .map(({ message, parsed }) => ({ toolName: message.tool_name ?? '', error: typeof parsed.error === 'string' ? parsed.error : '' }))
+          .filter(item => item.error);
+        const hasRecentToolErrors = recentToolErrors.length > 0;
+        const hasRecentReplaceNotFound = recentToolErrors.some(item => item.toolName === 'replace_in_file' && /old_text not found/i.test(item.error));
 
         const isLongDump = finalContent.length > 300;
         const hasLargeCodeBlocks = /```[\w]*\n[\s\S]{100,}?```/.test(finalContent);
-        const claimsDone = /(?:зробив|замінив|оновив|готово|i've made|i have made|i have updated|i updated|i fixed|i removed|i verified|i confirmed|addressed the|fixed the|removed the|updated the|verified the|confirmed the|summary of the changes)/i.test(finalContent);
-        const mentionsChange = /(?:змін|зроби|оновл|replac|chang|updat|modif|address|fix(?:ed)?|remov(?:e|ed)|verif(?:y|ied)|confirm(?:ed)?)/i.test(finalContent);
+        const claimsDone = /(?:зробив|замінив|оновив|готово|i've made|i have made|i have updated|i updated|i fixed|i removed|i verified|i confirmed|i corrected|i aligned|addressed the|fixed the|removed the|updated the|verified the|confirmed the|corrected the|aligned the|summary of the changes|summary:)/i.test(finalContent);
+        const mentionsChange = /(?:змін|зроби|оновл|replac|chang|updat|modif|address|fix(?:ed)?|remov(?:e|ed)|verif(?:y|ied)|confirm(?:ed)?|correct(?:ed)?|align(?:ed)?)/i.test(finalContent);
         const isLazyAcknowledgment = (/^(?:understood|sure|ok|okay|got it|i will|let me know|i can help|i'll make sure)\b/i.test(finalContent.trim())
           || /no (?:immediate|obvious) (?:file changes|issues|errors|problems)/i.test(finalContent)
           || /further debugging (?:would be|is) needed/i.test(finalContent))
@@ -1023,16 +1055,42 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         // Detect incomplete plan execution: model mentions "Step N/M" but hasn't reached the final step
         const stepMatch = finalContent.match(/step\s+(\d+)\s*[\/of]+\s*(\d+)/i);
         const hasIncompletePlan = stepMatch && parseInt(stepMatch[1], 10) < parseInt(stepMatch[2], 10);
+        const hasExplicitNextSteps = /next steps?:/i.test(finalContent) && /\n\s*(?:2|3|4|5)\.\s+/i.test(finalContent);
+
+        const recentExecutedCommands = recentToolMessages
+          .filter(message => message.tool_name === 'execute_terminal_command')
+          .map(message => {
+            try {
+              const parsed = JSON.parse(message.content) as Record<string, unknown>;
+              return String(parsed.command ?? '').toLowerCase();
+            } catch {
+              return '';
+            }
+          })
+          .filter(Boolean);
+        const claimedCommands = Array.from(finalContent.matchAll(/`([^`]+)`/g)).map(match => match[1].trim().toLowerCase());
+        const claimedButUnexecutedCommand = claimedCommands.some(command => {
+          if (!/(?:^|\s)(?:npm|pnpm|yarn|bun|node|npx|python|pytest|pip|cargo|go|dotnet|gradle|mvn)\b/i.test(command)) {
+            return false;
+          }
+          return !recentExecutedCommands.some(executed => executed.includes(command) || command.includes(executed));
+        });
 
         const shouldNudge = (
-          isPassingToUser || isAnnouncedButNotExecuted ||
-          (!hasRecentToolResults && (isLongDump || hasLargeCodeBlocks || claimsDone || mentionsChange || isLazyAcknowledgment || hasIncompletePlan))
+          isPassingToUser
+          || isAnnouncedButNotExecuted
+          || !!hasIncompletePlan
+          || hasExplicitNextSteps
+          || claimedButUnexecutedCommand
+          || (hasRecentReplaceNotFound && (mentionsChange || claimsDone || isLazyAcknowledgment || hasIncompletePlan || hasExplicitNextSteps))
+          || (hasRecentToolErrors && (claimsDone || mentionsChange || isLazyAcknowledgment))
+          || (!hasRecentSuccessfulAction && (isLongDump || hasLargeCodeBlocks || claimsDone || mentionsChange || isLazyAcknowledgment))
         ) && retryCount < 2;
 
         if (shouldNudge) {
-          this.debugLog('nudge', { retryCount, hasRecentToolResults, isLongDump, hasLargeCodeBlocks, claimsDone, mentionsChange, isLazyAcknowledgment, hasIncompletePlan: !!hasIncompletePlan, isPassingToUser, isAnnouncedButNotExecuted, contentPreview: finalContent.substring(0, 200) });
+          this.debugLog('nudge', { retryCount, hasRecentToolResults, hasRecentSuccessfulAction, hasRecentToolErrors, hasRecentReplaceNotFound, isLongDump, hasLargeCodeBlocks, claimsDone, mentionsChange, isLazyAcknowledgment, hasIncompletePlan: !!hasIncompletePlan, hasExplicitNextSteps, claimedButUnexecutedCommand, isPassingToUser, isAnnouncedButNotExecuted, contentPreview: finalContent.substring(0, 200) });
           // Show plan/progress text to the user before nudging
-          if (hasIncompletePlan || claimsDone || mentionsChange || isPassingToUser || isAnnouncedButNotExecuted) {
+          if (hasIncompletePlan || hasExplicitNextSteps || claimedButUnexecutedCommand || claimsDone || mentionsChange || isPassingToUser || isAnnouncedButNotExecuted) {
             const planText = finalContent.trim();
             if (planText) {
               messages.push({ role: 'assistant', content: planText });
@@ -1049,6 +1107,12 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           let nudgeMessage = '';
           if (hasIncompletePlan) {
             nudgeMessage = `You are on step ${stepMatch![1]} of ${stepMatch![2]} but stopped. Continue executing your plan. Proceed to the next step now — use the provided tools.`;
+          } else if (hasExplicitNextSteps) {
+            nudgeMessage = 'You listed next steps but stopped before executing them. Continue now. Do not stop after the first step or the first issue — keep using tools until the scan is complete.';
+          } else if (hasRecentReplaceNotFound) {
+            nudgeMessage = 'Your replace_in_file call failed because old_text did not match the real file content. Do NOT guess. First call read_specific_file for that file, then call replace_in_file again using the exact current text including whitespace.';
+          } else if (claimedButUnexecutedCommand) {
+            nudgeMessage = 'You claimed that a command or action was completed, but there is no matching tool execution in this exchange. Do not claim completion without actually running the command. Execute it now with execute_terminal_command or continue the remaining scan steps.';
           } else if (isAnnouncedButNotExecuted) {
             nudgeMessage = 'You announced an action but did not execute it. Do not describe what you will do — actually do it now by calling the appropriate tool. Use execute_terminal_command for commands or replace_in_file for edits.';
           } else if (isPassingToUser) {
