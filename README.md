@@ -37,6 +37,7 @@ ManulAI is designed for developers who already want Ollama as the model runtime 
 - launcher view in the Activity Bar
 - chat stays beside the editor instead of replacing the main work area
 - conversation history is kept in memory for follow-up requests
+- the sidebar layout is compacted for narrow widths and low-height laptop screens so chat history remains visible above the composer
 
 ### Local Ollama Integration
 
@@ -66,14 +67,13 @@ ManulAI has two working modes:
 ### Project Scan And File Discovery
 
 - project scan requests can attach a workspace snapshot with the file tree and a capped set of file contents
-- scan triggers work across English, Ukrainian, and Russian phrasing such as `scan project`, `проскануй проект`, and `просканируй репо`
 - scan requests push the agent to keep reading and fixing instead of stopping after the first directory or first issue
 - edit requests can auto-discover likely targets such as `README.md`, `LICENSE`, `package.json`, `tsconfig.json`, and explicit file paths even if those files were not attached first
 - when a likely target file is auto-discovered, the chat prints that discovery as a visible progress step before the next tool actions
 
 ### Visible Tool Transcript
 
-- tool execution results are rendered in the chat with compact summaries, previews, or full terminal output as appropriate
+- tool execution results are rendered in the chat with compact summaries, diffs for file edits, previews for new or first-fill file writes, or full terminal output as appropriate
 - terminal actions show the command, exit code, stdout, stderr, and tool error text when present
 - file creation and rewrite actions show a preview, including when an empty file was filled for the first time
 - multi-step actions can print progress step-by-step while tools are running
@@ -93,6 +93,8 @@ Agent Mode currently exposes these tools to Ollama:
 
 These cover the main local coding tasks: reading files, targeted edits, full rewrites when necessary, file creation, file deletion, listing workspace directories, and running local shell commands.
 
+`list_workspace_files` accepts both workspace-relative directories and absolute paths inside the current machine workspace context.
+
 ### Safer Editing Behavior
 
 The extension now pushes stricter file-editing rules into the agent prompt:
@@ -105,6 +107,8 @@ The extension now pushes stricter file-editing rules into the agent prompt:
 - do not treat a failed replacement or failed terminal command as a completed fix
 - do not stop on partial plans like `Step 1/3` when more reading or fixing is still required
 - do not leak raw or malformed tool-call JSON into fallback file writes; those responses are retried as tool calls instead of being treated as file content
+- do not treat shell command blocks as file content during fallback file-write extraction
+- reject suspicious pseudo-filenames such as numeric dotted names or names with trailing dots before writing files
 
 This exists specifically to reduce destructive edits like replacing an entire README when the request was only to remove one line or one image block.
 
@@ -184,7 +188,7 @@ Default values:
 
 ## What's New
 
-- **0.0.2:** Auto-retry without tools when the model does not support tool calling (HTTP 400 fallback). Diff markers no longer leak into written files. Destructive writes to critical files like `package.json` are blocked (invalid JSON, shell commands as content, suspiciously short content). Code block extraction now rejects diff-formatted blocks. Raw or malformed JSON tool-call payloads are now retried as tool executions instead of being mistaken for file content. Project scan requests can attach a capped workspace snapshot. Tool results are visible in chat with terminal output and file previews. Multi-step actions can print progress while tools run. Edit requests can auto-discover likely files such as `README.md` when they are mentioned but not attached. Publisher ID updated to `manul-engine`.
+- **0.0.2:** Auto-retry without tools when the model does not support tool calling (HTTP 400 fallback). Diff markers no longer leak into written files. Destructive writes to critical files like `package.json` are blocked (invalid JSON, shell commands as content, suspiciously short content). Code block extraction now rejects diff-formatted blocks and shell command blocks during fallback file-write extraction. Raw or malformed JSON tool-call payloads are now retried as tool executions instead of being mistaken for file content. Edit transcripts now prefer diffs for existing-file changes instead of dumping full rewritten content. Project scan requests can attach a capped workspace snapshot. Tool results are visible in chat with terminal output and file previews. Multi-step actions can print progress while tools run. Edit requests can auto-discover likely files such as `README.md` when they are mentioned but not attached. `list_workspace_files` now handles absolute paths correctly. Debug logging uses stable JSONL session files under `.manulai/logs/` for file-backed workspaces. The sidebar UI is compacted further for narrow and low-height screens. Publisher ID updated to `manul-engine`.
 - **0.0.1 (Alpha Release):** Initial public alpha with right-side chat UI, local Ollama integration, workspace file attachments, native tool-calling support, agent/chat mode separation, approval controls, directory listing and file deletion tools, and stricter prompt rules for safer file edits.
 
 ## License

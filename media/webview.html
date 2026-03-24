@@ -31,6 +31,8 @@
       --header-height: 13px;
       --body-height: 12px;
       --meta-height: 10px;
+      --input-min-height: 88px;
+      --input-max-height: 220px;
       font-family: 'Segoe UI Variable Text', 'Inter', var(--vscode-font-family);
     }
 
@@ -45,7 +47,9 @@
 
     body {
       margin: 0;
+      height: 100dvh;
       min-height: 100vh;
+      min-height: 100dvh;
       display: grid;
       grid-template-rows: auto 1fr auto;
       background:
@@ -149,6 +153,7 @@
       grid-template-rows: auto 1fr;
       gap: 8px;
       padding: 8px 12px 0;
+      overflow: hidden;
     }
 
     .topbar {
@@ -750,6 +755,7 @@
     .composer {
       padding: 10px 14px 14px;
       background: linear-gradient(180deg, transparent, color-mix(in srgb, var(--bg) 80%, black 20%) 36%);
+      min-height: 0;
     }
 
     .composer-shell {
@@ -768,6 +774,8 @@
       flex-wrap: wrap;
       gap: 7px;
       padding: 10px 10px 0;
+      max-height: 78px;
+      overflow-y: auto;
     }
 
     .chip {
@@ -892,8 +900,8 @@
     textarea {
       width: 100%;
       resize: none;
-      min-height: 88px;
-      max-height: 220px;
+      min-height: var(--input-min-height);
+      max-height: var(--input-max-height);
       border: 0;
       background: transparent;
       color: var(--text);
@@ -1243,6 +1251,145 @@
         justify-content: flex-end;
       }
     }
+
+    @media (max-height: 860px) {
+      :root {
+        --input-min-height: 72px;
+        --input-max-height: 160px;
+      }
+
+      .subtitle {
+        display: none;
+      }
+
+      .header {
+        padding: 7px 10px 6px;
+      }
+
+      .workspace {
+        gap: 6px;
+        padding: 6px 10px 0;
+      }
+
+      .history-meta {
+        padding: 7px 10px;
+      }
+
+      .history {
+        padding: 10px;
+      }
+
+      .composer {
+        padding: 7px 10px 10px;
+      }
+
+      .composer-inner {
+        padding: 8px;
+        gap: 6px;
+      }
+
+      .chips {
+        max-height: 56px;
+        gap: 6px;
+        padding: 8px 8px 0;
+      }
+
+      .composer-actions {
+        gap: 8px;
+        padding: 0 8px 8px;
+      }
+
+      .ghost-button,
+      .model-select,
+      .send,
+      .stop {
+        padding-top: 6px;
+        padding-bottom: 6px;
+      }
+    }
+
+    @media (max-height: 720px) {
+      :root {
+        --input-min-height: 56px;
+        --input-max-height: 120px;
+      }
+
+      .eyebrow,
+      .composer-hint {
+        display: none;
+      }
+
+      .header {
+        padding: 6px 9px 5px;
+      }
+
+      .title {
+        font-size: 12px;
+      }
+
+      .status-pill {
+        padding: 4px 7px;
+      }
+
+      .workspace {
+        gap: 5px;
+        padding: 5px 9px 0;
+      }
+
+      .topbar,
+      .controls,
+      .control-group {
+        gap: 5px 6px;
+      }
+
+      .drop-inline,
+      .ghost-button,
+      .model-select,
+      .send,
+      .stop {
+        min-height: 30px;
+      }
+
+      .drop-inline,
+      .ghost-button,
+      .model-select {
+        padding-top: 5px;
+        padding-bottom: 5px;
+      }
+
+      .history-shell {
+        border-radius: 14px;
+      }
+
+      .history-meta {
+        padding: 6px 9px;
+      }
+
+      .history {
+        padding: 9px;
+        gap: 8px;
+      }
+
+      .composer {
+        padding: 6px 9px 8px;
+      }
+
+      .chips {
+        display: none;
+      }
+
+      .composer-inner {
+        padding: 7px;
+      }
+
+      textarea {
+        padding: 10px 11px 6px;
+      }
+
+      .composer-actions {
+        padding: 0 7px 7px;
+      }
+    }
   </style>
 </head>
 <body>
@@ -1416,8 +1563,12 @@
     }
 
     function autoResizeTextarea() {
+      const inputMaxHeight = Number.parseInt(
+        getComputedStyle(document.documentElement).getPropertyValue('--input-max-height'),
+        10,
+      ) || 220;
       inputEl.style.height = '0px';
-      inputEl.style.height = `${Math.min(inputEl.scrollHeight, 220)}px`;
+      inputEl.style.height = `${Math.min(inputEl.scrollHeight, inputMaxHeight)}px`;
     }
 
     function setDragging(active) {

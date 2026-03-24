@@ -32,6 +32,7 @@ ManulAI is a local-first, privacy-focused coding agent for VS Code. All intellig
 - **Folder Isolation:** Attached folders are marked separately from regular files and must not be treated as editable file targets.
 - **Auto File Discovery:** Edit requests can auto-resolve likely targets such as `README.md`, `LICENSE`, `package.json`, `tsconfig.json`, and explicit file paths before the model starts editing.
 - **Scan Nudges:** Full-project scan requests inject hidden guidance to keep reading relevant files and not stop after the first directory or first detected issue.
+- **Workspace Listing:** `list_workspace_files` must accept both workspace-relative directories and absolute paths without incorrectly re-rooting absolute paths under the workspace.
 
 ## Product Constraints and Rules
 
@@ -114,13 +115,21 @@ Direct pre-agent handlers also exist for common fast-path edits such as Markdown
 - Chat Mode bypasses tool fallback write layers and returns plain text only.
 - Agent Mode still includes fallback write extraction layers for weaker models that fail to emit native tool calls reliably.
 - Ollama requests are not hard-timed out by the extension; users can stop them explicitly.
+- Debug sessions append to stable JSONL files so live debugging does not depend on a long-lived writable stream.
 
 ## Transcript And Tool Feedback
 
 - Tool results are rendered back into the chat transcript instead of staying hidden in backend-only messages.
 - Terminal transcripts include command, exit code, stdout, stderr, and execution errors when available.
-- File write results include previews for newly created content and for writes that fill previously empty files.
+- File write results prefer diffs for edits to existing files and previews for newly created content or writes that fill previously empty files.
 - The provider can inject local-only progress messages such as `Step 2: Reading README.md` while tools are executing. These messages are visible in chat but are filtered out from the next model request.
+
+## Webview Layout Constraints
+
+- The Secondary Sidebar UI must remain usable on narrow widths and low-height laptop screens.
+- History needs to keep a visible, scrollable area even when the header, controls, attachments, and composer are present.
+- The composer must not grow enough to push the history fully out of view; textarea growth should stay bounded by viewport-sensitive limits.
+- When vertical space is constrained, non-essential copy such as subtitles, hints, or attachment chip overflow can be reduced before sacrificing message visibility.
 
 ## Agent Reliability Safeguards
 
@@ -128,6 +137,7 @@ Direct pre-agent handlers also exist for common fast-path edits such as Markdown
 - Replace failures like `old_text not found` are treated as incomplete work and should trigger a read-then-retry path.
 - Responses that claim commands ran, claim fixes were completed, or end on partial plans without executing the work should be nudged back into the tool loop.
 - Raw or malformed tool-call JSON leaked into assistant text must be treated as a failed tool invocation and retried; fallback file-write extractors must never treat that payload as file content.
+- Fallback file-write extraction must ignore shell-language fenced blocks and reject suspicious pseudo-filenames such as numeric dotted names or names with trailing dots.
 - Direct fast paths remain conservative and are limited to narrow cases such as Markdown title rename and LICENSE author rename.
 
 ## Documentation Sync

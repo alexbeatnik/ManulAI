@@ -2230,6 +2230,10 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       return false;
     }
 
+    if (/[.]$/.test(candidate.trim())) {
+      return false;
+    }
+
     if (/^\d+(?:\.\d+)+$/.test(trimmed)) {
       return false;
     }
@@ -3271,6 +3275,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
 
   private extractCodeBlockFileWrites(content: string): Array<{ fullMatch: string; filepath: string; fileContent: string }> {
     const blocks: Array<{ fullMatch: string; filepath: string; fileContent: string }> = [];
+    const shellLanguages = new Set(['bash', 'sh', 'shell', 'zsh', 'fish', 'powershell', 'ps1', 'cmd', 'bat']);
     // Match: ```lang:filepath or ```lang filepath
     // Also: ```lang\n// filepath  or ```lang\n# filepath
     const pattern = /```(\w+)[:\s]+([^\n`]+)\n([\s\S]*?)```/g;
@@ -3279,6 +3284,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       const lang = (match[1] || '').toLowerCase();
       const filepath = match[2].trim();
       const fileContent = match[3];
+      if (shellLanguages.has(lang)) { continue; }
       if (lang === 'diff' || lang === 'patch') { continue; }
       if (this.looksLikeToolCallContent(fileContent)) { continue; }
       if (filepath && fileContent && !filepath.includes(' ') && this.isLikelyFileReference(filepath) && !this.looksLikeDiffOutput(fileContent)) {
@@ -3292,6 +3298,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       const lang = (match[1] || '').toLowerCase();
       const filepath = match[2].trim();
       const fileContent = match[3];
+      if (shellLanguages.has(lang)) { continue; }
       if (lang === 'diff' || lang === 'patch') { continue; }
       if (this.looksLikeToolCallContent(fileContent)) { continue; }
       if (filepath && fileContent && this.isLikelyFileReference(filepath) && !blocks.some(b => b.filepath === filepath) && !this.looksLikeDiffOutput(fileContent)) {
@@ -3305,6 +3312,9 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       const filepath = match[1].trim();
       const lang = (match[2] || '').toLowerCase();
       const fileContent = match[3];
+      if (shellLanguages.has(lang)) {
+        continue;
+      }
       if (lang === 'diff' || lang === 'patch') {
         continue;
       }
@@ -3673,9 +3683,12 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         return JSON.stringify({ error: 'No workspace open.' });
       }
 
-      const baseUri = directory.trim()
-        ? vscode.Uri.joinPath(workspaceFolders[0].uri, directory)
-        : workspaceFolders[0].uri;
+      const normalizedDirectory = directory.trim();
+      const baseUri = !normalizedDirectory
+        ? workspaceFolders[0].uri
+        : path.isAbsolute(normalizedDirectory)
+          ? vscode.Uri.file(normalizedDirectory)
+          : vscode.Uri.joinPath(workspaceFolders[0].uri, normalizedDirectory);
 
       const entries = await vscode.workspace.fs.readDirectory(baseUri);
       const items = entries.map(([name, type]) => ({
