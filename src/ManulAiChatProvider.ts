@@ -1280,7 +1280,16 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     const activeEditorPath = vscode.window.activeTextEditor?.document.uri.scheme === 'file'
       ? vscode.window.activeTextEditor.document.uri.fsPath
       : undefined;
-    return activeEditorPath;
+    // Do not treat log files, config files, or .manulai/ internal files as large-refactor targets
+    if (activeEditorPath) {
+      const sourceExtensions = ['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs', '.py', '.java', '.cs', '.go', '.rb', '.rs', '.cpp', '.c', '.h'];
+      const ext = path.extname(activeEditorPath).toLowerCase();
+      const isInsideManulai = activeEditorPath.includes(`${path.sep}.manulai${path.sep}`) || activeEditorPath.includes('/.manulai/');
+      if (sourceExtensions.includes(ext) && !isInsideManulai) {
+        return activeEditorPath;
+      }
+    }
+    return undefined;
   }
 
   private async tryHandleDirectLicenseAuthorRename(text: string): Promise<FileWriteSummary | undefined> {
@@ -2019,6 +2028,12 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           hasReadButNoWriteOnLargeRefactor
           && (isProgressOnlyResponse || isAnnouncedButNotExecuted || !!hasIncompletePlan || hasExplicitNextSteps || hasAnnouncedExtractionWithoutWrite)
         );
+        const hasLazyRefusalOnLargeRefactor = Boolean(
+          isLargeRefactorRequest
+          && hasRecentReadOfLargeRefactorTarget
+          && !hasRecentMeaningfulWrite
+          && /(?:no changes? (?:are )?needed|no modification(?:s)? (?:are )?needed|already correctly formatted|looks? good as[ -]is|no adjustment(?:s)? needed|no updates? (?:are )?needed|this (?:looks|is) correct|nothing to change|does not require any modifications?|no (?:further )?(?:changes?|modifications?) (?:are )?(?:required|necessary))/i.test(finalContent)
+        );
         const isAskingUserForExactSlice = Boolean(
           isLargeRefactorRequest
           && /(?:please provide|provide) (?:the )?(?:exact startline and endline|first\s+\d+\s+lines|next\s+\d+\s+lines|lines?\s+\d+\s*(?:to|-)+\s*\d+|bounded slice)|exact startline and endline|bounded slice you would like to extract|replace this with the actual content/i.test(finalContent)
@@ -2035,7 +2050,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
             ? 4
           : isAskingUserForExactSlice
             ? 5
-          : hasFakePostReadAnalysisDump || hasAnnouncedExtractionWithoutWrite || hasReadButNoWriteOnLargeRefactor
+          : hasFakePostReadAnalysisDump || hasAnnouncedExtractionWithoutWrite || hasReadButNoWriteOnLargeRefactor || hasLazyRefusalOnLargeRefactor
             ? 4
             : 2;
         const requiresToolContinuation = (
@@ -2051,6 +2066,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           || isAskingUserForExactSlice
           || hasFakePostReadAnalysisDump
           || hasAnnouncedExtractionWithoutWrite
+          || hasLazyRefusalOnLargeRefactor
           || hasPostCreateRefactorNarration
           || (isLargeRefactorRequest && hasRecentToolResults && (!hasRecentSuccessfulAction || !hasRecentReadOfLargeRefactorTarget || !hasRecentMeaningfulWrite))
           || (hasRecentReplaceNotFound && (mentionsChange || claimsDone || isLazyAcknowledgment || hasIncompletePlan || hasExplicitNextSteps))
@@ -2100,7 +2116,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         }
 
         if (shouldNudge) {
-          this.debugLog('nudge', { retryCount, hasRecentToolResults, hasRecentSuccessfulAction, hasRecentMeaningfulWrite, latestCreatedFilePath, hasRecentReadOfLargeRefactorTarget, hasLargeRefactorShellReadBypass, hasPreReadLargeRefactorNarration, hasFakePreReadCodeDump, hasFakePostReadAnalysisDump, hasAnnouncedExtractionWithoutWrite, isAskingUserForExactSlice, suggestedNextSlice, hasReadButNoWriteOnLargeRefactor, hasPostReadToolStall, hasPostCreateRefactorNarration, announcedNewFilePath, hasRecentToolErrors, hasRecentReplaceNotFound, replaceNotFoundFilepath, replaceNotFoundStartLine, replaceNotFoundEndLine, lastSuccessfulActionIndex, isLongDump, hasLargeCodeBlocks, claimsDone, mentionsChange, isLazyAcknowledgment, hasIncompletePlan: !!hasIncompletePlan, hasExplicitNextSteps, isProgressOnlyResponse, claimedButUnexecutedCommand, isPassingToUser, isAnnouncedButNotExecuted, isLargeRefactorRequest, contentPreview: finalContent.substring(0, 200) });
+          this.debugLog('nudge', { retryCount, hasRecentToolResults, hasRecentSuccessfulAction, hasRecentMeaningfulWrite, latestCreatedFilePath, hasRecentReadOfLargeRefactorTarget, hasLargeRefactorShellReadBypass, hasPreReadLargeRefactorNarration, hasFakePreReadCodeDump, hasFakePostReadAnalysisDump, hasAnnouncedExtractionWithoutWrite, hasLazyRefusalOnLargeRefactor, isAskingUserForExactSlice, suggestedNextSlice, hasReadButNoWriteOnLargeRefactor, hasPostReadToolStall, hasPostCreateRefactorNarration, announcedNewFilePath, hasRecentToolErrors, hasRecentReplaceNotFound, replaceNotFoundFilepath, replaceNotFoundStartLine, replaceNotFoundEndLine, lastSuccessfulActionIndex, isLongDump, hasLargeCodeBlocks, claimsDone, mentionsChange, isLazyAcknowledgment, hasIncompletePlan: !!hasIncompletePlan, hasExplicitNextSteps, isProgressOnlyResponse, claimedButUnexecutedCommand, isPassingToUser, isAnnouncedButNotExecuted, isLargeRefactorRequest, contentPreview: finalContent.substring(0, 200) });
           // Show plan/progress text to the user before nudging
           if (!isProgressOnlyResponse
             && !hasFakePreReadCodeDump
@@ -2143,6 +2159,11 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
             nudgeMessage = announcedNewFilePath
               ? `This is a large refactor request for ${primaryTarget}. You already read the real file. Do NOT output generic summaries, fake JSON tool responses, invented class descriptions, or code-analysis dumps. Your next response must be tool calls only. First call create_or_edit_file for ${announcedNewFilePath} with one real self-contained type, interface group, or function from the bounded slices you actually read. Then call replace_in_file on ${primaryTarget} to remove the moved block and add any needed import. No prose before the tool calls.`
               : `This is a large refactor request for ${primaryTarget}. You already read the real file. Do NOT output generic summaries, fake JSON tool responses, invented class descriptions, or code-analysis dumps. Your next response must be tool calls only. Either call create_or_edit_file now for one concrete self-contained type, interface group, or function from the slices you already read and then call replace_in_file on ${primaryTarget}, or call read_file_slice for the next suggested bounded slice. No prose before the tool calls.`;
+          } else if (hasLazyRefusalOnLargeRefactor) {
+            const primaryTarget = largeRefactorTargets[0] ?? 'the target file';
+            nudgeMessage = suggestedNextSlice?.filepath && suggestedNextSlice.startLine && suggestedNextSlice.endLine
+              ? `You are performing a REFACTOR task: splitting ${primaryTarget} into smaller modules. You are NOT reviewing code quality or checking whether the file needs formatting fixes. "No changes needed" is the wrong answer for a refactor task. The code you just read is the SOURCE to EXTRACT content from. You MUST call create_or_edit_file to create a new file containing one self-contained group of types, interfaces, or functions from the source. Then call replace_in_file on ${primaryTarget} to remove the extracted block and add an import. If you need more context first, call read_file_slice for ${suggestedNextSlice.filepath} with startLine=${suggestedNextSlice.startLine} and endLine=${suggestedNextSlice.endLine}. Do NOT call list_workspace_files. No prose before the tool calls.`
+              : `You are performing a REFACTOR task: splitting ${primaryTarget} into smaller modules. You are NOT reviewing code quality or checking whether the file needs formatting fixes. "No changes needed" is the wrong answer for a refactor task. The code you just read is the SOURCE to EXTRACT content from. You MUST call create_or_edit_file to create a new file containing one self-contained group of types, interfaces, or functions from the source. Then call replace_in_file on ${primaryTarget} to remove the extracted block and add an import. Do NOT call list_workspace_files. No prose before the tool calls.`;
           } else if (hasAnnouncedExtractionWithoutWrite) {
             const primaryTarget = largeRefactorTargets[0] ?? 'the target file';
             nudgeMessage = announcedNewFilePath
@@ -2231,6 +2252,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
             hasFakePreReadCodeDump,
             hasFakePostReadAnalysisDump,
             hasAnnouncedExtractionWithoutWrite,
+            hasLazyRefusalOnLargeRefactor,
             isAskingUserForExactSlice,
             suggestedNextSlice,
             hasReadButNoWriteOnLargeRefactor,
@@ -2252,6 +2274,8 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
             ? 'The model read the real file but then produced a fake analysis dump or synthetic tool-response JSON instead of making a concrete file edit. Retry the request or use a stronger tool-calling model for iterative refactors.'
             : hasAnnouncedExtractionWithoutWrite
             ? `The model announced an extraction${announcedNewFilePath ? ` to ${announcedNewFilePath}` : ''} but never executed the required file tools. It must call create_or_edit_file and replace_in_file instead of narrating the extraction.`
+            : hasLazyRefusalOnLargeRefactor
+            ? 'The model responded with "no changes needed" to a refactoring request. It is treating the task as a code review instead of a file-splitting task. Retry the request with a more explicit prompt, or use a stronger tool-calling model.'
             : hasPostReadToolStall
             ? suggestedNextSlice?.filepath && suggestedNextSlice.startLine && suggestedNextSlice.endLine
               ? `The model read a bounded section of the target file but then stalled in progress-only text instead of making the next tool call. The next bounded slice was ${suggestedNextSlice.filepath}:${suggestedNextSlice.startLine}-${suggestedNextSlice.endLine}, but it still did not continue. Retry the request or use a stronger tool-calling model for iterative refactors.`
