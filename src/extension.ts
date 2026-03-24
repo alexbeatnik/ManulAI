@@ -121,6 +121,16 @@ export function activate(context: vscode.ExtensionContext): void {
       if (args.length >= 1 && args[0] instanceof vscode.Uri) {
         uri = args[0];
       }
+      if (!uri) {
+        const selection = await vscode.window.showOpenDialog({
+          canSelectMany: false,
+          canSelectFiles: false,
+          canSelectFolders: true,
+          openLabel: 'Attach folder',
+          title: 'Attach folder to ManulAI context'
+        });
+        uri = selection?.[0];
+      }
       if (uri) {
         await provider.attachFolderByUri(uri);
       }
@@ -159,7 +169,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
   context.subscriptions.push(
     vscode.workspace.onDidChangeConfiguration(async event => {
-      if (event.affectsConfiguration('manulai.ollamaBaseUrl') || event.affectsConfiguration('manulai.ollamaModel') || event.affectsConfiguration('manulai.agentMode') || event.affectsConfiguration('manulai.autoApprove')) {
+      if (event.affectsConfiguration('manulai')) {
         await provider.handleConfigurationChange();
       }
     })

@@ -139,7 +139,27 @@ The extension exposes these settings:
 - `manulai.ollamaBaseUrl` — base URL for the local Ollama server
 - `manulai.agentMode` — turns tool-enabled agent behavior on or off
 - `manulai.autoApprove` — skips approval prompts for tool execution when enabled
+- `manulai.debugMode` — saves detailed local debug logs when enabled
 - `manulai.systemPrompt` — extra system prompt text prepended to each Ollama request
+
+When a file-backed workspace is open, ManulAI treats `.manulai/settings.json` as the only workspace-level source of truth for these values. It does not keep workspace state in `.vscode/settings.json` anymore.
+
+That file is created on first write and stores the settings that the ManulAI UI manages inside the workspace.
+
+Example `.manulai/settings.json`:
+
+```json
+{
+	"ollamaModel": "llama3.2",
+	"ollamaBaseUrl": "http://localhost:11434",
+	"agentMode": true,
+	"autoApprove": false,
+	"debugMode": false,
+	"systemPrompt": "You are ManulAI, a privacy-first local coding assistant running inside VS Code. Work across any programming language. Prefer precise, minimal changes and explain results clearly."
+}
+```
+
+If an older workspace still has `manulai.*` values in `.vscode/settings.json`, ManulAI migrates those workspace values into `.manulai/settings.json` and clears the old workspace entries.
 
 Default values:
 
@@ -147,6 +167,7 @@ Default values:
 - Ollama base URL: `http://localhost:11434`
 - agent mode: `true`
 - auto-approve: `false`
+- debug mode: `false`
 
 ---
 
@@ -155,6 +176,7 @@ Default values:
 - `icon.png` is used as the extension icon in the VS Code manifest
 - `media/manulai-icon.svg` is used for the contributed sidebar container and view icon
 - the project is intentionally Ollama-only and local-first
+- workspace-owned ManulAI state lives under `.manulai/`; debug logs use `.manulai/logs/` when the workspace is file-backed
 - the README describes current behavior and avoids cloud-oriented setup or product marketing fluff
 
 ---

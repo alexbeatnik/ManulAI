@@ -127,6 +127,24 @@ interface FileWriteSummary {
   revertOperationId?: string;
 }
 
+interface ManulAiStoredSettings {
+  ollamaModel?: string;
+  ollamaBaseUrl?: string;
+  agentMode?: boolean;
+  autoApprove?: boolean;
+  debugMode?: boolean;
+  systemPrompt?: string;
+}
+
+const DEFAULT_STORED_SETTINGS: Required<ManulAiStoredSettings> = {
+  ollamaModel: 'llama3.2',
+  ollamaBaseUrl: 'http://localhost:11434',
+  agentMode: true,
+  autoApprove: false,
+  debugMode: false,
+  systemPrompt: 'You are ManulAI, a privacy-first local coding assistant running inside VS Code. Work across any programming language. Prefer precise, minimal changes and explain results clearly.'
+};
+
 export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = 'manulai.chatView';
 
@@ -143,15 +161,25 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   private pendingApproval?: WebviewPendingApprovalState;
   private pendingApprovalResolver?: (approved: boolean) => void;
   private readonly revertSnapshots = new Map<string, RevertSnapshot>();
-  private debugLogStream?: fs.WriteStream;
+  private debugLogFilePath?: string;
   private debugSessionId = '';
   private progressStepCounter = 0;
+  private workspaceSettings: Partial<ManulAiStoredSettings> = {};
+  private workspaceSettingsLoaded = false;
+  private workspaceSettingsLoadPromise?: Promise<void>;
+  private migratingWorkspaceConfiguration = false;
 
   public constructor(private readonly extensionContext: vscode.ExtensionContext) {
-    const config = vscode.workspace.getConfiguration('manulai');
-    this.agentMode = Boolean(config.get('agentMode', true));
-    this.autoApprove = Boolean(config.get('autoApprove', false));
-    this.debugMode = Boolean(config.get('debugMode', false));
+    if (vscode.workspace.workspaceFolders?.length) {
+      this.agentMode = DEFAULT_STORED_SETTINGS.agentMode;
+      this.autoApprove = DEFAULT_STORED_SETTINGS.autoApprove;
+      this.debugMode = DEFAULT_STORED_SETTINGS.debugMode;
+    } else {
+      const config = vscode.workspace.getConfiguration('manulai');
+      this.agentMode = Boolean(config.get('agentMode', DEFAULT_STORED_SETTINGS.agentMode));
+      this.autoApprove = Boolean(config.get('autoApprove', DEFAULT_STORED_SETTINGS.autoApprove));
+      this.debugMode = Boolean(config.get('debugMode', DEFAULT_STORED_SETTINGS.debugMode));
+    }
     if (this.debugMode) {
       this.startDebugSession();
     }
@@ -184,8 +212,12 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       }
     });
 
+    void this.initializeSettingsState();
+
     // Push initial state once the webview is ready
-    setTimeout(() => this.postStateToWebview(), 100);
+    setTimeout(() => {
+      void this.initializeSettingsState();
+    }, 100);
   }
 
   public reveal(preserveFocus = false): void {
@@ -196,8 +228,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     const currentModel = this.getSelectedModel();
 
     try {
-      const config = vscode.workspace.getConfiguration('manulai');
-      const baseUrl = String(config.get('ollamaBaseUrl', 'http://localhost:11434')).replace(/\/$/, '');
+      const baseUrl = this.getOllamaBaseUrl();
       const response = await fetch(`${baseUrl}/api/tags`);
 
       if (!response.ok) {
@@ -223,8 +254,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   }
 
   public getSelectedModel(): string {
-    const config = vscode.workspace.getConfiguration('manulai');
-    return String(config.get('ollamaModel', 'llama3.2'));
+    return this.getStringSetting('ollamaModel', DEFAULT_STORED_SETTINGS.ollamaModel);
   }
 
   public async setSelectedModel(model: string): Promise<void> {
@@ -233,11 +263,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       return;
     }
 
-    const target = vscode.workspace.workspaceFolders?.length
-      ? vscode.ConfigurationTarget.Workspace
-      : vscode.ConfigurationTarget.Global;
-
-    await vscode.workspace.getConfiguration('manulai').update('ollamaModel', normalizedModel, target);
+    await this.persistStoredSetting('ollamaModel', normalizedModel);
     await this.refreshModelCatalog(false);
     this.postStateToWebview();
     this.postStatus(`Ollama model set to ${normalizedModel}.`);
@@ -248,11 +274,186 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   }
 
   public async handleConfigurationChange(): Promise<void> {
-    const config = vscode.workspace.getConfiguration('manulai');
-    this.agentMode = Boolean(config.get('agentMode', true));
-    this.autoApprove = Boolean(config.get('autoApprove', false));
+    await this.initializeSettingsState();
+  }
+
+  private async initializeSettingsState(): Promise<void> {
+    await this.migrateWorkspaceConfigurationToStorage();
+    await this.ensureWorkspaceSettingsLoaded();
+
+    const previousDebugMode = this.debugMode;
+    this.agentMode = this.getBooleanSetting('agentMode', DEFAULT_STORED_SETTINGS.agentMode);
+    this.autoApprove = this.getBooleanSetting('autoApprove', DEFAULT_STORED_SETTINGS.autoApprove);
+    this.debugMode = this.getBooleanSetting('debugMode', DEFAULT_STORED_SETTINGS.debugMode);
+
+    if (this.debugMode && !previousDebugMode) {
+      this.startDebugSession();
+    } else if (!this.debugMode && previousDebugMode) {
+      this.stopDebugSession();
+    }
+
     await this.refreshModelCatalog(false);
     this.postStateToWebview();
+  }
+
+  private getWorkspaceSettingsDirUri(): vscode.Uri | undefined {
+    const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri;
+    if (!workspaceRoot) {
+      return undefined;
+    }
+    return vscode.Uri.joinPath(workspaceRoot, '.manulai');
+  }
+
+  private getWorkspaceSettingsUri(): vscode.Uri | undefined {
+    const settingsDir = this.getWorkspaceSettingsDirUri();
+    if (!settingsDir) {
+      return undefined;
+    }
+    return vscode.Uri.joinPath(settingsDir, 'settings.json');
+  }
+
+  private async ensureWorkspaceSettingsLoaded(): Promise<void> {
+    if (this.workspaceSettingsLoaded) {
+      return;
+    }
+    if (this.workspaceSettingsLoadPromise) {
+      await this.workspaceSettingsLoadPromise;
+      return;
+    }
+
+    this.workspaceSettingsLoadPromise = (async () => {
+      const settingsUri = this.getWorkspaceSettingsUri();
+      if (!settingsUri) {
+        this.workspaceSettings = {};
+        this.workspaceSettingsLoaded = true;
+        return;
+      }
+
+      try {
+        const bytes = await vscode.workspace.fs.readFile(settingsUri);
+        const parsed = JSON.parse(Buffer.from(bytes).toString('utf8')) as unknown;
+        this.workspaceSettings = this.normalizeStoredSettings(parsed);
+      } catch {
+        this.workspaceSettings = {};
+      }
+      this.workspaceSettingsLoaded = true;
+    })();
+
+    try {
+      await this.workspaceSettingsLoadPromise;
+    } finally {
+      this.workspaceSettingsLoadPromise = undefined;
+    }
+  }
+
+  private normalizeStoredSettings(value: unknown): Partial<ManulAiStoredSettings> {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      return {};
+    }
+
+    const candidate = value as Record<string, unknown>;
+    const normalized: Partial<ManulAiStoredSettings> = {};
+    if (typeof candidate.ollamaModel === 'string') {
+      normalized.ollamaModel = candidate.ollamaModel;
+    }
+    if (typeof candidate.ollamaBaseUrl === 'string') {
+      normalized.ollamaBaseUrl = candidate.ollamaBaseUrl;
+    }
+    if (typeof candidate.agentMode === 'boolean') {
+      normalized.agentMode = candidate.agentMode;
+    }
+    if (typeof candidate.autoApprove === 'boolean') {
+      normalized.autoApprove = candidate.autoApprove;
+    }
+    if (typeof candidate.debugMode === 'boolean') {
+      normalized.debugMode = candidate.debugMode;
+    }
+    if (typeof candidate.systemPrompt === 'string') {
+      normalized.systemPrompt = candidate.systemPrompt;
+    }
+    return normalized;
+  }
+
+  private getStringSetting(key: keyof ManulAiStoredSettings, fallback: string): string {
+    const storedValue = this.workspaceSettings[key];
+    if (typeof storedValue === 'string') {
+      return storedValue;
+    }
+    if (vscode.workspace.workspaceFolders?.length) {
+      return String(DEFAULT_STORED_SETTINGS[key] ?? fallback);
+    }
+    const config = vscode.workspace.getConfiguration('manulai');
+    return String(config.get(String(key), fallback));
+  }
+
+  private getBooleanSetting(key: keyof ManulAiStoredSettings, fallback: boolean): boolean {
+    const storedValue = this.workspaceSettings[key];
+    if (typeof storedValue === 'boolean') {
+      return storedValue;
+    }
+    if (vscode.workspace.workspaceFolders?.length) {
+      return Boolean(DEFAULT_STORED_SETTINGS[key] ?? fallback);
+    }
+    const config = vscode.workspace.getConfiguration('manulai');
+    return Boolean(config.get(String(key), fallback));
+  }
+
+  private getOllamaBaseUrl(): string {
+    return this.getStringSetting('ollamaBaseUrl', DEFAULT_STORED_SETTINGS.ollamaBaseUrl).replace(/\/$/, '');
+  }
+
+  private getSystemPrompt(): string {
+    return this.getStringSetting('systemPrompt', DEFAULT_STORED_SETTINGS.systemPrompt).trim();
+  }
+
+  private async persistStoredSetting<K extends keyof ManulAiStoredSettings>(key: K, value: NonNullable<ManulAiStoredSettings[K]>): Promise<void> {
+    const settingsUri = this.getWorkspaceSettingsUri();
+    if (!settingsUri) {
+      await vscode.workspace.getConfiguration('manulai').update(String(key), value, vscode.ConfigurationTarget.Global);
+      return;
+    }
+
+    await this.ensureWorkspaceSettingsLoaded();
+    this.workspaceSettings = {
+      ...this.workspaceSettings,
+      [key]: value
+    };
+
+    const settingsDir = this.getWorkspaceSettingsDirUri();
+    if (!settingsDir) {
+      return;
+    }
+    await vscode.workspace.fs.createDirectory(settingsDir);
+    await vscode.workspace.fs.writeFile(settingsUri, Buffer.from(JSON.stringify(this.workspaceSettings, null, 2) + '\n', 'utf8'));
+  }
+
+  private async migrateWorkspaceConfigurationToStorage(): Promise<void> {
+    if (this.migratingWorkspaceConfiguration || !vscode.workspace.workspaceFolders?.length) {
+      return;
+    }
+
+    const config = vscode.workspace.getConfiguration('manulai');
+    const keys: Array<keyof ManulAiStoredSettings> = ['ollamaModel', 'ollamaBaseUrl', 'agentMode', 'autoApprove', 'debugMode', 'systemPrompt'];
+    let migratedAny = false;
+
+    this.migratingWorkspaceConfiguration = true;
+    try {
+      for (const key of keys) {
+        const inspected = config.inspect<unknown>(String(key));
+        if (!inspected || inspected.workspaceValue === undefined) {
+          continue;
+        }
+        await this.persistStoredSetting(key, inspected.workspaceValue as NonNullable<ManulAiStoredSettings[typeof key]>);
+        await config.update(String(key), undefined, vscode.ConfigurationTarget.Workspace);
+        migratedAny = true;
+      }
+    } finally {
+      this.migratingWorkspaceConfiguration = false;
+    }
+
+    if (migratedAny) {
+      this.postStatus('Moved ManulAI workspace settings from .vscode/settings.json to .manulai/settings.json.');
+    }
   }
 
   public handleActiveEditorChange(): void {
@@ -1209,7 +1410,9 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           .map(({ message, parsed }) => ({ toolName: message.tool_name ?? '', error: typeof parsed.error === 'string' ? parsed.error : '' }))
           .filter(item => item.error);
         const hasRecentToolErrors = recentToolErrors.length > 0;
-        const hasRecentReplaceNotFound = recentToolErrors.some(item => item.toolName === 'replace_in_file' && /old_text not found/i.test(item.error));
+        const replaceNotFoundContext = this.getLatestReplaceNotFoundContext(messages);
+        const hasRecentReplaceNotFound = Boolean(replaceNotFoundContext);
+        const replaceNotFoundFilepath = replaceNotFoundContext?.filepath;
 
         const isLongDump = finalContent.length > 300;
         const hasLargeCodeBlocks = /```[\w]*\n[\s\S]{100,}?```/.test(finalContent);
@@ -1233,6 +1436,13 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         const stepMatch = finalContent.match(/step\s+(\d+)\s*[\/of]+\s*(\d+)/i);
         const hasIncompletePlan = stepMatch && parseInt(stepMatch[1], 10) < parseInt(stepMatch[2], 10);
         const hasExplicitNextSteps = /next steps?:/i.test(finalContent) && /\n\s*(?:2|3|4|5)\.\s+/i.test(finalContent);
+        const progressLines = finalContent
+          .split('\n')
+          .map(line => line.trim())
+          .filter(Boolean);
+        const isProgressOnlyResponse = progressLines.length > 0
+          && finalContent.trim().length < 220
+          && progressLines.every(line => /^(?:step\s+\d+\s*(?:\/|of)\s*\d+[:\s-].*|reading (?:the )?file first\.{0,3}|reading and modifying .+|i(?:'| a)?ll read the file.*|i apologize for the oversight\.?|sorry for the oversight\.?)$/i.test(line));
 
         const recentExecutedCommands = recentToolMessages
           .filter(message => message.tool_name === 'execute_terminal_command')
@@ -1253,21 +1463,23 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           return !recentExecutedCommands.some(executed => executed.includes(command) || command.includes(executed));
         });
 
+        const maxNudgeRetries = hasRecentReplaceNotFound ? 3 : 2;
         const shouldNudge = (
           isPassingToUser
           || isAnnouncedButNotExecuted
           || !!hasIncompletePlan
           || hasExplicitNextSteps
+          || isProgressOnlyResponse
           || claimedButUnexecutedCommand
           || (hasRecentReplaceNotFound && (mentionsChange || claimsDone || isLazyAcknowledgment || hasIncompletePlan || hasExplicitNextSteps))
           || (hasRecentToolErrors && (claimsDone || mentionsChange || isLazyAcknowledgment))
           || (!hasRecentSuccessfulAction && (isLongDump || hasLargeCodeBlocks || claimsDone || mentionsChange || isLazyAcknowledgment))
-        ) && retryCount < 2;
+        ) && retryCount < maxNudgeRetries;
 
         if (shouldNudge) {
-          this.debugLog('nudge', { retryCount, hasRecentToolResults, hasRecentSuccessfulAction, hasRecentToolErrors, hasRecentReplaceNotFound, lastSuccessfulActionIndex, isLongDump, hasLargeCodeBlocks, claimsDone, mentionsChange, isLazyAcknowledgment, hasIncompletePlan: !!hasIncompletePlan, hasExplicitNextSteps, claimedButUnexecutedCommand, isPassingToUser, isAnnouncedButNotExecuted, contentPreview: finalContent.substring(0, 200) });
+          this.debugLog('nudge', { retryCount, hasRecentToolResults, hasRecentSuccessfulAction, hasRecentToolErrors, hasRecentReplaceNotFound, replaceNotFoundFilepath, lastSuccessfulActionIndex, isLongDump, hasLargeCodeBlocks, claimsDone, mentionsChange, isLazyAcknowledgment, hasIncompletePlan: !!hasIncompletePlan, hasExplicitNextSteps, isProgressOnlyResponse, claimedButUnexecutedCommand, isPassingToUser, isAnnouncedButNotExecuted, contentPreview: finalContent.substring(0, 200) });
           // Show plan/progress text to the user before nudging
-          if (hasIncompletePlan || hasExplicitNextSteps || claimedButUnexecutedCommand || claimsDone || mentionsChange || isPassingToUser || isAnnouncedButNotExecuted) {
+          if (!isProgressOnlyResponse && (hasIncompletePlan || hasExplicitNextSteps || claimedButUnexecutedCommand || claimsDone || mentionsChange || isPassingToUser || isAnnouncedButNotExecuted)) {
             const planText = finalContent.trim();
             if (planText) {
               messages.push({ role: 'assistant', content: planText });
@@ -1287,7 +1499,9 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           } else if (hasExplicitNextSteps) {
             nudgeMessage = 'You listed next steps but stopped before executing them. Continue now. Do not stop after the first step or the first issue — keep using tools until the scan is complete.';
           } else if (hasRecentReplaceNotFound) {
-            nudgeMessage = 'Your replace_in_file call failed because old_text did not match the real file content. Do NOT guess. First call read_specific_file for that file, then call replace_in_file again using the exact current text including whitespace.';
+            nudgeMessage = `Your replace_in_file call failed because old_text did not match the real file content.${replaceNotFoundFilepath ? ` First call read_specific_file for ${replaceNotFoundFilepath}.` : ' First call read_specific_file for that file.'} Do NOT guess. Then call replace_in_file again using the exact current text including whitespace.`;
+          } else if (isProgressOnlyResponse) {
+            nudgeMessage = 'Do not print progress updates like "Step 3/3" without taking action. Call a tool now. If you need the current file content, use read_specific_file first, then continue with replace_in_file or another appropriate tool.';
           } else if (claimedButUnexecutedCommand) {
             nudgeMessage = 'You claimed that a command or action was completed, but there is no matching tool execution in this exchange. Do not claim completion without actually running the command. Execute it now with execute_terminal_command or continue the remaining scan steps.';
           } else if (isAnnouncedButNotExecuted) {
@@ -1365,6 +1579,69 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       filepath,
       fileContent: fileContent.trim()
     };
+  }
+
+  private getLatestReplaceNotFoundContext(messages: OllamaMessage[]): { filepath?: string } | undefined {
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      const message = messages[index];
+      if (message.role !== 'tool') {
+        continue;
+      }
+
+      let parsed: Record<string, unknown> = {};
+      try {
+        parsed = JSON.parse(message.content) as Record<string, unknown>;
+      } catch {
+        parsed = {};
+      }
+
+      if (!parsed.error) {
+        if (message.tool_name === 'execute_terminal_command') {
+          if (Number(parsed.exitCode ?? 0) === 0) {
+            return undefined;
+          }
+          continue;
+        }
+
+        if (message.tool_name === 'create_or_edit_file'
+          || message.tool_name === 'write_to_file'
+          || message.tool_name === 'replace_in_file'
+          || message.tool_name === 'delete_file') {
+          return undefined;
+        }
+        continue;
+      }
+
+      if (message.tool_name === 'replace_in_file' && /old_text not found/i.test(String(parsed.error))) {
+        return { filepath: this.getReplaceInFilePathForToolMessage(messages, index) };
+      }
+    }
+
+    return undefined;
+  }
+
+  private getReplaceInFilePathForToolMessage(messages: OllamaMessage[], toolMessageIndex: number): string | undefined {
+    for (let index = toolMessageIndex - 1; index >= 0; index -= 1) {
+      const message = messages[index];
+      if (message.role !== 'assistant' || !message.tool_calls?.length) {
+        continue;
+      }
+
+      for (let toolIndex = message.tool_calls.length - 1; toolIndex >= 0; toolIndex -= 1) {
+        const toolCall = message.tool_calls[toolIndex];
+        if (this.remapWeakModelToolName(toolCall.function?.name ?? '') !== 'replace_in_file') {
+          continue;
+        }
+
+        const args = this.normalizeToolArguments(toolCall.function?.arguments);
+        const filepath = String(args.filepath ?? '').trim();
+        if (filepath) {
+          return filepath;
+        }
+      }
+    }
+
+    return undefined;
   }
 
   private matchResponseToAttachedFile(content: string): { filepath: string; fileContent: string } | undefined {
@@ -1512,27 +1789,48 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   }
 
   private stripDiffPrefixes(content: string): string {
-    // If content looks like a diff with +/- prefixes on most lines, strip them
+    // Only strip unified diff content. This avoids corrupting normal text such as Markdown lists.
     const lines = content.split('\n');
     const nonEmptyLines = lines.filter(l => l.trim().length > 0);
     if (nonEmptyLines.length < 3) {
       return content;
     }
+
+    const isMetadataLine = (line: string): boolean => {
+      const trimmed = line.trim();
+      return /^diff --git\s+/.test(trimmed)
+        || /^index\s+[0-9a-f]+\.\.[0-9a-f]+/.test(trimmed)
+        || /^@@\s+.+\s+@@/.test(trimmed)
+        || /^---(\s|$)/.test(trimmed)
+        || /^\+\+\+(\s|$)/.test(trimmed)
+        || /^\\ No newline at end of file$/.test(trimmed);
+    };
+
+    const hasUnifiedDiffMarkers = nonEmptyLines.some(line => isMetadataLine(line));
+    if (!hasUnifiedDiffMarkers) {
+      return content;
+    }
+
     const prefixedCount = nonEmptyLines.filter(l => /^[+-]\s/.test(l) || /^[+-](?![-+]{2})/.test(l)).length;
     if (prefixedCount / nonEmptyLines.length < 0.4) {
       return content;
     }
-    // Strip leading +/- prefix (keep space lines and context lines)
+
     return lines.map(line => {
+      if (isMetadataLine(line)) {
+        return '';
+      }
       if (/^\+(?!\+\+)/.test(line)) {
         return line.substring(1);
       }
       if (/^-(?!--)/.test(line)) {
-        return ''; // removed line — drop it
+        return '';
+      }
+      if (/^ /.test(line)) {
+        return line.substring(1);
       }
       return line;
     }).filter((line, i, arr) => {
-      // Remove consecutive blank lines left by stripped '-' lines
       if (line === '' && i > 0 && arr[i - 1] === '') {
         return false;
       }
@@ -1889,6 +2187,10 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       return false;
     }
 
+    if (/^\d+(?:\.\d+)+$/.test(trimmed)) {
+      return false;
+    }
+
     const lower = trimmed.toLowerCase();
     const banned = new Set([
       'directly',
@@ -1915,7 +2217,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       return true;
     }
 
-    if (/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]{1,12}$/.test(trimmed)) {
+    if (/^[A-Za-z0-9_-]+\.[A-Za-z][A-Za-z0-9_-]{0,11}$/.test(trimmed)) {
       return true;
     }
 
@@ -2143,10 +2445,9 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   }
 
   private async callOllama(messages: OllamaMessage[]): Promise<OllamaResponse> {
-    const config = vscode.workspace.getConfiguration('manulai');
-    const baseUrl = String(config.get('ollamaBaseUrl', 'http://localhost:11434')).replace(/\/$/, '');
+    const baseUrl = this.getOllamaBaseUrl();
     const model = this.getSelectedModel();
-    const systemPrompt = String(config.get('systemPrompt', '')).trim();
+    const systemPrompt = this.getSystemPrompt();
 
     const requestMessages: OllamaMessage[] = [];
 
@@ -2315,7 +2616,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     stripped = stripped.replace(/<function=[^>]+>\s*[\s\S]*?<\/function>/g, '');
     stripped = stripped.replace(/<\/?tool_call>/g, '');
     // Strip plain JSON tool call objects from the text
-    const toolNamePattern = /\{\s*"(?:name|function_name)"\s*:\s*"/g;
+    const toolNamePattern = /\{\s*"(?:name|function_name|function)"\s*:\s*"/g;
     let match: RegExpExecArray | null;
     while ((match = toolNamePattern.exec(stripped)) !== null) {
       const jsonStr = this.extractBalancedJson(stripped, match.index);
@@ -2370,7 +2671,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
 
     // Catch-all: extract balanced JSON objects that look like tool calls from plain text.
     // Models like Llama/Qwen/Gemma often output raw JSON tool calls directly.
-    const toolNamePattern = /\{\s*["'](?:name|function_name)["']\s*:\s*["']/g;
+    const toolNamePattern = /\{\s*["'](?:name|function_name|function)["']\s*:\s*["']/g;
     while ((match = toolNamePattern.exec(trimmed)) !== null) {
       const jsonStr = this.extractBalancedJson(trimmed, match.index);
       if (jsonStr) { candidates.push(jsonStr); }
@@ -2467,6 +2768,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     const obj = parsed as {
       type?: unknown;
       function?: { name?: unknown; arguments?: unknown };
+      functionName?: unknown;
       name?: unknown;
       function_name?: unknown;
       arguments?: unknown;
@@ -2481,10 +2783,16 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         && (functionArguments === undefined || typeof functionArguments === 'string' || (functionArguments !== null && typeof functionArguments === 'object'));
     }
 
+    if (typeof obj.function === 'string') {
+      const topLevelArgs = obj.arguments ?? obj.parameters;
+      return toolNames.has(this.remapWeakModelToolName(obj.function))
+        && (typeof topLevelArgs === 'string' || (topLevelArgs !== null && typeof topLevelArgs === 'object'));
+    }
+
     const topLevelName = obj.name ?? obj.function_name;
     const topLevelArgs = obj.arguments ?? obj.parameters;
     return typeof topLevelName === 'string'
-      && toolNames.has(topLevelName)
+      && toolNames.has(this.remapWeakModelToolName(topLevelName))
       && (typeof topLevelArgs === 'string' || (topLevelArgs !== null && typeof topLevelArgs === 'object'));
   }
 
@@ -2585,6 +2893,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     const record = rawValue as Record<string, unknown>;
     const directName = typeof record.name === 'string' ? record.name.trim()
       : typeof record.function_name === 'string' ? record.function_name.trim()
+      : typeof record.function === 'string' ? record.function.trim()
       : '';
     const directArguments = record.arguments ?? record.parameters;
     const functionRecord = this.toObjectRecord(record.function);
@@ -2622,25 +2931,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     }
 
     if (value && typeof value === 'object' && !Array.isArray(value)) {
-      const obj = value as Record<string, unknown>;
-      // Map common argument aliases used by weak models
-      const aliasMap: Record<string, string> = {
-        file_path: 'filepath',
-        file_name: 'filename',
-        file: 'filepath',
-        path: 'filepath',
-        old_string: 'old_text',
-        new_string: 'new_text',
-        old_code: 'old_text',
-        new_code: 'new_text',
-        cmd: 'command',
-        dir: 'directory'
-      };
-      const normalized: Record<string, unknown> = {};
-      for (const [key, val] of Object.entries(obj)) {
-        normalized[aliasMap[key] ?? key] = val;
-      }
-      return normalized;
+      return this.remapWeakModelArgumentAliases(value as Record<string, unknown>);
     }
 
     return undefined;
@@ -3165,10 +3456,15 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
 
       await this.writeWorkspaceText(targetUri, sanitizedContent);
 
+      const diff = oldContent !== undefined && oldContent !== sanitizedContent
+        ? this.buildDiffSummary(displayName, oldContent, sanitizedContent)
+        : undefined;
+
       return JSON.stringify({
         path: targetUri.fsPath,
         bytesWritten: Buffer.byteLength(sanitizedContent, 'utf8'),
-        preview: this.buildPreviewSnippet(sanitizedContent)
+        preview: oldContent === undefined || !oldContent.trim() ? this.buildPreviewSnippet(sanitizedContent) : undefined,
+        diff
       });
     } catch (error) {
       return JSON.stringify({
@@ -3519,12 +3815,13 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
 
       const updated = original.replace(oldText, newText);
       await this.writeWorkspaceText(target, updated);
+      const diff = this.buildDiffSummary(path.basename(target.fsPath), original, updated);
 
       return JSON.stringify({
         path: target.fsPath,
         replacements: 1,
         bytesWritten: Buffer.byteLength(updated, 'utf8'),
-        preview: this.buildPreviewSnippet(updated)
+        diff
       });
     } catch (error) {
       return JSON.stringify({
@@ -3553,12 +3850,13 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
 
       const updated = original.split(oldText).join(newText);
       await this.writeWorkspaceText(target, updated);
+      const diff = this.buildDiffSummary(path.basename(target.fsPath), original, updated);
 
       return JSON.stringify({
         path: target.fsPath,
         replacements: occurrences,
         bytesWritten: Buffer.byteLength(updated, 'utf8'),
-        preview: this.buildPreviewSnippet(updated)
+        diff
       });
     } catch (error) {
       return JSON.stringify({
@@ -3845,12 +4143,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
 
   private async setAgentMode(value: boolean | undefined): Promise<void> {
     this.agentMode = value !== undefined ? value : !this.agentMode;
-
-    const target = vscode.workspace.workspaceFolders?.length
-      ? vscode.ConfigurationTarget.Workspace
-      : vscode.ConfigurationTarget.Global;
-
-    await vscode.workspace.getConfiguration('manulai').update('agentMode', this.agentMode, target);
+    await this.persistStoredSetting('agentMode', this.agentMode);
     this.postStateToWebview();
     this.postStatus(
       this.agentMode
@@ -3869,11 +4162,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       this.pendingApprovalResolver = undefined;
     }
 
-    const target = vscode.workspace.workspaceFolders?.length
-      ? vscode.ConfigurationTarget.Workspace
-      : vscode.ConfigurationTarget.Global;
-
-    await vscode.workspace.getConfiguration('manulai').update('autoApprove', this.autoApprove, target);
+    await this.persistStoredSetting('autoApprove', this.autoApprove);
     this.postStateToWebview();
     this.postStatus(
       this.autoApprove
@@ -3884,16 +4173,15 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
 
   private async setDebugMode(value: boolean | undefined): Promise<void> {
     this.debugMode = value !== undefined ? value : !this.debugMode;
-
-    const target = vscode.workspace.workspaceFolders?.length
-      ? vscode.ConfigurationTarget.Workspace
-      : vscode.ConfigurationTarget.Global;
-
-    await vscode.workspace.getConfiguration('manulai').update('debugMode', this.debugMode, target);
+    await this.persistStoredSetting('debugMode', this.debugMode);
 
     if (this.debugMode) {
       this.startDebugSession();
-      this.postStatus('Debug Mode enabled. Logs are saved to .manulai/ folder.');
+      const folders = vscode.workspace.workspaceFolders;
+      const usingWorkspaceLogs = Boolean(folders?.length && folders[0].uri.scheme === 'file');
+      this.postStatus(usingWorkspaceLogs
+        ? 'Debug Mode enabled. Logs are saved to .manulai/ folder.'
+        : 'Debug Mode enabled. Logs are saved to extension storage for this workspace.');
     } else {
       this.stopDebugSession();
       this.postStatus('Debug Mode disabled.');
@@ -3903,20 +4191,24 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
 
   private getDebugLogDir(): string | undefined {
     const folders = vscode.workspace.workspaceFolders;
-    if (!folders?.length) { return undefined; }
-    if (folders[0].uri.scheme !== 'file') { return undefined; }
-    return path.join(folders[0].uri.fsPath, '.manulai', 'logs');
+    if (folders?.length && folders[0].uri.scheme === 'file') {
+      return path.join(folders[0].uri.fsPath, '.manulai', 'logs');
+    }
+    return path.join(this.extensionContext.globalStorageUri.fsPath, 'logs');
   }
 
   private startDebugSession(): void {
     const logDir = this.getDebugLogDir();
     if (!logDir) { return; }
     try {
+      if (this.debugLogFilePath) {
+        this.stopDebugSession();
+      }
       fs.mkdirSync(logDir, { recursive: true });
       const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
       this.debugSessionId = timestamp;
       const logFile = path.join(logDir, `session-${timestamp}.jsonl`);
-      this.debugLogStream = fs.createWriteStream(logFile, { flags: 'a', encoding: 'utf8' });
+      this.debugLogFilePath = logFile;
       this.debugLog('session_start', { version: this.extensionContext.extension.packageJSON?.version, model: this.getSelectedModel(), agentMode: this.agentMode, autoApprove: this.autoApprove });
     } catch {
       // Silently fail if we can't write logs
@@ -3924,22 +4216,30 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   }
 
   private stopDebugSession(): void {
-    if (this.debugLogStream) {
-      this.debugLog('session_end', {});
-      this.debugLogStream.end();
-      this.debugLogStream = undefined;
+    if (this.debugLogFilePath) {
+      this.writeDebugEntry('session_end', {});
+      this.debugLogFilePath = undefined;
     }
     this.debugSessionId = '';
   }
 
-  private debugLog(event: string, data: Record<string, unknown>): void {
-    if (!this.debugMode || !this.debugLogStream) { return; }
+  private writeDebugEntry(event: string, data: Record<string, unknown>): void {
+    if (!this.debugLogFilePath) {
+      return;
+    }
+
     try {
+      fs.mkdirSync(path.dirname(this.debugLogFilePath), { recursive: true });
       const entry = { ts: new Date().toISOString(), event, ...data };
-      this.debugLogStream.write(JSON.stringify(entry) + '\n');
+      fs.appendFileSync(this.debugLogFilePath, JSON.stringify(entry) + '\n', 'utf8');
     } catch {
       // Silently fail
     }
+  }
+
+  private debugLog(event: string, data: Record<string, unknown>): void {
+    if (!this.debugMode || !this.debugLogFilePath) { return; }
+    this.writeDebugEntry(event, data);
   }
 
   public dispose(): void {
@@ -4368,6 +4668,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         const targetPath = String(parsed?.path ?? parsed?.deleted ?? '');
         const bytesWritten = parsed?.bytesWritten !== undefined ? String(parsed.bytesWritten) : '';
         const replacements = parsed?.replacements !== undefined ? String(parsed.replacements) : '';
+        const diff = this.formatToolTextBlock(parsed?.diff);
         const preview = this.formatToolTextBlock(parsed?.preview);
         const parts = [`Path: ${targetPath || '(unknown path)'}`];
         if (bytesWritten) {
@@ -4376,7 +4677,9 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         if (replacements) {
           parts.push(`Replacements: ${replacements}`);
         }
-        if (preview) {
+        if (diff) {
+          parts.push(diff);
+        } else if (preview) {
           parts.push(`Preview\n\n\`\`\`text\n${preview}\n\`\`\``);
         }
         return {

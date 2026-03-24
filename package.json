@@ -164,7 +164,7 @@
         "manulai.debugMode": {
           "type": "boolean",
           "default": false,
-          "description": "When enabled, ManulAI saves detailed JSONL logs to .manulai/logs/ in the workspace. Logs include Ollama requests, tool calls, fallback decisions, and blocked writes."
+          "description": "When enabled, ManulAI saves detailed JSONL logs to .manulai/logs/ for file-backed workspaces, or to extension storage when the workspace is not file-backed. Logs include Ollama requests, tool calls, fallback decisions, and blocked writes."
         },
         "manulai.systemPrompt": {
           "type": "string",

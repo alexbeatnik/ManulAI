@@ -1,5 +1,6 @@
 .git/**
 .github/**
+.manulai/**
 .vscode/**
 node_modules/**
 src/**
