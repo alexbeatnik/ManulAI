@@ -1056,6 +1056,14 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         content: 'This is a large refactor request. Do NOT try to rewrite or summarize the whole file in one pass. First inspect structure with list_workspace_files and read_file_slice for bounded sections when the file is large. Then refactor in many small consecutive steps if needed: function-by-function, type-by-type, or one small self-contained block at a time. A long plan is acceptable, but do not stop after planning or after the first step. Keep using tools and continue the refactor across multiple consecutive small edits until the whole task is done or you are genuinely blocked by missing exact file context.',
         hiddenFromTranscript: true
       });
+        const preferredLargeRefactorTarget = await this.findPreferredLargeRefactorTargetPath(text);
+        if (preferredLargeRefactorTarget) {
+          this.messages.push({
+            role: 'user',
+            content: `Primary target file for this large refactor is ${preferredLargeRefactorTarget}. Use this exact file path or the same basename only. Do NOT invent alternate directories such as src/webview/chat or other nonexistent paths for this file.`,
+            hiddenFromTranscript: true
+          });
+        }
     }
 
     if (this.agentMode) {
@@ -1258,6 +1266,21 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     }
 
     return bestMatch?.fsPath;
+  }
+
+  private async findPreferredLargeRefactorTargetPath(text: string): Promise<string | undefined> {
+    const requestTargets = this.extractLikelyRequestFileTargets(text);
+    for (const requestTarget of requestTargets) {
+      const resolvedTarget = await this.findBestWorkspaceMatchForRequestTarget(requestTarget);
+      if (resolvedTarget) {
+        return resolvedTarget;
+      }
+    }
+
+    const activeEditorPath = vscode.window.activeTextEditor?.document.uri.scheme === 'file'
+      ? vscode.window.activeTextEditor.document.uri.fsPath
+      : undefined;
+    return activeEditorPath;
   }
 
   private async tryHandleDirectLicenseAuthorRename(text: string): Promise<FileWriteSummary | undefined> {
@@ -1971,7 +1994,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         const hasPreReadLargeRefactorNarration = Boolean(
           isLargeRefactorRequest
           && !hasRecentReadOfLargeRefactorTarget
-          && /(?:specific section|specific function|focus on initially|please wait while i read|reading [`'\w./-]+ file|analyzing [`'\w./-]+ file|inspect(?:ing)? the structure of [`'\w./-]+|reading project structure|i will start by breaking down [`'\w./-]+|before proceeding with the refactor)/i.test(finalContent)
+          && /(?:specific section|specific function|focus on initially|please wait while i read|reading [`'\w./-]+ file|reading first slice of [`'\w./-]+|reading [`'\w./-]+\.{0,3}|analyzing [`'\w./-]+ file|inspect(?:ing)? the structure of [`'\w./-]+|reading project structure|listing workspace files in [`'\w./-]+|i will start by breaking down [`'\w./-]+|before proceeding with the refactor)/i.test(finalContent)
         );
         const hasFakePreReadCodeDump = Boolean(
           isLargeRefactorRequest
@@ -1998,7 +2021,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         );
         const maxNudgeRetries = hasRecentReplaceNotFound
           ? 3
-          : (hasPreReadLargeRefactorNarration || hasFakePreReadCodeDump || hasLargeRefactorShellReadBypass)
+          : (hasPreReadLargeRefactorNarration || hasFakePreReadCodeDump || hasLargeRefactorShellReadBypass || (isLargeRefactorRequest && !hasRecentReadOfLargeRefactorTarget))
             ? 4
           : isAskingUserForExactSlice
             ? 5
@@ -4576,6 +4599,23 @@ If the user asks for a change but provides NO code:
         content
       });
     } catch (error) {
+      const recovered = await this.tryRecoverReadTargetUri(filepath);
+      if (recovered) {
+        try {
+          const content = await this.readWorkspaceText(recovered);
+          const languageId = vscode.workspace.textDocuments.find(doc => doc.uri.toString() === recovered.toString())?.languageId ?? 'plaintext';
+          this.debugLog('read_target_recovered', { requestedPath: filepath, recoveredPath: recovered.fsPath, tool: 'read_specific_file' });
+          return JSON.stringify({
+            path: recovered.fsPath,
+            languageId,
+            content,
+            recoveredFromPath: filepath
+          });
+        } catch {
+          // Fall through to the original error below.
+        }
+      }
+
       return JSON.stringify({
         error: error instanceof Error ? error.message : 'Failed to read file.'
       });
@@ -4634,10 +4674,87 @@ If the user asks for a change but provides NO code:
         content: slice
       });
     } catch (error) {
+      const recovered = await this.tryRecoverReadTargetUri(filepath);
+      if (recovered) {
+        try {
+          const content = await this.readWorkspaceText(recovered);
+          const languageId = vscode.workspace.textDocuments.find(doc => doc.uri.toString() === recovered.toString())?.languageId ?? 'plaintext';
+          const normalizedContent = content.replace(/\r\n/g, '\n');
+          const lines = normalizedContent.length > 0 ? normalizedContent.split('\n') : [];
+          const totalLines = lines.length;
+
+          if (totalLines === 0) {
+            this.debugLog('read_target_recovered', { requestedPath: filepath, recoveredPath: recovered.fsPath, tool: 'read_file_slice', startLine: start, endLine: end });
+            return JSON.stringify({
+              path: recovered.fsPath,
+              languageId,
+              startLine: 1,
+              endLine: 0,
+              totalLines: 0,
+              content: '',
+              recoveredFromPath: filepath
+            });
+          }
+
+          if (start > totalLines) {
+            return JSON.stringify({ error: `startLine ${start} exceeds total line count ${totalLines}.` });
+          }
+
+          const clampedEnd = Math.min(end, totalLines);
+          this.debugLog('read_target_recovered', { requestedPath: filepath, recoveredPath: recovered.fsPath, tool: 'read_file_slice', startLine: start, endLine: clampedEnd });
+          return JSON.stringify({
+            path: recovered.fsPath,
+            languageId,
+            startLine: start,
+            endLine: clampedEnd,
+            totalLines,
+            content: lines.slice(start - 1, clampedEnd).join('\n'),
+            recoveredFromPath: filepath
+          });
+        } catch {
+          // Fall through to the original error below.
+        }
+      }
+
       return JSON.stringify({
         error: error instanceof Error ? error.message : 'Failed to read file slice.'
       });
     }
+  }
+
+  private async tryRecoverReadTargetUri(filepath: string): Promise<vscode.Uri | undefined> {
+    const normalizedPath = filepath.trim().replace(/\\/g, '/');
+    if (!normalizedPath) {
+      return undefined;
+    }
+
+    const basename = path.basename(normalizedPath);
+    if (!basename) {
+      return undefined;
+    }
+
+    const activeEditorPath = vscode.window.activeTextEditor?.document.uri.scheme === 'file'
+      ? vscode.window.activeTextEditor.document.uri.fsPath
+      : undefined;
+    if (activeEditorPath && path.basename(activeEditorPath).toLowerCase() === basename.toLowerCase()) {
+      return vscode.Uri.file(activeEditorPath);
+    }
+
+    const latestVisibleUserRequest = this.getLatestVisibleUserRequest(this.messages);
+    const requestTargets = latestVisibleUserRequest ? this.extractLikelyRequestFileTargets(latestVisibleUserRequest) : [];
+    for (const requestTarget of requestTargets) {
+      const resolvedTarget = await this.findBestWorkspaceMatchForRequestTarget(requestTarget);
+      if (resolvedTarget && path.basename(resolvedTarget).toLowerCase() === basename.toLowerCase()) {
+        return vscode.Uri.file(resolvedTarget);
+      }
+    }
+
+    const resolvedByBasename = await this.resolveExistingWorkspacePath(basename);
+    if (resolvedByBasename && path.basename(resolvedByBasename).toLowerCase() === basename.toLowerCase()) {
+      return vscode.Uri.file(resolvedByBasename);
+    }
+
+    return undefined;
   }
 
   private async createOrEditFile(filename: string, content: string): Promise<string> {
