@@ -1971,13 +1971,13 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         const hasPreReadLargeRefactorNarration = Boolean(
           isLargeRefactorRequest
           && !hasRecentReadOfLargeRefactorTarget
-          && /(?:specific section|specific function|focus on initially|please wait while i read|reading [`'\w./-]+ file|analyzing [`'\w./-]+ file)/i.test(finalContent)
+          && /(?:specific section|specific function|focus on initially|please wait while i read|reading [`'\w./-]+ file|analyzing [`'\w./-]+ file|inspect(?:ing)? the structure of [`'\w./-]+|reading project structure|i will start by breaking down [`'\w./-]+|before proceeding with the refactor)/i.test(finalContent)
         );
         const hasFakePreReadCodeDump = Boolean(
           isLargeRefactorRequest
           && !hasRecentReadOfLargeRefactorTarget
-          && hasLargeCodeBlocks
-          && /(?:bounded lines|reading bounded lines|first\s+\d+\s+lines|content of [`'\w./-]+|here(?: is| are) the lines|analyzing [`'\w./-]+ file)/i.test(finalContent)
+          && (hasLargeCodeBlocks || isLongDump)
+          && /(?:bounded lines|reading bounded lines|first\s+\d+\s+lines|content of [`'\w./-]+|here(?: is| are) the lines|analyzing [`'\w./-]+ file|placeholder for the actual code content|replace this with the actual content|"items"\s*:\s*\[|"content"\s*:\s*"|reading project structure|reading [`'\w./-]+\.{0,3})/i.test(finalContent)
         );
         const hasReadButNoWriteOnLargeRefactor = isLargeRefactorRequest
           && hasRecentReadOfLargeRefactorTarget
@@ -1988,8 +1988,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         );
         const isAskingUserForExactSlice = Boolean(
           isLargeRefactorRequest
-          && hasRecentReadOfLargeRefactorTarget
-          && /(?:please provide|provide) the exact startline and endline|exact startline and endline|bounded slice you would like to extract/i.test(finalContent)
+          && /(?:please provide|provide) (?:the )?(?:exact startline and endline|first\s+\d+\s+lines|next\s+\d+\s+lines|lines?\s+\d+\s*(?:to|-)+\s*\d+|bounded slice)|exact startline and endline|bounded slice you would like to extract|replace this with the actual content/i.test(finalContent)
         );
         const hasPostCreateRefactorNarration = Boolean(
           isLargeRefactorRequest
@@ -2028,7 +2027,12 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         if (shouldNudge) {
           this.debugLog('nudge', { retryCount, hasRecentToolResults, hasRecentSuccessfulAction, hasRecentMeaningfulWrite, latestCreatedFilePath, hasRecentReadOfLargeRefactorTarget, hasLargeRefactorShellReadBypass, hasPreReadLargeRefactorNarration, hasFakePreReadCodeDump, isAskingUserForExactSlice, suggestedNextSlice, hasReadButNoWriteOnLargeRefactor, hasPostReadToolStall, hasPostCreateRefactorNarration, announcedNewFilePath, hasRecentToolErrors, hasRecentReplaceNotFound, replaceNotFoundFilepath, replaceNotFoundStartLine, replaceNotFoundEndLine, lastSuccessfulActionIndex, isLongDump, hasLargeCodeBlocks, claimsDone, mentionsChange, isLazyAcknowledgment, hasIncompletePlan: !!hasIncompletePlan, hasExplicitNextSteps, isProgressOnlyResponse, claimedButUnexecutedCommand, isPassingToUser, isAnnouncedButNotExecuted, isLargeRefactorRequest, contentPreview: finalContent.substring(0, 200) });
           // Show plan/progress text to the user before nudging
-          if (!isProgressOnlyResponse && (hasIncompletePlan || hasExplicitNextSteps || claimedButUnexecutedCommand || claimsDone || mentionsChange || isPassingToUser || isAnnouncedButNotExecuted)) {
+          if (!isProgressOnlyResponse
+            && !hasFakePreReadCodeDump
+            && !hasPreReadLargeRefactorNarration
+            && !isAskingUserForExactSlice
+            && !(isLargeRefactorRequest && !hasRecentSuccessfulAction && (isLongDump || hasLargeCodeBlocks))
+            && (hasIncompletePlan || hasExplicitNextSteps || claimedButUnexecutedCommand || claimsDone || mentionsChange || isPassingToUser || isAnnouncedButNotExecuted)) {
             const planText = finalContent.trim();
             if (planText) {
               messages.push({ role: 'assistant', content: planText });
@@ -2049,13 +2053,13 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           } else if (isAskingUserForExactSlice) {
             const primaryTarget = largeRefactorTargets[0] ?? 'the target file';
             if (suggestedNextSlice?.filepath && suggestedNextSlice.startLine && suggestedNextSlice.endLine) {
-              nudgeMessage = `This is a large refactor request for ${primaryTarget}. Do NOT ask the user for exact startLine and endLine. Choose the next bounded slice yourself. Your next response must call read_file_slice for ${suggestedNextSlice.filepath} with startLine=${suggestedNextSlice.startLine} and endLine=${suggestedNextSlice.endLine}. After that, continue with one small extraction step from that slice.`;
+              nudgeMessage = `This is a large refactor request for ${primaryTarget}. Do NOT ask the user to provide file lines, content, or exact startLine and endLine. Choose the next bounded slice yourself. Your next response must call read_file_slice for ${suggestedNextSlice.filepath} with startLine=${suggestedNextSlice.startLine} and endLine=${suggestedNextSlice.endLine}. After that, continue with one small extraction step from that slice.`;
             } else {
-              nudgeMessage = `This is a large refactor request for ${primaryTarget}. Do NOT ask the user for exact startLine and endLine. Choose the next bounded slice yourself and call read_file_slice now. Start with startLine=1 and endLine=120 if you have no better slice yet.`;
+              nudgeMessage = `This is a large refactor request for ${primaryTarget}. Do NOT ask the user to provide file lines, content, or exact startLine and endLine. Choose the next bounded slice yourself and call read_file_slice now. Start with startLine=1 and endLine=120 if you have no better slice yet.`;
             }
           } else if (hasFakePreReadCodeDump) {
             const primaryTarget = largeRefactorTargets[0] ?? 'the target file';
-            nudgeMessage = `This is a large refactor request for ${primaryTarget}. Do NOT paste guessed or remembered code blocks and do NOT claim that you already read bounded lines without a tool call. Your next response must call read_file_slice immediately for ${primaryTarget} with startLine=1 and endLine=120. Use the actual tool result, not a pasted snippet.`;
+            nudgeMessage = `This is a large refactor request for ${primaryTarget}. Do NOT paste guessed or remembered code blocks, JSON project structure dumps, or placeholder snippets, and do NOT claim that you already read bounded lines without a tool call. Your next response must call read_file_slice immediately for ${primaryTarget} with startLine=1 and endLine=120. Use the actual tool result, not a pasted snippet.`;
           } else if (hasPreReadLargeRefactorNarration) {
             const primaryTarget = largeRefactorTargets[0] ?? 'the target file';
             nudgeMessage = `This is a large refactor request for ${primaryTarget}. Do NOT ask the user which section to start with, and do NOT say that you will read the file later. Your next response must call read_file_slice immediately for ${primaryTarget} with startLine=1 and endLine=120. After that, continue with the next bounded slice or the next small extraction step.`;
