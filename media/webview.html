@@ -104,18 +104,6 @@
       letter-spacing: 0.01em;
     }
 
-    .subtitle {
-      margin: 2px 0 0;
-      font-size: 10px;
-      color: var(--muted);
-      line-height: 1.3;
-      line-clamp: 2;
-      display: -webkit-box;
-      -webkit-line-clamp: 2;
-      -webkit-box-orient: vertical;
-      overflow: hidden;
-    }
-
     .status-pill {
       flex-shrink: 0;
       display: inline-flex;
@@ -971,18 +959,28 @@
 
     .composer-buttons {
       display: flex;
-      align-items: center;
+      align-items: flex-end;
       gap: 8px;
       flex-shrink: 0;
       flex-wrap: wrap;
-      justify-content: flex-end;
+      justify-content: flex-start;
     }
 
     .composer-toggles {
       display: inline-flex;
-      align-items: center;
+      align-items: flex-end;
       gap: 6px;
       flex-wrap: wrap;
+      order: 3;
+      margin-left: auto;
+    }
+
+    .stop {
+      order: 1;
+    }
+
+    .send {
+      order: 2;
     }
 
     .composer-hint {
@@ -1271,20 +1269,6 @@
     }
 
     @media (max-width: 920px) {
-      .topbar {
-        grid-template-columns: 1fr;
-        align-items: stretch;
-      }
-
-      .controls {
-        grid-template-columns: 1fr;
-        gap: 6px;
-      }
-
-      .control-group.secondary {
-        justify-content: flex-start;
-      }
-
       .header {
         padding: 8px 11px 7px;
       }
@@ -1299,6 +1283,12 @@
     }
 
     @media (max-width: 520px) {
+      .topbar {
+        grid-template-columns: auto minmax(0, 1fr);
+        align-items: start;
+        gap: 4px;
+      }
+
       .header-row {
         flex-wrap: wrap;
       }
@@ -1321,9 +1311,9 @@
 
       .controls {
         display: flex;
-        flex-direction: column;
-        align-items: stretch;
-        gap: 4px;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 4px 5px;
       }
 
       .control-group {
@@ -1334,10 +1324,9 @@
       }
 
       .topbar-primary,
-      .topbar-secondary,
       .context-actions,
-      .control-group {
-        width: 100%;
+      .control-group.primary {
+        width: auto;
       }
 
       .context-actions {
@@ -1346,7 +1335,18 @@
         gap: 4px;
       }
 
+      .topbar-secondary {
+        width: 100%;
+        min-width: 0;
+      }
+
+      .control-group.primary {
+        flex: 0 0 auto;
+      }
+
       .control-group.secondary {
+        flex: 1 1 100%;
+        width: 100%;
         justify-content: flex-start;
       }
 
@@ -1378,7 +1378,7 @@
       .model-select,
       .chat-select,
       .compact-select {
-        flex: 1 1 100%;
+        flex: 1 1 156px;
         width: 100%;
         max-width: none;
       }
@@ -1390,16 +1390,27 @@
 
       .composer-buttons {
         width: 100%;
-        justify-content: space-between;
+        justify-content: flex-start;
       }
 
       .composer-toggles {
-        width: 100%;
-        justify-content: flex-start;
+        width: auto;
+        justify-content: flex-end;
+        margin-left: auto;
       }
     }
 
     @media (max-width: 380px) {
+      .topbar {
+        grid-template-columns: 1fr;
+      }
+
+      .topbar-primary,
+      .context-actions,
+      .control-group.primary {
+        width: 100%;
+      }
+
       .header {
         padding: 7px 9px 6px;
       }
@@ -1589,7 +1600,6 @@
       <div class="title-wrap">
         <p class="eyebrow">Chat</p>
         <p class="title">ManulAI <span id="versionBadge" class="version-badge"></span></p>
-        <p class="subtitle">Local-first coding agent in the right sidebar. Click Browse or use Attach to ManulAI Chat from Explorer to add context.</p>
       </div>
       <div id="statusPill" class="status-pill">Ready</div>
     </div>
