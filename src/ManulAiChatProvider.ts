@@ -4393,7 +4393,8 @@ If the user asks for a change but provides NO code:
     }
 
     if (allowCreate) {
-      return directUri;
+      const requestScopedCreateUri = await this.resolveRequestScopedCreateUri(normalizedTarget);
+      return requestScopedCreateUri ?? directUri;
     }
 
     const existingPath = await this.resolveExistingWorkspacePath(normalizedTarget);
@@ -4402,6 +4403,38 @@ If the user asks for a change but provides NO code:
     }
 
     return directUri;
+  }
+
+  private async resolveRequestScopedCreateUri(targetPath: string): Promise<vscode.Uri | undefined> {
+    const normalizedTarget = targetPath.trim().replace(/\\/g, '/');
+    if (!normalizedTarget || normalizedTarget.includes('/')) {
+      return undefined;
+    }
+
+    const latestVisibleUserRequest = this.getLatestVisibleUserRequest(this.messages);
+    if (!latestVisibleUserRequest || !this.looksLikeLargeRefactorRequest(latestVisibleUserRequest)) {
+      return undefined;
+    }
+
+    const requestTargets = this.extractLikelyRequestFileTargets(latestVisibleUserRequest);
+    for (const requestTarget of requestTargets) {
+      const resolvedTarget = await this.resolveExistingWorkspacePath(requestTarget);
+      if (!resolvedTarget) {
+        continue;
+      }
+
+      const preferredDir = path.dirname(resolvedTarget);
+      return vscode.Uri.file(path.join(preferredDir, normalizedTarget));
+    }
+
+    const activeEditorPath = vscode.window.activeTextEditor?.document.uri.scheme === 'file'
+      ? vscode.window.activeTextEditor.document.uri.fsPath
+      : undefined;
+    if (activeEditorPath) {
+      return vscode.Uri.file(path.join(path.dirname(activeEditorPath), normalizedTarget));
+    }
+
+    return undefined;
   }
 
   private async readActiveFile(): Promise<string> {
