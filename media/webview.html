@@ -79,8 +79,7 @@
 
     .header-row {
       display: flex;
-      align-items: flex-start;
-      justify-content: space-between;
+        align-items: center;
       gap: 10px;
     }
 
@@ -102,6 +101,27 @@
       font-size: var(--header-height);
       font-weight: 700;
       letter-spacing: 0.01em;
+      display: flex;
+      align-items: baseline;
+      gap: 6px;
+      min-width: 0;
+      white-space: nowrap;
+      overflow: hidden;
+    }
+
+    .title-label {
+      color: var(--accent);
+      font-size: 9px;
+      font-weight: 700;
+      letter-spacing: 0.16em;
+      text-transform: uppercase;
+      flex-shrink: 0;
+    }
+
+    .title-product {
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
     }
 
     .status-pill {
@@ -140,10 +160,17 @@
 
     .chat-strip {
       display: grid;
-      grid-template-columns: minmax(0, 1fr) repeat(2, auto);
+      grid-template-columns: minmax(0, 1fr) auto repeat(2, auto);
       gap: 4px;
       align-items: center;
       margin-top: 8px;
+    }
+
+    .chat-strip .status-pill {
+      min-width: 0;
+      max-width: 100%;
+      overflow: hidden;
+      text-overflow: ellipsis;
     }
 
     .workspace {
@@ -859,6 +886,7 @@
       color: var(--muted);
       letter-spacing: 0.04em;
       vertical-align: middle;
+      flex-shrink: 0;
     }
 
     .chip span {
@@ -964,7 +992,7 @@
     .composer-actions {
       display: flex;
       align-items: center;
-      justify-content: space-between;
+        justify-content: flex-end;
       gap: 10px;
       padding: 0 10px 10px;
     }
@@ -976,16 +1004,18 @@
       flex: 1 1 auto;
       min-width: 0;
       flex-wrap: nowrap;
-      justify-content: flex-start;
+        justify-content: flex-end;
+        margin-left: auto;
     }
 
     .composer-toggles {
       display: inline-flex;
       align-items: flex-end;
       gap: 6px;
-      flex: 1 1 auto;
+        flex: 0 1 auto;
       min-width: 0;
       flex-wrap: nowrap;
+        justify-content: flex-end;
     }
 
     .composer-submit-actions {
@@ -1340,7 +1370,7 @@
       }
 
       .chat-strip {
-        grid-template-columns: minmax(0, 1fr) auto auto;
+        grid-template-columns: minmax(0, 1fr) auto auto auto;
       }
 
       .chat-select {
@@ -1633,13 +1663,12 @@
   <header class="header">
     <div class="header-row">
       <div class="title-wrap">
-        <p class="eyebrow">Chat</p>
-        <p class="title">ManulAI <span id="versionBadge" class="version-badge"></span></p>
+        <p class="title"><span class="title-label">Chat</span><span class="title-product">ManulAI Local Agent</span><span id="versionBadge" class="version-badge"></span></p>
       </div>
-      <div id="statusPill" class="status-pill">Ready</div>
     </div>
     <div class="chat-strip">
       <select id="chatSelect" class="chat-select compact-select" aria-label="Current chat" title="Select chat"></select>
+      <div id="statusPill" class="status-pill">Ready</div>
       <button id="newChat" class="ghost-button icon-button" type="button" title="Create chat" aria-label="Create chat">
         <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M7.25 2h1.5v5.25H14v1.5H8.75V14h-1.5V8.75H2v-1.5h5.25V2z"/></svg>
       </button>
@@ -1719,9 +1748,6 @@
           </div>
           <textarea id="input" placeholder="Ask ManulAI to inspect, change, or explain code..."></textarea>
           <div class="composer-actions">
-            <div class="composer-hint">
-              <span><strong>Tip:</strong> use Browse, Active File, or Explorer attach actions to add context.</span>
-            </div>
             <div class="composer-buttons">
               <div class="composer-toggles">
                 <label class="toggle-switch toolbar-toggle" title="Enable Agent Mode so Ollama can call local tools automatically">
@@ -2465,7 +2491,7 @@
         pendingApproval = payload.pendingApproval || null;
         activeFile = payload.activeFile || null;
         if (payload.extensionVersion && versionBadgeEl) {
-          versionBadgeEl.textContent = 'v' + payload.extensionVersion;
+          versionBadgeEl.textContent = payload.extensionVersion;
         }
         render();
         return;
