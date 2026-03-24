@@ -538,7 +538,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     };
 
     let match: RegExpExecArray | null;
-    const explicitPathPattern = /(?:^|\s)([A-Za-z0-9_./-]+\.(?:ts|tsx|js|jsx|json|md|css|scss|html|py|yml|yaml|xml|txt|sh|toml|ini))(?:\s|$)/gi;
+    const explicitPathPattern = /(?:^|\s)((?:[A-Za-z]:)?[A-Za-z0-9_./\\-]+\.(?:ts|tsx|js|jsx|json|md|css|scss|html|py|yml|yaml|xml|txt|sh|toml|ini))(?:\s|$)/gi;
     while ((match = explicitPathPattern.exec(text)) !== null) {
       pushCandidate(match[1]);
     }
@@ -576,7 +576,12 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   }
 
   private async findBestWorkspaceMatchForRequestTarget(target: string): Promise<string | undefined> {
-    const normalizedTarget = target.trim().replace(/^\.\//, '');
+    let normalizedTarget = target.trim().replace(/\\/g, '/');
+    if (!path.isAbsolute(normalizedTarget)) {
+      normalizedTarget = normalizedTarget.replace(/^\.\//, '');
+      normalizedTarget = normalizedTarget.replace(/^\.[/\\]/, '');
+      normalizedTarget = normalizedTarget.replace(/^[/\\]+/, '');
+    }
     if (!normalizedTarget) {
       return undefined;
     }
@@ -2437,14 +2442,41 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   private looksLikeToolCallContent(content: string): boolean {
     const trimmed = content.trim();
     if (!trimmed.startsWith('{')) { return false; }
-    const toolNames = this.getToolDefinitions().map(t => t.function.name);
-    for (const name of toolNames) {
-      // Match both double-quoted and single-quoted key/value patterns
-      if (/["']name["']/.test(trimmed) && trimmed.includes(name) && /["']arguments["']/.test(trimmed)) {
-        return true;
-      }
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(trimmed);
+    } catch {
+      return false;
     }
-    return false;
+
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return false;
+    }
+
+    const toolNames = new Set(this.getToolDefinitions().map(t => t.function.name));
+    const obj = parsed as {
+      type?: unknown;
+      function?: { name?: unknown; arguments?: unknown };
+      name?: unknown;
+      function_name?: unknown;
+      arguments?: unknown;
+      parameters?: unknown;
+    };
+
+    if (obj.type === 'function' && obj.function && typeof obj.function === 'object') {
+      const functionName = obj.function.name;
+      const functionArguments = obj.function.arguments;
+      return typeof functionName === 'string'
+        && toolNames.has(functionName)
+        && (functionArguments === undefined || typeof functionArguments === 'string' || (functionArguments !== null && typeof functionArguments === 'object'));
+    }
+
+    const topLevelName = obj.name ?? obj.function_name;
+    const topLevelArgs = obj.arguments ?? obj.parameters;
+    return typeof topLevelName === 'string'
+      && toolNames.has(topLevelName)
+      && (typeof topLevelArgs === 'string' || (topLevelArgs !== null && typeof topLevelArgs === 'object'));
   }
 
   /** Extract a balanced JSON object starting at `startIndex` in `text`. */
@@ -3709,6 +3741,9 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     const maxContentChars = 220_000;
     const skipDirs = new Set(['.git', 'node_modules', '.next', 'dist', 'out', 'build', '__pycache__', '.venv', 'venv', '.tox', 'coverage', '.nyc_output', '.cache']);
     const skipExtensions = new Set(['.png', '.jpg', '.jpeg', '.gif', '.bmp', '.ico', '.svg', '.woff', '.woff2', '.ttf', '.eot', '.mp3', '.mp4', '.zip', '.tar', '.gz', '.lock', '.vsix']);
+    const allowedHiddenDirs = new Set(['.github', '.vscode']);
+    const skipFileNames = new Set(['.env', 'id_rsa', 'id_dsa', 'id_ecdsa', 'id_ed25519']);
+    const skipFilePatterns = [/^\.env\./i, /\.(?:pem|key|p12|pfx|crt|cer|der)$/i];
 
     const collected: string[] = [];
     const listedFiles: string[] = [];
@@ -3730,13 +3765,14 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         const childUri = vscode.Uri.joinPath(dir, name);
 
         if (type & vscode.FileType.Directory) {
-          if (!skipDirs.has(name) && !name.startsWith('.')) {
+          if (!skipDirs.has(name) && (!name.startsWith('.') || allowedHiddenDirs.has(name))) {
             await walk(childUri, depth + 1);
           }
           continue;
         }
 
         if (!(type & vscode.FileType.File)) { continue; }
+        if (skipFileNames.has(name) || skipFilePatterns.some(pattern => pattern.test(name))) { continue; }
         const ext = path.extname(name).toLowerCase();
         if (skipExtensions.has(ext)) { continue; }
 
@@ -3853,6 +3889,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   private getDebugLogDir(): string | undefined {
     const folders = vscode.workspace.workspaceFolders;
     if (!folders?.length) { return undefined; }
+    if (folders[0].uri.scheme !== 'file') { return undefined; }
     return path.join(folders[0].uri.fsPath, '.manulai', 'logs');
   }
 
@@ -3893,6 +3930,10 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     } catch {
       // Silently fail
     }
+  }
+
+  public dispose(): void {
+    this.stopDebugSession();
   }
 
   private synchronizeAttachmentContextMessage(): void {
@@ -4331,8 +4372,23 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           content: parts.join('\n\n')
         };
       }
-      default:
-        return undefined;
+      default: {
+        const error = parsed?.error ? String(parsed.error) : '';
+        if (error) {
+          return {
+            role: 'tool',
+            content: `Tool: ${message.tool_name}\n\n${error}`
+          };
+        }
+
+        const summary = this.formatToolTextBlock(JSON.stringify(parsed, null, 2));
+        return {
+          role: 'tool',
+          content: summary
+            ? `Tool: ${message.tool_name}\n\nResult\n\n\`\`\`json\n${summary}\n\`\`\``
+            : `Tool: ${message.tool_name}`
+        };
+      }
     }
   }
 

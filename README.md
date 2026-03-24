@@ -73,7 +73,7 @@ ManulAI has two working modes:
 
 ### Visible Tool Transcript
 
-- tool execution results are rendered in the chat instead of staying hidden
+- tool execution results are rendered in the chat with compact summaries, previews, or full terminal output as appropriate
 - terminal actions show the command, exit code, stdout, stderr, and tool error text when present
 - file creation and rewrite actions show a preview, including when an empty file was filled for the first time
 - multi-step actions can print progress step-by-step while tools are running

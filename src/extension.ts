@@ -19,6 +19,8 @@ export function activate(context: vscode.ExtensionContext): void {
   const provider = new ManulAiChatProvider(context);
   const launcherProvider = new ManulAiLauncherProvider();
 
+  context.subscriptions.push(provider);
+
   const openSecondarySidebar = async (): Promise<void> => {
     const commandsToTry = [
       'workbench.action.focusAuxiliaryBar',
