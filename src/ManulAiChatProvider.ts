@@ -1846,7 +1846,8 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
               continue;
             }
             if (message.tool_name === 'execute_terminal_command') {
-              if (Number(parsed.exitCode ?? 0) === 0) {
+              const command = String(parsed.command ?? '');
+              if (Number(parsed.exitCode ?? 0) === 0 && !this.isTerminalReadOnlyInspectionCommand(command)) {
                 return index;
               }
               continue;
@@ -1867,7 +1868,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
             return false;
           }
           if (message.tool_name === 'execute_terminal_command') {
-            return Number(parsed.exitCode ?? 0) === 0;
+            return Number(parsed.exitCode ?? 0) === 0 && !this.isTerminalReadOnlyInspectionCommand(String(parsed.command ?? ''));
           }
           if (message.tool_name === 'create_or_edit_file') {
             return !this.isPlaceholderCreateResult(parsed);
@@ -1963,6 +1964,10 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
 
         const announcedNewFilePath = this.extractAnnouncedNewFilePath(finalContent);
         const suggestedNextSlice = this.suggestNextLargeRefactorSlice(recentToolResults, largeRefactorTargets);
+        const hasLargeRefactorShellReadBypass = Boolean(
+          isLargeRefactorRequest
+          && recentToolResults.some(({ message, parsed }) => message.tool_name === 'execute_terminal_command' && this.isTerminalReadOnlyInspectionCommand(String(parsed.command ?? '')))
+        );
         const hasPreReadLargeRefactorNarration = Boolean(
           isLargeRefactorRequest
           && !hasRecentReadOfLargeRefactorTarget
@@ -1972,7 +1977,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           isLargeRefactorRequest
           && !hasRecentReadOfLargeRefactorTarget
           && hasLargeCodeBlocks
-          && /(?:bounded lines|reading bounded lines|content of [`'\w./-]+|here(?: is| are) the lines|analyzing [`'\w./-]+ file)/i.test(finalContent)
+          && /(?:bounded lines|reading bounded lines|first\s+\d+\s+lines|content of [`'\w./-]+|here(?: is| are) the lines|analyzing [`'\w./-]+ file)/i.test(finalContent)
         );
         const hasReadButNoWriteOnLargeRefactor = isLargeRefactorRequest
           && hasRecentReadOfLargeRefactorTarget
@@ -1990,7 +1995,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         );
         const maxNudgeRetries = hasRecentReplaceNotFound
           ? 3
-          : (hasPreReadLargeRefactorNarration || hasFakePreReadCodeDump)
+          : (hasPreReadLargeRefactorNarration || hasFakePreReadCodeDump || hasLargeRefactorShellReadBypass)
             ? 4
           : isAskingUserForExactSlice
             ? 5
@@ -2004,6 +2009,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           || hasExplicitNextSteps
           || isProgressOnlyResponse
           || claimedButUnexecutedCommand
+          || hasLargeRefactorShellReadBypass
           || hasPreReadLargeRefactorNarration
           || hasFakePreReadCodeDump
           || isAskingUserForExactSlice
@@ -2016,7 +2022,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         const shouldNudge = requiresToolContinuation && retryCount < maxNudgeRetries;
 
         if (shouldNudge) {
-          this.debugLog('nudge', { retryCount, hasRecentToolResults, hasRecentSuccessfulAction, hasRecentMeaningfulWrite, latestCreatedFilePath, hasRecentReadOfLargeRefactorTarget, hasPreReadLargeRefactorNarration, hasFakePreReadCodeDump, isAskingUserForExactSlice, suggestedNextSlice, hasReadButNoWriteOnLargeRefactor, hasPostCreateRefactorNarration, announcedNewFilePath, hasRecentToolErrors, hasRecentReplaceNotFound, replaceNotFoundFilepath, replaceNotFoundStartLine, replaceNotFoundEndLine, lastSuccessfulActionIndex, isLongDump, hasLargeCodeBlocks, claimsDone, mentionsChange, isLazyAcknowledgment, hasIncompletePlan: !!hasIncompletePlan, hasExplicitNextSteps, isProgressOnlyResponse, claimedButUnexecutedCommand, isPassingToUser, isAnnouncedButNotExecuted, isLargeRefactorRequest, contentPreview: finalContent.substring(0, 200) });
+          this.debugLog('nudge', { retryCount, hasRecentToolResults, hasRecentSuccessfulAction, hasRecentMeaningfulWrite, latestCreatedFilePath, hasRecentReadOfLargeRefactorTarget, hasLargeRefactorShellReadBypass, hasPreReadLargeRefactorNarration, hasFakePreReadCodeDump, isAskingUserForExactSlice, suggestedNextSlice, hasReadButNoWriteOnLargeRefactor, hasPostCreateRefactorNarration, announcedNewFilePath, hasRecentToolErrors, hasRecentReplaceNotFound, replaceNotFoundFilepath, replaceNotFoundStartLine, replaceNotFoundEndLine, lastSuccessfulActionIndex, isLongDump, hasLargeCodeBlocks, claimsDone, mentionsChange, isLazyAcknowledgment, hasIncompletePlan: !!hasIncompletePlan, hasExplicitNextSteps, isProgressOnlyResponse, claimedButUnexecutedCommand, isPassingToUser, isAnnouncedButNotExecuted, isLargeRefactorRequest, contentPreview: finalContent.substring(0, 200) });
           // Show plan/progress text to the user before nudging
           if (!isProgressOnlyResponse && (hasIncompletePlan || hasExplicitNextSteps || claimedButUnexecutedCommand || claimsDone || mentionsChange || isPassingToUser || isAnnouncedButNotExecuted)) {
             const planText = finalContent.trim();
@@ -2033,7 +2039,10 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           });
           
           let nudgeMessage = '';
-          if (isAskingUserForExactSlice) {
+          if (hasLargeRefactorShellReadBypass) {
+            const primaryTarget = largeRefactorTargets[0] ?? 'the target file';
+            nudgeMessage = `This is a large refactor request for ${primaryTarget}. Do NOT use execute_terminal_command for file inspection commands like cat, head, tail, sed, or ls. Use file tools only. Your next response must call read_file_slice for ${primaryTarget} with startLine=1 and endLine=120, or use the next suggested bounded slice if you already have one.`;
+          } else if (isAskingUserForExactSlice) {
             const primaryTarget = largeRefactorTargets[0] ?? 'the target file';
             if (suggestedNextSlice?.filepath && suggestedNextSlice.startLine && suggestedNextSlice.endLine) {
               nudgeMessage = `This is a large refactor request for ${primaryTarget}. Do NOT ask the user for exact startLine and endLine. Choose the next bounded slice yourself. Your next response must call read_file_slice for ${suggestedNextSlice.filepath} with startLine=${suggestedNextSlice.startLine} and endLine=${suggestedNextSlice.endLine}. After that, continue with one small extraction step from that slice.`;
@@ -2113,6 +2122,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
             hasRecentMeaningfulWrite,
             latestCreatedFilePath,
             hasRecentReadOfLargeRefactorTarget,
+            hasLargeRefactorShellReadBypass,
             hasPreReadLargeRefactorNarration,
             hasFakePreReadCodeDump,
             isAskingUserForExactSlice,
@@ -5172,6 +5182,17 @@ If the user asks for a change but provides NO code:
     }
 
     return undefined;
+  }
+
+  private isTerminalReadOnlyInspectionCommand(command: string): boolean {
+    const normalized = command.trim().toLowerCase();
+    if (!normalized) {
+      return false;
+    }
+
+    return /^(?:cat|head|tail|sed|awk|grep|rg|less|more|ls|find)/.test(normalized)
+      || /(?:cat|head|tail|sed|awk|grep|rg).*manulaichatprovider\.ts/.test(normalized)
+      || /^ls(?:|.*-)/.test(normalized);
   }
 
   private async executeTerminalCommand(command: string): Promise<string> {
