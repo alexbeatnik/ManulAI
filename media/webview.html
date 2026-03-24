@@ -722,7 +722,7 @@
 
     .thinking-card {
       display: flex;
-      align-items: center;
+      align-items: flex-start;
       gap: 9px;
       padding: 10px 12px;
       border-radius: 14px;
@@ -835,6 +835,28 @@
     .thinking-card .label {
       font-size: 11px;
       color: var(--text);
+      min-width: 0;
+      flex: 1 1 auto;
+    }
+
+    .thinking-copy {
+      display: grid;
+      gap: 4px;
+      min-width: 0;
+    }
+
+    .thinking-title {
+      font-size: 11px;
+      font-weight: 600;
+      color: var(--text);
+    }
+
+    .thinking-status {
+      font-size: 10px;
+      line-height: 1.45;
+      color: var(--muted);
+      white-space: pre-wrap;
+      word-break: break-word;
     }
 
     .composer {
@@ -1842,7 +1864,27 @@
     let debugMode = false;
     let activeFile = null;
     let pendingApproval = null;
+    let liveThinkingText = '';
     const seenMessageKeys = new Set();
+
+    function deriveLiveThinkingText() {
+      for (let index = messages.length - 1; index >= 0; index -= 1) {
+        const message = messages[index];
+        if (!message || typeof message.content !== 'string') {
+          continue;
+        }
+
+        if (message.role === 'status') {
+          return message.content.trim();
+        }
+
+        if (message.role === 'assistant' && /^Step\s+\d+:/i.test(message.content)) {
+          return message.content.trim();
+        }
+      }
+
+      return '';
+    }
 
     function roleLabel(role) {
       if (role === 'user') {
@@ -1943,7 +1985,25 @@
       if (busy) {
         const thinking = document.createElement('div');
         thinking.className = 'thinking-card';
-        thinking.innerHTML = '<div class="dots" aria-hidden="true"><span></span><span></span><span></span></div><div class="label">Model is thinking, may call tools, and will answer in this thread.</div>';
+
+        const dots = document.createElement('div');
+        dots.className = 'dots';
+        dots.setAttribute('aria-hidden', 'true');
+        dots.innerHTML = '<span></span><span></span><span></span>';
+
+        const label = document.createElement('div');
+        label.className = 'label thinking-copy';
+
+        const title = document.createElement('div');
+        title.className = 'thinking-title';
+        title.textContent = 'Model is thinking, may call tools, and will answer in this thread.';
+
+        const status = document.createElement('div');
+        status.className = 'thinking-status';
+        status.textContent = liveThinkingText || deriveLiveThinkingText() || 'Waiting for the next model or tool update...';
+
+        label.append(title, status);
+        thinking.append(dots, label);
         historyEl.appendChild(thinking);
       }
 
@@ -2183,6 +2243,9 @@
 
     function appendStatus(text) {
       messages = [...messages, { role: 'status', content: text }];
+      if (busy) {
+        liveThinkingText = String(text || '').trim();
+      }
       render();
     }
 
@@ -2504,6 +2567,9 @@
         debugMode = payload.debugMode !== undefined ? payload.debugMode : debugMode;
         pendingApproval = payload.pendingApproval || null;
         activeFile = payload.activeFile || null;
+        if (busy && !liveThinkingText) {
+          liveThinkingText = deriveLiveThinkingText();
+        }
         if (payload.extensionVersion && versionBadgeEl) {
           versionBadgeEl.textContent = payload.extensionVersion;
         }
@@ -2524,6 +2590,11 @@
 
       if (payload.command === 'busy') {
         busy = Boolean(payload.busy);
+        if (!busy) {
+          liveThinkingText = '';
+        } else if (!liveThinkingText) {
+          liveThinkingText = deriveLiveThinkingText();
+        }
         render();
       }
     });
