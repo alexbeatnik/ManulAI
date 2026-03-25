@@ -1872,6 +1872,7 @@ async function main() {
   const seenReadSigs = new Map(); // cross-turn dedup: sig -> read count (block after 2 reads)
   let totalReadOps = 0;           // total read operations across the session (for summarize nudge)
   let hadReadWorkspaceNotes = false; // short-circuit repeated reads
+  const failedCommandCounts = new Map(); // command signature -> failure count
   dryRunFiles.clear(); // reset for this session
 
   const hasMetExtractionGoal = () => {
@@ -2221,6 +2222,26 @@ async function main() {
         logEvent('tool_exec_result', { tool: toolName, result: result.substring(0, 300) });
 
         messages.push({ role: 'tool', content: result, tool_name: toolName });
+
+        // ── Repeated failing command detection ──
+        if (toolName === 'execute_terminal_command') {
+          try {
+            const cmdParsed = JSON.parse(result);
+            const exitCode = Number(cmdParsed.exitCode ?? 0);
+            const coreSig = String(cmdParsed.command ?? '').replace(/^cd\s+\S+\s*&&\s*/, '').trim();
+            if (exitCode !== 0 && coreSig) {
+              const count = (failedCommandCounts.get(coreSig) ?? 0) + 1;
+              failedCommandCounts.set(coreSig, count);
+              if (count >= 2) {
+                const nudge = `The command "${coreSig}" has failed ${count} times with the same error (exit code ${exitCode}). STOP retrying it. Try a completely different approach — for example, write the config file manually instead of relying on a CLI tool, or use a different package/tool.`;
+                label(Y, 'FAILING-CMD NUDGE', nudge.substring(0, 200));
+                messages.push({ role: 'user', content: nudge });
+              }
+            } else if (exitCode === 0 && coreSig) {
+              failedCommandCounts.delete(coreSig);
+            }
+          } catch (_) { /* non-JSON result — skip */ }
+        }
       }
 
       if (hadSuccessfulWrite) {

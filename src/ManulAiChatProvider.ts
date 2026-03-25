@@ -49,6 +49,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   private progressStepCounter = 0;
   private totalReadOps = 0;
   private currentRequestRequiresWrite = true;
+  private failedCommandCounts = new Map<string, number>();
   private repeatedNarratedToolSignature: string | null = null;
   private repeatedNarratedToolCount = 0;
   private workspaceSettings: Partial<ManulAiStoredSettings> = {};
@@ -800,6 +801,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     this.postStateToWebview();
     this.totalReadOps = 0;
     this.currentRequestRequiresWrite = /\b(?:create|write|edit|modify|update|add|append|change|rename|delete|remove|refactor|split|move)\b/i.test(text);
+    this.failedCommandCounts.clear();
     await this.runAgentLoop(exchangeStartIndex);
   }
 
@@ -1343,6 +1345,53 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         // Count read operations for read-loop nudge
         if (toolName === 'read_file_slice' || toolName === 'read_specific_file') {
           this.totalReadOps++;
+        }
+
+        // Track repeated failing terminal commands
+        if (toolName === 'execute_terminal_command') {
+          try {
+            const cmdResult = JSON.parse(toolResult) as Record<string, unknown>;
+            const exitCode = Number(cmdResult.exitCode ?? 0);
+            if (exitCode !== 0) {
+              const cmdStr = String(cmdResult.command ?? '');
+              // Normalize: strip leading cd ... && to get the core command signature
+              const coreSig = cmdStr.replace(/^cd\s+\S+\s*&&\s*/, '').trim();
+              const count = (this.failedCommandCounts.get(coreSig) ?? 0) + 1;
+              this.failedCommandCounts.set(coreSig, count);
+              if (count >= 2) {
+                const stderr = String(cmdResult.stderr ?? cmdResult.error ?? '');
+                this.debugLog('repeated_command_failure', { command: coreSig, count, exitCode });
+
+                if (this.autoApprove) {
+                  // Auto-approve: inject nudge telling model to try a different approach
+                  const nudge = `The command "${coreSig}" has failed ${count} times with the same error (exit code ${exitCode}${stderr ? `: ${stderr.substring(0, 200)}` : ''}). This command is not going to work. STOP retrying it. Try a completely different approach — use a different tool, library, or write the config file manually instead.`;
+                  this.postProgressStep(`Command failed ${count}x — nudging model to try alternative`);
+                  messages.push({ role: 'user', content: nudge, hiddenFromTranscript: true });
+                } else {
+                  // Manual mode: ask user whether to continue or abort
+                  const approved = await this.requestApproval({
+                    kind: 'tool',
+                    title: 'Repeated Command Failure',
+                    message: `"${coreSig}" has failed ${count} times. Continue or let the model try a different approach?`,
+                    details: stderr.substring(0, 500) || `Exit code ${exitCode}`,
+                    approveLabel: 'Continue',
+                    declineLabel: 'Try different approach'
+                  });
+                  if (!approved) {
+                    const redirectNudge = `The user says this command is not working. STOP retrying "${coreSig}". Use a completely different approach — write the file manually with create_or_edit_file, or use a different tool/library.`;
+                    messages.push({ role: 'user', content: redirectNudge, hiddenFromTranscript: true });
+                  }
+                }
+              }
+            } else {
+              // Successful execution — clear failure count for this command
+              const cmdStr = String(cmdResult.command ?? '');
+              const coreSig = cmdStr.replace(/^cd\s+\S+\s*&&\s*/, '').trim();
+              this.failedCommandCounts.delete(coreSig);
+            }
+          } catch {
+            // Ignore JSON parse errors on tool results
+          }
         }
       }
 
