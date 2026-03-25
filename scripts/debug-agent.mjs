@@ -746,7 +746,7 @@ function buildReplaceReminder(createdPath, newFileContent, allRecentReads) {
     .filter(n => n && !['from', 'type', 'default', 'as', 'export', 'import', 'declare', 'abstract'].includes(n))
     .slice(0, 10);
 
-  let msg = `File ${path.basename(createdPath)} created. Now call replace_in_file on src/ChatProviderRefactor.ts to replace the original ${exportNames[0] ?? 'block'} definition with an import statement.\n`;
+  let msg = `File ${path.basename(createdPath)} created. Now call replace_in_file on ${TARGET_FILE} to replace the original ${exportNames[0] ?? 'block'} definition with an import statement.\n`;
 
   // Find the read that actually contains the exported symbol name
   const allReads = Array.isArray(allRecentReads) ? allRecentReads : (allRecentReads ? [allRecentReads] : []);
@@ -792,11 +792,11 @@ function buildReplaceReminder(createdPath, newFileContent, allRecentReads) {
     if (exactBlock) {
       msg += `\nSet old_text to this EXACT block (copy precisely, do NOT include any import statements above it):\n\`\`\`typescript\n${exactBlock}\n\`\`\`\n`;
     } else {
-      msg += `\nContent at lines ${bestRead.startLine}\u2013${bestRead.endLine} of src/ChatProviderRefactor.ts:\n\`\`\`typescript\n${bestRead.content.substring(0, 900)}${bestRead.content.length > 900 ? '\n...' : ''}\n\`\`\`\n`;
+      msg += `\nContent at lines ${bestRead.startLine}\u2013${bestRead.endLine} of ${TARGET_FILE}:\n\`\`\`typescript\n${bestRead.content.substring(0, 900)}${bestRead.content.length > 900 ? '\n...' : ''}\n\`\`\`\n`;
       msg += `Set old_text = ONLY the block that defines ${exportNames[0] ?? 'the extracted type'} (the type/interface body, NOT the import lines at the top of the file).\n`;
     }
   } else {
-    msg += `Use read_file_slice to read the section of ChatProviderRefactor.ts where ${exportNames[0] ?? 'the extracted code'} is defined, then set old_text to that exact block.\n`;
+    msg += `Use read_file_slice to read the section of ${TARGET_BASENAME}.ts where ${exportNames[0] ?? 'the extracted code'} is defined, then set old_text to that exact block.\n`;
   }
 
   if (exportNames.length > 0) {
@@ -811,9 +811,9 @@ function buildNudge(analysis, lastToolWasError, ctx = {}) {
 
   // Context-rich nudge when a new file was created but replace_in_file hasn't succeeded yet
   if (pReplace && lastCreated) {
-    let nudge = `You MUST call replace_in_file on src/ChatProviderRefactor.ts NOW. You already created ${path.basename(lastCreated.filePath)}.`;
+    let nudge = `You MUST call replace_in_file on ${TARGET_FILE} NOW. You already created ${path.basename(lastCreated.filePath)}.`;
     if (lastRead && lastRead.content) {
-      nudge += `\nContent at lines ${lastRead.startLine}–${lastRead.endLine} of ChatProviderRefactor.ts:\n\`\`\`typescript\n${lastRead.content.substring(0, 700)}\n\`\`\``;
+      nudge += `\nContent at lines ${lastRead.startLine}–${lastRead.endLine} of ${TARGET_BASENAME}.ts:\n\`\`\`typescript\n${lastRead.content.substring(0, 700)}\n\`\`\``;
       nudge += `\nCopy ONLY the exact block that defines ${lastCreated.exportNames.slice(0, 3).join(', ')} as old_text (do NOT include the import statements at the top).`;
     }
     if (lastCreated.exportNames.length > 0) {
@@ -827,7 +827,7 @@ function buildNudge(analysis, lastToolWasError, ctx = {}) {
     const { pendingReplaceAfterCreate, lastCreatedFileState, extractionContinuationPending, lastSuccessfulRead, extractionCount } = ctx;
     if (pendingReplaceAfterCreate && lastCreatedFileState) {
       const names = lastCreatedFileState.exportNames?.join(', ') ?? 'the extracted types';
-      return `The tool result is already recorded. Do NOT echo tool results. Call replace_in_file on src/ChatProviderRefactor.ts now to replace the original ${names} block with an import statement.`;
+      return `The tool result is already recorded. Do NOT echo tool results. Call replace_in_file on ${TARGET_FILE} now to replace the original ${names} block with an import statement.`;
     }
     if (extractionContinuationPending) {
       const nextStart = (lastSuccessfulRead?.endLine ?? 120) + 1;
@@ -839,16 +839,16 @@ function buildNudge(analysis, lastToolWasError, ctx = {}) {
     const { pendingReplaceAfterCreate: pReplace, lastCreatedFileState: lastCreated, extractionContinuationPending: contPending, lastSuccessfulRead: lastRead } = ctx;
     if (pReplace && lastCreated) {
       const names = lastCreated.exportNames?.join(', ') ?? 'the extracted types';
-      return `Stop writing. Call replace_in_file NOW on src/ChatProviderRefactor.ts to replace the original ${names} block with an import statement. Do not describe it — call the tool.`;
+      return `Stop writing. Call replace_in_file NOW on ${TARGET_FILE} to replace the original ${names} block with an import statement. Do not describe it — call the tool.`;
     }
     if (contPending && lastRead) {
       const nextStart = lastRead.endLine + 1;
-      return `Stop writing. Call read_file_slice NOW: filepath="src/ChatProviderRefactor.ts", startLine=${nextStart}, endLine=${nextStart + 119}. Then create a new module file and call replace_in_file. No preamble.`;
+      return `Stop writing. Call read_file_slice NOW: filepath="${TARGET_FILE}", startLine=${nextStart}, endLine=${nextStart + 119}. Then create a new module file and call replace_in_file. No preamble.`;
     }
     if (lastRead) {
       return `Stop writing. You already read lines ${lastRead.startLine}–${lastRead.endLine}. Now call create_or_edit_file to create a new module with the extracted TypeScript definitions. Do not describe it — call the tool.`;
     }
-    return 'Stop writing plans. Call a tool NOW — use read_file_slice on src/ChatProviderRefactor.ts to start.';
+    return `Stop writing plans. Call a tool NOW — use read_file_slice on ${TARGET_FILE} to start.`;
   }
   if (analysis.isPassingToUser) {
     return 'Do not ask the user anything. You have all the tools you need. Use read_file_slice to read the source file, copy the actual TypeScript code, and call create_or_edit_file with that real code.';
@@ -906,7 +906,7 @@ async function main() {
     if (messages.length > 22) {
       const first2 = messages.slice(0, 2); // initial plan + user prompt
       const recent = messages.slice(-14); // most recent 14 messages
-      const trimNotice = { role: 'user', content: 'Context trimmed to prevent overflow. Continue splitting src/ChatProviderRefactor.ts: read the next un-extracted section and extract another module.' };
+      const trimNotice = { role: 'user', content: `Context trimmed to prevent overflow. Continue splitting ${TARGET_FILE}: read the next un-extracted section and extract another module.` };
       messages.splice(0, messages.length, ...first2, trimNotice, ...recent);
       seenReadSigs.clear(); // allow re-reads after context trim
       label(Y, 'CONTEXT TRIM', `Trimmed to ${messages.length} messages`);
@@ -991,7 +991,7 @@ async function main() {
           const readCount = seenReadSigs.get(readSig) ?? 0;
           if (readCount >= 2) {
             label(Y, `  \u27f3 SKIP DUPE READ`, `${toolName} same args already seen ${readCount}x`);
-            messages.push({ role: 'tool', content: JSON.stringify({ warning: `Duplicate read \u2014 you already read this exact section ${readCount} times. You already have this file content in your context. Do NOT re-read it. Create a NEW file (e.g. src/types.ts, NOT src/ChatProviderRefactor.ts) for the extracted code using create_or_edit_file, then use replace_in_file on src/ChatProviderRefactor.ts to replace that block with an import statement.` }), tool_name: toolName });
+            messages.push({ role: 'tool', content: JSON.stringify({ warning: `Duplicate read \u2014 you already read this exact section ${readCount} times. You already have this file content in your context. Do NOT re-read it. Create a NEW file (e.g. src/types.ts, NOT ${TARGET_FILE}) for the extracted code using create_or_edit_file, then use replace_in_file on ${TARGET_FILE} to replace that block with an import statement.` }), tool_name: toolName });
             continue;
           }
           seenReadSigs.set(readSig, readCount + 1);
@@ -1030,7 +1030,7 @@ async function main() {
             // After creating a NEW file (not the main refactor target), remind model to replace in original
             if (toolName === 'create_or_edit_file') {
               const createdPath = parsed.path ?? '';
-              const isOriginal = createdPath.includes('ChatProviderRefactor') || createdPath.includes('ManulAiChatProvider');
+              const isOriginal = createdPath.includes(TARGET_BASENAME);
               if (!isOriginal) {
                 const fileContent = args.content ?? '';
                 const exportNames = [...fileContent.matchAll(/export\s+(?:(?:type|interface|abstract|declare)\s+)*(?:function\s+|class\s+|const\s+|let\s+|var\s+|enum\s+)?([A-Z][\w]*)/g)]
@@ -1049,7 +1049,7 @@ async function main() {
               extractionCount++;
               extractionContinuationPending = true; // wait for model to start next cycle
               label(G, '  EXTRACTED', `Cycle ${extractionCount} done. Injecting continuation nudge.`);
-              const continueMsg = `Module extraction ${extractionCount} complete. Now read the next section of src/ChatProviderRefactor.ts (use a NEW line range you haven't read yet, beyond the block you just replaced) and extract another self-contained block (interface group, class, or utility functions). Aim to extract at least 3 modules total.`;
+              const continueMsg = `Module extraction ${extractionCount} complete. Now read the next section of ${TARGET_FILE} (use a NEW line range you haven't read yet, beyond the block you just replaced) and extract another self-contained block (interface group, class, or utility functions). Aim to extract at least 3 modules total.`;
               postToolMessages.push({ role: 'user', content: continueMsg, _type: 'continuation' });
             }
           }
@@ -1103,13 +1103,13 @@ async function main() {
       } else if (extractionContinuationPending) {
         const nextStart = (lastSuccessfulRead?.endLine ?? 120) + 1;
         const nextEnd = nextStart + 119;
-        emptyNudge = `Extraction ${extractionCount} complete. Read the NEXT section of src/ChatProviderRefactor.ts — use read_file_slice with lines ${nextStart}–${nextEnd} — then extract another self-contained block (interface, class, or utility functions).`;
+        emptyNudge = `Extraction ${extractionCount} complete. Read the NEXT section of ${TARGET_FILE} — use read_file_slice with lines ${nextStart}–${nextEnd} — then extract another self-contained block (interface, class, or utility functions).`;
       } else if (lastSuccessfulRead && lastSuccessfulRead.content) {
         emptyNudge = `You already read lines ${lastSuccessfulRead.startLine}–${lastSuccessfulRead.endLine} of ${path.basename(lastSuccessfulRead.filepath ?? '')}. ` +
           `Do NOT re-read those lines. Use that content to create a NEW file (e.g. src/types.ts or src/interfaces.ts) with the extracted TypeScript code — use create_or_edit_file. ` +
-          `Do NOT attempt to overwrite src/ChatProviderRefactor.ts.`;
+          `Do NOT attempt to overwrite ${TARGET_FILE}.`;
       } else {
-        emptyNudge = 'Your response was empty. Call read_file_slice on src/ChatProviderRefactor.ts to read a section, then call create_or_edit_file to create a new module file with the extracted code.';
+        emptyNudge = `Your response was empty. Call read_file_slice on ${TARGET_FILE} to read a section, then call create_or_edit_file to create a new module file with the extracted code.`;
       }
       label(Y, 'NUDGE', emptyNudge.substring(0, 300));
       messages.push({ role: 'assistant', content: '' });
@@ -1162,8 +1162,8 @@ async function main() {
           // Case 1: Fake read_file_slice result (has startLine + endLine for the source file)
           // Require retryCount >= 1 to give model one chance to resolve naturally first
           if (typeof fakeResult.startLine === 'number' && typeof fakeResult.endLine === 'number' &&
-              (fakeResult.path ?? '').includes('ChatProviderRefactor') && retryCount >= 1) {
-            const fp = resolveFilepath(fakeResult.path ?? 'src/ChatProviderRefactor.ts');
+              (fakeResult.path ?? '').includes(TARGET_BASENAME) && retryCount >= 1) {
+            const fp = resolveFilepath(fakeResult.path ?? TARGET_FILE);
             const realResult = await executeTool('read_file_slice', { filepath: fp, startLine: fakeResult.startLine, endLine: fakeResult.endLine });
             const realParsed = JSON.parse(realResult);
             if (!realParsed.error && realParsed.content) {
@@ -1174,7 +1174,7 @@ async function main() {
               messages.push({ role: 'assistant', content: '' });
               messages.push({ role: 'tool', content: realResult, tool_name: 'read_file_slice' });
               const recoveryNudge = `Real read_file_slice result for lines ${fakeResult.startLine}–${fakeResult.endLine} is above. ` +
-                `Now create a new module file with the TypeScript definitions from those lines, then call replace_in_file on src/ChatProviderRefactor.ts.`;
+                `Now create a new module file with the TypeScript definitions from those lines, then call replace_in_file on ${TARGET_FILE}.`;
               messages.push({ role: 'user', content: recoveryNudge });
               retryCount = 0;
               continue;
@@ -1182,7 +1182,7 @@ async function main() {
           }
 
           // Case 2: Fake create_or_edit_file result (fire immediately — don't wait for retryCount)
-          if (fakeResult.path && !(fakeResult.path ?? '').includes('ChatProviderRefactor') &&
+          if (fakeResult.path && !(fakeResult.path ?? '').includes(TARGET_BASENAME) &&
               !fakeResult.startLine && !fakeResult.endLine) {
             const rawContent = typeof fakeResult.content === 'string' && fakeResult.content.trim().length > 50
               ? fakeResult.content
@@ -1209,7 +1209,7 @@ async function main() {
           }
 
           // Case 3: Fake replace_in_file result (fire immediately)
-          if ((fakeResult.path ?? '').includes('ChatProviderRefactor') && fakeResult.replacements >= 1 &&
+          if ((fakeResult.path ?? '').includes(TARGET_BASENAME) && fakeResult.replacements >= 1 &&
               pendingReplaceAfterCreate && lastCreatedFileState) {
             const diffBlock = fakeResult.diff ?? '';
             const removedLines = (diffBlock.match(/^-(.*)$/gm) ?? []).map(l => l.slice(1)).join('\n');
@@ -1218,14 +1218,14 @@ async function main() {
               const replaceResult = await executeTool('replace_in_file', { filepath: fakeResult.path, old_text: removedLines, new_text: newText });
               const replaceParsed = JSON.parse(replaceResult);
               if (!replaceParsed.error) {
-                label(Y, 'HALLUCINATION RECOVERY', `Model faked replace in ChatProviderRefactor.ts; executed real replace`);
+                label(Y, 'HALLUCINATION RECOVERY', `Model faked replace in ${TARGET_BASENAME}.ts; executed real replace`);
                 pendingReplaceAfterCreate = false;
                 extractionCount++;
                 extractionContinuationPending = true;
                 messages.push({ role: 'assistant', content: '' });
                 messages.push({ role: 'tool', content: replaceResult, tool_name: 'replace_in_file' });
                 const nextStart = (lastSuccessfulRead?.endLine ?? 120) + 1;
-                const continueMsg = `Module extraction ${extractionCount} complete. Read lines ${nextStart}–${nextStart + 119} of src/ChatProviderRefactor.ts and extract another block.`;
+                const continueMsg = `Module extraction ${extractionCount} complete. Read lines ${nextStart}\u2013${nextStart + 119} of ${TARGET_FILE} and extract another block.`;
                 messages.push({ role: 'user', content: continueMsg });
                 retryCount = 0;
                 continue;

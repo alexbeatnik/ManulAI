@@ -1,0 +1,115 @@
+import type * as vscode from 'vscode';
+
+export type ChatRole = 'system' | 'user' | 'assistant' | 'tool';
+
+export interface ToolFunctionCall {
+  type?: 'function';
+  function: {
+    index?: number;
+    name: string;
+    arguments?: Record<string, unknown> | string;
+  };
+}
+
+export interface OllamaMessage {
+  role: ChatRole;
+  content: string;
+  tool_calls?: ToolFunctionCall[];
+  tool_name?: string;
+  localOnly?: boolean;
+  hiddenFromTranscript?: boolean;
+  attachmentContext?: boolean;
+  activeEditorContext?: boolean;
+  revertOperationIds?: string[];
+}
+
+export interface OllamaResponse {
+  message?: OllamaMessage;
+  done: boolean;
+  done_reason?: string;
+}
+
+export interface ParsedToolCall {
+  name: string;
+  arguments?: Record<string, unknown> | string;
+}
+
+export interface AttachedFileContext {
+  uri: vscode.Uri;
+  name: string;
+  content: string;
+  languageId: string;
+  readOnly?: boolean;
+}
+
+export interface ToolDefinition {
+  type: 'function';
+  function: {
+    name: string;
+    description: string;
+    parameters: Record<string, unknown>;
+  };
+}
+
+export interface WebviewInboundMessage {
+  command:
+    | 'ready'
+    | 'sendMessage'
+    | 'stopRequest'
+    | 'clearChat'
+    | 'createChat'
+    | 'deleteChat'
+    | 'switchChat'
+    | 'attachActiveFile'
+    | 'revertFileChanges'
+    | 'approvePendingAction'
+    | 'declinePendingAction'
+    | 'addFileContext'
+    | 'addFileContent'
+    | 'addFilePathContext'
+    | 'removeFileContext'
+    | 'selectModel'
+    | 'refreshModels'
+    | 'browseFiles'
+    | 'browseFolder'
+    | 'attachProject'
+    | 'toggleAgentMode'
+    | 'toggleAutoApprove'
+    | 'toggleDebugMode';
+  text?: string;
+  path?: string;
+  paths?: string[];
+  model?: string;
+  value?: boolean;
+  autoApprove?: boolean;
+  operationIds?: string[];
+  filename?: string;
+  content?: string;
+  attachments?: Array<{ name: string; content: string }>;
+  chatId?: string;
+}
+
+export interface WebviewRenderableMessage {
+  role: Exclude<ChatRole, 'system'> | 'status';
+  content: string;
+  revertAction?: {
+    operationIds: string[];
+    label: string;
+    details?: string;
+  };
+}
+
+export interface WebviewActiveFileState {
+  path: string;
+  name: string;
+  displayPath: string;
+}
+
+export interface WebviewPendingApprovalState {
+  kind: 'tool' | 'file-write';
+  title: string;
+  message: string;
+  details?: string;
+  approveLabel: string;
+  declineLabel: string;
+}
