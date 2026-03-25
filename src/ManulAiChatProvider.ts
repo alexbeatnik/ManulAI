@@ -1201,6 +1201,92 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     return undefined;
   }
 
+  private async getPrimaryLargeRefactorTargetPath(): Promise<string | undefined> {
+    const latestVisibleUserRequest = this.getLatestVisibleUserRequest(this.messages);
+    if (!latestVisibleUserRequest || !this.looksLikeLargeRefactorRequest(latestVisibleUserRequest)) {
+      return undefined;
+    }
+    return await this.findPreferredLargeRefactorTargetPath(latestVisibleUserRequest);
+  }
+
+  private isPathInsideWorkspace(fsPath: string): boolean {
+    const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    if (!workspaceRoot) {
+      return true;
+    }
+
+    const normalizedRoot = path.normalize(workspaceRoot);
+    const normalizedTarget = path.normalize(fsPath);
+    return normalizedTarget === normalizedRoot || normalizedTarget.startsWith(`${normalizedRoot}${path.sep}`);
+  }
+
+  private async recoverRequestScopedTargetPath(targetPath: string): Promise<{ resolvedPath?: string; recoveredFrom?: string }> {
+    const normalizedTarget = targetPath.trim();
+    if (!normalizedTarget || !this.isLargeRefactorScenario()) {
+      return {};
+    }
+
+    const primaryTarget = await this.getPrimaryLargeRefactorTargetPath();
+    if (!primaryTarget) {
+      return {};
+    }
+
+    const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? path.dirname(primaryTarget);
+    const requestedAbsolute = path.normalize(path.isAbsolute(normalizedTarget)
+      ? normalizedTarget
+      : path.join(workspaceRoot, normalizedTarget));
+    const normalizedPrimaryTarget = path.normalize(primaryTarget);
+    if (requestedAbsolute === normalizedPrimaryTarget) {
+      return { resolvedPath: normalizedPrimaryTarget };
+    }
+
+    const sameBasename = path.basename(requestedAbsolute).toLowerCase() === path.basename(normalizedPrimaryTarget).toLowerCase();
+    const sameExtension = path.extname(requestedAbsolute).toLowerCase() === path.extname(normalizedPrimaryTarget).toLowerCase();
+    if (!sameBasename || !sameExtension) {
+      return {};
+    }
+
+    try {
+      await vscode.workspace.fs.stat(vscode.Uri.file(requestedAbsolute));
+      return {};
+    } catch {
+      return {
+        resolvedPath: normalizedPrimaryTarget,
+        recoveredFrom: normalizedTarget
+      };
+    }
+  }
+
+  private async validateRequestScopedCreatePath(requestedPath: string, resolvedFsPath: string): Promise<string | undefined> {
+    const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    if (workspaceRoot && !this.isPathInsideWorkspace(resolvedFsPath)) {
+      return `Refusing to write outside the workspace: ${resolvedFsPath}. Use a path under ${workspaceRoot}.`;
+    }
+
+    if (!this.isLargeRefactorScenario()) {
+      return undefined;
+    }
+
+    const primaryTarget = await this.getPrimaryLargeRefactorTargetPath();
+    if (!primaryTarget) {
+      return undefined;
+    }
+
+    const sameExtension = path.extname(resolvedFsPath).toLowerCase() === path.extname(primaryTarget).toLowerCase();
+    if (!sameExtension) {
+      return undefined;
+    }
+
+    const targetDir = path.normalize(path.dirname(primaryTarget));
+    const normalizedResolvedPath = path.normalize(resolvedFsPath);
+    const isUnderTargetDir = normalizedResolvedPath.startsWith(`${targetDir}${path.sep}`);
+    if (!isUnderTargetDir) {
+      return `For this large refactor, create the extracted module under ${path.dirname(primaryTarget)}, not at ${requestedPath || resolvedFsPath}. Use an exact sibling or child path beneath the primary target directory.`;
+    }
+
+    return undefined;
+  }
+
   private async tryHandleDirectLicenseAuthorRename(text: string): Promise<FileWriteSummary | undefined> {
     const match = text.match(/change\s+author\s+name\s+to\s+(.+?)\s+in\s+license\b/i);
     if (!match) {
@@ -1934,6 +2020,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         const replaceNotFoundFilepath = replaceNotFoundContext?.filepath;
         const replaceNotFoundStartLine = replaceNotFoundContext?.startLine;
         const replaceNotFoundEndLine = replaceNotFoundContext?.endLine;
+        const replaceNeverPresentInTarget = replaceNotFoundContext?.neverPresentInTarget === true;
 
         const isLongDump = finalContent.length > 300;
         const hasLargeCodeBlocks = /```[\w]*\n[\s\S]{100,}?```/.test(finalContent);
@@ -2240,9 +2327,13 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           } else if (hasExplicitNextSteps) {
             nudgeMessage = 'You listed next steps but stopped before executing them. Continue now. Do not stop after the first step or the first issue — keep using tools until the scan is complete.';
           } else if (hasRecentReplaceNotFound) {
-            nudgeMessage = replaceNotFoundFilepath && replaceNotFoundStartLine && replaceNotFoundEndLine
-              ? `Your replace_in_file call failed because old_text did not match the real file content. First call read_file_slice for ${replaceNotFoundFilepath} with startLine=${replaceNotFoundStartLine} and endLine=${replaceNotFoundEndLine}. Do NOT guess. Then call replace_in_file again using the exact current text including whitespace.`
-              : `Your replace_in_file call failed because old_text did not match the real file content.${replaceNotFoundFilepath ? ` First call read_file_slice for ${replaceNotFoundFilepath} with startLine=1 and endLine=120 (or the section containing your target text).` : ' First call read_file_slice for that file with a bounded line range containing the section you want to edit.'} Do NOT guess. Do NOT ask the user to confirm. Read the slice now, then call replace_in_file again using the exact current text including whitespace and indentation.`;
+            nudgeMessage = replaceNeverPresentInTarget
+              ? (replaceNotFoundFilepath && replaceNotFoundStartLine && replaceNotFoundEndLine
+                ? `Your replace_in_file call failed because the block you tried to replace does not appear anywhere in ${replaceNotFoundFilepath}. Do NOT invent old_text and do NOT copy code from the new helper/module file. First call read_file_slice for ${replaceNotFoundFilepath} with startLine=${replaceNotFoundStartLine} and endLine=${replaceNotFoundEndLine}. Then call replace_in_file again using only exact text that currently exists in the target file.`
+                : `Your replace_in_file call failed because the block you tried to replace does not appear anywhere in the real target file.${replaceNotFoundFilepath ? ` First call read_file_slice for ${replaceNotFoundFilepath} with a bounded line range containing the real target block.` : ' First call read_file_slice for the target file with a bounded line range.'} Do NOT invent old_text and do NOT copy code from a newly created file. Re-read the real file, then retry replace_in_file using only exact current text from that file.`)
+              : (replaceNotFoundFilepath && replaceNotFoundStartLine && replaceNotFoundEndLine
+                ? `Your replace_in_file call failed because old_text did not match the real file content. First call read_file_slice for ${replaceNotFoundFilepath} with startLine=${replaceNotFoundStartLine} and endLine=${replaceNotFoundEndLine}. Do NOT guess. Then call replace_in_file again using the exact current text including whitespace.`
+                : `Your replace_in_file call failed because old_text did not match the real file content.${replaceNotFoundFilepath ? ` First call read_file_slice for ${replaceNotFoundFilepath} with startLine=1 and endLine=120 (or the section containing your target text).` : ' First call read_file_slice for that file with a bounded line range containing the section you want to edit.'} Do NOT guess. Do NOT ask the user to confirm. Read the slice now, then call replace_in_file again using the exact current text including whitespace and indentation.`);
           } else if (hasRecentBuildVerifyFailure && latestBuildVerifyFailure) {
             nudgeMessage = this.buildBuildVerifyFailureNudge(latestBuildVerifyFailure.stack, latestBuildVerifyFailure.result);
           } else if (hasRecentToolErrors) {
@@ -2390,7 +2481,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     };
   }
 
-  private getLatestReplaceNotFoundContext(messages: OllamaMessage[]): { filepath?: string; startLine?: number; endLine?: number } | undefined {
+  private getLatestReplaceNotFoundContext(messages: OllamaMessage[]): { filepath?: string; startLine?: number; endLine?: number; neverPresentInTarget?: boolean } | undefined {
     for (let index = messages.length - 1; index >= 0; index -= 1) {
       const message = messages[index];
       if (message.role !== 'tool') {
@@ -2429,7 +2520,8 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         return {
           filepath: this.getReplaceInFilePathForToolMessage(messages, index),
           startLine: typeof slice?.startLine === 'number' ? slice.startLine : undefined,
-          endLine: typeof slice?.endLine === 'number' ? slice.endLine : undefined
+          endLine: typeof slice?.endLine === 'number' ? slice.endLine : undefined,
+          neverPresentInTarget: parsed.neverPresentInTarget === true
         };
       }
     }
@@ -5175,6 +5267,10 @@ If the user asks for a change but provides NO code:
 
     try {
       const targetUri = await this.resolveWorkspaceUriForOperation(filename, true);
+      const pathGuardError = await this.validateRequestScopedCreatePath(filename, targetUri.fsPath);
+      if (pathGuardError) {
+        return JSON.stringify({ error: pathGuardError });
+      }
 
       await vscode.workspace.fs.createDirectory(vscode.Uri.file(path.dirname(targetUri.fsPath)));
 
@@ -6139,14 +6235,24 @@ If the user asks for a change but provides NO code:
     }
 
     try {
-      const target = await this.resolveWorkspaceUriForOperation(filepath);
+      const recoveredTarget = await this.recoverRequestScopedTargetPath(filepath);
+      const target = recoveredTarget.resolvedPath
+        ? vscode.Uri.file(recoveredTarget.resolvedPath)
+        : await this.resolveWorkspaceUriForOperation(filepath);
       const original = await this.readWorkspaceText(target);
       const occurrences = original.split(oldText).length - 1;
 
       if (occurrences === 0) {
+        const replaceFailure = this.analyzeReplaceNotFound(original, oldText);
         return JSON.stringify({
-          error: 'old_text not found in file. Make sure it matches exactly, including whitespace.',
-          suggestedReadSlice: this.suggestReadSliceForReplaceFailure(original, oldText)
+          error: replaceFailure.neverPresentInTarget
+            ? 'old_text not found in file. The block you tried to replace does not appear anywhere in the target file. Do NOT guess or copy code from the extracted module as old_text.'
+            : 'old_text not found in file. Make sure it matches exactly, including whitespace.',
+          suggestedReadSlice: replaceFailure.suggestedReadSlice,
+          neverPresentInTarget: replaceFailure.neverPresentInTarget,
+          ...(recoveredTarget.recoveredFrom
+            ? { note: `Recovered requested path ${recoveredTarget.recoveredFrom} to exact target ${target.fsPath}. Use this exact target path for subsequent replace_in_file calls.` }
+            : {})
         });
       }
       if (occurrences > 1) {
@@ -6163,7 +6269,10 @@ If the user asks for a change but provides NO code:
         replacements: 1,
         bytesWritten: Buffer.byteLength(updated, 'utf8'),
         diff,
-        revertOperationId
+        revertOperationId,
+        ...(recoveredTarget.recoveredFrom
+          ? { note: `Recovered requested path ${recoveredTarget.recoveredFrom} to exact target ${target.fsPath}.` }
+          : {})
       });
     } catch (error) {
       return JSON.stringify({
@@ -6205,6 +6314,23 @@ If the user asks for a change but provides NO code:
         error: error instanceof Error ? error.message : 'Failed to replace text in file.'
       });
     }
+  }
+
+  private analyzeReplaceNotFound(
+    originalContent: string,
+    attemptedOldText: string
+  ): { suggestedReadSlice?: { startLine: number; endLine: number }; neverPresentInTarget: boolean } {
+    const originalLines = originalContent.replace(/\r\n/g, '\n').split('\n');
+    const attemptedLines = attemptedOldText.replace(/\r\n/g, '\n').split('\n');
+    const anchorCandidates = attemptedLines
+      .map(line => line.trim())
+      .filter(line => line.length >= 8);
+    const neverPresentInTarget = !anchorCandidates.some(candidate => originalLines.some(line => line.includes(candidate)));
+
+    return {
+      suggestedReadSlice: this.suggestReadSliceForReplaceFailure(originalContent, attemptedOldText),
+      neverPresentInTarget
+    };
   }
 
   private suggestReadSliceForReplaceFailure(originalContent: string, attemptedOldText: string): { startLine: number; endLine: number } | undefined {

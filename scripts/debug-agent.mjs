@@ -210,10 +210,12 @@ function resolveFilepathInfo(fp, options = {}) {
 
 function findNearestProjectRoot(startPath) {
   const startDir = path.dirname(startPath);
-  const markers = ['package.json', 'tsconfig.json', 'pyproject.toml', 'requirements.txt', 'setup.py', 'Cargo.toml', 'go.mod', 'pom.xml', 'build.gradle', 'build.gradle.kts', 'gradlew', '.sln', '.csproj'];
+  const markers = ['package.json', 'tsconfig.json', 'pyproject.toml', 'requirements.txt', 'setup.py', 'Cargo.toml', 'go.mod', 'pom.xml', 'build.gradle', 'build.gradle.kts', 'gradlew'];
   let current = startDir;
   while (current.startsWith(wsRoot)) {
-    if (markers.some(marker => existsSync(path.join(current, marker)))) {
+    const hasStandardMarker = markers.some(marker => existsSync(path.join(current, marker)));
+    const hasDotnetMarker = readdirSafe(current).some(name => name.endsWith('.sln') || name.endsWith('.csproj'));
+    if (hasStandardMarker || hasDotnetMarker) {
       return current;
     }
     const parent = path.dirname(current);
@@ -542,6 +544,35 @@ function resolveFilepath(fp) {
   return resolveFilepathInfo(fp).path;
 }
 
+function analyzeReplaceMiss(currentContent, attemptedOldText, filepath) {
+  const currentLines = currentContent.replace(/\r\n/g, '\n').split('\n');
+  const attemptedLines = attemptedOldText.replace(/\r\n/g, '\n').split('\n');
+  const anchorCandidates = attemptedLines
+    .map(line => line.trim())
+    .filter(line => line.length >= 8);
+
+  let anchorIndex = -1;
+  for (const candidate of anchorCandidates) {
+    anchorIndex = currentLines.findIndex(line => line.includes(candidate));
+    if (anchorIndex >= 0) break;
+  }
+
+  const attemptedNonEmptyLineCount = attemptedLines.filter(line => line.trim().length > 0).length;
+  const contextSpan = Math.max(28, attemptedNonEmptyLineCount + 16);
+  const suggestedSlice = anchorIndex >= 0
+    ? {
+        filepath,
+        startLine: Math.max(1, anchorIndex + 1 - 4),
+        endLine: Math.min(currentLines.length, Math.max(1, anchorIndex + 1 - 4) + contextSpan - 1)
+      }
+    : undefined;
+
+  return {
+    neverPresentInTarget: anchorIndex < 0,
+    suggestedSlice
+  };
+}
+
 async function executeTool(name, args) {
   switch (name) {
     case 'list_workspace_files': {
@@ -858,6 +889,20 @@ async function executeTool(name, args) {
       const fp = resolveFilepath(args.filename ?? args.filepath ?? '');
       let content = String(args.content ?? '');
       if (!fp) return JSON.stringify({ error: 'filename is required.' });
+      const withinWorkspace = fp === wsRoot || fp.startsWith(`${wsRoot}${path.sep}`);
+      if (!withinWorkspace) {
+        return JSON.stringify({
+          error: `Refusing to write outside the workspace: ${fp}. Use a path under ${wsRoot}.`
+        });
+      }
+      const targetDirAbs = path.normalize(path.join(wsRoot, TARGET_DIR));
+      const isUnderTargetDir = fp.startsWith(`${targetDirAbs}${path.sep}`);
+      const isTargetLikeCodeFile = path.extname(fp).toLowerCase() === TARGET_EXTENSION.toLowerCase();
+      if (IS_SPLIT_TASK && isTargetLikeCodeFile && !isUnderTargetDir) {
+        return JSON.stringify({
+          error: `For this split flow, create the extracted module under ${TARGET_DIR}, not at ${fp}. Use an exact sibling or child path beneath ${TARGET_DIR}.`
+        });
+      }
 
       // Guard: if overwriting a large existing file with much smaller content, force replace_in_file
       if (existsSync(fp)) {
@@ -958,13 +1003,13 @@ async function executeTool(name, args) {
       try {
         const current = readFileSync(fp, 'utf8');
         if (!current.includes(oldText)) {
-          const firstLine = oldText.split('\n')[0].trim();
-          const approxLine = current.split('\n').findIndex(l => l.includes(firstLine));
+          const replaceMiss = analyzeReplaceMiss(current, oldText, fp);
           return JSON.stringify({
-            error: 'old_text not found in file — text does not match exactly (check whitespace/indentation).',
-            suggestedSlice: approxLine >= 0
-              ? { filepath: fp, startLine: Math.max(1, approxLine - 3), endLine: approxLine + 25 }
-              : undefined
+            error: replaceMiss.neverPresentInTarget
+              ? 'old_text not found in file — the block you tried to replace does not appear anywhere in the target file. Do NOT invent a helper block or guessed replacement target. Read the exact target slice again and copy the real block verbatim.'
+              : 'old_text not found in file — text does not match exactly (check whitespace/indentation).',
+            suggestedSlice: replaceMiss.suggestedSlice,
+            neverPresentInTarget: replaceMiss.neverPresentInTarget
           });
         }
         const rmCount = removedLines.length;
@@ -1493,9 +1538,21 @@ async function main() {
   let lastCreatedFileState = null; // { filePath, content, exportNames } — last successfully created extraction file
   let extractionCount = 0;         // how many complete extract-and-replace cycles succeeded
   let extractionContinuationPending = false; // true after replace_in_file success; cleared when model starts next tool call
+  let targetTotalLinesObserved = 0;
+  let targetAppearsExhausted = false;
   const recentReads = [];          // all successful read results (capped at 20) for reminder context
   const seenReadSigs = new Map(); // cross-turn dedup: sig -> read count (block after 2 reads)
   dryRunFiles.clear(); // reset for this session
+
+  const hasMetExtractionGoal = () => {
+    if (extractionCount >= 2) return true;
+    if (!IS_SPLIT_TASK || extractionCount < 1) return false;
+    if (targetAppearsExhausted) return true;
+    if (targetTotalLinesObserved <= 0) return false;
+    const lastReadEnd = lastSuccessfulRead?.endLine ?? 0;
+    const remainingUnreadLines = Math.max(0, targetTotalLinesObserved - lastReadEnd);
+    return targetTotalLinesObserved <= 40 || remainingUnreadLines <= 8;
+  };
 
   while (turn < MAX_TURNS) {
     turn++;
@@ -1606,6 +1663,12 @@ async function main() {
           if (toolName === 'create_or_edit_file') {
             seenReadSigs.clear();
           }
+          if (toolName === 'replace_in_file' && parsed.neverPresentInTarget && pendingReplaceAfterCreate && lastCreatedFileState) {
+            const exactBlockMsg = lastSuccessfulRead?.content
+              ? `The block you tried to replace does not exist anywhere in ${TARGET_FILE}. Do NOT try to replace code from ${path.basename(lastCreatedFileState.filePath)} or any invented helper block. Use ONLY code that already exists in ${TARGET_FILE} as old_text. Re-read the exact target slice and copy that original block verbatim before calling replace_in_file again.`
+              : `The block you tried to replace does not exist anywhere in ${TARGET_FILE}. Do NOT invent a replacement target. Read the exact target slice from ${TARGET_FILE}, then call replace_in_file again using only code that currently exists there as old_text.`;
+            messages.push({ role: 'tool', content: JSON.stringify({ warning: exactBlockMsg }), tool_name: 'replace_in_file' });
+          }
           // On replace_in_file failure: auto-read the suggested slice so model gets exact old_text
           if (toolName === 'replace_in_file' && parsed.suggestedSlice) {
             const autoRead = await executeTool('read_file_slice', parsed.suggestedSlice);
@@ -1619,6 +1682,19 @@ async function main() {
           }
         } else {
           label(G, `  ✓ ${toolName}`, result.substring(0, 200));
+          if ((toolName === 'read_file_slice' || toolName === 'read_specific_file') && path.normalize(String(parsed.path ?? '')) === TARGET_ABS_FILE) {
+            const totalLines = Number(parsed.totalLines ?? 0);
+            if (Number.isFinite(totalLines) && totalLines > 0) {
+              targetTotalLinesObserved = totalLines;
+            }
+            const startLine = Number(parsed.startLine ?? args.startLine ?? 1);
+            const hasVisibleContent = typeof parsed.content === 'string' && parsed.content.length > 0;
+            if (!hasVisibleContent && targetTotalLinesObserved > 0 && startLine > targetTotalLinesObserved) {
+              targetAppearsExhausted = true;
+            } else if (hasVisibleContent) {
+              targetAppearsExhausted = false;
+            }
+          }
           // Track successful reads for replace_in_file reminder context
           if (toolName === 'read_file_slice' && parsed.content) {
             lastSuccessfulRead = { filepath: String(args.filepath ?? ''), startLine: args.startLine ?? 1, endLine: args.endLine ?? 1, content: parsed.content };
@@ -1702,13 +1778,13 @@ async function main() {
     if (content.trim().length === 0 || isTokenOverflow || isEchoOfUserMsg) {
       if (isTokenOverflow) label(Y, 'TOKEN OVERFLOW', 'Model returned a raw im_start token — treating as empty');
       if (isEchoOfUserMsg) label(Y, 'ECHO DETECTED', 'Model echoed a user message — treating as empty');
-      if (hadSuccessfulWrite && !pendingReplaceAfterCreate && !extractionContinuationPending && extractionCount >= 2) {
+      if (hadSuccessfulWrite && !pendingReplaceAfterCreate && !extractionContinuationPending && hasMetExtractionGoal()) {
         label(G, 'DONE', `Empty response after ${extractionCount} extraction cycles — task complete.`);
         logEvent('session_done', { turn, reason: 'empty_after_write', extractionCount });
         break;
       }
       // If model got a continuation nudge but returned empty repeatedly, accept done if we did at least 2 cycles
-      if (extractionContinuationPending && retryCount >= 2) {
+      if (extractionContinuationPending && retryCount >= 2 && hasMetExtractionGoal()) {
         label(G, 'DONE', `${extractionCount} module(s) extracted — model could not continue further.`);
         logEvent('session_done', { turn, reason: 'continuation_exhausted', extractionCount });
         break;
@@ -1879,10 +1955,10 @@ async function main() {
       !analysis.mentionsToolButNotCalled && !hasPendingTextCall && !analysis.isHallucinatingToolResponse &&
       (!REQUIRES_FILE_WRITE || hadSuccessfulWrite);
     if ((!writeStillPending && (!analysis.requiresContinuation || isDoneAfterWrite || isNonSplitFinalAnswer)) && !lastToolWasError) {
-      // Require at least 2 full extraction cycles before accepting a quiet finish — only for split tasks
-      if (IS_SPLIT_TASK && extractionCount < 2) {
+      // For split tasks, require 2 cycles normally, but relax for tiny/exhausted targets.
+      if (IS_SPLIT_TASK && !hasMetExtractionGoal()) {
         const nextStart = (lastSuccessfulRead?.endLine ?? 120) + 1;
-        const tooFewNudge = `Only ${extractionCount} module(s) extracted so far — need at least 2. ` +
+        const tooFewNudge = `Only ${extractionCount} module(s) extracted so far — need another extraction unless the target is already exhausted. ` +
           `Read the next section of ${TARGET_FILE} (lines ${nextStart}–${nextStart + 119}) and extract another self-contained block.`;
         label(Y, 'NUDGE (too few extractions)', tooFewNudge);
         messages.push({ role: 'assistant', content });
