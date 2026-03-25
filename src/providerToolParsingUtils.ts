@@ -143,16 +143,53 @@ export function parseToolCallsFromContent(content: string, toolDefinitions: Tool
     }
   }
 
-  const bareToolPattern = /^([a-z][a-z0-9_]+)\s+(\{[\s\S]*)/m;
-  const bareMatch = bareToolPattern.exec(trimmed);
-  if (bareMatch && knownToolNames.has(bareMatch[1])) {
-    const argsStr = extractBalancedJson(bareMatch[2], 0);
-    if (argsStr) {
-      const argsObj = relaxedJsonParse(argsStr);
-      if (argsObj) {
-        return [{ type: 'function', function: { name: bareMatch[1], arguments: argsObj } }];
+  // Direct JSON parser: tool_name {json_args} — handles multiple occurrences and mid-text positions.
+  // Iterates known tool names (including aliases) to find `toolName {…}` anywhere in text.
+  const directJsonResults: ToolFunctionCall[] = [];
+  const allToolNamesForDirectJson = new Set([...knownToolNames]);
+  // Also include common aliases so we catch e.g. `create_file {…}`
+  const aliasKeys = ['write_file', 'create_file', 'create_or_replace', 'create_or_overwrite',
+    'edit_file', 'replace_content', 'read_file', 'read_file_range', 'read_file_chunk',
+    'run_command', 'terminal_command'];
+  for (const alias of aliasKeys) { allToolNamesForDirectJson.add(alias); }
+
+  for (const toolName of allToolNamesForDirectJson) {
+    const directJsonRe = new RegExp(`\\b${toolName}\\s+(\\{)`, 'gi');
+    let djm: RegExpExecArray | null;
+    while ((djm = directJsonRe.exec(trimmed)) !== null) {
+      const start = djm.index + djm[0].length - 1;
+      const argsStr = extractBalancedJson(trimmed, start);
+      if (argsStr) {
+        const args = relaxedJsonParse(argsStr);
+        if (args && typeof args === 'object') {
+          // Skip {name, arguments} wrappers — those are handled by the blob parser above
+          if (args.name && args.arguments !== undefined) { continue; }
+          directJsonResults.push({
+            type: 'function',
+            function: { name: remapWeakModelToolName(toolName), arguments: remapWeakModelArgumentAliases(args as Record<string, unknown>) }
+          });
+        }
       }
     }
+  }
+  if (directJsonResults.length > 0) {
+    return directJsonResults;
+  }
+
+  // Match read_file_slice filepath="path" startLine=N endLine=N (key=value format)
+  const readSliceKVRe = /\bread_file_slice\s+filepath="([^"]+)"\s+startLine=(\d+)\s+endLine=(\d+)/g;
+  let readSliceKVMatch: RegExpExecArray | null;
+  while ((readSliceKVMatch = readSliceKVRe.exec(trimmed)) !== null) {
+    directJsonResults.push({
+      type: 'function',
+      function: {
+        name: 'read_file_slice',
+        arguments: { filepath: readSliceKVMatch[1], startLine: parseInt(readSliceKVMatch[2], 10), endLine: parseInt(readSliceKVMatch[3], 10) }
+      }
+    });
+  }
+  if (directJsonResults.length > 0) {
+    return directJsonResults;
   }
 
   // Detect positional tool calls like: create_or_edit_file src/app.ts "content here"

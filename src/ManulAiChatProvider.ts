@@ -46,6 +46,8 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   private debugLogFilePath?: string;
   private debugSessionId = '';
   private progressStepCounter = 0;
+  private totalReadOps = 0;
+  private currentRequestRequiresWrite = true;
   private repeatedNarratedToolSignature: string | null = null;
   private repeatedNarratedToolCount = 0;
   private workspaceSettings: Partial<ManulAiStoredSettings> = {};
@@ -788,6 +790,8 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     }
 
     this.postStateToWebview();
+    this.totalReadOps = 0;
+    this.currentRequestRequiresWrite = /\b(?:create|write|edit|modify|update|add|append|change|rename|delete|remove|refactor|split|move)\b/i.test(text);
     await this.runAgentLoop(exchangeStartIndex);
   }
 
@@ -1327,6 +1331,11 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           hiddenFromTranscript: true,
           revertOperationIds: this.extractToolResultRevertOperationIds(toolResult)
         });
+
+        // Count read operations for read-loop nudge
+        if (toolName === 'read_file_slice' || toolName === 'read_specific_file') {
+          this.totalReadOps++;
+        }
       }
 
       // --- Post-write build verification ---
@@ -1367,6 +1376,13 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
             });
           }
         }
+      }
+
+      // For non-write tasks (summarize, explain, review), nudge the model to stop reading and produce output
+      if (!this.currentRequestRequiresWrite && this.totalReadOps >= 3 && !hadSuccessfulWrite) {
+        const readNudge = `You have already read ${this.totalReadOps} sections of the file(s). You now have enough context. STOP reading additional sections and produce your summary/analysis/answer as a text response NOW. Do NOT call any more tools.`;
+        this.debugLog('read_loop_nudge', { totalReadOps: this.totalReadOps });
+        messages.push({ role: 'user', content: readNudge, hiddenFromTranscript: true });
       }
 
       // If all executed tools were inspection-only (no writes), preserve retryCount
