@@ -993,6 +993,14 @@ async function executeTool(name, args) {
       // Trivial 1-line rename guard
       const removedLines = oldText.split('\n');
       const addedLines   = newText.split('\n');
+      const addedNonEmptyLines = newText.replace(/\r\n/g, '\n').split('\n').map(line => line.trim()).filter(Boolean);
+      const newTextLooksPlaceholder = addedNonEmptyLines.length > 0 && addedNonEmptyLines.every(line =>
+        /^(?:\/\/|#|\/\*|\*|<!--)?\s*(?:code will be inserted here|todo|tbd|placeholder|stub|coming soon|implement me|fill me in)/i.test(line));
+      if (IS_SPLIT_TASK && newTextLooksPlaceholder) {
+        return JSON.stringify({
+          error: 'new_text is a placeholder comment, not a valid extraction replacement. Replace the original block with the correct module reference or equivalent real code update — never with "Code will be inserted here".'
+        });
+      }
       if (removedLines.length <= 1 && addedLines.length <= 1 && !/^\s*import\b/.test(newText)) {
         return JSON.stringify({
           error: 'Single-line rename without an import replacement is not a valid extraction step. ' +
@@ -1509,6 +1517,106 @@ function buildNudge(analysis, lastToolWasError, ctx = {}) {
   return 'You described changes but did not call a tool. Call the appropriate tool now.';
 }
 
+function inferReadRangeFromNarration(content, fallbackStart, fallbackEnd) {
+  const explicitRangeMatch = content.match(/lines?\s+(\d+)\s*(?:[-–—]|to)\s*(\d+)/i);
+  if (explicitRangeMatch) {
+    const startLine = Number(explicitRangeMatch[1]);
+    const endLine = Number(explicitRangeMatch[2]);
+    if (Number.isFinite(startLine) && Number.isFinite(endLine) && startLine >= 1 && endLine >= startLine) {
+      return { startLine, endLine };
+    }
+  }
+  return { startLine: fallbackStart, endLine: fallbackEnd };
+}
+
+function inferCreateFileArgsFromContext(lastRead, lastCreated) {
+  if (!lastRead?.content) return null;
+  const extractedContent = extractDefinitionsFromSource(lastRead.content, lastRead.filepath || TARGET_FILE);
+  if (!extractedContent || extractedContent.trim().length < 20) return null;
+  const symbolNames = extractSymbolNamesFromContent(extractedContent, lastRead.filepath || TARGET_FILE);
+  const extension = path.extname(lastRead.filepath || TARGET_FILE) || TARGET_EXTENSION;
+  const filename = lastCreated?.filePath
+    ? path.relative(wsRoot, lastCreated.filePath)
+    : (symbolNames.length === 1
+      ? (TARGET_DIR === '.' ? `${symbolNames[0]}${extension}` : `${TARGET_DIR}/${symbolNames[0]}${extension}`)
+      : SUGGESTED_TYPES_FILE);
+  return { filename, content: extractedContent };
+}
+
+function inferReplaceArgsFromContext(lastRead, lastCreated) {
+  if (!lastRead?.content || !lastCreated?.filePath) return null;
+  const oldText = extractDefinitionsFromSource(lastRead.content, TARGET_FILE);
+  const newText = buildExactModuleReference(lastCreated.filePath, lastCreated.exportNames);
+  if (!oldText || !newText) return null;
+  return { filepath: TARGET_FILE, old_text: oldText, new_text: newText };
+}
+
+function inferBootstrapToolCall(content, ctx = {}) {
+  const text = String(content ?? '').trim();
+  if (!text) return null;
+
+  const lower = text.toLowerCase();
+  const mentionsReadSlice = /\bread_file_slice\b/.test(lower) || /\bread\b.*(?:bounded|next|target|section|slice|line range|lines?)/i.test(text);
+  const mentionsReadSpecific = /\bread_specific_file\b/.test(lower) || /\bread\b.*\bfile\b/i.test(text);
+  const mentionsCreate = /\bcreate_or_edit_file\b/.test(lower) || /\bcreate\b.*\b(?:file|module)\b/i.test(text) || /\bextract\b.*\b(?:file|module)\b/i.test(text);
+  const mentionsReplace = /\breplace_in_file\b/.test(lower) || /\breplace\b.*\b(?:block|file|definition|original)\b/i.test(text) || /\bupdate\b.*\boriginal\b/i.test(text);
+  const mentionsList = /\blist_workspace_files\b/.test(lower) || /\blist\b.*\bworkspace\b/i.test(text) || /\binspect\b.*\bdirectory\b/i.test(text);
+
+  if (ctx.pendingReplaceAfterCreate && ctx.lastCreatedFileState && (mentionsReplace || ctx.analysis?.isAnnouncedButNotExecuted || ctx.analysis?.mentionsToolButNotCalled)) {
+    const replaceArgs = inferReplaceArgsFromContext(ctx.lastSuccessfulRead, ctx.lastCreatedFileState);
+    if (replaceArgs) {
+      return {
+        toolCall: { function: { name: 'replace_in_file', arguments: replaceArgs } },
+        reason: 'bootstrap narrated replace_in_file from split-flow state',
+        signature: `replace_in_file|${replaceArgs.filepath}|${ctx.lastCreatedFileState.filePath}`
+      };
+    }
+  }
+
+  if (ctx.extractionContinuationPending && (mentionsReadSlice || mentionsReadSpecific || ctx.analysis?.isAnnouncedButNotExecuted)) {
+    const fallbackStart = (ctx.lastSuccessfulRead?.endLine ?? 0) + 1 || 1;
+    const fallbackEnd = fallbackStart + 119;
+    const range = inferReadRangeFromNarration(text, fallbackStart, fallbackEnd);
+    return {
+      toolCall: { function: { name: 'read_file_slice', arguments: { filepath: TARGET_FILE, startLine: range.startLine, endLine: range.endLine } } },
+      reason: 'bootstrap narrated continuation read_file_slice',
+      signature: `read_file_slice|${TARGET_FILE}|${range.startLine}|${range.endLine}`
+    };
+  }
+
+  if (!ctx.pendingReplaceAfterCreate && !ctx.hadSuccessfulWrite && ctx.lastSuccessfulRead?.content && (mentionsCreate || ctx.analysis?.mentionsToolButNotCalled)) {
+    const createArgs = inferCreateFileArgsFromContext(ctx.lastSuccessfulRead, ctx.lastCreatedFileState);
+    if (createArgs) {
+      return {
+        toolCall: { function: { name: 'create_or_edit_file', arguments: createArgs } },
+        reason: 'bootstrap narrated create_or_edit_file from last successful read',
+        signature: `create_or_edit_file|${createArgs.filename}`
+      };
+    }
+  }
+
+  if (mentionsList && !ctx.lastSuccessfulRead && !ctx.hadSuccessfulWrite) {
+    return {
+      toolCall: { function: { name: 'list_workspace_files', arguments: { directory: '.' } } },
+      reason: 'bootstrap narrated list_workspace_files',
+      signature: 'list_workspace_files|.'
+    };
+  }
+
+  if (mentionsReadSlice || mentionsReadSpecific || ctx.analysis?.isAnnouncedButNotExecuted) {
+    const fallbackStart = ctx.lastSuccessfulRead ? ctx.lastSuccessfulRead.endLine + 1 : 1;
+    const fallbackEnd = fallbackStart + 119;
+    const range = inferReadRangeFromNarration(text, fallbackStart, fallbackEnd);
+    return {
+      toolCall: { function: { name: 'read_file_slice', arguments: { filepath: TARGET_FILE, startLine: range.startLine, endLine: range.endLine } } },
+      reason: 'bootstrap narrated read_file_slice',
+      signature: `read_file_slice|${TARGET_FILE}|${range.startLine}|${range.endLine}`
+    };
+  }
+
+  return null;
+}
+
 // ─── Main ────────────────────────────────────────────────────────────────────
 async function main() {
   label(B, 'CONFIG', `Model: ${MODEL} | ${OLLAMA_URL} | DryRun: ${DRY_RUN} | MaxTurns: ${MAX_TURNS}`);
@@ -1540,6 +1648,8 @@ async function main() {
   let extractionContinuationPending = false; // true after replace_in_file success; cleared when model starts next tool call
   let targetTotalLinesObserved = 0;
   let targetAppearsExhausted = false;
+  let repeatedNarratedCallSignature = null;
+  let repeatedNarratedCallCount = 0;
   const recentReads = [];          // all successful read results (capped at 20) for reminder context
   const seenReadSigs = new Map(); // cross-turn dedup: sig -> read count (block after 2 reads)
   dryRunFiles.clear(); // reset for this session
@@ -1552,6 +1662,144 @@ async function main() {
     const lastReadEnd = lastSuccessfulRead?.endLine ?? 0;
     const remainingUnreadLines = Math.max(0, targetTotalLinesObserved - lastReadEnd);
     return targetTotalLinesObserved <= 40 || remainingUnreadLines <= 8;
+  };
+
+  const executeResolvedToolCalls = async (toolCalls, options = {}) => {
+    const { assistantContent = '', toolCallsPayload = undefined, recoveryLabel = 'BOOTSTRAP TOOL CALL' } = options;
+
+    extractionContinuationPending = false;
+    label(Y, recoveryLabel, `Executing ${toolCalls.length} recovered tool call(s)`);
+    label(G, 'TOOL CALLS', toolCalls.map(tc => tc.function?.name).join(', '));
+    messages.push({ role: 'assistant', content: assistantContent, tool_calls: toolCallsPayload });
+
+    const postToolMessages = [];
+
+    for (const tc of toolCalls) {
+      const toolName = tc.function?.name ?? 'unknown';
+      const rawArgs = tc.function?.arguments ?? {};
+      const args = typeof rawArgs === 'string' ? JSON.parse(rawArgs) : rawArgs;
+
+      label(B, `  → ${toolName}`, JSON.stringify(args).substring(0, 150));
+      logEvent('tool_exec_start', { tool: toolName, args });
+
+      if (toolName === 'read_file_slice' || toolName === 'read_specific_file') {
+        const readSig = toolName + '|' + JSON.stringify(args);
+        const readCount = seenReadSigs.get(readSig) ?? 0;
+        if (readCount >= 2) {
+          label(Y, '  ⟳ SKIP DUPE READ', `${toolName} same args already seen ${readCount}x`);
+          messages.push({ role: 'tool', content: JSON.stringify({ warning: `Duplicate read — you already read this exact section ${readCount} times. You already have this file content in your context. Do NOT re-read it. Create a NEW sibling file (e.g. ${SUGGESTED_TYPES_FILE}, NOT ${TARGET_FILE}) for the extracted code using create_or_edit_file, then use replace_in_file on ${TARGET_FILE} to replace that block with the correct module reference or equivalent update.` }), tool_name: toolName });
+          continue;
+        }
+        seenReadSigs.set(readSig, readCount + 1);
+      }
+
+      const result = await executeTool(toolName, args);
+      const parsed = JSON.parse(result);
+
+      if (parsed.error) {
+        label(R, `  ✗ ${toolName}`, parsed.error);
+        if (toolName === 'create_or_edit_file') {
+          seenReadSigs.clear();
+        }
+        if (toolName === 'replace_in_file' && parsed.neverPresentInTarget && pendingReplaceAfterCreate && lastCreatedFileState) {
+          const exactBlockMsg = lastSuccessfulRead?.content
+            ? `The block you tried to replace does not exist anywhere in ${TARGET_FILE}. Do NOT try to replace code from ${path.basename(lastCreatedFileState.filePath)} or any invented helper block. Use ONLY code that already exists in ${TARGET_FILE} as old_text. Re-read the exact target slice and copy that original block verbatim before calling replace_in_file again.`
+            : `The block you tried to replace does not exist anywhere in ${TARGET_FILE}. Do NOT invent a replacement target. Read the exact target slice from ${TARGET_FILE}, then call replace_in_file again using only code that currently exists there as old_text.`;
+          messages.push({ role: 'tool', content: JSON.stringify({ warning: exactBlockMsg }), tool_name: 'replace_in_file' });
+        }
+        if (toolName === 'replace_in_file' && parsed.suggestedSlice) {
+          const autoRead = await executeTool('read_file_slice', parsed.suggestedSlice);
+          const autoReadParsed = JSON.parse(autoRead);
+          if (!autoReadParsed.error && autoReadParsed.content) {
+            lastSuccessfulRead = { filepath: String(parsed.suggestedSlice.filepath ?? ''), startLine: parsed.suggestedSlice.startLine, endLine: parsed.suggestedSlice.endLine, content: autoReadParsed.content };
+            const autoMsg = `[Auto-read lines ${parsed.suggestedSlice.startLine}–${parsed.suggestedSlice.endLine} to help you fix old_text]:\n\`\`\`${TARGET_CODE_FENCE}\n${autoReadParsed.content.substring(0, 800)}\n\`\`\`\nUse the EXACT text from above as old_text for replace_in_file.`;
+            label(Y, '  AUTO-READ', `injected ${autoReadParsed.content.length} chars for old_text context`);
+            messages.push({ role: 'tool', content: autoMsg, tool_name: 'read_file_slice' });
+          }
+        }
+      } else {
+        label(G, `  ✓ ${toolName}`, result.substring(0, 200));
+        if ((toolName === 'read_file_slice' || toolName === 'read_specific_file') && path.normalize(String(parsed.path ?? '')) === TARGET_ABS_FILE) {
+          const totalLines = Number(parsed.totalLines ?? 0);
+          if (Number.isFinite(totalLines) && totalLines > 0) {
+            targetTotalLinesObserved = totalLines;
+          }
+          const startLine = Number(parsed.startLine ?? args.startLine ?? 1);
+          const hasVisibleContent = typeof parsed.content === 'string' && parsed.content.length > 0;
+          if (!hasVisibleContent && targetTotalLinesObserved > 0 && startLine > targetTotalLinesObserved) {
+            targetAppearsExhausted = true;
+          } else if (hasVisibleContent) {
+            targetAppearsExhausted = false;
+          }
+        }
+        if (toolName === 'read_file_slice' && parsed.content) {
+          lastSuccessfulRead = { filepath: String(args.filepath ?? ''), startLine: args.startLine ?? 1, endLine: args.endLine ?? 1, content: parsed.content };
+          recentReads.push(lastSuccessfulRead);
+          if (recentReads.length > 20) recentReads.shift();
+        }
+        if (toolName === 'create_or_edit_file' || toolName === 'replace_in_file') {
+          hadSuccessfulWrite = true;
+          if (toolName === 'create_or_edit_file') {
+            const createdPath = parsed.path ?? '';
+            const isOriginal = createdPath.includes(TARGET_BASENAME);
+            if (!isOriginal) {
+              const fileContent = args.content ?? '';
+              const exportNames = extractSymbolNamesFromContent(fileContent, createdPath);
+              lastCreatedFileState = { filePath: createdPath, content: fileContent, exportNames };
+              pendingReplaceAfterCreate = true;
+              const reminder = buildReplaceReminder(createdPath, fileContent, recentReads);
+              label(Y, '  REMINDER', reminder.substring(0, 400));
+              postToolMessages.push({ role: 'user', content: reminder, _type: 'reminder' });
+            }
+          }
+          if (toolName === 'replace_in_file') {
+            pendingReplaceAfterCreate = false;
+            extractionCount++;
+            extractionContinuationPending = true;
+            label(G, '  EXTRACTED', `Cycle ${extractionCount} done. Injecting continuation nudge.`);
+            const continueMsg = `Module extraction ${extractionCount} complete. Now read the next section of ${TARGET_FILE} (use a NEW line range you haven't read yet, beyond the block you just replaced) and extract another self-contained block (types, functions, classes, methods, utilities, or similar). Aim to extract at least 3 modules total.`;
+            postToolMessages.push({ role: 'user', content: continueMsg, _type: 'continuation' });
+          }
+        }
+      }
+
+      logEvent('tool_exec_result', { tool: toolName, result: result.substring(0, 300) });
+      messages.push({ role: 'tool', content: result, tool_name: toolName });
+    }
+
+    if (hadSuccessfulWrite) {
+      const verifyTargetPath = lastCreatedFileState?.filePath || resolveFilepath(TARGET_FILE);
+      const verifyConfig = pickVerifyCommandForPath(verifyTargetPath);
+      if (verifyConfig) {
+        label(B, 'VERIFY', `${verifyConfig.stack}: ${verifyConfig.command}`);
+        const verifyResult = await executeTool('execute_terminal_command', { command: `cd ${JSON.stringify(verifyConfig.projectRoot)} && ${verifyConfig.command}` });
+        const parsedVerify = JSON.parse(verifyResult);
+        const verifyOutput = [String(parsedVerify.stdout ?? ''), String(parsedVerify.stderr ?? '')].filter(Boolean).join('\n').trim();
+        messages.push({
+          role: 'tool',
+          content: JSON.stringify({
+            tool: 'build_verify',
+            stack: verifyConfig.stack,
+            command: verifyConfig.command,
+            projectRoot: verifyConfig.projectRoot,
+            ok: Number(parsedVerify.exitCode ?? 1) === 0,
+            result: Number(parsedVerify.exitCode ?? 1) === 0
+              ? `Build verification passed for ${verifyConfig.stack}.`
+              : `Build verification failed for ${verifyConfig.stack}:\n${verifyOutput || '(no output)'}`
+          }),
+          tool_name: 'build_verify'
+        });
+      }
+    }
+
+    for (const { _type, ...msg } of postToolMessages) {
+      if (_type === 'reminder' && !pendingReplaceAfterCreate) continue;
+      messages.push(msg);
+    }
+
+    retryCount = 0;
+    repeatedNarratedCallSignature = null;
+    repeatedNarratedCallCount = 0;
   };
 
   while (turn < MAX_TURNS) {
@@ -1765,6 +2013,8 @@ async function main() {
       }
 
       retryCount = 0;
+      repeatedNarratedCallSignature = null;
+      repeatedNarratedCallCount = 0;
       continue;
     }
 
@@ -1822,6 +2072,41 @@ async function main() {
     const analysis = analyzeResponse(content, recentMessages);
     label(Y, 'ANALYSIS', JSON.stringify(analysis));
     logEvent('response_analysis', { turn, retryCount, ...analysis });
+
+    const bootstrapCandidate = inferBootstrapToolCall(content, {
+      analysis,
+      pendingReplaceAfterCreate,
+      lastSuccessfulRead,
+      lastCreatedFileState,
+      extractionContinuationPending,
+      hadSuccessfulWrite
+    });
+    if (bootstrapCandidate) {
+      if (bootstrapCandidate.signature === repeatedNarratedCallSignature) {
+        repeatedNarratedCallCount++;
+      } else {
+        repeatedNarratedCallSignature = bootstrapCandidate.signature;
+        repeatedNarratedCallCount = 1;
+      }
+      label(Y, 'BOOTSTRAP CANDIDATE', `${bootstrapCandidate.reason} [${repeatedNarratedCallCount}x]: ${bootstrapCandidate.signature}`);
+      if (repeatedNarratedCallCount >= 2) {
+        logEvent('bootstrap_tool_call', {
+          turn,
+          reason: bootstrapCandidate.reason,
+          signature: bootstrapCandidate.signature,
+          tool: bootstrapCandidate.toolCall.function?.name
+        });
+        await executeResolvedToolCalls([bootstrapCandidate.toolCall], {
+          wasNativeCall: false,
+          assistantContent: '',
+          recoveryLabel: 'BOOTSTRAP TOOL CALL'
+        });
+        continue;
+      }
+    } else {
+      repeatedNarratedCallSignature = null;
+      repeatedNarratedCallCount = 0;
+    }
 
     // Show plan to console then nudge
     if (analysis.looksLikePlan) {
@@ -1978,10 +2263,13 @@ async function main() {
     }
 
     const nudge = buildNudge(analysis, lastToolWasError, { pendingReplaceAfterCreate, lastSuccessfulRead, lastCreatedFileState, extractionContinuationPending, extractionCount, hadSuccessfulWrite });
-    label(Y, 'NUDGE', nudge);
-    logEvent('nudge', { kind: 'tool_continuation', turn, retryCount, nudge });
+    const narratedBootstrapWarning = bootstrapCandidate && repeatedNarratedCallCount === 1
+      ? `\nIf you describe the same tool call in plain text again instead of executing it, the harness will bootstrap ${bootstrapCandidate.toolCall.function?.name} automatically.`
+      : '';
+    label(Y, 'NUDGE', `${nudge}${narratedBootstrapWarning}`);
+    logEvent('nudge', { kind: 'tool_continuation', turn, retryCount, nudge: `${nudge}${narratedBootstrapWarning}` });
     messages.push({ role: 'assistant', content });
-    messages.push({ role: 'user', content: nudge });
+    messages.push({ role: 'user', content: `${nudge}${narratedBootstrapWarning}` });
     retryCount++;
   }
 

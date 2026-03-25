@@ -6298,6 +6298,11 @@ If the user asks for a change but provides NO code:
         error: 'old_text and new_text are identical — this replace would make no change to the file. This is wrong for a refactor task. To split the file into smaller modules, you must: (1) call create_or_edit_file with a new sibling file path such as types.ts next to the target file and the exact code block you are extracting; (2) call replace_in_file with old_text set to that extracted block and new_text set to an import statement. Never pass the same text as both old_text and new_text.'
       });
     }
+    if (this.isLargeRefactorScenario() && this.isPlaceholderReplacementText(newText)) {
+      return JSON.stringify({
+        error: 'new_text is a placeholder comment, not a valid extraction replacement. Replace the original block with the correct module reference or equivalent real code update — never with "Code will be inserted here".'
+      });
+    }
 
     try {
       const recoveredTarget = await this.recoverRequestScopedTargetPath(filepath);
@@ -6733,6 +6738,17 @@ If the user asks for a change but provides NO code:
     }).length;
 
     return codeLikeLineCount === 0 && bytesWritten <= 240;
+  }
+
+  private isPlaceholderReplacementText(content: string): boolean {
+    const normalizedLines = content
+      .replace(/\r\n/g, '\n')
+      .split('\n')
+      .map(line => line.trim())
+      .filter(Boolean);
+
+    return normalizedLines.length > 0 && normalizedLines.every(line =>
+      /^(?:\/\/|#|\/\*|\*|<!--)?\s*(?:code will be inserted here|todo|tbd|placeholder|stub|coming soon|implement me|fill me in)/i.test(line));
   }
 
   private toolResultMatchesAnyTargetPath(toolPathValue: unknown, targets: string[]): boolean {
