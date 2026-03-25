@@ -2015,6 +2015,31 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           return this.toolResultMatchesAnyTargetPath(parsed.path, largeRefactorTargets);
         });
         const isLargeRefactorRequest = this.looksLikeLargeRefactorRequest(latestVisibleUserRequest);
+        const latestLargeRefactorTargetRead = largeRefactorTargets.length > 0
+          ? [...recentToolResults].reverse().find(({ message, parsed }) => {
+            if (parsed.error) {
+              return false;
+            }
+            if (message.tool_name !== 'read_active_file'
+              && message.tool_name !== 'read_specific_file'
+              && message.tool_name !== 'read_file_slice') {
+              return false;
+            }
+            return this.toolResultMatchesAnyTargetPath(parsed.path, largeRefactorTargets);
+          })
+          : undefined;
+        const latestLargeRefactorTargetTotalLines = Number(latestLargeRefactorTargetRead?.parsed.totalLines ?? 0);
+        const latestLargeRefactorTargetEndLine = Number(latestLargeRefactorTargetRead?.parsed.endLine ?? 0);
+        const latestLargeRefactorTargetRemainingLines = latestLargeRefactorTargetTotalLines > 0
+          ? Math.max(0, latestLargeRefactorTargetTotalLines - latestLargeRefactorTargetEndLine)
+          : Number.POSITIVE_INFINITY;
+        const canStopAfterTinyLargeRefactor = Boolean(
+          isLargeRefactorRequest
+          && hasRecentMeaningfulWrite
+          && hasRecentReadOfLargeRefactorTarget
+          && latestLargeRefactorTargetTotalLines > 0
+          && (latestLargeRefactorTargetTotalLines <= 40 || latestLargeRefactorTargetRemainingLines <= 8)
+        );
         const replaceNotFoundContext = this.getLatestReplaceNotFoundContext(messages);
         const hasRecentReplaceNotFound = Boolean(replaceNotFoundContext);
         const replaceNotFoundFilepath = replaceNotFoundContext?.filepath;
@@ -2173,14 +2198,16 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           || hasPostReadSummaryOnLargeRefactor
           || hasModelRefusalResponse
           || hasLazyRefusalOnLargeRefactor
-          || hasPostCreateRefactorNarration
+          || (hasPostCreateRefactorNarration && !canStopAfterTinyLargeRefactor)
           || (hasRecentBuildVerifyFailure && (claimsDone || mentionsChange || isLazyAcknowledgment || hasIncompletePlan || hasExplicitNextSteps || isProgressOnlyResponse || isPassingToUser))
           || (isLargeRefactorRequest && hasRecentToolResults && (!hasRecentSuccessfulAction || !hasRecentReadOfLargeRefactorTarget || !hasRecentMeaningfulWrite))
           || (hasRecentReplaceNotFound && (mentionsChange || claimsDone || isLazyAcknowledgment || hasIncompletePlan || hasExplicitNextSteps || isPassingToUser || isProgressOnlyResponse))
           || (hasRecentToolErrors && (claimsDone || mentionsChange || isLazyAcknowledgment || hasIncompletePlan || hasExplicitNextSteps || isProgressOnlyResponse))
           || (!hasRecentSuccessfulAction && (isLongDump || hasLargeCodeBlocks || claimsDone || mentionsChange || isLazyAcknowledgment))
         );
-        const shouldNudge = requiresToolContinuation && retryCount < maxNudgeRetries;
+        const shouldNudge = requiresToolContinuation
+          && !canStopAfterTinyLargeRefactor
+          && retryCount < maxNudgeRetries;
         const shouldAutoBootstrapLargeRefactorRead = Boolean(
           shouldNudge
           && retryCount >= 1
@@ -2223,7 +2250,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         }
 
         if (shouldNudge) {
-          this.debugLog('nudge', { retryCount, hasRecentToolResults, hasRecentSuccessfulAction, hasRecentMeaningfulWrite, latestCreatedFilePath, hasRecentReadOfLargeRefactorTarget, hasLargeRefactorShellReadBypass, hasPreReadLargeRefactorNarration, hasFakePreReadCodeDump, hasFakePostReadAnalysisDump, hasPostReadSummaryOnLargeRefactor, hasModelRefusalResponse, hasAnnouncedExtractionWithoutWrite, hasLazyRefusalOnLargeRefactor, isAskingUserForExactSlice, suggestedNextSlice, hasReadButNoWriteOnLargeRefactor, hasPostReadToolStall, hasPostCreateRefactorNarration, announcedNewFilePath, hasRecentToolErrors, hasRecentBuildVerifyFailure, hasRecentReplaceNotFound, replaceNotFoundFilepath, replaceNotFoundStartLine, replaceNotFoundEndLine, lastSuccessfulActionIndex, isLongDump, hasLargeCodeBlocks, claimsDone, mentionsChange, isLazyAcknowledgment, hasIncompletePlan: !!hasIncompletePlan, hasExplicitNextSteps, isProgressOnlyResponse, claimedButUnexecutedCommand, isPassingToUser, isAnnouncedButNotExecuted, isLargeRefactorRequest, contentPreview: finalContent.substring(0, 200) });
+          this.debugLog('nudge', { retryCount, hasRecentToolResults, hasRecentSuccessfulAction, hasRecentMeaningfulWrite, latestCreatedFilePath, hasRecentReadOfLargeRefactorTarget, latestLargeRefactorTargetTotalLines, latestLargeRefactorTargetRemainingLines, canStopAfterTinyLargeRefactor, hasLargeRefactorShellReadBypass, hasPreReadLargeRefactorNarration, hasFakePreReadCodeDump, hasFakePostReadAnalysisDump, hasPostReadSummaryOnLargeRefactor, hasModelRefusalResponse, hasAnnouncedExtractionWithoutWrite, hasLazyRefusalOnLargeRefactor, isAskingUserForExactSlice, suggestedNextSlice, hasReadButNoWriteOnLargeRefactor, hasPostReadToolStall, hasPostCreateRefactorNarration, announcedNewFilePath, hasRecentToolErrors, hasRecentBuildVerifyFailure, hasRecentReplaceNotFound, replaceNotFoundFilepath, replaceNotFoundStartLine, replaceNotFoundEndLine, lastSuccessfulActionIndex, isLongDump, hasLargeCodeBlocks, claimsDone, mentionsChange, isLazyAcknowledgment, hasIncompletePlan: !!hasIncompletePlan, hasExplicitNextSteps, isProgressOnlyResponse, claimedButUnexecutedCommand, isPassingToUser, isAnnouncedButNotExecuted, isLargeRefactorRequest, contentPreview: finalContent.substring(0, 200) });
           // Show plan/progress text to the user before nudging
           if (!isProgressOnlyResponse
             && !hasFakePreReadCodeDump
@@ -5112,7 +5139,8 @@ If the user asks for a change but provides NO code:
             path: recovered.fsPath,
             languageId,
             content,
-            recoveredFromPath: filepath
+            recoveredFromPath: filepath,
+            note: this.buildRecoveredTargetNote(filepath, recovered.fsPath)
           });
         } catch {
           // Fall through to the original error below.
@@ -5195,7 +5223,8 @@ If the user asks for a change but provides NO code:
               endLine: 0,
               totalLines: 0,
               content: '',
-              recoveredFromPath: filepath
+              recoveredFromPath: filepath,
+              note: this.buildRecoveredTargetNote(filepath, recovered.fsPath)
             });
           }
 
@@ -5212,7 +5241,8 @@ If the user asks for a change but provides NO code:
             endLine: clampedEnd,
             totalLines,
             content: lines.slice(start - 1, clampedEnd).join('\n'),
-            recoveredFromPath: filepath
+            recoveredFromPath: filepath,
+            note: this.buildRecoveredTargetNote(filepath, recovered.fsPath)
           });
         } catch {
           // Fall through to the original error below.
@@ -5258,6 +5288,10 @@ If the user asks for a change but provides NO code:
     }
 
     return undefined;
+  }
+
+  private buildRecoveredTargetNote(requestedPath: string, resolvedPath: string): string {
+    return `Recovered requested path ${requestedPath} to exact target ${resolvedPath}. Use this exact target path for subsequent read and edit calls.`;
   }
 
   private async createOrEditFile(filename: string, content: string): Promise<string> {
