@@ -44,8 +44,9 @@ if (targetFlagIndex >= 0) {
 const TARGET_FILE = cliTargetFile ?? process.env.TARGET_FILE ?? 'src/ManulAiChatProvider.ts';
 const TARGET_BASENAME = path.basename(TARGET_FILE, '.ts'); // e.g. "ManulAiChatProvider"
 const TARGET_DIR = path.posix.dirname(TARGET_FILE.replace(/\\/g, '/'));
-const SUGGESTED_TYPES_FILE = TARGET_DIR === '.' ? 'types.ts' : `${TARGET_DIR}/types.ts`;
-const SUGGESTED_INTERFACES_FILE = TARGET_DIR === '.' ? 'interfaces.ts' : `${TARGET_DIR}/interfaces.ts`;
+const TARGET_EXTENSION = path.extname(TARGET_FILE) || '.txt';
+const SUGGESTED_TYPES_FILE = TARGET_DIR === '.' ? `types${TARGET_EXTENSION}` : `${TARGET_DIR}/types${TARGET_EXTENSION}`;
+const SUGGESTED_INTERFACES_FILE = TARGET_DIR === '.' ? `interfaces${TARGET_EXTENSION}` : `${TARGET_DIR}/interfaces${TARGET_EXTENSION}`;
 const TARGET_LANGUAGE_ID = detectLanguageId(TARGET_FILE);
 const TARGET_CODE_FENCE = detectCodeFenceLanguage(TARGET_FILE);
 
@@ -112,6 +113,26 @@ function detectCodeFenceLanguage(filepath) {
   if (languageId === 'markdown') return 'markdown';
   if (languageId === 'plaintext') return '';
   return languageId;
+}
+
+function buildModuleReferenceExample(createdPath, exportNames) {
+  const baseName = path.basename(createdPath, path.extname(createdPath));
+  const ext = path.extname(createdPath).toLowerCase();
+  const names = exportNames.filter(Boolean);
+  if (names.length === 0) return 'update references to point at the new module file';
+  if (['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs'].includes(ext)) {
+    return `import { ${names.join(', ')} } from './${baseName}';`;
+  }
+  if (ext === '.py') {
+    return `from ${baseName} import ${names.join(', ')}`;
+  }
+  if (ext === '.java') {
+    return `import ${baseName}.${names[0]};`;
+  }
+  if (ext === '.cs') {
+    return `using ${baseName};`;
+  }
+  return 'update references to point at the new module file';
 }
 
 function findNearestProjectRoot(startPath) {
@@ -1256,7 +1277,7 @@ function buildReplaceReminder(createdPath, newFileContent, allRecentReads) {
   }
 
   if (exportNames.length > 0) {
-    msg += `Set new_text = \`import { ${exportNames.join(', ')} } from './${baseName}';\`\n`;
+    msg += `Set new_text to the appropriate module reference, for example: \`${buildModuleReferenceExample(createdPath, exportNames)}\`\n`;
   }
 
   return msg;
@@ -1273,7 +1294,7 @@ function buildNudge(analysis, lastToolWasError, ctx = {}) {
       nudge += `\nCopy ONLY the exact block that defines ${lastCreated.exportNames.slice(0, 3).join(', ')} as old_text (do NOT include the import statements at the top).`;
     }
     if (lastCreated.exportNames.length > 0) {
-      nudge += `\nnew_text = \`import { ${lastCreated.exportNames.join(', ')} } from './${path.basename(lastCreated.filePath, '.ts')}';\``;
+      nudge += `\nnew_text should be the appropriate module reference, for example: \`${buildModuleReferenceExample(lastCreated.filePath, lastCreated.exportNames)}\``;
     }
     nudge += `\nCall replace_in_file now — do NOT describe it in text, execute the tool call.`;
     return nudge;
