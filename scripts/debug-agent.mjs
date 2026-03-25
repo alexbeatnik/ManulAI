@@ -2100,7 +2100,6 @@ async function main() {
   while (turn < MAX_TURNS) {
     turn++;
     label(C, `TURN ${turn}`, `retry=${retryCount} messages=${messages.length}`);
-    logEvent('ollama_request', { turn, retryCount, messageCount: messages.length });
 
     // Sliding window: prevent context overflow based on model size
     if (messages.length > MODEL_LIMITS.maxMessages) {
@@ -2112,6 +2111,8 @@ async function main() {
       seenReadSigs.clear(); // allow re-reads after context trim
       label(Y, 'CONTEXT TRIM', `Trimmed to ${messages.length} messages (limit ${MODEL_LIMITS.maxMessages} for model ${MODEL})`);
     }
+
+    logEvent('ollama_request', { turn, retryCount, messageCount: messages.length });
 
     const body = {
       model: MODEL,

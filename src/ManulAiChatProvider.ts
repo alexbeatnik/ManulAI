@@ -1328,15 +1328,19 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   private async processOllamaResponse(messages: OllamaMessage[], retryCount = 0): Promise<void> {
     this.throwIfRequestStopped();
 
-    // Context trimming: prevent overflow by keeping only recent messages
+    // Context trimming: prevent overflow by keeping only recent model-visible messages.
+    // localOnly progress messages don't go to Ollama (filtered in callOllama) so exclude them from the count.
     if (this.isAgentLike) {
       const { maxMessages } = this.getModelContextLimits();
-      if (messages.length > maxMessages) {
+      const modelMessages = messages.filter(m => !m.localOnly);
+      if (modelMessages.length > maxMessages) {
+        // Strip all localOnly progress messages first — they are UI-only
+        const stripped = messages.filter(m => !m.localOnly);
         // Keep first 2 messages (user prompt + plan nudge) and most recent ones
         const headCount = 2;
         const tailCount = maxMessages - headCount - 1; // -1 for the trim notice
-        const first = messages.slice(0, headCount);
-        const recent = messages.slice(-tailCount);
+        const first = stripped.slice(0, headCount);
+        const recent = stripped.slice(-tailCount);
         const trimNotice: OllamaMessage = {
           role: 'user',
           content: 'Context trimmed to prevent overflow. Continue with the task — execute the next required action.',
@@ -1344,12 +1348,11 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         };
         messages.splice(0, messages.length, ...first, trimNotice, ...recent);
         this.debugLog('context_trim', { maxMessages, trimmedTo: messages.length, model: this.getSelectedModel() });
-        this.postProgressStep(`Context trimmed to ${messages.length} messages`);
       }
     }
 
     this.postStatus(retryCount > 0 ? `Retry ${retryCount}: calling Ollama...` : 'Calling Ollama...');
-    this.debugLog('ollama_request', { retryCount, messageCount: messages.length, model: this.getSelectedModel() });
+    this.debugLog('ollama_request', { retryCount, messageCount: messages.filter(m => !m.localOnly).length, model: this.getSelectedModel() });
     const responseData = await this.callOllama(messages);
     this.throwIfRequestStopped();
     const assistantMessage = responseData.message;
