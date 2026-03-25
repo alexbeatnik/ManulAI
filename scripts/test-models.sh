@@ -59,22 +59,26 @@ for model in "${MODELS[@]}"; do
     echo "  Model: $model | Scenario: $scenario_name | MaxTurns: $max_turns"
     echo "═══════════════════════════════════════════════════════════════"
 
-    # Build command
-    cmd="DRY_RUN=$DRY_RUN MAX_TURNS=$max_turns MANUL_MODEL=$model"
+    # Build command as an array to avoid shell injection issues
+    cmd=(env "DRY_RUN=$DRY_RUN" "MAX_TURNS=$max_turns" "MANUL_MODEL=$model" node scripts/debug-agent.mjs)
     if [ -n "$target" ]; then
-      cmd="$cmd node scripts/debug-agent.mjs --target $target"
-    else
-      cmd="$cmd node scripts/debug-agent.mjs"
+      cmd+=(--target "$target")
     fi
-    cmd="$cmd \"$prompt\""
+    cmd+=("$prompt")
 
-    echo "  CMD: $cmd"
+    # Printable representation for logging
+    cmd_str=""
+    for part in "${cmd[@]}"; do
+      printf -v escaped '%q' "$part"
+      cmd_str+="${escaped} "
+    done
+    echo "  CMD: $cmd_str"
     echo "  Log: $out_file"
     echo ""
 
     # Run with timeout (5 min per test)
     set +e
-    timeout 300 bash -c "$cmd" > "$out_file" 2>&1
+    timeout 300 "${cmd[@]}" > "$out_file" 2>&1
     exit_code=$?
     set -e
 

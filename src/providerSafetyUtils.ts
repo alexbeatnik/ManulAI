@@ -61,8 +61,8 @@ export function isTerminalReadOnlyInspectionCommand(command: string): boolean {
     return false;
   }
 
-  return /^(?:cat|head|tail|sed|awk|grep|rg|less|more|ls|find)\b/.test(normalized)
-    || /(?:\bcat\b|\bhead\b|\btail\b|\bsed\b|\bawk\b|\bgrep\b|\brg\b).*\bmanulaichatprovider\.ts\b/.test(normalized)
+  return /^(?:cat|head|tail|sed|grep|rg|less|more|ls|find)\b/.test(normalized)
+    || /(?:\bcat\b|\bhead\b|\btail\b|\bsed\b|\bgrep\b|\brg\b).*\bmanulaichatprovider\.ts\b/.test(normalized)
     || /^ls(?:\b|\b.*-)/.test(normalized);
 }
 
