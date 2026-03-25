@@ -22,7 +22,7 @@ ManulAI is a local-first, privacy-focused coding agent for VS Code. All intellig
 - **UI Provider:** Built using `WebviewViewProvider` for the chat interface in the Secondary Sidebar.
 - **Agent Loop:** All context forwarding and tool results are handled by returning tool outputs directly to Ollama.
 - **Provider Split:** `src/ManulAiChatProvider.ts` remains the stateful orchestration layer, while `src/providerRefactorUtils.ts` contains pure large-refactor/bootstrap inference and generated-module validation helpers, `src/providerSafetyUtils.ts` contains build-verify classification, structured-write guards, preview generation, and placeholder/path heuristics, `src/providerPersistenceUtils.ts` contains workspace settings/chat persistence helpers, `src/providerWebviewUtils.ts` contains attachment rendering plus transcript/webview formatting helpers, `src/providerToolParsingUtils.ts` contains tool-call parsing plus malformed JSON recovery helpers, and `src/providerFileFallbackUtils.ts` contains fallback file-write extraction heuristics.
-- **Modes:** The extension supports tool-enabled Agent Mode and plain Chat Mode with separate system prompts.
+- **Modes:** The extension supports three working modes: tool-enabled Agent Mode, condensed step-by-step Planner Mode (same tools, shorter mandate, can answer text questions directly), and plain Chat Mode with no tool calls.
 - **File System:** Uses `vscode.workspace.fs` for file inspection and edits.
 - **State:** Conversation history and file context remain available in memory during the VS Code session. They are not sent to any cloud provider.
 - **Chat Sessions:** The provider maintains multiple chat sessions; each chat owns its own transcript and attached file context while sharing the same workspace settings and tool/runtime layer. File-backed workspaces persist this state under `.manulai/chats.json`, with extension-storage fallback when no file-backed workspace exists.
@@ -87,7 +87,7 @@ Reference shape:
 {
   "ollamaModel": "",
   "ollamaBaseUrl": "http://localhost:11434",
-  "agentMode": true,
+  "agentMode": "agent",
   "autoApprove": false,
   "debugMode": false,
   "systemPrompt": "You are ManulAI, a privacy-first local coding assistant running inside VS Code. Work across any programming language. Prefer precise, minimal changes and explain results clearly."
@@ -126,11 +126,13 @@ Chats also persist a compact `summaryMemory` alongside the full transcript in `.
 ## Response Pipeline Notes
 
 - Agent Mode sends tool definitions to Ollama and continues the loop automatically.
+- Planner Mode sends the same tool definitions but uses a shorter system mandate focused on step-by-step execution; direct text questions are answered without requiring tool calls.
 - Auto-Approve can bypass per-tool confirmations when enabled.
 - Chat Mode bypasses tool fallback write layers and returns plain text only.
 - Agent Mode still includes fallback write extraction layers for weaker models that fail to emit native tool calls reliably.
 - After successful file writes, the provider attempts an automatic `build_verify` step using the best available project command for the detected stack, such as package scripts, `tsc --noEmit`, `cargo check`, `go test ./...`, `python -m compileall`, `mvn compile`, `gradle build`, or `dotnet build`.
 - Ollama requests are not hard-timed out by the extension; users can stop them explicitly.
+- Context trimming is model-aware: the provider derives sliding-window size and `num_ctx` from the model size tag (e.g. `:7b` → 16 messages / 8K context, `:30b` → 32 / 16K) rather than using hardcoded limits. `num_ctx` is always present in the Ollama request body so the runtime allocates an appropriate KV-cache window.
 - Debug sessions append to stable JSONL files so live debugging does not depend on a long-lived writable stream.
 - Every debug event includes the extension version and session identifier, not only the session-start record.
 - User prompts are logged as explicit debug events before hidden scan nudges, auto-attachments, or tool-loop retries modify the request context.
@@ -173,7 +175,7 @@ Chats also persist a compact `summaryMemory` alongside the full transcript in `.
 
 ## Release Notes
 
-- **0.0.5:** Split provider-side helper logic out of `src/ManulAiChatProvider.ts` into `src/providerRefactorUtils.ts`, `src/providerSafetyUtils.ts`, `src/providerPersistenceUtils.ts`, `src/providerWebviewUtils.ts`, `src/providerToolParsingUtils.ts`, and `src/providerFileFallbackUtils.ts`. Production now matches the stronger repeated narrated-call bootstrap behavior already validated in the standalone harness, Go/Rust extraction writes are screened for obviously invalid generated blocks before they hit disk, tool-call parsing and malformed JSON recovery now live outside the main provider, and fallback file-write extraction heuristics are isolated from the orchestration layer.
+- **0.0.5:** Added Planner Mode as the third working mode alongside Chat and Agent — uses the same tools as Agent Mode but with a condensed step-by-step mandate; can answer direct text questions without tool calls. Context trimming is now model-aware: sliding-window size and `num_ctx` are derived from the model size tag instead of hardcoded limits. Tool-call stripping was tightened so only `json`/`tool_call`/`tool` code blocks are removed instead of all fenced code blocks. Split provider-side helper logic out of `src/ManulAiChatProvider.ts` into `src/providerRefactorUtils.ts`, `src/providerSafetyUtils.ts`, `src/providerPersistenceUtils.ts`, `src/providerWebviewUtils.ts`, `src/providerToolParsingUtils.ts`, and `src/providerFileFallbackUtils.ts`. Production now matches the stronger repeated narrated-call bootstrap behavior already validated in the standalone harness, Go/Rust extraction writes are screened for obviously invalid generated blocks before they hit disk, tool-call parsing and malformed JSON recovery now live outside the main provider, and fallback file-write extraction heuristics are isolated from the orchestration layer. Test script tool definitions are aligned with the extension's real parameter names.
 - Raw or malformed tool-call JSON leaked into assistant text must be treated as a failed tool invocation and retried; fallback file-write extractors must never treat that payload as file content.
 - Fallback file-write extraction must ignore shell-language fenced blocks and reject suspicious pseudo-filenames such as numeric dotted names or names with trailing dots.
 - Direct fast paths remain conservative and are limited to narrow cases such as Markdown title rename and LICENSE author rename.

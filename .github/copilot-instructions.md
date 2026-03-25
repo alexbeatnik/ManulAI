@@ -12,8 +12,10 @@ This repository contains a VS Code extension named ManulAI.
 - Prefer `WebviewViewProvider` for the chat UI.
 - Keep the webview implementation simple and production-oriented.
 - Avoid unrelated refactors when making targeted changes.
-- Preserve the distinction between Agent Mode and Chat Mode.
+- Preserve the distinction between Chat Mode, Agent Mode, and Planner Mode.
 - In Chat Mode, never claim that files were created, modified, or deleted.
+- Planner Mode uses the same tools as Agent Mode but with a condensed system mandate focused on step-by-step planning and execution.
+- Planner Mode must still answer direct text questions without requiring tool calls.
 - For small edit requests, prefer surgical edits over whole-file rewrites.
 - Never delete unrelated file content when the user asked for a narrow change.
 - Keep project-scan behavior persistent enough that the model can continue across multiple files instead of stopping after the first step.
@@ -39,7 +41,7 @@ This repository contains a VS Code extension named ManulAI.
 - Persist chat sessions for file-backed workspaces under `.manulai/` so they survive VS Code restarts; keep transcript and attached-file context scoped to the active chat.
 - Dropped file context must remain visible in the UI and be forwarded to the model context.
 - Tool results must be returned to Ollama using the native `tool` role flow.
-- Agent Mode should continue to support approvals, auto-approve, and fallback handling for weaker local models.
+- Agent Mode and Planner Mode should continue to support approvals, auto-approve, and fallback handling for weaker local models.
 - Keep direct handlers and fallback layers conservative: fast for common edits, but not destructive.
 - Treat unread files and unlisted project structure as unknown state; for edit tasks, require real tool-based inspection before claiming or applying a fix.
 - Fallback layers must reject raw or malformed tool-call JSON leaked into assistant text or code blocks and retry via native tool execution instead of treating that payload as file content.
@@ -56,12 +58,15 @@ This repository contains a VS Code extension named ManulAI.
 - Keep revert metadata attached to revertable native file-tool transcript entries so the webview can surface `Revert changes` directly on those results.
 - If retry exhaustion is reached and the model still returns pseudo-progress or plan text, surface a deterministic backend failure message instead of leaking raw `Step 1/3`-style output.
 - For large refactor requests, nudge the model toward short module/file plans and iterative execution instead of one-shot whole-file rewrites.
+- Keep context trimming model-aware; derive sliding-window size and `num_ctx` from the model size tag rather than using hardcoded limits.
+- Keep `num_ctx` always present in the Ollama request body so the runtime allocates an appropriate KV-cache window.
 
 ## Debug Script Parity
 
 - `scripts/debug-agent.mjs` is the standalone test harness for the agent loop. Fixes validated there must be ported to `src/ManulAiChatProvider.ts` in the same change or immediately after.
 - When a behavioral fix (hallucination detection, JSON parsing, fallback logic, nudge conditions) proves correct in `debug-agent.mjs`, treat it as a required backport — do not leave the production provider diverged.
 - Keep helper logic (e.g. `escapeJsonStringValues`, analysis flags, done-condition guards) in sync between the two files; if a helper is added or changed in the debug script, update the provider counterpart.
+- Keep tool definitions in `scripts/test-model.mjs` aligned with the extension's real parameter names (e.g. `filename` not `filepath` for `create_or_edit_file`).
 
 ## Documentation
 
