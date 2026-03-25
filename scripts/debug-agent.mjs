@@ -272,6 +272,45 @@ function getToolDefinitions() {
           required: ['command']
         }
       }
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'project_scan',
+        description: 'Build a structured project summary with key files, entry points, package manager, project type hints, and important modules.',
+        parameters: {
+          type: 'object',
+          properties: {},
+          required: []
+        }
+      }
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'read_workspace_notes',
+        description: 'Read persistent notes about this project from .manulai/notes.md.',
+        parameters: {
+          type: 'object',
+          properties: {},
+          required: []
+        }
+      }
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'write_workspace_notes',
+        description: 'Write persistent notes about this project to .manulai/notes.md.',
+        parameters: {
+          type: 'object',
+          properties: {
+            content: { type: 'string' },
+            mode: { type: 'string' }
+          },
+          required: ['content', 'mode']
+        }
+      }
     }
   ];
 }
@@ -287,14 +326,163 @@ async function executeTool(name, args) {
   switch (name) {
     case 'list_workspace_files': {
       const dir = resolveFilepath(args.directory ?? '') || wsRoot;
+      const maxDepth = typeof args.maxDepth === 'number' ? Math.min(Math.max(1, args.maxDepth), 8) : 4;
+      const IGNORED_DIRS = new Set([
+        'node_modules', '.git', '.hg', '.svn', 'dist', 'out', 'build', '.next', '.nuxt',
+        '__pycache__', '.cache', '.turbo', '.parcel-cache', 'coverage', '.nyc_output',
+        '.manulai', 'logs', '.venv', 'venv', '.tox'
+      ]);
+      const FILE_CAP = 400;
+      let fileCount = 0;
+
+      const readDirRec = async (dirPath, depth) => {
+        if (depth > maxDepth || fileCount >= FILE_CAP) { return []; }
+        let entries;
+        try {
+          const { readdirSync } = await import('fs');
+          entries = readdirSync(dirPath, { withFileTypes: true });
+        } catch { return []; }
+        entries.sort((a, b) => {
+          if (a.isDirectory() !== b.isDirectory()) { return a.isDirectory() ? -1 : 1; }
+          return a.name.localeCompare(b.name);
+        });
+        const result = [];
+        for (const ent of entries) {
+          if (fileCount >= FILE_CAP) { break; }
+          if (ent.isDirectory()) {
+            if (IGNORED_DIRS.has(ent.name) || ent.name.startsWith('.')) { continue; }
+            const children = await readDirRec(path.join(dirPath, ent.name), depth + 1);
+            result.push({ name: ent.name, type: 'directory', children });
+          } else {
+            fileCount++;
+            result.push({ name: ent.name, type: 'file' });
+          }
+        }
+        return result;
+      };
+
       try {
-        const { stdout } = await execAsync(`ls -la "${dir}"`);
-        const items = stdout.trim().split('\n').slice(1).map(line => {
-          const parts = line.trim().split(/\s+/);
-          const n = parts[parts.length - 1];
-          return { name: n, type: line.startsWith('d') ? 'directory' : 'file' };
-        }).filter(i => i.name && i.name !== '.' && i.name !== '..');
-        return JSON.stringify({ path: dir, items });
+        const tree = await readDirRec(dir, 1);
+        return JSON.stringify({ path: dir, tree, ...(fileCount >= FILE_CAP ? { note: `Results capped at ${FILE_CAP} files.` } : {}) });
+      } catch (e) { return JSON.stringify({ error: e.message }); }
+    }
+
+    case 'project_scan': {
+      try {
+        const notes = [];
+        const topLevel = existsSync(wsRoot) ? (await import('fs')).readdirSync(wsRoot, { withFileTypes: true }) : [];
+        const topLevelNames = new Set(topLevel.map(ent => ent.name));
+        const keyFiles = ['package.json', 'tsconfig.json', 'README.md', 'README-dev.md', 'Cargo.toml', 'go.mod', 'pyproject.toml', 'requirements.txt', 'Gemfile', 'pom.xml', 'build.gradle', 'build.gradle.kts', 'composer.json', 'Package.swift', 'CMakeLists.txt']
+          .filter(name => topLevelNames.has(name));
+        const languages = [];
+        let packageManager = 'unknown';
+        if (topLevelNames.has('pnpm-lock.yaml')) { packageManager = 'pnpm'; languages.push('javascript', 'typescript'); }
+        else if (topLevelNames.has('yarn.lock')) { packageManager = 'yarn'; languages.push('javascript', 'typescript'); }
+        else if (topLevelNames.has('package-lock.json')) { packageManager = 'npm'; languages.push('javascript', 'typescript'); }
+        else if (topLevelNames.has('bun.lockb') || topLevelNames.has('bun.lock')) { packageManager = 'bun'; languages.push('javascript', 'typescript'); }
+        else if (topLevelNames.has('Cargo.toml')) { packageManager = 'cargo'; languages.push('rust'); }
+        else if (topLevelNames.has('go.mod')) { packageManager = 'go'; languages.push('go'); }
+        else if (topLevelNames.has('pyproject.toml') || topLevelNames.has('requirements.txt')) { packageManager = 'python'; languages.push('python'); }
+        else if (topLevelNames.has('composer.json')) { packageManager = 'composer'; languages.push('php'); }
+        else if (topLevelNames.has('Gemfile')) { packageManager = 'bundler'; languages.push('ruby'); }
+        else if (topLevelNames.has('pom.xml')) { packageManager = 'maven'; languages.push('java'); }
+        else if (topLevelNames.has('build.gradle') || topLevelNames.has('build.gradle.kts')) { packageManager = 'gradle'; languages.push('java', 'kotlin'); }
+        else if (topLevelNames.has('Package.swift')) { packageManager = 'swiftpm'; languages.push('swift'); }
+
+        const entryPoints = [];
+        const importantModules = [];
+        const projectTypes = [];
+        if (topLevelNames.has('package.json')) {
+          try {
+            const pkg = JSON.parse(readFileSync(path.join(wsRoot, 'package.json'), 'utf8'));
+            if (typeof pkg.main === 'string') entryPoints.push(pkg.main);
+            if (typeof pkg.module === 'string') entryPoints.push(pkg.module);
+            if (typeof pkg.types === 'string') { importantModules.push(pkg.types); languages.push('typescript'); }
+            if (pkg.engines?.vscode) projectTypes.push('vscode-extension');
+            const deps = { ...(pkg.dependencies ?? {}), ...(pkg.devDependencies ?? {}) };
+            const depNames = Object.keys(deps);
+            if (depNames.some(name => ['react', 'next', 'vite', 'vue', 'svelte', 'angular'].includes(name))) projectTypes.push('webapp');
+            if (depNames.some(name => ['express', 'fastify', 'koa', 'nest', '@nestjs/core'].includes(name))) projectTypes.push('backend-service');
+            if (pkg.scripts && typeof pkg.scripts === 'object') notes.push(`package.json scripts: ${Object.keys(pkg.scripts).slice(0, 8).join(', ')}`);
+          } catch {
+            notes.push('package.json exists but could not be parsed');
+          }
+        }
+        if (topLevelNames.has('pyproject.toml')) projectTypes.push('python-project');
+        if (topLevelNames.has('Cargo.toml')) projectTypes.push('rust-project');
+        if (topLevelNames.has('go.mod')) projectTypes.push('go-project');
+        if (topLevelNames.has('pom.xml') || topLevelNames.has('build.gradle') || topLevelNames.has('build.gradle.kts')) projectTypes.push('jvm-project');
+        if (topLevelNames.has('composer.json')) projectTypes.push('php-project');
+        if (topLevelNames.has('Gemfile')) projectTypes.push('ruby-project');
+        if (topLevelNames.has('Package.swift')) projectTypes.push('swift-project');
+        if (topLevelNames.has('CMakeLists.txt') || topLevelNames.has('meson.build')) { projectTypes.push('native-project'); languages.push('c/c++'); }
+        if ([...topLevelNames].some(name => name.endsWith('.sln') || name.endsWith('.csproj'))) { projectTypes.push('.net-project'); languages.push('c#'); }
+
+        for (const candidate of ['src/extension.ts', 'src/extension.js', 'src/index.ts', 'src/index.js', 'src/main.ts', 'src/main.js', 'src/App.tsx', 'src/app.ts', 'app.py', 'main.py', 'manage.py', 'wsgi.py', 'asgi.py', 'server.ts', 'server.js', 'main.go', 'cmd/main.go', 'src/main.rs', 'main.rs', 'src/main/java/Main.java', 'src/main/kotlin/Main.kt', 'Program.cs', 'src/Program.cs', 'index.php', 'public/index.php', 'config/routes.rb', 'main.swift', 'Sources/main.swift', 'src/main.c', 'src/main.cpp']) {
+          if (existsSync(path.join(wsRoot, candidate))) entryPoints.push(candidate);
+        }
+        for (const ent of topLevel) {
+          if (ent.isDirectory() && !ent.name.startsWith('.') && !['node_modules', 'dist', 'build', 'out', '.manulai'].includes(ent.name)) {
+            importantModules.push(`${ent.name}/`);
+          }
+        }
+        const srcDir = path.join(wsRoot, 'src');
+        if (existsSync(srcDir)) {
+          for (const ent of (await import('fs')).readdirSync(srcDir, { withFileTypes: true }).slice(0, 12)) {
+            importantModules.push(ent.isDirectory() ? `src/${ent.name}/` : `src/${ent.name}`);
+            const lower = ent.name.toLowerCase();
+            if (lower.endsWith('.py')) languages.push('python');
+            if (lower.endsWith('.go')) languages.push('go');
+            if (lower.endsWith('.rs')) languages.push('rust');
+            if (lower.endsWith('.java')) languages.push('java');
+            if (lower.endsWith('.kt')) languages.push('kotlin');
+            if (lower.endsWith('.cs')) languages.push('c#');
+            if (lower.endsWith('.php')) languages.push('php');
+            if (lower.endsWith('.rb')) languages.push('ruby');
+            if (lower.endsWith('.swift')) languages.push('swift');
+            if (lower.endsWith('.c') || lower.endsWith('.cpp') || lower.endsWith('.h') || lower.endsWith('.hpp')) languages.push('c/c++');
+            if (lower.endsWith('.ts') || lower.endsWith('.tsx')) languages.push('typescript');
+            if (lower.endsWith('.js') || lower.endsWith('.jsx')) languages.push('javascript');
+          }
+        }
+        return JSON.stringify({
+          workspaceRoot: wsRoot,
+          packageManager,
+          languages: [...new Set(languages)],
+          projectTypes: [...new Set(projectTypes)],
+          keyFiles,
+          entryPoints: [...new Set(entryPoints)],
+          importantModules: [...new Set(importantModules)].slice(0, 20),
+          notes,
+          summary: [
+            languages.length ? `languages: ${[...new Set(languages)].join(', ')}` : '',
+            projectTypes.length ? `project type hints: ${[...new Set(projectTypes)].join(', ')}` : '',
+            packageManager !== 'unknown' ? `package manager: ${packageManager}` : '',
+            entryPoints.length ? `entry points: ${[...new Set(entryPoints)].slice(0, 8).join(', ')}` : '',
+            importantModules.length ? `important modules: ${[...new Set(importantModules)].slice(0, 12).join(', ')}` : ''
+          ].filter(Boolean).join(' | ')
+        });
+      } catch (e) { return JSON.stringify({ error: e.message }); }
+    }
+
+    case 'read_workspace_notes': {
+      try {
+        const fp = path.join(wsRoot, '.manulai', 'notes.md');
+        const content = existsSync(fp) ? readFileSync(fp, 'utf8') : '(no notes yet — use write_workspace_notes to save notes about this project)';
+        return JSON.stringify({ content });
+      } catch (e) { return JSON.stringify({ error: e.message }); }
+    }
+
+    case 'write_workspace_notes': {
+      try {
+        const dir = path.join(wsRoot, '.manulai');
+        mkdirSync(dir, { recursive: true });
+        const fp = path.join(dir, 'notes.md');
+        const mode = args.mode === 'overwrite' ? 'overwrite' : 'append';
+        const existing = existsSync(fp) ? readFileSync(fp, 'utf8') : '';
+        const content = mode === 'append' && existing ? `${existing.trimEnd()}\n\n${String(args.content ?? '')}` : String(args.content ?? '');
+        writeFileSync(fp, content, 'utf8');
+        return JSON.stringify({ success: true, note: 'Notes saved to .manulai/notes.md' });
       } catch (e) { return JSON.stringify({ error: e.message }); }
     }
 
@@ -509,7 +697,7 @@ function extractDefinitionsFromSource(source) {
 }
 
 // ─── Text-based tool call parser (handles leaked JSON tool calls) ────────────
-const KNOWN_TOOLS = ['list_workspace_files', 'read_file_slice', 'read_specific_file', 'create_or_edit_file', 'replace_in_file', 'execute_terminal_command'];
+const KNOWN_TOOLS = ['list_workspace_files', 'project_scan', 'read_workspace_notes', 'write_workspace_notes', 'read_file_slice', 'read_specific_file', 'create_or_edit_file', 'replace_in_file', 'execute_terminal_command'];
 
 // Escape literal control chars (newlines, tabs, etc.) that appear inside JSON string values only.
 // Applies only within "..." contexts so structural whitespace in pretty-printed JSON is preserved.

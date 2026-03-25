@@ -108,10 +108,19 @@ Agent Mode currently exposes these tools to Ollama:
 - `execute_terminal_command`
 - `delete_file`
 - `list_workspace_files`
+- `project_scan`
+- `read_workspace_notes`
+- `write_workspace_notes`
 
 Direct pre-agent handlers also exist for common fast-path edits such as Markdown title rename and LICENSE author rename.
 
 `read_file_slice` is the bounded-reader path for large files. It accepts a file path plus 1-based inclusive `startLine` and `endLine`, and should be preferred when the model only needs a local section instead of the entire file.
+
+`project_scan` is the high-level orientation tool. It summarizes key files, likely entry points, language hints, project type hints, package manager signals, and important top-level modules across common ecosystems without forcing the model to open many files first.
+
+`read_workspace_notes` and `write_workspace_notes` persist project memory in `.manulai/notes.md`. The provider can auto-append short notes after completed tasks so important discoveries survive beyond the active request.
+
+Chats also persist a compact `summaryMemory` alongside the full transcript in `.manulai/chats.json`; those summaries are injected back into the agent mandate as short dialog memory so the model can reuse prior outcomes without replaying the entire conversation.
 
 ## Response Pipeline Notes
 

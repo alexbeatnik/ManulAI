@@ -33,6 +33,7 @@ interface ChatSession {
   title: string;
   messages: OllamaMessage[];
   attachedFiles: Map<string, AttachedFileContext>;
+  summaryMemory: string[];
 }
 
 interface WebviewChatSummary {
@@ -55,6 +56,7 @@ interface PersistedChatSession {
   title: string;
   messages: OllamaMessage[];
   attachedFiles: PersistedAttachedFileContext[];
+  summaryMemory?: string[];
 }
 
 interface PersistedChatState {
@@ -90,6 +92,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   private pendingApproval?: WebviewPendingApprovalState;
   private pendingApprovalResolver?: (approved: boolean) => void;
   private readonly revertSnapshots = new Map<string, RevertSnapshot>();
+  private workspaceSnapshotCache: string | null = null;
   private debugLogFilePath?: string;
   private debugSessionId = '';
   private progressStepCounter = 0;
@@ -140,7 +143,8 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       id: `chat-${Date.now()}-${chatNumber}`,
       title: title?.trim() || `Chat ${chatNumber}`,
       messages: [],
-      attachedFiles: new Map<string, AttachedFileContext>()
+      attachedFiles: new Map<string, AttachedFileContext>(),
+      summaryMemory: []
     };
 
     this.chats.push(chat);
@@ -502,7 +506,10 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       id,
       title,
       messages,
-      attachedFiles
+      attachedFiles,
+      summaryMemory: Array.isArray(candidate.summaryMemory)
+        ? candidate.summaryMemory.filter((entry): entry is string => typeof entry === 'string').slice(-12)
+        : []
     };
   }
 
@@ -554,6 +561,9 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   }
 
   private normalizePersistedChatSession(chat: ChatSession): void {
+    chat.summaryMemory = Array.isArray(chat.summaryMemory)
+      ? chat.summaryMemory.filter(entry => typeof entry === 'string').slice(-12)
+      : [];
     this.removeAttachmentContextMessages(chat.messages);
     this.removeActiveEditorContextMessages(chat.messages);
 
@@ -569,13 +579,14 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
 
   private serializeChatState(): PersistedChatState {
     return {
-      version: 1,
+      version: 2,
       activeChatId: this.activeChatId,
       chatCounter: this.chatCounter,
       chats: this.chats.map(chat => ({
         id: chat.id,
         title: chat.title,
         messages: chat.messages.filter(message => !message.activeEditorContext),
+        summaryMemory: chat.summaryMemory.slice(-12),
         attachedFiles: Array.from(chat.attachedFiles.values()).map(file => ({
           fsPath: file.uri.fsPath,
           name: file.name,
@@ -931,6 +942,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         : vscode.window.activeTextEditor?.document.uri.fsPath
     });
     this.messages.push({ role: 'user', content: text });
+    const exchangeStartIndex = this.getLastVisibleUserMessageIndex(this.messages);
 
     if (this.agentMode && this.looksLikeFileMutationRequest(text)) {
       await this.autoAttachLikelyRequestFiles(text);
@@ -959,6 +971,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         || await this.tryHandleDirectTitleRename(text);
       if (directSummary) {
         this.messages.push(this.createAssistantMessage(directSummary.summary, directSummary.revertOperationId ? [directSummary.revertOperationId] : []));
+        await this.persistCompletedExchangeMemory(exchangeStartIndex);
         this.postStateToWebview();
         return;
       }
@@ -973,7 +986,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     }
 
     this.postStateToWebview();
-    await this.runAgentLoop();
+    await this.runAgentLoop(exchangeStartIndex);
   }
 
   private looksLikeFileMutationRequest(text: string): boolean {
@@ -1297,13 +1310,14 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     this.postStatus('Chat history and attached context cleared.');
   }
 
-  private async runAgentLoop(): Promise<void> {
+  private async runAgentLoop(exchangeStartIndex = this.getLastVisibleUserMessageIndex(this.messages)): Promise<void> {
     this.requestInFlight = true;
     this.stopRequested = false;
     this.postBusyState(true);
 
     try {
       await this.processOllamaResponse(this.messages);
+      await this.persistCompletedExchangeMemory(exchangeStartIndex);
       this.postStateToWebview();
     } catch (error) {
       if (this.isAbortError(error)) {
@@ -3302,6 +3316,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
 
     if (this.agentMode) {
       const workspaceInstructions = await this.getWorkspaceInstructions();
+      const recentChatSummaries = this.buildRecentChatSummaryContext();
 
       const wsRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? '';
     let agentMandate = `[IDENTITY]
@@ -3353,8 +3368,18 @@ CRITICAL:
 - File contents are UNKNOWN until read
 - Project structure is UNKNOWN until listed
 - Results are UNKNOWN until tool confirms
+- Previous project knowledge may exist in workspace notes; use it first before re-reading many files
 
 Never assume. Always verify.
+
+---
+
+[WORKSPACE MEMORY]
+
+- At the start of a task, use the injected workspace structure and saved workspace notes as prior context
+- If notes are missing or insufficient, inspect only the minimum files needed
+- After finishing meaningful work, save concise notes with write_workspace_notes so future requests preserve context across sessions
+- Notes should capture architecture facts, file roles, recurring patterns, and important decisions
 
 ---
 
@@ -3427,6 +3452,25 @@ If steps remain → continue with the next tool call.
       if (workspaceInstructions) {
         agentMandate += '\n\n<workspace_instructions>\n' + workspaceInstructions + '\n</workspace_instructions>';
       }
+
+      if (recentChatSummaries) {
+        agentMandate += '\n\n[RECENT CHAT SUMMARIES]\n' + recentChatSummaries + '\n\nUse these summaries as short-term memory of prior dialog outcomes before re-reading files.';
+      }
+
+      // Inject the compact workspace tree so the model knows the project structure up front
+      const workspaceTree = await this.buildCompactWorkspaceTree();
+      if (workspaceTree) {
+        agentMandate += '\n\n[WORKSPACE STRUCTURE]\n' + workspaceTree;
+      }
+
+      // Inject persisted notes from previous sessions if they exist
+      const notesResult = await this.readWorkspaceNotes();
+      try {
+        const { content: notesContent } = JSON.parse(notesResult) as { content: string };
+        if (notesContent && !notesContent.startsWith('(no notes') && !notesContent.startsWith('(empty)') && !notesContent.startsWith('(no workspace')) {
+          agentMandate += '\n\n[WORKSPACE NOTES FROM PREVIOUS SESSIONS]\n' + notesContent + '\n\nUse these notes to avoid re-reading files you already know about. Update them after completing a task.';
+        }
+      } catch { /* ignore parse errors */ }
 
       requestMessages.push({
         role: 'system',
@@ -4307,15 +4351,66 @@ If the user asks for a change but provides NO code:
         type: 'function',
         function: {
           name: 'list_workspace_files',
-          description: 'List files and folders in the workspace or in a specific subdirectory.',
+          description: 'Recursively list files and folders in the workspace or a specific subdirectory. Skips node_modules, .git, and other build artifacts. Use this to discover project structure before reading or editing files.',
           parameters: {
             type: 'object',
             properties: {
               directory: {
                 type: 'string',
                 description: 'Optional subdirectory path relative to workspace root. Omit or use empty string for root.'
+              },
+              maxDepth: {
+                type: 'number',
+                description: 'Maximum recursion depth. Default is 4. Use 1 for a shallow one-level listing.'
               }
             },
+            additionalProperties: false
+          }
+        }
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'project_scan',
+          description: 'Build a structured project summary with key files, entry points, package manager, project type hints, and important modules. Use this for high-level context before targeted reads.',
+          parameters: {
+            type: 'object',
+            properties: {},
+            additionalProperties: false
+          }
+        }
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'read_workspace_notes',
+          description: 'Read persistent notes about this project saved by the model in a previous session. Always call this at the start of a new task to recall prior discoveries, decisions, and project context.',
+          parameters: {
+            type: 'object',
+            properties: {},
+            additionalProperties: false
+          }
+        }
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'write_workspace_notes',
+          description: 'Save notes about this project to persistent memory (.manulai/notes.md). Use mode="append" to add new facts without erasing previous notes. Use mode="overwrite" only to fully replace notes. Call this after completing a task to record key facts: file roles, architecture decisions, repeated patterns, or anything needed to avoid re-reading files next time.',
+          parameters: {
+            type: 'object',
+            properties: {
+              content: {
+                type: 'string',
+                description: 'The notes to save. Use markdown for structure.'
+              },
+              mode: {
+                type: 'string',
+                enum: ['append', 'overwrite'],
+                description: 'append: adds to existing notes. overwrite: replaces all notes.'
+              }
+            },
+            required: ['content', 'mode'],
             additionalProperties: false
           }
         }
@@ -4557,8 +4652,17 @@ If the user asks for a change but provides NO code:
           return await this.executeTerminalCommand(String(args.command ?? ''));
         case 'delete_file':
           return await this.deleteFile(String(args.filepath ?? ''));
-        case 'list_workspace_files':
-          return await this.listWorkspaceFiles(String(args.directory ?? ''));
+        case 'list_workspace_files': {
+          const depth = typeof args.maxDepth === 'number' ? Math.min(Math.max(1, args.maxDepth), 8) : 4;
+          return await this.listWorkspaceFiles(String(args.directory ?? ''), depth);
+        }
+        case 'project_scan':
+          return await this.projectScan();
+        case 'read_workspace_notes':
+          return await this.readWorkspaceNotes();
+        case 'write_workspace_notes':
+          this.workspaceSnapshotCache = null; // notes changed — invalidate structure cache too
+          return await this.writeWorkspaceNotes(String(args.content ?? ''), String(args.mode ?? 'append'));
         default:
           return JSON.stringify({ error: `Unknown tool: ${name}` });
       }
@@ -5028,6 +5132,7 @@ If the user asks for a change but provides NO code:
       }
 
       await this.writeWorkspaceText(targetUri, sanitizedContent);
+      this.workspaceSnapshotCache = null; // file structure may have changed
 
       const revertOperationId = oldContent !== undefined && oldContent !== sanitizedContent
         ? this.createRevertSnapshot(targetUri.fsPath, oldContent, sanitizedContent)
@@ -5058,6 +5163,7 @@ If the user asks for a change but provides NO code:
     try {
       const uri = await this.resolveWorkspaceUriForOperation(filepath);
       await vscode.workspace.fs.delete(uri);
+      this.workspaceSnapshotCache = null;
       return JSON.stringify({ deleted: uri.fsPath });
     } catch (error) {
       return JSON.stringify({
@@ -5066,7 +5172,341 @@ If the user asks for a change but provides NO code:
     }
   }
 
-  private async listWorkspaceFiles(directory: string): Promise<string> {
+  private async buildCompactWorkspaceTree(): Promise<string> {
+    if (this.workspaceSnapshotCache !== null) { return this.workspaceSnapshotCache; }
+    const root = vscode.workspace.workspaceFolders?.[0]?.uri;
+    if (!root) { return ''; }
+
+    const IGNORED = new Set([
+      'node_modules', '.git', '.hg', '.svn', 'dist', 'out', 'build', '.next', '.nuxt',
+      '__pycache__', '.cache', '.turbo', '.parcel-cache', 'coverage', '.nyc_output',
+      '.manulai', 'logs', '.venv', 'venv', '.tox'
+    ]);
+    const MAX_DEPTH = 3;
+    const FILE_CAP = 200;
+    let count = 0;
+    const lines: string[] = [];
+
+    const walk = async (uri: vscode.Uri, indent: string, depth: number): Promise<void> => {
+      if (count >= FILE_CAP || depth > MAX_DEPTH) { return; }
+      let entries: [string, vscode.FileType][];
+      try { entries = await vscode.workspace.fs.readDirectory(uri); } catch { return; }
+      entries.sort(([a, at], [b, bt]) =>
+        at === bt ? a.localeCompare(b) : at === vscode.FileType.Directory ? -1 : 1
+      );
+      for (const [name, type] of entries) {
+        if (count >= FILE_CAP) { lines.push(`${indent}...`); break; }
+        if (type === vscode.FileType.Directory) {
+          if (IGNORED.has(name) || name.startsWith('.')) { continue; }
+          lines.push(`${indent}${name}/`);
+          await walk(vscode.Uri.joinPath(uri, name), indent + '  ', depth + 1);
+        } else {
+          lines.push(`${indent}${name}`);
+          count++;
+        }
+      }
+    };
+
+    await walk(root, '', 1);
+    this.workspaceSnapshotCache = lines.join('\n');
+    return this.workspaceSnapshotCache;
+  }
+
+  private async readWorkspaceNotes(): Promise<string> {
+    const dir = this.getWorkspaceSettingsDirUri();
+    if (!dir) { return JSON.stringify({ content: '(no workspace open)' }); }
+    try {
+      const uri = vscode.Uri.joinPath(dir, 'notes.md');
+      const bytes = await vscode.workspace.fs.readFile(uri);
+      const content = Buffer.from(bytes).toString('utf8');
+      return JSON.stringify({ content: content || '(empty)' });
+    } catch {
+      return JSON.stringify({ content: '(no notes yet — use write_workspace_notes to save notes about this project)' });
+    }
+  }
+
+  private async writeWorkspaceNotes(content: string, mode: string): Promise<string> {
+    const dir = this.getWorkspaceSettingsDirUri();
+    if (!dir) { return JSON.stringify({ error: 'No workspace open.' }); }
+    try {
+      await vscode.workspace.fs.createDirectory(dir);
+      const uri = vscode.Uri.joinPath(dir, 'notes.md');
+      let finalContent = content;
+      if (mode === 'append') {
+        let existing = '';
+        try {
+          const bytes = await vscode.workspace.fs.readFile(uri);
+          existing = Buffer.from(bytes).toString('utf8');
+        } catch { /* no existing file yet */ }
+        finalContent = existing ? existing.trimEnd() + '\n\n' + content : content;
+      }
+      await vscode.workspace.fs.writeFile(uri, Buffer.from(finalContent, 'utf8'));
+      return JSON.stringify({ success: true, note: 'Notes saved to .manulai/notes.md' });
+    } catch (error) {
+      return JSON.stringify({ error: error instanceof Error ? error.message : 'Failed to write notes.' });
+    }
+  }
+
+  private async projectScan(): Promise<string> {
+    const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri;
+    if (!workspaceRoot) {
+      return JSON.stringify({ error: 'No workspace open.' });
+    }
+
+    const topLevelEntries = await vscode.workspace.fs.readDirectory(workspaceRoot);
+    const topLevelNames = new Set(topLevelEntries.map(([name]) => name));
+    const projectTypes = new Set<string>();
+    const languageHints = new Set<string>();
+    const keyFiles: string[] = [];
+    const entryPoints = new Set<string>();
+    const importantModules = new Set<string>();
+    const notes: string[] = [];
+    let packageManager = 'unknown';
+
+    const knownKeyFiles = [
+      'package.json', 'tsconfig.json', 'README.md', 'README-dev.md', 'Cargo.toml', 'go.mod',
+      'pyproject.toml', 'requirements.txt', 'Gemfile', 'pom.xml', 'build.gradle', 'build.gradle.kts',
+      'settings.gradle', 'settings.gradle.kts', 'composer.json', 'Package.swift', 'CMakeLists.txt',
+      'Makefile', 'meson.build', '.csproj', '.sln', 'global.json'
+    ];
+    for (const file of knownKeyFiles) {
+      if (topLevelNames.has(file)) {
+        keyFiles.push(file);
+      }
+    }
+
+    if (topLevelNames.has('pnpm-lock.yaml')) {
+      packageManager = 'pnpm';
+      languageHints.add('javascript');
+      languageHints.add('typescript');
+    } else if (topLevelNames.has('yarn.lock')) {
+      packageManager = 'yarn';
+      languageHints.add('javascript');
+      languageHints.add('typescript');
+    } else if (topLevelNames.has('package-lock.json')) {
+      packageManager = 'npm';
+      languageHints.add('javascript');
+      languageHints.add('typescript');
+    } else if (topLevelNames.has('bun.lockb') || topLevelNames.has('bun.lock')) {
+      packageManager = 'bun';
+      languageHints.add('javascript');
+      languageHints.add('typescript');
+    } else if (topLevelNames.has('Cargo.toml')) {
+      packageManager = 'cargo';
+      languageHints.add('rust');
+    } else if (topLevelNames.has('go.mod')) {
+      packageManager = 'go';
+      languageHints.add('go');
+    } else if (topLevelNames.has('pyproject.toml') || topLevelNames.has('requirements.txt')) {
+      packageManager = 'python';
+      languageHints.add('python');
+    } else if (topLevelNames.has('composer.json')) {
+      packageManager = 'composer';
+      languageHints.add('php');
+    } else if (topLevelNames.has('Gemfile')) {
+      packageManager = 'bundler';
+      languageHints.add('ruby');
+    } else if (topLevelNames.has('pom.xml')) {
+      packageManager = 'maven';
+      languageHints.add('java');
+    } else if (topLevelNames.has('build.gradle') || topLevelNames.has('build.gradle.kts')) {
+      packageManager = 'gradle';
+      languageHints.add('java');
+      languageHints.add('kotlin');
+    } else if (topLevelNames.has('Package.swift')) {
+      packageManager = 'swiftpm';
+      languageHints.add('swift');
+    }
+
+    if (topLevelNames.has('package.json')) {
+      try {
+        const packageBytes = await vscode.workspace.fs.readFile(vscode.Uri.joinPath(workspaceRoot, 'package.json'));
+        const pkg = JSON.parse(Buffer.from(packageBytes).toString('utf8')) as Record<string, unknown>;
+        if (typeof pkg.main === 'string') {
+          entryPoints.add(pkg.main);
+        }
+        if (typeof pkg.module === 'string') {
+          entryPoints.add(pkg.module);
+        }
+        if (typeof pkg.browser === 'string') {
+          entryPoints.add(pkg.browser);
+        }
+        if (typeof pkg.types === 'string') {
+          importantModules.add(pkg.types);
+          languageHints.add('typescript');
+        }
+        if (pkg.engines && typeof pkg.engines === 'object' && !Array.isArray(pkg.engines) && typeof (pkg.engines as Record<string, unknown>).vscode === 'string') {
+          projectTypes.add('vscode-extension');
+        }
+        if (Array.isArray(pkg.activationEvents)) {
+          projectTypes.add('tool-driven-extension');
+        }
+        if (pkg.dependencies && typeof pkg.dependencies === 'object' && !Array.isArray(pkg.dependencies)) {
+          const dependencyNames = Object.keys(pkg.dependencies as Record<string, unknown>);
+          if (dependencyNames.some(name => ['react', 'next', 'vite', 'vue', 'svelte', 'angular'].includes(name))) {
+            projectTypes.add('webapp');
+          }
+          if (dependencyNames.some(name => ['express', 'fastify', 'koa', 'nest', '@nestjs/core'].includes(name))) {
+            projectTypes.add('backend-service');
+          }
+        }
+        if (pkg.scripts && typeof pkg.scripts === 'object' && !Array.isArray(pkg.scripts)) {
+          const scriptNames = Object.keys(pkg.scripts as Record<string, unknown>);
+          if (scriptNames.length > 0) {
+            notes.push(`package.json scripts: ${scriptNames.slice(0, 8).join(', ')}`);
+          }
+        }
+      } catch {
+        notes.push('package.json exists but could not be parsed');
+      }
+    }
+
+    if (topLevelNames.has('pyproject.toml')) {
+      projectTypes.add('python-project');
+    }
+    if (topLevelNames.has('requirements.txt')) {
+      languageHints.add('python');
+    }
+    if (topLevelNames.has('Cargo.toml')) {
+      projectTypes.add('rust-project');
+    }
+    if (topLevelNames.has('go.mod')) {
+      projectTypes.add('go-project');
+    }
+    if (topLevelNames.has('pom.xml') || topLevelNames.has('build.gradle') || topLevelNames.has('build.gradle.kts')) {
+      projectTypes.add('jvm-project');
+    }
+    if (topLevelNames.has('composer.json')) {
+      projectTypes.add('php-project');
+    }
+    if (topLevelNames.has('Gemfile')) {
+      projectTypes.add('ruby-project');
+    }
+    if (topLevelNames.has('Package.swift')) {
+      projectTypes.add('swift-project');
+    }
+    if (topLevelNames.has('CMakeLists.txt') || topLevelNames.has('meson.build')) {
+      projectTypes.add('native-project');
+      languageHints.add('c/c++');
+    }
+    if (Array.from(topLevelNames).some(name => name.endsWith('.sln') || name.endsWith('.csproj'))) {
+      projectTypes.add('.net-project');
+      languageHints.add('c#');
+    }
+
+    const candidateEntries = [
+      'src/extension.ts', 'src/extension.js', 'src/index.ts', 'src/index.js', 'src/main.ts', 'src/main.js',
+      'src/App.tsx', 'src/app.ts', 'app.py', 'main.py', 'manage.py', 'wsgi.py', 'asgi.py',
+      'server.js', 'server.ts', 'main.go', 'cmd/main.go', 'src/main.rs', 'main.rs',
+      'src/main/java/Main.java', 'src/main/kotlin/Main.kt', 'Program.cs', 'src/Program.cs',
+      'index.php', 'public/index.php', 'config/routes.rb', 'main.swift', 'Sources/main.swift',
+      'src/main.c', 'src/main.cpp'
+    ];
+    for (const candidate of candidateEntries) {
+      try {
+        await vscode.workspace.fs.stat(vscode.Uri.joinPath(workspaceRoot, candidate));
+        entryPoints.add(candidate);
+      } catch {
+        // ignore missing candidates
+      }
+    }
+
+    for (const [name, type] of topLevelEntries) {
+      if (type === vscode.FileType.Directory && !name.startsWith('.') && !['node_modules', 'dist', 'build', 'out', 'coverage', '.manulai'].includes(name)) {
+        importantModules.add(`${name}/`);
+      }
+    }
+
+    if (topLevelNames.has('src')) {
+      try {
+        const srcEntries = await vscode.workspace.fs.readDirectory(vscode.Uri.joinPath(workspaceRoot, 'src'));
+        for (const [name, type] of srcEntries.slice(0, 12)) {
+          importantModules.add(type === vscode.FileType.Directory ? `src/${name}/` : `src/${name}`);
+          const lower = name.toLowerCase();
+          if (lower.endsWith('.py')) { languageHints.add('python'); }
+          if (lower.endsWith('.go')) { languageHints.add('go'); }
+          if (lower.endsWith('.rs')) { languageHints.add('rust'); }
+          if (lower.endsWith('.java')) { languageHints.add('java'); }
+          if (lower.endsWith('.kt')) { languageHints.add('kotlin'); }
+          if (lower.endsWith('.cs')) { languageHints.add('c#'); }
+          if (lower.endsWith('.php')) { languageHints.add('php'); }
+          if (lower.endsWith('.rb')) { languageHints.add('ruby'); }
+          if (lower.endsWith('.swift')) { languageHints.add('swift'); }
+          if (lower.endsWith('.c') || lower.endsWith('.cpp') || lower.endsWith('.h') || lower.endsWith('.hpp')) { languageHints.add('c/c++'); }
+          if (lower.endsWith('.ts') || lower.endsWith('.tsx')) { languageHints.add('typescript'); }
+          if (lower.endsWith('.js') || lower.endsWith('.jsx')) { languageHints.add('javascript'); }
+        }
+      } catch {
+        // ignore unreadable src
+      }
+    }
+
+    if (topLevelNames.has('media')) {
+      importantModules.add('media/');
+    }
+
+    const tree = await this.buildCompactWorkspaceTree();
+    const summary = [
+      languageHints.size > 0 ? `languages: ${Array.from(languageHints).join(', ')}` : undefined,
+      projectTypes.size > 0 ? `project type hints: ${Array.from(projectTypes).join(', ')}` : undefined,
+      packageManager !== 'unknown' ? `package manager: ${packageManager}` : undefined,
+      entryPoints.size > 0 ? `entry points: ${Array.from(entryPoints).slice(0, 8).join(', ')}` : undefined,
+      importantModules.size > 0 ? `important modules: ${Array.from(importantModules).slice(0, 12).join(', ')}` : undefined
+    ].filter((value): value is string => Boolean(value)).join(' | ');
+
+    return JSON.stringify({
+      workspaceRoot: workspaceRoot.fsPath,
+      packageManager,
+      languages: Array.from(languageHints),
+      projectTypes: Array.from(projectTypes),
+      keyFiles,
+      entryPoints: Array.from(entryPoints),
+      importantModules: Array.from(importantModules).slice(0, 20),
+      notes,
+      summary,
+      tree
+    });
+  }
+
+  private async listWorkspaceFiles(directory: string, maxDepth = 4): Promise<string> {
+    const IGNORED_DIRS = new Set([
+      'node_modules', '.git', '.hg', '.svn', 'dist', 'out', 'build', '.next', '.nuxt',
+      '__pycache__', '.cache', '.turbo', '.parcel-cache', 'coverage', '.nyc_output',
+      '.manulai', 'logs', '.venv', 'venv', '.tox'
+    ]);
+    const FILE_CAP = 400;
+    let fileCount = 0;
+
+    interface TreeEntry { name: string; type: 'file' | 'directory'; children?: TreeEntry[] }
+
+    const readDir = async (uri: vscode.Uri, depth: number): Promise<TreeEntry[]> => {
+      if (depth > maxDepth) { return []; }
+      let entries: [string, vscode.FileType][];
+      try {
+        entries = await vscode.workspace.fs.readDirectory(uri);
+      } catch {
+        return [];
+      }
+      entries.sort(([a, at], [b, bt]) => {
+        // directories first, then alphabetical
+        if (at === bt) { return a.localeCompare(b); }
+        return at === vscode.FileType.Directory ? -1 : 1;
+      });
+      const result: TreeEntry[] = [];
+      for (const [name, type] of entries) {
+        if (fileCount >= FILE_CAP) { break; }
+        if (type === vscode.FileType.Directory) {
+          if (IGNORED_DIRS.has(name) || name.startsWith('.')) { continue; }
+          const children = await readDir(vscode.Uri.joinPath(uri, name), depth + 1);
+          result.push({ name, type: 'directory', children });
+        } else {
+          fileCount++;
+          result.push({ name, type: 'file' });
+        }
+      }
+      return result;
+    };
+
     try {
       const workspaceFolders = vscode.workspace.workspaceFolders;
       if (!workspaceFolders) {
@@ -5080,13 +5520,11 @@ If the user asks for a change but provides NO code:
           ? vscode.Uri.file(normalizedDirectory)
           : vscode.Uri.joinPath(workspaceFolders[0].uri, normalizedDirectory);
 
-      const entries = await vscode.workspace.fs.readDirectory(baseUri);
-      const items = entries.map(([name, type]) => ({
-        name,
-        type: type === vscode.FileType.Directory ? 'directory' : 'file'
-      }));
+      fileCount = 0;
+      const tree = await readDir(baseUri, 1);
+      const capped = fileCount >= FILE_CAP;
 
-      return JSON.stringify({ path: baseUri.fsPath, items });
+      return JSON.stringify({ path: baseUri.fsPath, tree, ...(capped ? { note: `Results capped at ${FILE_CAP} files. Use a subdirectory to narrow the listing.` } : {}) });
     } catch (error) {
       return JSON.stringify({
         error: error instanceof Error ? error.message : 'Failed to list directory.'
@@ -6714,6 +7152,139 @@ If the user asks for a change but provides NO code:
     return messages[index]?.content ?? '';
   }
 
+  private compactMemoryText(value: string, maxLength: number): string {
+    const normalized = value.replace(/\s+/g, ' ').trim();
+    if (normalized.length <= maxLength) {
+      return normalized;
+    }
+
+    return `${normalized.slice(0, Math.max(0, maxLength - 3)).trimEnd()}...`;
+  }
+
+  private buildRecentChatSummaryContext(limit = 8): string {
+    const collected: string[] = [];
+    for (const chat of this.chats) {
+      for (const summary of chat.summaryMemory.slice(-2)) {
+        collected.push(`[${chat.title}] ${summary}`);
+      }
+    }
+    return collected.slice(-limit).join('\n');
+  }
+
+  private extractTouchedPathsFromToolResults(messages: OllamaMessage[]): string[] {
+    const touched = new Set<string>();
+    const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+
+    for (const message of messages) {
+      if (message.role !== 'tool') {
+        continue;
+      }
+
+      try {
+        const parsed = JSON.parse(message.content) as Record<string, unknown>;
+        const candidates = [parsed.path, parsed.deleted, parsed.filepath];
+        for (const candidate of candidates) {
+          if (typeof candidate !== 'string' || !candidate.trim()) {
+            continue;
+          }
+
+          const normalized = workspaceRoot && candidate.startsWith(workspaceRoot)
+            ? path.relative(workspaceRoot, candidate).replace(/\\/g, '/')
+            : candidate.replace(/\\/g, '/');
+          touched.add(normalized);
+        }
+      } catch {
+        // Ignore non-JSON tool results.
+      }
+    }
+
+    return Array.from(touched).slice(0, 8);
+  }
+
+  private normalizePersistedNotesContent(content: string): string {
+    if (!content || /^\((?:no notes yet|empty|no workspace open)/i.test(content.trim())) {
+      return '';
+    }
+
+    return content.trim();
+  }
+
+  private async appendWorkspaceAutoNoteEntry(entry: string): Promise<void> {
+    const existingResult = await this.readWorkspaceNotes();
+    let existingContent = '';
+    try {
+      existingContent = this.normalizePersistedNotesContent(String((JSON.parse(existingResult) as { content?: string }).content ?? ''));
+    } catch {
+      existingContent = '';
+    }
+
+    const trimmedEntry = entry.trim();
+    if (!trimmedEntry || existingContent.includes(trimmedEntry)) {
+      return;
+    }
+
+    const combined = existingContent ? `${existingContent}\n\n${trimmedEntry}` : trimmedEntry;
+    const sections = combined.split(/\n(?=### )/g);
+    const limited = sections.length > 20 ? sections.slice(-20).join('\n') : combined;
+    await this.writeWorkspaceNotes(limited, 'overwrite');
+  }
+
+  private async persistCompletedExchangeMemory(startIndex: number): Promise<void> {
+    const exchangeMessages = this.messages.slice(Math.max(0, startIndex));
+    const userMessage = exchangeMessages.find(message => message.role === 'user' && !message.hiddenFromTranscript && !message.localOnly);
+    const assistantMessage = [...exchangeMessages].reverse().find(
+      message => message.role === 'assistant' && !message.hiddenFromTranscript && !message.localOnly && message.content.trim()
+    );
+    if (!userMessage || !assistantMessage) {
+      return;
+    }
+
+    if (/^Request (?:failed|was stopped)\b/i.test(assistantMessage.content.trim())) {
+      return;
+    }
+
+    const toolMessages = exchangeMessages.filter((message): message is OllamaMessage & { role: 'tool' } => message.role === 'tool');
+    const touchedPaths = this.extractTouchedPathsFromToolResults(toolMessages);
+    const toolNames = Array.from(new Set(toolMessages.map(message => message.tool_name).filter((name): name is string => Boolean(name))));
+    const chatSummary = `${this.compactMemoryText(userMessage.content, 140)} -> ${this.compactMemoryText(assistantMessage.content, 180)}${touchedPaths.length > 0 ? ` | files: ${touchedPaths.join(', ')}` : ''}`;
+    if (chatSummary && this.activeChat.summaryMemory[this.activeChat.summaryMemory.length - 1] !== chatSummary) {
+      this.activeChat.summaryMemory.push(chatSummary);
+      this.activeChat.summaryMemory = this.activeChat.summaryMemory.slice(-12);
+    }
+
+    const latestProjectScan = [...toolMessages].reverse().find(message => message.tool_name === 'project_scan');
+    let projectScanSummary = '';
+    if (latestProjectScan) {
+      try {
+        projectScanSummary = String((JSON.parse(latestProjectScan.content) as { summary?: string }).summary ?? '').trim();
+      } catch {
+        projectScanSummary = '';
+      }
+    }
+
+    const hasMeaningfulToolWork = toolNames.some(name => [
+      'project_scan',
+      'create_or_edit_file',
+      'write_to_file',
+      'replace_in_file',
+      'delete_file',
+      'read_workspace_notes',
+      'write_workspace_notes'
+    ].includes(name)) || Boolean(assistantMessage.revertOperationIds?.length);
+    if (!hasMeaningfulToolWork) {
+      return;
+    }
+
+    const noteLines = [
+      `### ${new Date().toISOString()} - ${this.compactMemoryText(userMessage.content, 100)}`,
+      `- Outcome: ${this.compactMemoryText(assistantMessage.content, 220)}`,
+      ...(touchedPaths.length > 0 ? [`- Files: ${touchedPaths.join(', ')}`] : []),
+      ...(projectScanSummary ? [`- Project scan: ${projectScanSummary}`] : []),
+      ...(toolNames.length > 0 ? [`- Tools: ${toolNames.join(', ')}`] : [])
+    ];
+    await this.appendWorkspaceAutoNoteEntry(noteLines.join('\n'));
+  }
+
   private getLastVisibleUserMessageIndex(messages: OllamaMessage[]): number {
     for (let index = messages.length - 1; index >= 0; index -= 1) {
       const message = messages[index];
@@ -6779,6 +7350,12 @@ If the user asks for a change but provides NO code:
         return 'Reading the active file';
       case 'list_workspace_files':
         return args.directory ? `Scanning project structure in ${formatPath(args.directory)}` : 'Scanning project structure';
+      case 'project_scan':
+        return 'Scanning project summary';
+      case 'read_workspace_notes':
+        return 'Reading workspace notes';
+      case 'write_workspace_notes':
+        return 'Saving workspace notes';
       case 'replace_in_file':
         return `Editing ${formatPath(args.filepath)}`;
       case 'create_or_edit_file':
