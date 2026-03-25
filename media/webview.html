@@ -160,10 +160,22 @@
 
     .chat-strip {
       display: grid;
-      grid-template-columns: minmax(0, 1fr) auto repeat(2, auto);
+      grid-template-columns: minmax(0, 1fr) auto;
       gap: 4px;
       align-items: center;
       margin-top: 8px;
+    }
+
+    .chat-select-group {
+      min-width: 0;
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+    }
+
+    .chat-select-group .chat-select {
+      flex: 1 1 auto;
+      min-width: 0;
     }
 
     .chat-strip .status-pill {
@@ -710,7 +722,7 @@
 
     .thinking-card {
       display: flex;
-      align-items: center;
+      align-items: flex-start;
       gap: 9px;
       padding: 10px 12px;
       border-radius: 14px;
@@ -823,6 +835,28 @@
     .thinking-card .label {
       font-size: 11px;
       color: var(--text);
+      min-width: 0;
+      flex: 1 1 auto;
+    }
+
+    .thinking-copy {
+      display: grid;
+      gap: 4px;
+      min-width: 0;
+    }
+
+    .thinking-title {
+      font-size: 11px;
+      font-weight: 600;
+      color: var(--text);
+    }
+
+    .thinking-status {
+      font-size: 10px;
+      line-height: 1.45;
+      color: var(--muted);
+      white-space: pre-wrap;
+      word-break: break-word;
     }
 
     .composer {
@@ -1370,7 +1404,7 @@
       }
 
       .chat-strip {
-        grid-template-columns: minmax(0, 1fr) auto auto auto;
+        grid-template-columns: minmax(0, 1fr) auto;
       }
 
       .chat-select {
@@ -1663,18 +1697,20 @@
   <header class="header">
     <div class="header-row">
       <div class="title-wrap">
-        <p class="title"><span class="title-label">Chat</span><span class="title-product">ManulAI Local Agent</span><span id="versionBadge" class="version-badge"></span></p>
+        <p class="title"><span class="title-product">ManulAI Local Agent</span><span id="versionBadge" class="version-badge"></span></p>
       </div>
     </div>
     <div class="chat-strip">
-      <select id="chatSelect" class="chat-select compact-select" aria-label="Current chat" title="Select chat"></select>
+      <div class="chat-select-group">
+        <select id="chatSelect" class="chat-select compact-select" aria-label="Current chat" title="Select chat"></select>
+        <button id="newChat" class="ghost-button icon-button" type="button" title="Create chat" aria-label="Create chat">
+          <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M7.25 2h1.5v5.25H14v1.5H8.75V14h-1.5V8.75H2v-1.5h5.25V2z"/></svg>
+        </button>
+        <button id="deleteChat" class="ghost-button danger icon-button" type="button" title="Delete current chat" aria-label="Delete current chat">
+          <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M6 2h4l.75 1.25H13v1.5h-1v8.25L11.25 14h-6.5L4 13.25V4.75H3v-1.5h2.25L6 2zm-.5 2.75v7.75h5V4.75h-5zm1.25 1.5h1.5v4.75h-1.5V6.25zm3 0h1.5v4.75h-1.5V6.25z"/></svg>
+        </button>
+      </div>
       <div id="statusPill" class="status-pill">Ready</div>
-      <button id="newChat" class="ghost-button icon-button" type="button" title="Create chat" aria-label="Create chat">
-        <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M7.25 2h1.5v5.25H14v1.5H8.75V14h-1.5V8.75H2v-1.5h5.25V2z"/></svg>
-      </button>
-      <button id="deleteChat" class="ghost-button danger icon-button" type="button" title="Delete current chat" aria-label="Delete current chat">
-        <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M6 2h4l.75 1.25H13v1.5h-1v8.25L11.25 14h-6.5L4 13.25V4.75H3v-1.5h2.25L6 2zm-.5 2.75v7.75h5V4.75h-5zm1.25 1.5h1.5v4.75h-1.5V6.25zm3 0h1.5v4.75h-1.5V6.25z"/></svg>
-      </button>
     </div>
   </header>
 
@@ -1828,7 +1864,27 @@
     let debugMode = false;
     let activeFile = null;
     let pendingApproval = null;
+    let liveThinkingText = '';
     const seenMessageKeys = new Set();
+
+    function deriveLiveThinkingText() {
+      for (let index = messages.length - 1; index >= 0; index -= 1) {
+        const message = messages[index];
+        if (!message || typeof message.content !== 'string') {
+          continue;
+        }
+
+        if (message.role === 'status') {
+          return message.content.trim();
+        }
+
+        if (message.role === 'assistant' && /^Step\s+\d+:/i.test(message.content)) {
+          return message.content.trim();
+        }
+      }
+
+      return '';
+    }
 
     function roleLabel(role) {
       if (role === 'user') {
@@ -1929,7 +1985,25 @@
       if (busy) {
         const thinking = document.createElement('div');
         thinking.className = 'thinking-card';
-        thinking.innerHTML = '<div class="dots" aria-hidden="true"><span></span><span></span><span></span></div><div class="label">Model is thinking, may call tools, and will answer in this thread.</div>';
+
+        const dots = document.createElement('div');
+        dots.className = 'dots';
+        dots.setAttribute('aria-hidden', 'true');
+        dots.innerHTML = '<span></span><span></span><span></span>';
+
+        const label = document.createElement('div');
+        label.className = 'label thinking-copy';
+
+        const title = document.createElement('div');
+        title.className = 'thinking-title';
+        title.textContent = 'Model is thinking, may call tools, and will answer in this thread.';
+
+        const status = document.createElement('div');
+        status.className = 'thinking-status';
+        status.textContent = liveThinkingText || deriveLiveThinkingText() || 'Waiting for the next model or tool update...';
+
+        label.append(title, status);
+        thinking.append(dots, label);
         historyEl.appendChild(thinking);
       }
 
@@ -2168,6 +2242,12 @@
     }
 
     function appendStatus(text) {
+      if (busy) {
+        liveThinkingText = String(text || '').trim();
+        render();
+        return;
+      }
+
       messages = [...messages, { role: 'status', content: text }];
       render();
     }
@@ -2490,6 +2570,9 @@
         debugMode = payload.debugMode !== undefined ? payload.debugMode : debugMode;
         pendingApproval = payload.pendingApproval || null;
         activeFile = payload.activeFile || null;
+        if (busy && !liveThinkingText) {
+          liveThinkingText = deriveLiveThinkingText();
+        }
         if (payload.extensionVersion && versionBadgeEl) {
           versionBadgeEl.textContent = payload.extensionVersion;
         }
@@ -2510,6 +2593,11 @@
 
       if (payload.command === 'busy') {
         busy = Boolean(payload.busy);
+        if (!busy) {
+          liveThinkingText = '';
+        } else if (!liveThinkingText) {
+          liveThinkingText = deriveLiveThinkingText();
+        }
         render();
       }
     });

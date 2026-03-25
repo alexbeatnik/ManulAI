@@ -19,6 +19,7 @@ This repository contains a VS Code extension named ManulAI.
 - Keep project-scan behavior persistent enough that the model can continue across multiple files instead of stopping after the first step.
 - When the user references a likely target file such as `README`, `LICENSE`, `package.json`, or an explicit path, prefer resolving it automatically instead of waiting for manual attachment.
 - Keep the sidebar usable on narrow widths and low-height laptop screens; preserve a visible scrollable chat history above the composer.
+- Do not reintroduce a separate Activity Bar launcher container; keep ManulAI focused on the Secondary Sidebar chat view.
 
 ## Code Style
 
@@ -48,8 +49,19 @@ This repository contains a VS Code extension named ManulAI.
 - Keep step-by-step progress messages visible in chat during multi-tool actions, but do not feed those local progress messages back into the next model request.
 - Keep folder snapshot context distinct from file context so directories are never treated as editable files.
 - Keep `list_workspace_files` compatible with both workspace-relative and absolute directory paths.
+- Keep bounded file reading available for large files; prefer a line-range reader over full-file reads when only a section is needed.
 - Keep debug JSONL entries attributable to a specific build; include the extension version in the logged session/event payloads.
 - Keep debug logging useful for reproducing issues; log the original user request before local hidden nudges or retries alter the effective agent context.
+- Keep the model selector truthful: when no local model is chosen, the UI and backend state must remain empty rather than showing a fake fallback model.
+- Keep revert metadata attached to revertable native file-tool transcript entries so the webview can surface `Revert changes` directly on those results.
+- If retry exhaustion is reached and the model still returns pseudo-progress or plan text, surface a deterministic backend failure message instead of leaking raw `Step 1/3`-style output.
+- For large refactor requests, nudge the model toward short module/file plans and iterative execution instead of one-shot whole-file rewrites.
+
+## Debug Script Parity
+
+- `scripts/debug-agent.mjs` is the standalone test harness for the agent loop. Fixes validated there must be ported to `src/ManulAiChatProvider.ts` in the same change or immediately after.
+- When a behavioral fix (hallucination detection, JSON parsing, fallback logic, nudge conditions) proves correct in `debug-agent.mjs`, treat it as a required backport — do not leave the production provider diverged.
+- Keep helper logic (e.g. `escapeJsonStringValues`, analysis flags, done-condition guards) in sync between the two files; if a helper is added or changed in the debug script, update the provider counterpart.
 
 ## Documentation
 
@@ -63,3 +75,4 @@ This repository contains a VS Code extension named ManulAI.
 - When tool lists change, update user-facing docs and developer docs in the same change.
 - When agent reliability or context-handling behavior changes, update README, README-dev, and these instructions in the same change.
 - When responsive chat layout behavior changes, update the docs if the change affects visible UX constraints or implementation rules.
+- When sidebar navigation or transcript revert behavior changes, update these instructions in the same change so workspace guidance stays aligned with the implemented UX.
