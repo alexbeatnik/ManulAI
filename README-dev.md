@@ -128,6 +128,7 @@ Chats also persist a compact `summaryMemory` alongside the full transcript in `.
 - Auto-Approve can bypass per-tool confirmations when enabled.
 - Chat Mode bypasses tool fallback write layers and returns plain text only.
 - Agent Mode still includes fallback write extraction layers for weaker models that fail to emit native tool calls reliably.
+- After successful file writes, the provider attempts an automatic `build_verify` step using the best available project command for the detected stack, such as package scripts, `tsc --noEmit`, `cargo check`, `go test ./...`, `python -m compileall`, `mvn compile`, `gradle build`, or `dotnet build`.
 - Ollama requests are not hard-timed out by the extension; users can stop them explicitly.
 - Debug sessions append to stable JSONL files so live debugging does not depend on a long-lived writable stream.
 - Every debug event includes the extension version and session identifier, not only the session-start record.

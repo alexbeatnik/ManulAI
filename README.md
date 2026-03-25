@@ -108,6 +108,8 @@ These cover the main local coding tasks: reading files, targeted edits, full rew
 
 `read_file_slice` reads only a bounded 1-based line range from a file and is intended for large files where a full-file read would waste context or push a weaker local model into summary-only behavior.
 
+After successful file edits, ManulAI also tries to run a stack-appropriate verification command automatically when the workspace provides one, instead of assuming every project is TypeScript-only.
+
 ### Safer Editing Behavior
 
 The extension now pushes stricter file-editing rules into the agent prompt:

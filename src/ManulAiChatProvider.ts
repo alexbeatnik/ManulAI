@@ -980,7 +980,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     if (this.agentMode) {
       this.messages.push({
         role: 'user',
-        content: 'Before taking any action, output a brief numbered plan (3–8 steps) describing what you will do. Keep it concise. After the plan, immediately start executing step 1 with the appropriate tool call — do NOT wait for confirmation. After each file modification, run the project build/compile check (for TypeScript: execute_terminal_command with "npx tsc --noEmit 2>&1 | head -30") to verify nothing is broken. Fix any errors before moving to the next step.',
+        content: 'Before taking any action, output a brief numbered plan (3–8 steps) describing what you will do. Keep it concise. After the plan, immediately start executing step 1 with the appropriate tool call — do NOT wait for confirmation. After each file modification, make sure the project verification/build check passes. Prefer the project\'s own verification command for the detected stack. If the system injects a build_verify tool result with errors, fix those errors before moving to the next step.',
         hiddenFromTranscript: true
       });
     }
@@ -3390,7 +3390,7 @@ When splitting a file into smaller modules:
 1. Read a bounded section with read_file_slice (e.g. lines 1–120).
 2. Identify one self-contained block (interfaces, a class, utility functions).
 3. Call create_or_edit_file with the NEW file path and the EXACT copied code.
-   - content MUST be the real extracted TypeScript code, NOT a comment placeholder.
+  - content MUST be the real extracted code, NOT a comment placeholder.
    - "// Code will be inserted here" is FORBIDDEN. Copy the real code.
 4. Call replace_in_file on the original file:
    - old_text = the exact extracted block
@@ -4639,7 +4639,7 @@ If the user asks for a change but provides NO code:
               && (/(?:^|\s)(?:export|import|const|let|var|function|class|interface|type|enum|async|return)\b/.test(l) || /[{}();=]/.test(l))
             );
             if (codeLikeLines.length === 0) {
-              return JSON.stringify({ error: 'Content is a placeholder or has no actual code — do NOT write placeholder comments. You must copy the exact TypeScript code blocks you want to extract (the interfaces, constants, or methods you just read from read_file_slice) directly into this new file. Then call replace_in_file on the original file to replace that extracted block with an import statement.' });
+              return JSON.stringify({ error: 'Content is a placeholder or has no actual code — do NOT write placeholder comments. You must copy the exact real code blocks you want to extract (the definitions, constants, functions, methods, or classes you just read from read_file_slice) directly into this new file. Then call replace_in_file on the original file to replace that extracted block with an import statement or equivalent reference.' });
             }
           }
           return await this.createOrEditFile(createFilename, createContent);
@@ -4858,24 +4858,87 @@ If the user asks for a change but provides NO code:
       return null;
     }
 
-    // Detect build check command: prefer tsconfig.json → tsc --noEmit
+    const exists = async (relativePath: string): Promise<boolean> => {
+      try {
+        await vscode.workspace.fs.stat(vscode.Uri.joinPath(workspaceRoot, relativePath));
+        return true;
+      } catch {
+        return false;
+      }
+    };
+
+    const pickPackageManager = async (): Promise<'npm' | 'pnpm' | 'yarn' | 'bun'> => {
+      if (await exists('pnpm-lock.yaml')) {
+        return 'pnpm';
+      }
+      if (await exists('yarn.lock')) {
+        return 'yarn';
+      }
+      if (await exists('bun.lockb') || await exists('bun.lock')) {
+        return 'bun';
+      }
+      return 'npm';
+    };
+
+    const scriptCommand = (pm: 'npm' | 'pnpm' | 'yarn' | 'bun', scriptName: string): string => {
+      if (pm === 'npm') {
+        return `npm run ${scriptName} 2>&1 | head -30`;
+      }
+      if (pm === 'yarn') {
+        return `yarn ${scriptName} 2>&1 | head -30`;
+      }
+      if (pm === 'pnpm') {
+        return `pnpm ${scriptName} 2>&1 | head -30`;
+      }
+      return `bun run ${scriptName} 2>&1 | head -30`;
+    };
+
+    // Detect the best available verification command for the current stack.
     let command: string | undefined;
     try {
-      await vscode.workspace.fs.stat(vscode.Uri.joinPath(workspaceRoot, 'tsconfig.json'));
-      command = 'npx tsc --noEmit 2>&1 | head -30';
+      const pkgBytes = await vscode.workspace.fs.readFile(vscode.Uri.joinPath(workspaceRoot, 'package.json'));
+      const pkg = JSON.parse(Buffer.from(pkgBytes).toString('utf8')) as Record<string, unknown>;
+      const scripts = pkg.scripts as Record<string, string> | undefined;
+      const packageManager = await pickPackageManager();
+      if (scripts?.check) {
+        command = scriptCommand(packageManager, 'check');
+      } else if (scripts?.verify) {
+        command = scriptCommand(packageManager, 'verify');
+      } else if (scripts?.build) {
+        command = scriptCommand(packageManager, 'build');
+      } else if (scripts?.compile) {
+        command = scriptCommand(packageManager, 'compile');
+      } else if (scripts?.test) {
+        command = scriptCommand(packageManager, 'test');
+      }
     } catch {
-      // tsconfig not found — try package.json compile script as fallback
-      try {
-        const pkgBytes = await vscode.workspace.fs.readFile(vscode.Uri.joinPath(workspaceRoot, 'package.json'));
-        const pkg = JSON.parse(Buffer.from(pkgBytes).toString('utf8')) as Record<string, unknown>;
-        const scripts = pkg.scripts as Record<string, string> | undefined;
-        if (scripts?.compile) {
-          command = 'npm run compile 2>&1 | head -30';
-        } else if (scripts?.build) {
-          command = 'npm run build 2>&1 | head -30';
-        }
-      } catch {
-        // no package.json either
+      // no package.json or unreadable package.json
+    }
+
+    if (!command && await exists('tsconfig.json')) {
+      command = 'npx tsc --noEmit 2>&1 | head -30';
+    }
+    if (!command && await exists('Cargo.toml')) {
+      command = 'cargo check --quiet 2>&1 | head -30';
+    }
+    if (!command && await exists('go.mod')) {
+      command = 'go test ./... 2>&1 | head -30';
+    }
+    if (!command && (await exists('pyproject.toml') || await exists('requirements.txt') || await exists('setup.py'))) {
+      command = 'python -m compileall -q . 2>&1 | head -30';
+    }
+    if (!command && await exists('pom.xml')) {
+      command = 'mvn -q -DskipTests compile 2>&1 | head -30';
+    }
+    if (!command && (await exists('build.gradle') || await exists('build.gradle.kts'))) {
+      command = await exists('gradlew')
+        ? './gradlew -q build -x test 2>&1 | head -30'
+        : 'gradle -q build -x test 2>&1 | head -30';
+    }
+    if (!command) {
+      const dotnetProjects = await vscode.workspace.findFiles('**/*.{sln,csproj}', '**/{node_modules,dist,build,out,.git,.manulai}/**', 1);
+      if (dotnetProjects.length > 0) {
+        command = 'dotnet build -nologo 2>&1 | head -30';
       }
     }
 
