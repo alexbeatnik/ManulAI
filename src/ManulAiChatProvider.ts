@@ -818,6 +818,23 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       return false;
     }
 
+    const explicitTargets = this.extractLikelyRequestFileTargets(text);
+    const activeEditorPath = vscode.window.activeTextEditor?.document.uri.scheme === 'file'
+      ? vscode.window.activeTextEditor.document.uri.fsPath
+      : undefined;
+    const activeEditorExt = activeEditorPath ? path.extname(activeEditorPath).toLowerCase() : '';
+    const sourceExtensions = new Set(['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs', '.py', '.java', '.cs', '.go', '.rs']);
+    const activeEditorIsSourceFile = Boolean(
+      activeEditorPath
+      && sourceExtensions.has(activeEditorExt)
+      && !activeEditorPath.includes(`${path.sep}.manulai${path.sep}`)
+      && !activeEditorPath.includes('/.manulai/')
+    );
+    const looksLikeGreenfieldGeneration = /(?:\b(?:write|build|create|generate)\b[\s\S]{0,160}\b(?:complete|full|fully functional|ready to run)\b|\bfrom scratch\b|\bcomplete code\b|\bsingle file\b|\bcleanly separated components\b|\bturn-based game\b|\busing tailwind(?:css)?\b)/i.test(normalized);
+    if (looksLikeGreenfieldGeneration && explicitTargets.length === 0 && !activeEditorIsSourceFile) {
+      return false;
+    }
+
     const splitPattern = /\b(split|break\s+up|divide|decompose|modulari[sz]e|extract|separate|refactor)\b|(?:^|\s)(?:розбий|розділи|поділи|рознеси|винеси|декомпоз\w*|рефактор|перероби)(?:\s|$)/i;
     const targetPattern = /\b(file|class|module|component|service|provider)\b|(?:^|\s)(?:файл|клас|модул|компонент|сервіс|провайдер)(?:\s|$)/i;
     const multipartPattern = /\b(smaller|small|multiple|modules?|files?|parts?)\b|(?:^|\s)(?:менш\w*|маленьк\w*|декілька|кілька|частин|модулів|файлів)(?:\s|$)/i;
@@ -1087,6 +1104,15 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     }
 
     return undefined;
+  }
+
+  private requestExplicitlyAllowsPlaceholderWrites(): boolean {
+    const latestVisibleUserRequest = this.getLatestVisibleUserRequest(this.messages).toLowerCase();
+    if (!latestVisibleUserRequest) {
+      return false;
+    }
+
+    return /(?:placeholder|stub|scaffold|skeleton|template|boilerplate|todo|tbd|empty component|blank component)/i.test(latestVisibleUserRequest);
   }
 
   private async tryHandleDirectLicenseAuthorRename(text: string): Promise<FileWriteSummary | undefined> {
@@ -4115,6 +4141,11 @@ If the user asks for a change but provides NO code:
       if (this.looksLikeDiffOutput(sanitizedContent)) {
         sanitizedContent = this.stripDiffPrefixes(sanitizedContent);
       }
+      if (isPlaceholderReplacementText(sanitizedContent) && !this.requestExplicitlyAllowsPlaceholderWrites()) {
+        return JSON.stringify({
+          error: 'Blocked write: content is only a placeholder or stub comment, not real file content. Write the actual implementation instead.'
+        });
+      }
       const invalidStructuredContent = detectInvalidStructuredCreateContent(targetUri.fsPath, sanitizedContent);
       if (invalidStructuredContent) {
         return JSON.stringify({ error: invalidStructuredContent });
@@ -4720,11 +4751,21 @@ If the user asks for a change but provides NO code:
           ? vscode.Uri.file(normalizedDirectory)
           : vscode.Uri.joinPath(workspaceFolders[0].uri, normalizedDirectory);
 
+      let rawEntryCount = 0;
+      try {
+        rawEntryCount = (await vscode.workspace.fs.readDirectory(baseUri)).length;
+      } catch {
+        rawEntryCount = 0;
+      }
+
       fileCount = 0;
       const tree = await readDir(baseUri, 1);
       const capped = fileCount >= FILE_CAP;
+      const hiddenOnlyNote = tree.length === 0 && rawEntryCount > 0
+        ? 'Directory contains only hidden or ignored entries. It may still be valid to create a new source file here.'
+        : undefined;
 
-      return JSON.stringify({ path: baseUri.fsPath, tree, ...(capped ? { note: `Results capped at ${FILE_CAP} files. Use a subdirectory to narrow the listing.` } : {}) });
+      return JSON.stringify({ path: baseUri.fsPath, tree, ...(capped ? { note: `Results capped at ${FILE_CAP} files. Use a subdirectory to narrow the listing.` } : {}), ...(hiddenOnlyNote ? { note: hiddenOnlyNote } : {}) });
     } catch (error) {
       return JSON.stringify({
         error: error instanceof Error ? error.message : 'Failed to list directory.'
