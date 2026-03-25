@@ -2030,9 +2030,16 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           : undefined;
         const latestLargeRefactorTargetTotalLines = Number(latestLargeRefactorTargetRead?.parsed.totalLines ?? 0);
         const latestLargeRefactorTargetEndLine = Number(latestLargeRefactorTargetRead?.parsed.endLine ?? 0);
+        const latestLargeRefactorTargetStartLine = Number(latestLargeRefactorTargetRead?.parsed.startLine ?? 0);
         const latestLargeRefactorTargetRemainingLines = latestLargeRefactorTargetTotalLines > 0
           ? Math.max(0, latestLargeRefactorTargetTotalLines - latestLargeRefactorTargetEndLine)
           : Number.POSITIVE_INFINITY;
+        const latestLargeRefactorTargetReachedEof = Boolean(
+          latestLargeRefactorTargetRead
+          && latestLargeRefactorTargetTotalLines > 0
+          && latestLargeRefactorTargetStartLine > latestLargeRefactorTargetTotalLines
+          && String(latestLargeRefactorTargetRead.parsed.content ?? '') === ''
+        );
         const canStopAfterTinyLargeRefactor = Boolean(
           isLargeRefactorRequest
           && hasRecentMeaningfulWrite
@@ -2403,6 +2410,10 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
             hasRecentMeaningfulWrite,
             latestCreatedFilePath,
             hasRecentReadOfLargeRefactorTarget,
+            latestLargeRefactorTargetTotalLines,
+            latestLargeRefactorTargetRemainingLines,
+            latestLargeRefactorTargetReachedEof,
+            canStopAfterTinyLargeRefactor,
             hasLargeRefactorShellReadBypass,
             hasPreReadLargeRefactorNarration,
             hasFakePreReadCodeDump,
@@ -2438,6 +2449,8 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
             ? 'The model produced a safety refusal ("I\'m sorry, but I can\'t assist") when asked to refactor the file, likely because too much file content was loaded into context at once. Use read_file_slice with small bounded ranges instead of read_specific_file on large files. Retry the request.'
             : hasPostReadSummaryOnLargeRefactor
             ? 'The model read a bounded slice of the target file but responded with a summary or analysis instead of making a file-creation tool call. It must call create_or_edit_file to extract code into new modules. Retry the request or use a stronger tool-calling model.'
+            : (canStopAfterTinyLargeRefactor && latestLargeRefactorTargetReachedEof)
+            ? 'The model reached the end of a tiny refactor target after a real extraction/write and then read past EOF, so there was no further bounded block to extract. The loop stopped because the file appears exhausted, not because of an unrelated failure.'
             : hasPostReadToolStall
             ? suggestedNextSlice?.filepath && suggestedNextSlice.startLine && suggestedNextSlice.endLine
               ? `The model read a bounded section of the target file but then stalled in progress-only text instead of making the next tool call. The next bounded slice was ${suggestedNextSlice.filepath}:${suggestedNextSlice.startLine}-${suggestedNextSlice.endLine}, but it still did not continue. Retry the request or use a stronger tool-calling model for iterative refactors.`
@@ -5190,7 +5203,15 @@ If the user asks for a change but provides NO code:
       }
 
       if (start > totalLines) {
-        return JSON.stringify({ error: `startLine ${start} exceeds total line count ${totalLines}.` });
+        return JSON.stringify({
+          path: uri.fsPath,
+          languageId,
+          startLine: start,
+          endLine: totalLines,
+          totalLines,
+          content: '',
+          note: `startLine ${start} is beyond the end of the file. Treat this as EOF for ${uri.fsPath}. Use the exact target path above for any follow-up reads or edits.`
+        });
       }
 
       const clampedEnd = Math.min(end, totalLines);
@@ -5229,7 +5250,17 @@ If the user asks for a change but provides NO code:
           }
 
           if (start > totalLines) {
-            return JSON.stringify({ error: `startLine ${start} exceeds total line count ${totalLines}.` });
+            this.debugLog('read_target_recovered', { requestedPath: filepath, recoveredPath: recovered.fsPath, tool: 'read_file_slice', startLine: start, endLine: totalLines, eof: true });
+            return JSON.stringify({
+              path: recovered.fsPath,
+              languageId,
+              startLine: start,
+              endLine: totalLines,
+              totalLines,
+              content: '',
+              recoveredFromPath: filepath,
+              note: `${this.buildRecoveredTargetNote(filepath, recovered.fsPath)} startLine ${start} is beyond the end of the file, so this is an EOF-style empty slice.`
+            });
           }
 
           const clampedEnd = Math.min(end, totalLines);
