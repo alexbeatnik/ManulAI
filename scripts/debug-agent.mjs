@@ -17,7 +17,7 @@
  *   TARGET_FILE   src-relative path of the file to split (default: src/ManulAiChatProvider.ts)
  */
 
-import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'fs';
+import { readFileSync, writeFileSync, mkdirSync, existsSync, readdirSync } from 'fs';
 import { exec } from 'child_process';
 import { promisify } from 'util';
 import path from 'path';
@@ -46,6 +46,8 @@ const TARGET_BASENAME = path.basename(TARGET_FILE, '.ts'); // e.g. "ManulAiChatP
 const TARGET_DIR = path.posix.dirname(TARGET_FILE.replace(/\\/g, '/'));
 const SUGGESTED_TYPES_FILE = TARGET_DIR === '.' ? 'types.ts' : `${TARGET_DIR}/types.ts`;
 const SUGGESTED_INTERFACES_FILE = TARGET_DIR === '.' ? 'interfaces.ts' : `${TARGET_DIR}/interfaces.ts`;
+const TARGET_LANGUAGE_ID = detectLanguageId(TARGET_FILE);
+const TARGET_CODE_FENCE = detectCodeFenceLanguage(TARGET_FILE);
 
 const sessionId   = new Date().toISOString().replace(/[:.]/g, '-');
 const logDir      = path.join(wsRoot, '.manulai', 'logs');
@@ -63,6 +65,119 @@ if (!userPrompt) {
 // Detect whether this run is a file-splitting task — only then enforce extractionCount gate
 const IS_SPLIT_TASK = /розбий|split|refactor.*module|extract.*module/i.test(userPrompt);
 const REQUIRES_FILE_WRITE = /\b(?:create|write|edit|modify|update|add|append|change|rename|delete|remove|refactor|split|move)\b/i.test(userPrompt);
+
+function detectLanguageId(filepath) {
+  const ext = path.extname(filepath).toLowerCase();
+  const map = {
+    '.ts': 'typescript',
+    '.tsx': 'typescriptreact',
+    '.js': 'javascript',
+    '.jsx': 'javascriptreact',
+    '.mjs': 'javascript',
+    '.cjs': 'javascript',
+    '.py': 'python',
+    '.go': 'go',
+    '.rs': 'rust',
+    '.java': 'java',
+    '.kt': 'kotlin',
+    '.cs': 'csharp',
+    '.php': 'php',
+    '.rb': 'ruby',
+    '.swift': 'swift',
+    '.c': 'c',
+    '.h': 'c',
+    '.cpp': 'cpp',
+    '.cc': 'cpp',
+    '.cxx': 'cpp',
+    '.hpp': 'cpp',
+    '.hh': 'cpp',
+    '.json': 'json',
+    '.md': 'markdown',
+    '.html': 'html',
+    '.css': 'css',
+    '.yml': 'yaml',
+    '.yaml': 'yaml',
+    '.xml': 'xml',
+    '.sh': 'shell',
+    '.bash': 'shell'
+  };
+  return map[ext] ?? 'plaintext';
+}
+
+function detectCodeFenceLanguage(filepath) {
+  const languageId = detectLanguageId(filepath);
+  if (languageId === 'typescriptreact') return 'tsx';
+  if (languageId === 'javascriptreact') return 'jsx';
+  if (languageId === 'csharp') return 'csharp';
+  if (languageId === 'markdown') return 'markdown';
+  if (languageId === 'plaintext') return '';
+  return languageId;
+}
+
+function findNearestProjectRoot(startPath) {
+  const startDir = path.dirname(startPath);
+  const markers = ['package.json', 'tsconfig.json', 'pyproject.toml', 'requirements.txt', 'setup.py', 'Cargo.toml', 'go.mod', 'pom.xml', 'build.gradle', 'build.gradle.kts', 'gradlew', '.sln', '.csproj'];
+  let current = startDir;
+  while (current.startsWith(wsRoot)) {
+    if (markers.some(marker => existsSync(path.join(current, marker)))) {
+      return current;
+    }
+    const parent = path.dirname(current);
+    if (parent === current) break;
+    current = parent;
+  }
+  return wsRoot;
+}
+
+function pickPackageManager(projectRoot) {
+  if (existsSync(path.join(projectRoot, 'pnpm-lock.yaml'))) return 'pnpm';
+  if (existsSync(path.join(projectRoot, 'yarn.lock'))) return 'yarn';
+  if (existsSync(path.join(projectRoot, 'bun.lockb')) || existsSync(path.join(projectRoot, 'bun.lock'))) return 'bun';
+  return 'npm';
+}
+
+function scriptCommand(pm, scriptName) {
+  if (pm === 'npm') return `npm run ${scriptName} 2>&1 | head -30`;
+  if (pm === 'yarn') return `yarn ${scriptName} 2>&1 | head -30`;
+  if (pm === 'pnpm') return `pnpm ${scriptName} 2>&1 | head -30`;
+  return `bun run ${scriptName} 2>&1 | head -30`;
+}
+
+function pickVerifyCommandForPath(targetPath) {
+  const projectRoot = findNearestProjectRoot(targetPath);
+  const packageJsonPath = path.join(projectRoot, 'package.json');
+  if (existsSync(packageJsonPath)) {
+    try {
+      const pkg = JSON.parse(readFileSync(packageJsonPath, 'utf8'));
+      const scripts = pkg?.scripts ?? {};
+      const pm = pickPackageManager(projectRoot);
+      if (typeof scripts.check === 'string') return { command: scriptCommand(pm, 'check'), projectRoot, stack: 'javascript/typescript' };
+      if (typeof scripts.verify === 'string') return { command: scriptCommand(pm, 'verify'), projectRoot, stack: 'javascript/typescript' };
+      if (typeof scripts.build === 'string') return { command: scriptCommand(pm, 'build'), projectRoot, stack: 'javascript/typescript' };
+      if (typeof scripts.compile === 'string') return { command: scriptCommand(pm, 'compile'), projectRoot, stack: 'javascript/typescript' };
+      if (typeof scripts.test === 'string') return { command: scriptCommand(pm, 'test'), projectRoot, stack: 'javascript/typescript' };
+    } catch { /* ignore */ }
+  }
+  if (existsSync(path.join(projectRoot, 'tsconfig.json'))) return { command: 'npx tsc --noEmit 2>&1 | head -30', projectRoot, stack: 'typescript' };
+  if (existsSync(path.join(projectRoot, 'Cargo.toml'))) return { command: 'cargo check --quiet 2>&1 | head -30', projectRoot, stack: 'rust' };
+  if (existsSync(path.join(projectRoot, 'go.mod'))) return { command: 'go test ./... 2>&1 | head -30', projectRoot, stack: 'go' };
+  if (existsSync(path.join(projectRoot, 'pyproject.toml')) || existsSync(path.join(projectRoot, 'requirements.txt')) || existsSync(path.join(projectRoot, 'setup.py'))) return { command: 'python -m compileall -q . 2>&1 | head -30', projectRoot, stack: 'python' };
+  if (existsSync(path.join(projectRoot, 'pom.xml'))) return { command: 'mvn -q -DskipTests compile 2>&1 | head -30', projectRoot, stack: 'java' };
+  if (existsSync(path.join(projectRoot, 'build.gradle')) || existsSync(path.join(projectRoot, 'build.gradle.kts'))) {
+    return { command: existsSync(path.join(projectRoot, 'gradlew')) ? './gradlew -q build -x test 2>&1 | head -30' : 'gradle -q build -x test 2>&1 | head -30', projectRoot, stack: 'java/gradle' };
+  }
+  const hasDotnet = existsSync(projectRoot) && readdirSafe(projectRoot).some(name => name.endsWith('.sln') || name.endsWith('.csproj'));
+  if (hasDotnet) return { command: 'dotnet build -nologo 2>&1 | head -30', projectRoot, stack: '.net' };
+  return null;
+}
+
+function readdirSafe(dir) {
+  try {
+    return readdirSync(dir);
+  } catch {
+    return [];
+  }
+}
 
 // ─── Colours ───────────────────────────────────────────────────────────────
 const R = '\x1b[31m', G = '\x1b[32m', Y = '\x1b[33m', B = '\x1b[34m';
@@ -140,7 +255,7 @@ When splitting a file into smaller modules:
 1. Read a bounded section with read_file_slice (e.g. lines 1–120).
 2. Identify one self-contained block (interfaces, a class, utility functions).
 3. Call create_or_edit_file with the NEW file path and the EXACT copied code.
-   - content MUST be the real extracted TypeScript code, NOT a comment placeholder.
+  - content MUST be the real extracted code, NOT a comment placeholder.
    - "// Code will be inserted here" is FORBIDDEN. Copy the real code.
 4. Call replace_in_file on the original file:
    - old_text = the exact extracted block
@@ -612,7 +727,7 @@ async function executeTool(name, args) {
         const start = Math.max(1, Number(args.startLine ?? 1));
         const end   = Math.min(lines.length, Number(args.endLine ?? lines.length));
         return JSON.stringify({
-          path: fp, languageId: 'typescript',
+          path: fp, languageId: detectLanguageId(fp),
           startLine: start, endLine: end,
           totalLines: lines.length,
           content: lines.slice(start - 1, end).join('\n')
@@ -630,7 +745,7 @@ async function executeTool(name, args) {
         const lines = rawContent.split('\n');
         const capped = lines.length > 200 ? lines.slice(0, 200) : lines;
         const result = {
-          path: fp, languageId: 'typescript',
+          path: fp, languageId: detectLanguageId(fp),
           startLine: 1, endLine: capped.length, totalLines: lines.length,
           content: capped.join('\n')
         };
@@ -685,8 +800,8 @@ async function executeTool(name, args) {
           /^\s*import\s/.test(l) || /^\s*export\s+(?:type\s+)?\{/.test(l) || /^\s*export\s+\*/.test(l));
       if (allAreImports) {
         return JSON.stringify({
-          error: 'Content contains only import or re-export statements with no actual TypeScript definitions. ' +
-            'The new file must contain the ACTUAL definitions (e.g. `interface Foo { ... }`, `type Bar = ...`, `function baz() { ... }`). ' +
+          error: 'Content contains only import or re-export statements with no actual definitions. ' +
+            'The new file must contain the ACTUAL definitions, implementations, or declarations you are extracting. ' +
             'Use read_file_slice to read the source section, then copy the exact definition blocks into this new file.'
         });
       }
@@ -783,7 +898,7 @@ async function executeTool(name, args) {
   }
 }
 
-// Extract exportable TypeScript definitions (interface/type/enum/class) from source code
+// Extract likely exportable definitions from source code for recovery flows.
 function extractDefinitionsFromSource(source) {
   const lines = source.split('\n');
   const resultLines = [];
@@ -1014,30 +1129,32 @@ function parseToolCallsFromText(content) {
     results.push({ function: { name: 'read_specific_file', arguments: { filepath: TARGET_FILE } } });
   }
 
-  // Match ```typescript blocks — model showing code it intends to write.
-  // Auto-detect filename from interface/type names when no filename is mentioned.
+  // Match fenced code blocks — model showing code it intends to write.
+  // Auto-detect filename from symbol names when no filename is mentioned.
   if (results.length === 0) {
-    const tsFenceRe = /```typescript\n([\s\S]*?)\n```/g;
-    while ((match = tsFenceRe.exec(content)) !== null) {
-      const codeContent = match[1].trim();
+    const genericFenceRe = /```([a-zA-Z0-9_+-]*)\n([\s\S]*?)\n```/g;
+    while ((match = genericFenceRe.exec(content)) !== null) {
+      const fenceLanguage = String(match[1] ?? '').trim().toLowerCase();
+      const codeContent = match[2].trim();
       if (codeContent.length < 50) continue;
-      // Must have actual TypeScript definitions (not just imports)
-      const hasDefinitions = /(?:export\s+)?(?:interface|type\s+\w+\s*=|class\s|enum\s|function\s|const\s)/.test(codeContent);
+      const looksLikeCode = /(?:\b(?:class|interface|enum|struct|trait|impl|func|def|fn|function|const|let|var|type|export|import|package|public|private|protected|namespace|module)\b|[{}();=])/m.test(codeContent);
+      const looksLikeKnownFence = !fenceLanguage || ['typescript', 'tsx', 'javascript', 'jsx', 'python', 'go', 'rust', 'java', 'kotlin', 'csharp', 'php', 'ruby', 'swift', 'c', 'cpp'].includes(fenceLanguage);
+      const hasDefinitions = looksLikeCode && looksLikeKnownFence;
       if (!hasDefinitions) continue;
       // Try to find filename from surrounding text (200 chars before the block)
       const textBefore = content.substring(Math.max(0, match.index - 200), match.index);
       const bt = String.fromCharCode(96);
       const filenameMatch =
-        textBefore.match(/(?:file|named?|called|path)\s+['"`]?([\w\/.-]+\.ts)['"`]?/i) ||
-        textBefore.match(new RegExp(bt + '([\\w\\/.-]+\\.ts)' + bt)) ||
-        content.substring(match.index + match[0].length).match(new RegExp(bt + '([\\w\\/.-]+\\.ts)' + bt));
+        textBefore.match(/(?:file|named?|called|path)\s+['"`]?([\w\/.-]+\.[\w]+)['"`]?/i) ||
+        textBefore.match(new RegExp(bt + '([\\w\\/.-]+\\.[\\w]+)' + bt)) ||
+        content.substring(match.index + match[0].length).match(new RegExp(bt + '([\\w\\/.-]+\\.[\\w]+)' + bt));
       let filename;
       if (filenameMatch) {
         filename = filenameMatch[1].includes('/') ? filenameMatch[1] : `src/${filenameMatch[1]}`;
       } else {
-        // Auto-infer filename from exported symbol names in code
-        const symbolNames = [...codeContent.matchAll(/(?:export\s+)?(?:interface|class|enum)\s+(\w+)/g)].map(m => m[1]);
-        if (symbolNames.length === 1) filename = (TARGET_DIR === '.' ? `${symbolNames[0]}.ts` : `${TARGET_DIR}/${symbolNames[0]}.ts`);
+        const symbolNames = [...codeContent.matchAll(/(?:export\s+)?(?:interface|class|enum|type|struct|trait|impl|func|def)\s+(\w+)/g)].map(m => m[1]);
+        const extension = path.extname(TARGET_FILE) || '.txt';
+        if (symbolNames.length === 1) filename = (TARGET_DIR === '.' ? `${symbolNames[0]}${extension}` : `${TARGET_DIR}/${symbolNames[0]}${extension}`);
         else if (symbolNames.length > 1) filename = SUGGESTED_TYPES_FILE;
       }
       if (filename) {
@@ -1129,10 +1246,10 @@ function buildReplaceReminder(createdPath, newFileContent, allRecentReads) {
     }
 
     if (exactBlock) {
-      msg += `\nSet old_text to this EXACT block (copy precisely, do NOT include any import statements above it):\n\`\`\`typescript\n${exactBlock}\n\`\`\`\n`;
+      msg += `\nSet old_text to this EXACT block (copy precisely, do NOT include any unrelated lines above it):\n\`\`\`${TARGET_CODE_FENCE}\n${exactBlock}\n\`\`\`\n`;
     } else {
-      msg += `\nContent at lines ${bestRead.startLine}\u2013${bestRead.endLine} of ${TARGET_FILE}:\n\`\`\`typescript\n${bestRead.content.substring(0, 900)}${bestRead.content.length > 900 ? '\n...' : ''}\n\`\`\`\n`;
-      msg += `Set old_text = ONLY the block that defines ${exportNames[0] ?? 'the extracted type'} (the type/interface body, NOT the import lines at the top of the file).\n`;
+      msg += `\nContent at lines ${bestRead.startLine}\u2013${bestRead.endLine} of ${TARGET_FILE}:\n\`\`\`${TARGET_CODE_FENCE}\n${bestRead.content.substring(0, 900)}${bestRead.content.length > 900 ? '\n...' : ''}\n\`\`\`\n`;
+      msg += `Set old_text = ONLY the block that defines ${exportNames[0] ?? 'the extracted code'} (the definition or implementation body, NOT unrelated imports or headers).\n`;
     }
   } else {
     msg += `Use read_file_slice to read the section of ${TARGET_BASENAME}.ts where ${exportNames[0] ?? 'the extracted code'} is defined, then set old_text to that exact block.\n`;
@@ -1152,7 +1269,7 @@ function buildNudge(analysis, lastToolWasError, ctx = {}) {
   if (pReplace && lastCreated) {
     let nudge = `You MUST call replace_in_file on ${TARGET_FILE} NOW. You already created ${path.basename(lastCreated.filePath)}.`;
     if (lastRead && lastRead.content) {
-      nudge += `\nContent at lines ${lastRead.startLine}–${lastRead.endLine} of ${TARGET_BASENAME}.ts:\n\`\`\`typescript\n${lastRead.content.substring(0, 700)}\n\`\`\``;
+      nudge += `\nContent at lines ${lastRead.startLine}–${lastRead.endLine} of ${path.basename(TARGET_FILE)}:\n\`\`\`${TARGET_CODE_FENCE}\n${lastRead.content.substring(0, 700)}\n\`\`\``;
       nudge += `\nCopy ONLY the exact block that defines ${lastCreated.exportNames.slice(0, 3).join(', ')} as old_text (do NOT include the import statements at the top).`;
     }
     if (lastCreated.exportNames.length > 0) {
@@ -1185,15 +1302,15 @@ function buildNudge(analysis, lastToolWasError, ctx = {}) {
       return `Stop writing. Call read_file_slice NOW: filepath="${TARGET_FILE}", startLine=${nextStart}, endLine=${nextStart + 119}. Then create a new module file and call replace_in_file. No preamble.`;
     }
     if (lastRead) {
-      return `Stop writing. You already read lines ${lastRead.startLine}–${lastRead.endLine}. Now call create_or_edit_file to create a new module with the extracted TypeScript definitions. Do not describe it — call the tool.`;
+      return `Stop writing. You already read lines ${lastRead.startLine}–${lastRead.endLine}. Now call create_or_edit_file to create a new file with the extracted real code. Do not describe it — call the tool.`;
     }
     return `Stop writing plans. Call a tool NOW — use read_file_slice on ${TARGET_FILE} to start.`;
   }
   if (analysis.isPassingToUser) {
-    return 'Do not ask the user anything. You have all the tools you need. Use read_file_slice to read the source file, copy the actual TypeScript code, and call create_or_edit_file with that real code.';
+    return 'Do not ask the user anything. You have all the tools you need. Use read_file_slice to read the source file, copy the actual code, and call create_or_edit_file with that real code.';
   }
   if (lastToolWasError) {
-    return 'The last tool call failed. Read the error, then call read_file_slice on the source file to get the actual code, and retry create_or_edit_file with the real extracted TypeScript code (not placeholder comments).';
+    return 'The last tool call failed. Read the error, then call read_file_slice on the source file to get the actual code, and retry create_or_edit_file with the real extracted code (not placeholder comments).';
   }
   if (analysis.isProgressOnly) {
     return 'Do not print progress text. Call a tool now — no preamble.';
@@ -1220,9 +1337,9 @@ async function main() {
   const messages = [
     {
       role: 'user',
-      content: 'You are an expert TypeScript developer. Call tools directly and immediately — do NOT output numbered plans, step lists, or descriptions of what you will do. ' +
+      content: 'You are an expert software developer. Call tools directly and immediately — do NOT output numbered plans, step lists, or descriptions of what you will do. ' +
         'When asked to split a file: use read_file_slice to read a section, create_or_edit_file to create the new module file, then replace_in_file to replace the original block with an import statement. ' +
-        'After each file write, run: execute_terminal_command("npx tsc --noEmit 2>&1 | head -20") to verify nothing broke. Repeat for each extractable block.'
+        'After each successful file write, verify the project using the most appropriate command for the detected stack instead of assuming TypeScript.'
     },
     { role: 'user', content: userPrompt }
   ];
@@ -1354,7 +1471,7 @@ async function main() {
             const autoReadParsed = JSON.parse(autoRead);
             if (!autoReadParsed.error && autoReadParsed.content) {
               lastSuccessfulRead = { filepath: String(parsed.suggestedSlice.filepath ?? ''), startLine: parsed.suggestedSlice.startLine, endLine: parsed.suggestedSlice.endLine, content: autoReadParsed.content };
-              const autoMsg = `[Auto-read lines ${parsed.suggestedSlice.startLine}–${parsed.suggestedSlice.endLine} to help you fix old_text]:\n\`\`\`typescript\n${autoReadParsed.content.substring(0, 800)}\n\`\`\`\nUse the EXACT text from above as old_text for replace_in_file.`;
+              const autoMsg = `[Auto-read lines ${parsed.suggestedSlice.startLine}–${parsed.suggestedSlice.endLine} to help you fix old_text]:\n\`\`\`${TARGET_CODE_FENCE}\n${autoReadParsed.content.substring(0, 800)}\n\`\`\`\nUse the EXACT text from above as old_text for replace_in_file.`;
               label(Y, '  AUTO-READ', `injected ${autoReadParsed.content.length} chars for old_text context`);
               messages.push({ role: 'tool', content: autoMsg, tool_name: 'read_file_slice' });
             }
@@ -1391,7 +1508,7 @@ async function main() {
               extractionCount++;
               extractionContinuationPending = true; // wait for model to start next cycle
               label(G, '  EXTRACTED', `Cycle ${extractionCount} done. Injecting continuation nudge.`);
-              const continueMsg = `Module extraction ${extractionCount} complete. Now read the next section of ${TARGET_FILE} (use a NEW line range you haven't read yet, beyond the block you just replaced) and extract another self-contained block (interface group, class, or utility functions). Aim to extract at least 3 modules total.`;
+              const continueMsg = `Module extraction ${extractionCount} complete. Now read the next section of ${TARGET_FILE} (use a NEW line range you haven't read yet, beyond the block you just replaced) and extract another self-contained block (types, functions, classes, methods, utilities, or similar). Aim to extract at least 3 modules total.`;
               postToolMessages.push({ role: 'user', content: continueMsg, _type: 'continuation' });
             }
           }
@@ -1399,6 +1516,31 @@ async function main() {
         logEvent('tool_exec_result', { tool: toolName, result: result.substring(0, 300) });
 
         messages.push({ role: 'tool', content: result, tool_name: toolName });
+      }
+
+      if (hadSuccessfulWrite) {
+        const verifyTargetPath = lastCreatedFileState?.filePath || resolveFilepath(TARGET_FILE);
+        const verifyConfig = pickVerifyCommandForPath(verifyTargetPath);
+        if (verifyConfig) {
+          label(B, 'VERIFY', `${verifyConfig.stack}: ${verifyConfig.command}`);
+          const verifyResult = await executeTool('execute_terminal_command', { command: `cd ${JSON.stringify(verifyConfig.projectRoot)} && ${verifyConfig.command}` });
+          const parsedVerify = JSON.parse(verifyResult);
+          const verifyOutput = [String(parsedVerify.stdout ?? ''), String(parsedVerify.stderr ?? '')].filter(Boolean).join('\n').trim();
+          messages.push({
+            role: 'tool',
+            content: JSON.stringify({
+              tool: 'build_verify',
+              stack: verifyConfig.stack,
+              command: verifyConfig.command,
+              projectRoot: verifyConfig.projectRoot,
+              ok: Number(parsedVerify.exitCode ?? 1) === 0,
+              result: Number(parsedVerify.exitCode ?? 1) === 0
+                ? `Build verification passed for ${verifyConfig.stack}.`
+                : `Build verification failed for ${verifyConfig.stack}:\n${verifyOutput || '(no output)'}`
+            }),
+            tool_name: 'build_verify'
+          });
+        }
       }
 
       // Inject reminder/continuation after all tool results (correct message ordering)
