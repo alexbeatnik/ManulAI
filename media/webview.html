@@ -36,6 +36,9 @@
       --control-height: 26px;
       --control-padding-y: 4px;
       --control-padding-x: 7px;
+      --page-gutter: 8px;
+      --page-gutter-compact: 6px;
+      --page-gutter-tight: 5px;
       font-family: 'Segoe UI Variable Text', 'Inter', var(--vscode-font-family);
     }
 
@@ -71,7 +74,7 @@
     }
 
     .header {
-      padding: 9px 12px 8px;
+      padding: 9px var(--page-gutter) 8px;
       border-bottom: 1px solid var(--border-muted);
       background: linear-gradient(180deg, color-mix(in srgb, var(--panel-soft) 70%, transparent), transparent);
       backdrop-filter: blur(8px);
@@ -190,7 +193,7 @@
       display: grid;
       grid-template-rows: auto 1fr;
       gap: 8px;
-      padding: 8px 12px 0;
+      padding: 8px var(--page-gutter) 0;
       overflow: hidden;
     }
 
@@ -860,7 +863,7 @@
     }
 
     .composer {
-      padding: 10px 14px 14px;
+      padding: 10px var(--page-gutter) 12px;
       background: linear-gradient(180deg, transparent, color-mix(in srgb, var(--bg) 80%, black 20%) 36%);
       min-height: 0;
     }
@@ -1376,7 +1379,7 @@
 
     @media (max-width: 920px) {
       .header {
-        padding: 8px 11px 7px;
+        padding: 8px var(--page-gutter) 7px;
       }
 
       .chat-strip {
@@ -1384,7 +1387,7 @@
       }
 
       .workspace {
-        padding: 7px 11px 0;
+        padding: 7px var(--page-gutter) 0;
       }
     }
 
@@ -1511,15 +1514,15 @@
 
     @media (max-width: 380px) {
       .header {
-        padding: 7px 9px 6px;
+        padding: 7px var(--page-gutter-compact) 6px;
       }
 
       .workspace {
-        padding: 6px 9px 0;
+        padding: 6px var(--page-gutter-compact) 0;
       }
 
       .composer {
-        padding: 7px 9px 9px;
+        padding: 7px var(--page-gutter-compact) 9px;
       }
 
       .history-meta {
@@ -1548,12 +1551,12 @@
       }
 
       .header {
-        padding: 7px 10px 6px;
+        padding: 7px var(--page-gutter-compact) 6px;
       }
 
       .workspace {
         gap: 6px;
-        padding: 6px 10px 0;
+        padding: 6px var(--page-gutter-compact) 0;
       }
 
       .history-meta {
@@ -1565,7 +1568,7 @@
       }
 
       .composer {
-        padding: 7px 10px 10px;
+        padding: 7px var(--page-gutter-compact) 10px;
       }
 
       .composer-inner {
@@ -1606,7 +1609,7 @@
       }
 
       .header {
-        padding: 6px 9px 5px;
+        padding: 6px var(--page-gutter-tight) 5px;
       }
 
       .title {
@@ -1624,7 +1627,7 @@
 
       .workspace {
         gap: 5px;
-        padding: 5px 9px 0;
+        padding: 5px var(--page-gutter-tight) 0;
       }
 
       .topbar,
@@ -1664,7 +1667,7 @@
       }
 
       .composer {
-        padding: 6px 9px 8px;
+        padding: 6px var(--page-gutter-tight) 8px;
       }
 
       .chips {
