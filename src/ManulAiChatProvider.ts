@@ -96,6 +96,8 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   private debugLogFilePath?: string;
   private debugSessionId = '';
   private progressStepCounter = 0;
+  private repeatedNarratedToolSignature: string | null = null;
+  private repeatedNarratedToolCount = 0;
   private workspaceSettings: Partial<ManulAiStoredSettings> = {};
   private workspaceSettingsLoaded = false;
   private workspaceSettingsLoadPromise?: Promise<void>;
@@ -1399,6 +1401,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   private async runAgentLoop(exchangeStartIndex = this.getLastVisibleUserMessageIndex(this.messages)): Promise<void> {
     this.requestInFlight = true;
     this.stopRequested = false;
+    this.resetNarratedBootstrapState();
     this.postBusyState(true);
 
     try {
@@ -1415,6 +1418,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       this.messages.push({ role: 'assistant', content: `Request failed: ${message}` });
       this.postStateToWebview();
     } finally {
+      this.resetNarratedBootstrapState();
       this.currentRequestAbortController = undefined;
       this.stopRequested = false;
       this.requestInFlight = false;
@@ -1527,6 +1531,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         }
       }
 
+      this.resetNarratedBootstrapState();
       await this.processOllamaResponse(messages, 0);
       return;
     }
@@ -2116,6 +2121,8 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
 
         const announcedNewFilePath = this.extractAnnouncedNewFilePath(finalContent);
         const suggestedNextSlice = this.suggestNextLargeRefactorSlice(recentToolResults, largeRefactorTargets);
+        const latestSuccessfulReadContext = this.getLatestSuccessfulReadContext(recentToolResults, largeRefactorTargets);
+        const latestSuccessfulCreateContext = this.getLatestSuccessfulCreateContext(messages, recentToolResults);
         const hasLargeRefactorShellReadBypass = Boolean(
           isLargeRefactorRequest
           && recentToolResults.some(({ message, parsed }) => message.tool_name === 'execute_terminal_command' && this.isTerminalReadOnlyInspectionCommand(String(parsed.command ?? '')))
@@ -2256,6 +2263,49 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           }
         }
 
+        const bootstrapCandidate = this.inferRepeatedNarratedBootstrapToolCall({
+          content: finalContent,
+          isLargeRefactorRequest,
+          hasRecentReadOfLargeRefactorTarget,
+          hasRecentMeaningfulWrite,
+          hasReadButNoWriteOnLargeRefactor,
+          hasPostCreateRefactorNarration,
+          isAnnouncedButNotExecuted,
+          isProgressOnlyResponse,
+          hasIncompletePlan: !!hasIncompletePlan,
+          hasExplicitNextSteps,
+          claimsDone,
+          mentionsChange,
+          largeRefactorTargets,
+          suggestedNextSlice,
+          latestRead: latestSuccessfulReadContext,
+          latestCreate: latestSuccessfulCreateContext
+        });
+        const bootstrapCandidateCount = this.recordNarratedBootstrapSignature(bootstrapCandidate?.signature);
+
+        if (bootstrapCandidate) {
+          this.debugLog('bootstrap_candidate', {
+            retryCount,
+            reason: bootstrapCandidate.reason,
+            signature: bootstrapCandidate.signature,
+            count: bootstrapCandidateCount,
+            tool: bootstrapCandidate.toolCall.function?.name
+          });
+        }
+
+        if (bootstrapCandidate && bootstrapCandidateCount >= 2) {
+          this.debugLog('bootstrap_tool_call', {
+            retryCount,
+            reason: bootstrapCandidate.reason,
+            signature: bootstrapCandidate.signature,
+            tool: bootstrapCandidate.toolCall.function?.name
+          });
+          const didExecuteBootstrap = await this.executeSyntheticBootstrapToolCall(messages, finalContent, bootstrapCandidate.toolCall);
+          if (didExecuteBootstrap) {
+            return;
+          }
+        }
+
         if (shouldNudge) {
           this.debugLog('nudge', { retryCount, hasRecentToolResults, hasRecentSuccessfulAction, hasRecentMeaningfulWrite, latestCreatedFilePath, hasRecentReadOfLargeRefactorTarget, latestLargeRefactorTargetTotalLines, latestLargeRefactorTargetRemainingLines, canStopAfterTinyLargeRefactor, hasLargeRefactorShellReadBypass, hasPreReadLargeRefactorNarration, hasFakePreReadCodeDump, hasFakePostReadAnalysisDump, hasPostReadSummaryOnLargeRefactor, hasModelRefusalResponse, hasAnnouncedExtractionWithoutWrite, hasLazyRefusalOnLargeRefactor, isAskingUserForExactSlice, suggestedNextSlice, hasReadButNoWriteOnLargeRefactor, hasPostReadToolStall, hasPostCreateRefactorNarration, announcedNewFilePath, hasRecentToolErrors, hasRecentBuildVerifyFailure, hasRecentReplaceNotFound, replaceNotFoundFilepath, replaceNotFoundStartLine, replaceNotFoundEndLine, lastSuccessfulActionIndex, isLongDump, hasLargeCodeBlocks, claimsDone, mentionsChange, isLazyAcknowledgment, hasIncompletePlan: !!hasIncompletePlan, hasExplicitNextSteps, isProgressOnlyResponse, claimedButUnexecutedCommand, isPassingToUser, isAnnouncedButNotExecuted, isLargeRefactorRequest, contentPreview: finalContent.substring(0, 200) });
           // Show plan/progress text to the user before nudging
@@ -2391,9 +2441,13 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
             nudgeMessage = 'You described changes but did not call a tool. If you need to modify files, use one of the provided tools. If no file change is needed, answer normally.';
           }
 
+          const narratedBootstrapWarning = bootstrapCandidate && bootstrapCandidateCount === 1
+            ? `\nIf you describe the same tool call in plain text again instead of executing it, the system will auto-bootstrap ${bootstrapCandidate.toolCall.function?.name}.`
+            : '';
+
           messages.push({
             role: 'user',
-            content: nudgeMessage,
+            content: `${nudgeMessage}${narratedBootstrapWarning}`,
             hiddenFromTranscript: true
           });
           this.postStatus(`Model did not use tools (attempt ${retryCount + 1}) — continuing...`);
@@ -5347,6 +5401,10 @@ If the user asks for a change but provides NO code:
       if (invalidStructuredContent) {
         return JSON.stringify({ error: invalidStructuredContent });
       }
+      const invalidGeneratedModuleContent = this.validateGeneratedModuleContent(targetUri.fsPath, sanitizedContent);
+      if (invalidGeneratedModuleContent) {
+        return JSON.stringify({ error: invalidGeneratedModuleContent });
+      }
 
       // Guard against destructive writes from tool calls
       const displayName = path.basename(targetUri.fsPath);
@@ -6470,6 +6528,517 @@ If the user asks for a change but provides NO code:
     return fallbackRead;
   }
 
+  private resetNarratedBootstrapState(): void {
+    this.repeatedNarratedToolSignature = null;
+    this.repeatedNarratedToolCount = 0;
+  }
+
+  private recordNarratedBootstrapSignature(signature: string | undefined): number {
+    if (!signature) {
+      this.resetNarratedBootstrapState();
+      return 0;
+    }
+
+    if (this.repeatedNarratedToolSignature === signature) {
+      this.repeatedNarratedToolCount += 1;
+    } else {
+      this.repeatedNarratedToolSignature = signature;
+      this.repeatedNarratedToolCount = 1;
+    }
+
+    return this.repeatedNarratedToolCount;
+  }
+
+  private detectLanguageIdForPath(filepath: string): string {
+    const extension = path.extname(filepath).toLowerCase();
+    const map: Record<string, string> = {
+      '.ts': 'typescript',
+      '.tsx': 'typescriptreact',
+      '.js': 'javascript',
+      '.jsx': 'javascriptreact',
+      '.mjs': 'javascript',
+      '.cjs': 'javascript',
+      '.py': 'python',
+      '.go': 'go',
+      '.rs': 'rust',
+      '.java': 'java',
+      '.kt': 'kotlin',
+      '.cs': 'csharp',
+      '.php': 'php',
+      '.rb': 'ruby',
+      '.swift': 'swift',
+      '.c': 'c',
+      '.h': 'c',
+      '.cpp': 'cpp',
+      '.cc': 'cpp',
+      '.cxx': 'cpp',
+      '.hpp': 'cpp',
+      '.hh': 'cpp',
+      '.json': 'json',
+      '.md': 'markdown',
+      '.html': 'html',
+      '.css': 'css',
+      '.yml': 'yaml',
+      '.yaml': 'yaml',
+      '.xml': 'xml',
+      '.sh': 'shell',
+      '.bash': 'shell'
+    };
+    return map[extension] ?? 'plaintext';
+  }
+
+  private extractSymbolNamesFromGeneratedContent(content: string, filepath: string): string[] {
+    const languageId = this.detectLanguageIdForPath(filepath);
+    const names: string[] = [];
+    const add = (value: string | undefined): void => {
+      if (!value || names.includes(value)) {
+        return;
+      }
+      names.push(value);
+    };
+
+    const patternsByLanguage: Record<string, RegExp[]> = {
+      typescript: [
+        /^\s*export\s+(?:(?:type|interface|abstract|declare)\s+)*(?:function\s+|class\s+|const\s+|let\s+|var\s+|enum\s+)?([A-Za-z_][\w]*)/gm,
+        /^\s*(?:interface|type|class|enum|function)\s+([A-Za-z_][\w]*)/gm
+      ],
+      typescriptreact: [
+        /^\s*export\s+(?:(?:type|interface|abstract|declare)\s+)*(?:function\s+|class\s+|const\s+|let\s+|var\s+|enum\s+)?([A-Za-z_][\w]*)/gm,
+        /^\s*(?:interface|type|class|enum|function)\s+([A-Za-z_][\w]*)/gm
+      ],
+      javascript: [
+        /^\s*export\s+(?:async\s+)?(?:function\s+|class\s+|const\s+|let\s+|var\s+)?([A-Za-z_][\w]*)/gm,
+        /^\s*(?:async\s+)?function\s+([A-Za-z_][\w]*)/gm,
+        /^\s*class\s+([A-Za-z_][\w]*)/gm
+      ],
+      javascriptreact: [
+        /^\s*export\s+(?:async\s+)?(?:function\s+|class\s+|const\s+|let\s+|var\s+)?([A-Za-z_][\w]*)/gm,
+        /^\s*(?:async\s+)?function\s+([A-Za-z_][\w]*)/gm,
+        /^\s*class\s+([A-Za-z_][\w]*)/gm
+      ],
+      python: [/^\s*(?:class|def)\s+([A-Za-z_][\w]*)/gm],
+      go: [/^\s*type\s+([A-Za-z_][\w]*)\s+(?:struct|interface)\b/gm, /^\s*func\s+(?:\([^)]*\)\s*)?([A-Za-z_][\w]*)\s*\(/gm],
+      rust: [/^\s*(?:pub\s+)?(?:struct|enum|trait|fn|const|mod)\s+([A-Za-z_][\w]*)/gm, /^\s*impl\s+([A-Za-z_][\w]*)/gm],
+      java: [/^\s*(?:public\s+)?(?:class|interface|enum|record)\s+([A-Za-z_][\w]*)/gm],
+      csharp: [/^\s*(?:public|internal|private|protected)\s+(?:static\s+)?(?:class|interface|enum|record|struct)\s+([A-Za-z_][\w]*)/gm]
+    };
+
+    const patterns = patternsByLanguage[languageId] ?? [/^\s*(?:class|interface|enum|record|struct|trait|type|def|fn|function)\s+([A-Za-z_][\w]*)/gm];
+    for (const pattern of patterns) {
+      for (const match of content.matchAll(pattern)) {
+        add(match[1]);
+      }
+    }
+
+    return names.slice(0, 10);
+  }
+
+  private buildExactModuleReference(createdPath: string, symbolNames: string[]): string | undefined {
+    const baseName = path.basename(createdPath, path.extname(createdPath));
+    const extension = path.extname(createdPath).toLowerCase();
+    const names = symbolNames.filter(Boolean);
+    if (names.length === 0) {
+      return undefined;
+    }
+    if (['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs'].includes(extension)) {
+      return `import { ${names.join(', ')} } from './${baseName}';`;
+    }
+    if (extension === '.py') {
+      return `from ${baseName} import ${names.join(', ')}`;
+    }
+    return undefined;
+  }
+
+  private extractDefinitionsFromSource(source: string, filepath: string): string {
+    const normalized = source.replace(/\r\n/g, '\n').trim();
+    if (!normalized) {
+      return '';
+    }
+
+    const languageId = this.detectLanguageIdForPath(filepath);
+    const lines = normalized.split('\n');
+    const packageLine = languageId === 'go' ? lines.find(line => /^\s*package\s+[A-Za-z_][\w]*/.test(line)) : undefined;
+
+    const captureBraceBlock = (startIndex: number): string => {
+      const collected: string[] = [];
+      let depth = 0;
+      let seenOpen = false;
+      for (let index = startIndex; index < lines.length; index += 1) {
+        const line = lines[index];
+        collected.push(line);
+        for (const char of line) {
+          if (char === '{') {
+            depth += 1;
+            seenOpen = true;
+          } else if (char === '}') {
+            depth -= 1;
+          }
+        }
+        if (seenOpen && depth <= 0) {
+          const block = collected.join('\n').trim();
+          return languageId === 'go' && packageLine && !/^\s*package\s+/m.test(block)
+            ? `${packageLine}\n\n${block}`
+            : block;
+        }
+        if (!seenOpen && /;\s*$/.test(line.trim())) {
+          const block = collected.join('\n').trim();
+          return languageId === 'go' && packageLine && !/^\s*package\s+/m.test(block)
+            ? `${packageLine}\n\n${block}`
+            : block;
+        }
+      }
+      const block = collected.join('\n').trim();
+      return languageId === 'go' && packageLine && !/^\s*package\s+/m.test(block)
+        ? `${packageLine}\n\n${block}`
+        : block;
+    };
+
+    const captureIndentedBlock = (startIndex: number): string => {
+      const collected = [lines[startIndex]];
+      const baseIndent = (lines[startIndex].match(/^\s*/) ?? [''])[0].length;
+      for (let index = startIndex + 1; index < lines.length; index += 1) {
+        const line = lines[index];
+        const trimmed = line.trim();
+        if (!trimmed) {
+          collected.push(line);
+          continue;
+        }
+        const indent = (line.match(/^\s*/) ?? [''])[0].length;
+        if (indent <= baseIndent && !/^\s*@/.test(line)) {
+          break;
+        }
+        collected.push(line);
+      }
+      return collected.join('\n').trim();
+    };
+
+    const patternsByLanguage: Record<string, RegExp[]> = {
+      python: [/^\s*(?:class|def)\s+[A-Za-z_][\w]*/],
+      go: [/^\s*type\s+[A-Za-z_][\w]*\s+(?:struct|interface)\b/, /^\s*func\s+(?:\([^)]*\)\s*)?[A-Za-z_][\w]*\s*\(/],
+      rust: [/^\s*(?:pub\s+)?(?:struct|enum|trait|fn|const|mod)\s+[A-Za-z_][\w]*/, /^\s*impl\s+[A-Za-z_][\w]*/],
+      java: [/^\s*(?:public\s+)?(?:class|interface|enum|record)\s+[A-Za-z_][\w]*/, /^\s*(?:public|private|protected)\s+(?:static\s+)?[A-Za-z_][\w<>\[\], ?]*\s+[A-Za-z_][\w]*\s*\(/],
+      csharp: [/^\s*(?:public|internal|private|protected)\s+(?:static\s+)?(?:class|interface|enum|record|struct)\s+[A-Za-z_][\w]*/, /^\s*(?:public|internal|private|protected)\s+(?:static\s+)?[A-Za-z_][\w<>\[\], ?]*\s+[A-Za-z_][\w]*\s*\(/],
+      typescript: [/^\s*(?:export\s+)?(?:interface|type|enum|class|function)\s+[A-Za-z_][\w]*/, /^\s*export\s+(?:const|let|var)\s+[A-Za-z_][\w]*/],
+      typescriptreact: [/^\s*(?:export\s+)?(?:interface|type|enum|class|function)\s+[A-Za-z_][\w]*/, /^\s*export\s+(?:const|let|var)\s+[A-Za-z_][\w]*/],
+      javascript: [/^\s*export\s+(?:async\s+)?(?:function|class|const|let|var)\s+[A-Za-z_][\w]*/, /^\s*(?:async\s+)?function\s+[A-Za-z_][\w]*/, /^\s*class\s+[A-Za-z_][\w]*/],
+      javascriptreact: [/^\s*export\s+(?:async\s+)?(?:function|class|const|let|var)\s+[A-Za-z_][\w]*/, /^\s*(?:async\s+)?function\s+[A-Za-z_][\w]*/, /^\s*class\s+[A-Za-z_][\w]*/]
+    };
+
+    const patterns = patternsByLanguage[languageId] ?? [/^\s*(?:class|interface|enum|record|struct|trait|type|def|fn|function)\s+[A-Za-z_][\w]*/];
+    for (let index = 0; index < lines.length; index += 1) {
+      const line = lines[index];
+      if (!patterns.some(pattern => pattern.test(line))) {
+        continue;
+      }
+      return languageId === 'python' ? captureIndentedBlock(index) : captureBraceBlock(index);
+    }
+
+    if (languageId === 'rust' && lines.every(line => /^\s*(?:pub\s+)?use\b/.test(line) || line.trim() === '')) {
+      return '';
+    }
+
+    return normalized.length <= 1200 ? normalized : lines.slice(0, Math.min(lines.length, 80)).join('\n').trim();
+  }
+
+  private inferReadRangeFromNarration(content: string, fallbackStart: number, fallbackEnd: number): { startLine: number; endLine: number } {
+    const explicitRangeMatch = content.match(/lines?\s+(\d+)\s*(?:[-–—]|to)\s*(\d+)/i);
+    if (explicitRangeMatch) {
+      const startLine = Number(explicitRangeMatch[1]);
+      const endLine = Number(explicitRangeMatch[2]);
+      if (Number.isFinite(startLine) && Number.isFinite(endLine) && startLine >= 1 && endLine >= startLine) {
+        return { startLine, endLine };
+      }
+    }
+    return { startLine: fallbackStart, endLine: fallbackEnd };
+  }
+
+  private getLatestSuccessfulReadContext(
+    recentToolResults: Array<{ message: OllamaMessage & { role: 'tool' }; parsed: Record<string, unknown>; index: number }>,
+    targetPaths: string[]
+  ): { filepath: string; startLine: number; endLine: number; totalLines: number; content: string } | undefined {
+    for (let index = recentToolResults.length - 1; index >= 0; index -= 1) {
+      const { message, parsed } = recentToolResults[index];
+      if (parsed.error) {
+        continue;
+      }
+      if (message.tool_name !== 'read_active_file' && message.tool_name !== 'read_specific_file' && message.tool_name !== 'read_file_slice') {
+        continue;
+      }
+      const filepath = typeof parsed.path === 'string' ? parsed.path : '';
+      if (!filepath || (targetPaths.length > 0 && !this.toolResultMatchesAnyTargetPath(filepath, targetPaths))) {
+        continue;
+      }
+      return {
+        filepath,
+        startLine: Number(parsed.startLine ?? 1),
+        endLine: Number(parsed.endLine ?? 1),
+        totalLines: Number(parsed.totalLines ?? 0),
+        content: String(parsed.content ?? '')
+      };
+    }
+    return undefined;
+  }
+
+  private getCreateArgsForToolMessage(messages: OllamaMessage[], toolMessageIndex: number, expectedPath?: string): { filepath: string; content: string } | undefined {
+    for (let index = toolMessageIndex - 1; index >= 0; index -= 1) {
+      const message = messages[index];
+      if (message.role !== 'assistant' || !message.tool_calls?.length) {
+        continue;
+      }
+      for (let toolIndex = message.tool_calls.length - 1; toolIndex >= 0; toolIndex -= 1) {
+        const toolCall = message.tool_calls[toolIndex];
+        if (this.remapWeakModelToolName(toolCall.function?.name ?? '') !== 'create_or_edit_file') {
+          continue;
+        }
+        const args = this.normalizeToolArguments(toolCall.function?.arguments);
+        const filepath = String(args.filename ?? args.filepath ?? '').trim();
+        const content = String(args.content ?? '');
+        if (!filepath || !content) {
+          continue;
+        }
+        if (expectedPath) {
+          const normalizedExpected = expectedPath.replace(/\\/g, '/').toLowerCase();
+          const normalizedActual = filepath.replace(/\\/g, '/').toLowerCase();
+          if (normalizedActual !== normalizedExpected && !normalizedExpected.endsWith(`/${path.basename(normalizedActual)}`)) {
+            continue;
+          }
+        }
+        return { filepath, content };
+      }
+    }
+    return undefined;
+  }
+
+  private getLatestSuccessfulCreateContext(
+    messages: OllamaMessage[],
+    recentToolResults: Array<{ message: OllamaMessage & { role: 'tool' }; parsed: Record<string, unknown>; index: number }>
+  ): { filepath: string; content: string; exportNames: string[] } | undefined {
+    for (let index = recentToolResults.length - 1; index >= 0; index -= 1) {
+      const { message, parsed, index: toolMessageIndex } = recentToolResults[index];
+      if (parsed.error || message.tool_name !== 'create_or_edit_file' || this.isPlaceholderCreateResult(parsed)) {
+        continue;
+      }
+      const resultPath = typeof parsed.path === 'string' ? parsed.path : '';
+      const createArgs = this.getCreateArgsForToolMessage(messages, toolMessageIndex, resultPath);
+      const filepath = resultPath || createArgs?.filepath || '';
+      const content = createArgs?.content ?? '';
+      if (!filepath || !content) {
+        continue;
+      }
+      return {
+        filepath,
+        content,
+        exportNames: this.extractSymbolNamesFromGeneratedContent(content, filepath)
+      };
+    }
+    return undefined;
+  }
+
+  private inferRepeatedNarratedBootstrapToolCall(options: {
+    content: string;
+    isLargeRefactorRequest: boolean;
+    hasRecentReadOfLargeRefactorTarget: boolean;
+    hasRecentMeaningfulWrite: boolean;
+    hasReadButNoWriteOnLargeRefactor: boolean;
+    hasPostCreateRefactorNarration: boolean;
+    isAnnouncedButNotExecuted: boolean;
+    isProgressOnlyResponse: boolean;
+    hasIncompletePlan: boolean;
+    hasExplicitNextSteps: boolean;
+    claimsDone: boolean;
+    mentionsChange: boolean;
+    largeRefactorTargets: string[];
+    suggestedNextSlice?: { filepath: string; startLine: number; endLine: number };
+    latestRead?: { filepath: string; startLine: number; endLine: number; totalLines: number; content: string };
+    latestCreate?: { filepath: string; content: string; exportNames: string[] };
+  }): { toolCall: ToolFunctionCall; signature: string; reason: string } | undefined {
+    const {
+      content,
+      isLargeRefactorRequest,
+      hasRecentReadOfLargeRefactorTarget,
+      hasRecentMeaningfulWrite,
+      hasReadButNoWriteOnLargeRefactor,
+      hasPostCreateRefactorNarration,
+      isAnnouncedButNotExecuted,
+      isProgressOnlyResponse,
+      hasIncompletePlan,
+      hasExplicitNextSteps,
+      claimsDone,
+      mentionsChange,
+      largeRefactorTargets,
+      suggestedNextSlice,
+      latestRead,
+      latestCreate
+    } = options;
+
+    if (!isLargeRefactorRequest) {
+      return undefined;
+    }
+
+    const normalizedContent = content.trim();
+    if (!normalizedContent) {
+      return undefined;
+    }
+
+    const primaryTarget = largeRefactorTargets[0] ?? latestRead?.filepath;
+    const lower = normalizedContent.toLowerCase();
+    const mentionsRead = /\bread_file_slice\b/.test(lower) || /\bread_specific_file\b/.test(lower) || /\bread\b.*(?:section|slice|file|lines?|bounded)/i.test(normalizedContent);
+    const mentionsCreate = /\bcreate_or_edit_file\b/.test(lower) || /\bcreate\b.*\b(?:file|module)\b/i.test(normalizedContent) || /\bextract\b.*\b(?:file|module|helper)\b/i.test(normalizedContent);
+    const mentionsReplace = /\breplace_in_file\b/.test(lower) || /\breplace\b.*\b(?:block|original|definition|file)\b/i.test(normalizedContent) || /\bupdate\b.*\boriginal\b/i.test(normalizedContent);
+
+    if (!hasRecentReadOfLargeRefactorTarget && primaryTarget && (mentionsRead || isAnnouncedButNotExecuted || isProgressOnlyResponse || hasIncompletePlan)) {
+      const range = suggestedNextSlice && suggestedNextSlice.filepath
+        ? { startLine: suggestedNextSlice.startLine, endLine: suggestedNextSlice.endLine, filepath: suggestedNextSlice.filepath }
+        : { ...this.inferReadRangeFromNarration(normalizedContent, 1, 120), filepath: primaryTarget };
+      return {
+        toolCall: {
+          type: 'function',
+          function: {
+            name: 'read_file_slice',
+            arguments: { filepath: range.filepath, startLine: range.startLine, endLine: range.endLine }
+          }
+        },
+        signature: `read_file_slice|${range.filepath}|${range.startLine}|${range.endLine}`,
+        reason: 'bootstrap narrated read_file_slice for large refactor target'
+      };
+    }
+
+    if (hasReadButNoWriteOnLargeRefactor && latestRead?.content && primaryTarget && (mentionsCreate || isProgressOnlyResponse || hasExplicitNextSteps || claimsDone || mentionsChange)) {
+      const extractedContent = this.extractDefinitionsFromSource(latestRead.content, latestRead.filepath || primaryTarget);
+      if (extractedContent) {
+        const targetExtension = path.extname(primaryTarget);
+        const symbolNames = this.extractSymbolNamesFromGeneratedContent(extractedContent, primaryTarget);
+        const candidateFilename = latestCreate?.filepath
+          ?? (symbolNames.length === 1
+            ? path.join(path.dirname(primaryTarget), `${symbolNames[0]}${targetExtension}`)
+            : path.join(path.dirname(primaryTarget), `types${targetExtension}`));
+        return {
+          toolCall: {
+            type: 'function',
+            function: {
+              name: 'create_or_edit_file',
+              arguments: {
+                filename: candidateFilename.replace(/\\/g, '/'),
+                content: extractedContent
+              }
+            }
+          },
+          signature: `create_or_edit_file|${candidateFilename.replace(/\\/g, '/')}`,
+          reason: 'bootstrap narrated create_or_edit_file from last successful bounded read'
+        };
+      }
+    }
+
+    if (hasPostCreateRefactorNarration && latestRead?.content && latestCreate?.filepath && primaryTarget && (mentionsReplace || isAnnouncedButNotExecuted || claimsDone || mentionsChange)) {
+      const oldText = this.extractDefinitionsFromSource(latestRead.content, primaryTarget);
+      const newText = this.buildExactModuleReference(latestCreate.filepath, latestCreate.exportNames);
+      if (oldText && newText) {
+        return {
+          toolCall: {
+            type: 'function',
+            function: {
+              name: 'replace_in_file',
+              arguments: { filepath: primaryTarget, old_text: oldText, new_text: newText }
+            }
+          },
+          signature: `replace_in_file|${primaryTarget}|${latestCreate.filepath}`,
+          reason: 'bootstrap narrated replace_in_file after successful create'
+        };
+      }
+    }
+
+    if (hasRecentMeaningfulWrite && primaryTarget && latestRead) {
+      const fallbackStart = latestRead.endLine > 0 ? latestRead.endLine + 1 : 1;
+      const fallbackEnd = fallbackStart + 119;
+      if (mentionsRead || isAnnouncedButNotExecuted || isProgressOnlyResponse || hasExplicitNextSteps) {
+        const range = suggestedNextSlice && suggestedNextSlice.filepath
+          ? suggestedNextSlice
+          : { filepath: primaryTarget, ...this.inferReadRangeFromNarration(normalizedContent, fallbackStart, fallbackEnd) };
+        return {
+          toolCall: {
+            type: 'function',
+            function: {
+              name: 'read_file_slice',
+              arguments: { filepath: range.filepath, startLine: range.startLine, endLine: range.endLine }
+            }
+          },
+          signature: `read_file_slice|${range.filepath}|${range.startLine}|${range.endLine}`,
+          reason: 'bootstrap narrated continuation read_file_slice after extraction'
+        };
+      }
+    }
+
+    return undefined;
+  }
+
+  private async executeSyntheticBootstrapToolCall(messages: OllamaMessage[], assistantContent: string, toolCall: ToolFunctionCall): Promise<boolean> {
+    const toolName = toolCall.function?.name ?? 'unknown_tool';
+
+    if (!this.autoApprove) {
+      const approved = await this.requestApproval({
+        kind: 'tool',
+        title: 'Tool Approval Required',
+        message: `ManulAI wants to auto-bootstrap: ${toolName}`,
+        details: assistantContent || undefined,
+        approveLabel: 'Approve',
+        declineLabel: 'Decline'
+      });
+      if (!approved) {
+        messages.push({ role: 'assistant', content: `[Auto-bootstrap denied by user: ${toolName}]` });
+        return true;
+      }
+    }
+
+    messages.push({
+      role: 'assistant',
+      content: assistantContent,
+      tool_calls: [toolCall],
+      hiddenFromTranscript: true
+    });
+
+    this.postProgressStep(this.describeToolExecution(toolCall));
+    this.debugLog('tool_exec_start', { tool: toolName, args: toolCall.function?.arguments, synthetic: true });
+    const toolResult = await this.executeToolCall(toolCall);
+    this.debugLog('tool_exec_result', { tool: toolName, result: toolResult.substring(0, 500), synthetic: true });
+    messages.push({
+      role: 'tool',
+      content: toolResult,
+      tool_name: toolName,
+      hiddenFromTranscript: true,
+      revertOperationIds: this.extractToolResultRevertOperationIds(toolResult)
+    });
+
+    const writeToolNames = new Set(['replace_in_file', 'create_or_edit_file', 'write_to_file', 'delete_file']);
+    if (writeToolNames.has(toolName)) {
+      try {
+        const parsed = JSON.parse(toolResult) as Record<string, unknown>;
+        if (!parsed.error) {
+          const verifyResult = await this.tryRunBuildVerify(messages);
+          if (verifyResult !== null) {
+            if (verifyResult.ok) {
+              this.postProgressStep('Build check: OK');
+            } else {
+              this.postProgressStep('Build errors detected — sending to model...');
+              const verifyContent = `Build verification (compile check) after edit failed:\n${verifyResult.output || '(no output)'}\n\nFix all errors shown above before continuing. Then re-run the build check to confirm.`;
+              messages.push({
+                role: 'tool',
+                content: JSON.stringify({ tool: 'build_verify', result: verifyContent }),
+                tool_name: 'build_verify',
+                hiddenFromTranscript: false
+              });
+            }
+          }
+        }
+      } catch {
+        // Ignore parse/verify bootstrap failures and let the loop continue naturally.
+      }
+    }
+
+    this.resetNarratedBootstrapState();
+    await this.processOllamaResponse(messages, 0);
+    return true;
+  }
+
   private getLatestBuildVerifyFailure(
     recentToolResults: Array<{ message: OllamaMessage & { role: 'tool' }; parsed: Record<string, unknown>; index: number }>
   ): { stack: string; result: string } | undefined {
@@ -6738,6 +7307,50 @@ If the user asks for a change but provides NO code:
     }).length;
 
     return codeLikeLineCount === 0 && bytesWritten <= 240;
+  }
+
+  private validateGeneratedModuleContent(filepath: string, content: string): string | undefined {
+    const extension = path.extname(filepath).toLowerCase();
+    const normalized = content.replace(/\r\n/g, '\n');
+    const nonEmptyLines = normalized
+      .split('\n')
+      .map(line => line.trim())
+      .filter(Boolean);
+    const codeLines = nonEmptyLines.filter(line => !/^(?:\/\/|\/\*|\*|#)/.test(line));
+
+    if (extension === '.go') {
+      if (/\bexport\s+(?:type|interface|class|enum|const|function)\b/.test(normalized)) {
+        return 'Generated Go code is invalid: Go declarations must not use the export keyword. Use forms like "type Name interface { ... }" or "func Name(...)".';
+      }
+      if (/^\s*interface\s+[A-Za-z_][\w]*/m.test(normalized)) {
+        return 'Generated Go code is invalid: interfaces must be declared as "type Name interface { ... }", not "interface Name".';
+      }
+      if (/\bclass\s+[A-Za-z_][\w]*/.test(normalized)) {
+        return 'Generated Go code is invalid: Go does not have class declarations.';
+      }
+      if (!nonEmptyLines.some(line => /^package\s+[A-Za-z_][\w]*/.test(line))) {
+        return 'Generated Go module content is incomplete: extracted .go files must start with a package declaration.';
+      }
+      const hasGoDefinition = codeLines.some(line => /^(?:package\s+\w+|import\s+|type\s+\w+\s+(?:struct|interface)\b|func\s+(?:\([^)]*\)\s*)?\w+\s*\(|const\s+\w+|var\s+\w+)/.test(line));
+      if (!hasGoDefinition) {
+        return 'Generated Go module content is invalid: the file must contain real Go declarations, not placeholder or cross-language syntax.';
+      }
+    }
+
+    if (extension === '.rs') {
+      if (/\bexport\s+(?:type|interface|class|enum|const|function)\b/.test(normalized) || /\binterface\s+[A-Za-z_][\w]*/.test(normalized) || /\bclass\s+[A-Za-z_][\w]*/.test(normalized)) {
+        return 'Generated Rust code is invalid: the file contains non-Rust class/interface/export syntax.';
+      }
+      if (/^\s*(?:pub\s+)?mod\s+[A-Za-z_][\w]*\s*\{\s*\}\s*$/m.test(normalized) && codeLines.length <= 2) {
+        return 'Generated Rust module content is invalid: empty mod wrappers are not a valid extraction.';
+      }
+      const hasOnlyUseOrModLines = codeLines.length > 0 && codeLines.every(line => /^(?:pub\s+)?use\b/.test(line) || /^(?:pub\s+)?mod\b/.test(line));
+      if (hasOnlyUseOrModLines) {
+        return 'Generated Rust module content is invalid: the new file must contain real Rust items, not only use/mod re-exports.';
+      }
+    }
+
+    return undefined;
   }
 
   private isPlaceholderReplacementText(content: string): boolean {

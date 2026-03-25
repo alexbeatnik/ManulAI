@@ -573,6 +573,47 @@ function analyzeReplaceMiss(currentContent, attemptedOldText, filepath) {
   };
 }
 
+function validateGeneratedModuleContent(filepath, content) {
+  const extension = path.extname(filepath).toLowerCase();
+  const normalized = content.replace(/\r\n/g, '\n');
+  const nonEmptyLines = normalized.split('\n').map(line => line.trim()).filter(Boolean);
+  const codeLines = nonEmptyLines.filter(line => !/^(?:\/\/|\/\*|\*|#)/.test(line));
+
+  if (extension === '.go') {
+    if (/\bexport\s+(?:type|interface|class|enum|const|function)\b/.test(normalized)) {
+      return 'Generated Go code is invalid: Go declarations must not use the export keyword. Use forms like "type Name interface { ... }" or "func Name(...)".';
+    }
+    if (/^\s*interface\s+[A-Za-z_][\w]*/m.test(normalized)) {
+      return 'Generated Go code is invalid: interfaces must be declared as "type Name interface { ... }", not "interface Name".';
+    }
+    if (/\bclass\s+[A-Za-z_][\w]*/.test(normalized)) {
+      return 'Generated Go code is invalid: Go does not have class declarations.';
+    }
+    if (!nonEmptyLines.some(line => /^package\s+[A-Za-z_][\w]*/.test(line))) {
+      return 'Generated Go module content is incomplete: extracted .go files must start with a package declaration.';
+    }
+    const hasGoDefinition = codeLines.some(line => /^(?:package\s+\w+|import\s+|type\s+\w+\s+(?:struct|interface)\b|func\s+(?:\([^)]*\)\s*)?\w+\s*\(|const\s+\w+|var\s+\w+)/.test(line));
+    if (!hasGoDefinition) {
+      return 'Generated Go module content is invalid: the file must contain real Go declarations, not placeholder or cross-language syntax.';
+    }
+  }
+
+  if (extension === '.rs') {
+    if (/\bexport\s+(?:type|interface|class|enum|const|function)\b/.test(normalized) || /\binterface\s+[A-Za-z_][\w]*/.test(normalized) || /\bclass\s+[A-Za-z_][\w]*/.test(normalized)) {
+      return 'Generated Rust code is invalid: the file contains non-Rust class/interface/export syntax.';
+    }
+    if (/^\s*(?:pub\s+)?mod\s+[A-Za-z_][\w]*\s*\{\s*\}\s*$/m.test(normalized) && codeLines.length <= 2) {
+      return 'Generated Rust module content is invalid: empty mod wrappers are not a valid extraction.';
+    }
+    const hasOnlyUseOrModLines = codeLines.length > 0 && codeLines.every(line => /^(?:pub\s+)?use\b/.test(line) || /^(?:pub\s+)?mod\b/.test(line));
+    if (hasOnlyUseOrModLines) {
+      return 'Generated Rust module content is invalid: the new file must contain real Rust items, not only use/mod re-exports.';
+    }
+  }
+
+  return null;
+}
+
 async function executeTool(name, args) {
   switch (name) {
     case 'list_workspace_files': {
@@ -921,6 +962,10 @@ async function executeTool(name, args) {
 
       const nonEmptyLines = content.replace(/\r\n/g, '\n').split('\n').map(l => l.trim()).filter(Boolean);
       const isCodeLikeTarget = /\.(?:ts|tsx|js|jsx|mjs|cjs|py|go|rs|java|kt|cs|php|rb|swift|c|cpp|h|hpp)$/i.test(fp);
+      const invalidGeneratedModuleContent = validateGeneratedModuleContent(fp, content);
+      if (invalidGeneratedModuleContent) {
+        return JSON.stringify({ error: invalidGeneratedModuleContent });
+      }
       const looksLikePlaceholder = nonEmptyLines.length > 0 && nonEmptyLines.every(l =>
         /^(?:\/\/|#|\/\*|\*|<!--)?\s*(?:code will be inserted here|todo|tbd|placeholder|stub|coming soon|implement me|fill me in)/i.test(l));
       // Placeholder guard should apply only to split/code extraction flows, not to markdown/text creation.
@@ -952,7 +997,8 @@ async function executeTool(name, args) {
       }
 
       // Auto-export fix: add 'export' to interface/type/class/enum declarations missing it
-      if (!/\bexport\b/.test(content)) {
+      const autoExportEligibleExtensions = new Set(['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs']);
+      if (autoExportEligibleExtensions.has(path.extname(fp).toLowerCase()) && !/\bexport\b/.test(content)) {
         const fixedLines = content.split('\n').map(line => {
           const trimmed = line.trimStart();
           if (/^(interface|type|class|enum)\s+\w/.test(trimmed)) {
@@ -1103,8 +1149,8 @@ function extractDefinitionsFromSource(source, filepath = TARGET_FILE) {
 
   const patternsByLanguage = {
     python: [/^\s*(?:class|def)\s+[A-Za-z_][\w]*/],
-    go: [/^\s*type\s+[A-Za-z_][\w]*\s+struct\b/, /^\s*func\s+(?:\([^)]*\)\s*)?[A-Za-z_][\w]*\s*\(/],
-    rust: [/^\s*(?:pub\s+)?(?:struct|enum|trait|fn)\s+[A-Za-z_][\w]*/, /^\s*impl\s+[A-Za-z_][\w]*/],
+    go: [/^\s*type\s+[A-Za-z_][\w]*\s+(?:struct|interface)\b/, /^\s*func\s+(?:\([^)]*\)\s*)?[A-Za-z_][\w]*\s*\(/],
+    rust: [/^\s*(?:pub\s+)?(?:struct|enum|trait|fn|const|mod)\s+[A-Za-z_][\w]*/, /^\s*impl\s+[A-Za-z_][\w]*/],
     java: [/^\s*(?:public\s+)?(?:class|interface|enum|record)\s+[A-Za-z_][\w]*/, /^\s*(?:public|private|protected)\s+(?:static\s+)?[A-Za-z_][\w<>\[\], ?]*\s+[A-Za-z_][\w]*\s*\(/],
     csharp: [/^\s*(?:public|internal|private|protected)\s+(?:static\s+)?(?:class|interface|enum|record|struct)\s+[A-Za-z_][\w]*/, /^\s*(?:public|internal|private|protected)\s+(?:static\s+)?[A-Za-z_][\w<>\[\], ?]*\s+[A-Za-z_][\w]*\s*\(/],
     typescript: [/^\s*(?:export\s+)?(?:interface|type|enum|class|function)\s+[A-Za-z_][\w]*/, /^\s*export\s+(?:const|let|var)\s+[A-Za-z_][\w]*/],
@@ -1117,7 +1163,18 @@ function extractDefinitionsFromSource(source, filepath = TARGET_FILE) {
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
     if (!patterns.some(pattern => pattern.test(line))) continue;
-    return languageId === 'python' ? captureIndentedBlock(i) : captureBraceBlock(i);
+    const block = languageId === 'python' ? captureIndentedBlock(i) : captureBraceBlock(i);
+    if (languageId === 'go') {
+      const packageLine = lines.find(candidate => /^\s*package\s+[A-Za-z_][\w]*/.test(candidate));
+      if (packageLine && !/^\s*package\s+/m.test(block)) {
+        return `${packageLine}\n\n${block}`;
+      }
+    }
+    return block;
+  }
+
+  if (languageId === 'rust' && lines.every(line => /^\s*(?:pub\s+)?use\b/.test(line) || line.trim() === '')) {
+    return '';
   }
 
   return normalized.length <= 1200 ? normalized : lines.slice(0, Math.min(lines.length, 80)).join('\n').trim();
