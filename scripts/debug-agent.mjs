@@ -1427,6 +1427,12 @@ function parseToolCallsFromText(content) {
     results.push({ function: { name: 'read_file_slice', arguments: { filepath: match[1], startLine: parseInt(match[2]), endLine: parseInt(match[3]) } } });
   }
 
+  // Match read_file_slice filepath="path" startLine=N endLine=N (key=value format)
+  const readSliceKVRe = /\bread_file_slice\s+filepath="([^"]+)"\s+startLine=(\d+)\s+endLine=(\d+)/g;
+  while ((match = readSliceKVRe.exec(content)) !== null) {
+    results.push({ function: { name: 'read_file_slice', arguments: { filepath: match[1], startLine: parseInt(match[2]), endLine: parseInt(match[3]) } } });
+  }
+
   // Match read_specific_file "filepath"/path or list_workspace_files "dir"/dir
   const singleArgRe = /\b(read_specific_file|list_workspace_files)\s+(?:"([^"]+)"|([^\s,(){}[\]"'`]+))/g;
   while ((match = singleArgRe.exec(content)) !== null) {
@@ -1435,6 +1441,35 @@ function parseToolCallsFromText(content) {
     // Skip if value looks like a keyword rather than a path (e.g. "with", "and", "then")
     if (/^(?:with|and|then|to|for|the|is|of|at|in|on|as|if|so)$/i.test(argVal)) continue;
     results.push({ function: { name: match[1], arguments: { [argKey]: argVal } } });
+  }
+
+  // Match tool_name {json_args} — tool name followed directly by JSON args (no "with arguments" keyword).
+  // This handles models that output e.g. create_or_edit_file {"filename":"path","content":"..."}.
+  for (const toolName of ALL_TOOL_NAMES) {
+    const directJsonRe = new RegExp(`\\b${toolName}\\s+(\\{)`, 'gi');
+    let djm;
+    while ((djm = directJsonRe.exec(content)) !== null) {
+      const start = djm.index + djm[0].length - 1;
+      let depth = 0, inStr = false, esc = false, end = -1;
+      for (let j = start; j < content.length; j++) {
+        const ch = content[j];
+        if (esc) { esc = false; continue; }
+        if (ch === '\\' && inStr) { esc = true; continue; }
+        if (ch === '"') { inStr = !inStr; continue; }
+        if (inStr) continue;
+        if (ch === '{') depth++;
+        if (ch === '}') { depth--; if (depth === 0) { end = j; break; } }
+      }
+      if (end !== -1) {
+        const blob = content.substring(start, end + 1);
+        const args = relaxedJsonParse(blob);
+        if (args && typeof args === 'object') {
+          // Skip if it looks like a {name, arguments} wrapper — those are handled by the blob parser
+          if (args.name && args.arguments !== undefined) continue;
+          results.push({ function: { name: remapToolName(toolName), arguments: remapArgs(args) } });
+        }
+      }
+    }
   }
 
   // Match create_or_edit_file "filepath" "content" or create_or_edit_file path "content" positional format.
@@ -1812,7 +1847,11 @@ async function main() {
       content: `Primary target file for this run is ${TARGET_FILE}. Prefer this exact path, or exact sibling paths under ${TARGET_DIR === '.' ? wsRoot : TARGET_DIR}. Do NOT invent shortened or alternate directories for the target file.`
     }] : [{
       role: 'user',
-      content: `Workspace root is ${wsRoot}. Create all project files relative to this workspace root. Use list_workspace_files or project_scan first if you need to understand the existing project structure.`
+      content: `Workspace root is ${wsRoot}.` +
+        (cliTargetFile || process.env.TARGET_FILE
+          ? ` The target file for this task is ${TARGET_FILE} (absolute: ${TARGET_ABS_FILE}). Use read_file_slice or read_specific_file to read it.`
+          : '') +
+        ` Create all project files relative to this workspace root. Use list_workspace_files or project_scan first if you need to understand the existing project structure.`
     }]),
     { role: 'user', content: userPrompt }
   ];
@@ -1831,6 +1870,7 @@ async function main() {
   let repeatedNarratedCallCount = 0;
   const recentReads = [];          // all successful read results (capped at 20) for reminder context
   const seenReadSigs = new Map(); // cross-turn dedup: sig -> read count (block after 2 reads)
+  let totalReadOps = 0;           // total read operations across the session (for summarize nudge)
   let hadReadWorkspaceNotes = false; // short-circuit repeated reads
   dryRunFiles.clear(); // reset for this session
 
@@ -1871,6 +1911,7 @@ async function main() {
           continue;
         }
         seenReadSigs.set(readSig, readCount + 1);
+        totalReadOps++;
       }
 
       const result = await executeTool(toolName, args);
@@ -1975,6 +2016,16 @@ async function main() {
     for (const { _type, ...msg } of postToolMessages) {
       if (_type === 'reminder' && !pendingReplaceAfterCreate) continue;
       messages.push(msg);
+    }
+
+    // For non-write tasks, nudge after 3+ reads
+    if (!REQUIRES_FILE_WRITE && totalReadOps >= 3 && !hadSuccessfulWrite) {
+      const linesRead = recentReads.length > 0
+        ? `lines ${recentReads[0].startLine || 1}–${recentReads[recentReads.length - 1].endLine || '?'}`
+        : `${totalReadOps} sections`;
+      const readNudge = `You have already read ${linesRead} of the file. You now have enough context. STOP reading additional sections and produce your summary/analysis/answer as a text response NOW. Do NOT call any more tools.`;
+      label(Y, 'READ-LOOP NUDGE', readNudge.substring(0, 200));
+      messages.push({ role: 'user', content: readNudge });
     }
 
     retryCount = 0;
@@ -2083,6 +2134,7 @@ async function main() {
             continue;
           }
           seenReadSigs.set(readSig, readCount + 1);
+          totalReadOps++;
         }
 
         // Short-circuit repeated read_workspace_notes calls
@@ -2203,6 +2255,16 @@ async function main() {
         messages.push(msg);
       }
 
+      // For non-write tasks (summarize, explain, review), nudge the model to stop reading and produce output
+      if (!REQUIRES_FILE_WRITE && totalReadOps >= 3 && !hadSuccessfulWrite) {
+        const linesRead = recentReads.length > 0
+          ? `lines ${recentReads[0].startLine || 1}–${recentReads[recentReads.length - 1].endLine || '?'}`
+          : `${totalReadOps} sections`;
+        const readNudge = `You have already read ${linesRead} of the file. You now have enough context. STOP reading additional sections and produce your summary/analysis/answer as a text response NOW. Do NOT call any more tools.`;
+        label(Y, 'READ-LOOP NUDGE', readNudge.substring(0, 200));
+        messages.push({ role: 'user', content: readNudge });
+      }
+
       // Preserve retryCount when all tools were inspection-only (model isn't making progress)
       const allInspectionOnly = toolNamesInBatch.length > 0 && toolNamesInBatch.every(t => INSPECTION_ONLY_TOOLS.has(t));
       if (!allInspectionOnly) {
@@ -2260,7 +2322,9 @@ async function main() {
       } else {
         emptyNudge = IS_SPLIT_TASK
           ? `Your response was empty. Call read_file_slice on ${TARGET_FILE} to read a section, then call create_or_edit_file to create a new module file with the extracted code.`
-          : 'Your response was empty. Call create_or_edit_file to create the next file for this task, or execute_terminal_command if a setup command is needed. Do not output text — call a tool.';
+          : REQUIRES_FILE_WRITE
+            ? 'Your response was empty. Call create_or_edit_file to create the next file for this task, or execute_terminal_command if a setup command is needed. Do not output text — call a tool.'
+            : 'Your response was empty. Use read_file_slice or read_specific_file to read the requested file, then provide your analysis. Call a tool now.';
       }
       label(Y, 'NUDGE', emptyNudge.substring(0, 300));
       messages.push({ role: 'assistant', content: '' });
