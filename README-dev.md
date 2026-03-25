@@ -21,7 +21,7 @@ ManulAI is a local-first, privacy-focused coding agent for VS Code. All intellig
 
 - **UI Provider:** Built using `WebviewViewProvider` for the chat interface in the Secondary Sidebar.
 - **Agent Loop:** All context forwarding and tool results are handled by returning tool outputs directly to Ollama.
-- **Provider Split:** `src/ManulAiChatProvider.ts` remains the stateful orchestration layer, while `src/providerRefactorUtils.ts` contains pure large-refactor/bootstrap inference and generated-module validation helpers.
+- **Provider Split:** `src/ManulAiChatProvider.ts` remains the stateful orchestration layer, while `src/providerRefactorUtils.ts` contains pure large-refactor/bootstrap inference and generated-module validation helpers, `src/providerSafetyUtils.ts` contains build-verify classification, structured-write guards, preview generation, and placeholder/path heuristics, `src/providerPersistenceUtils.ts` contains workspace settings/chat persistence helpers, `src/providerWebviewUtils.ts` contains attachment rendering plus transcript/webview formatting helpers, `src/providerToolParsingUtils.ts` contains tool-call parsing plus malformed JSON recovery helpers, and `src/providerFileFallbackUtils.ts` contains fallback file-write extraction heuristics.
 - **Modes:** The extension supports tool-enabled Agent Mode and plain Chat Mode with separate system prompts.
 - **File System:** Uses `vscode.workspace.fs` for file inspection and edits.
 - **State:** Conversation history and file context remain available in memory during the VS Code session. They are not sent to any cloud provider.
@@ -173,7 +173,7 @@ Chats also persist a compact `summaryMemory` alongside the full transcript in `.
 
 ## Release Notes
 
-- **0.0.5:** Split provider-side large-refactor/bootstrap helpers into `src/providerRefactorUtils.ts`. Production now matches the stronger repeated narrated-call bootstrap behavior already validated in the standalone harness, and Go/Rust extraction writes are screened for obviously invalid generated blocks before they hit disk.
+- **0.0.5:** Split provider-side helper logic out of `src/ManulAiChatProvider.ts` into `src/providerRefactorUtils.ts`, `src/providerSafetyUtils.ts`, `src/providerPersistenceUtils.ts`, `src/providerWebviewUtils.ts`, `src/providerToolParsingUtils.ts`, and `src/providerFileFallbackUtils.ts`. Production now matches the stronger repeated narrated-call bootstrap behavior already validated in the standalone harness, Go/Rust extraction writes are screened for obviously invalid generated blocks before they hit disk, tool-call parsing and malformed JSON recovery now live outside the main provider, and fallback file-write extraction heuristics are isolated from the orchestration layer.
 - Raw or malformed tool-call JSON leaked into assistant text must be treated as a failed tool invocation and retried; fallback file-write extractors must never treat that payload as file content.
 - Fallback file-write extraction must ignore shell-language fenced blocks and reject suspicious pseudo-filenames such as numeric dotted names or names with trailing dots.
 - Direct fast paths remain conservative and are limited to narrow cases such as Markdown title rename and LICENSE author rename.

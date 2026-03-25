@@ -42,6 +42,62 @@ export interface AttachedFileContext {
   readOnly?: boolean;
 }
 
+export interface ManulAiStoredSettings {
+  ollamaModel?: string;
+  ollamaBaseUrl?: string;
+  agentMode?: boolean;
+  autoApprove?: boolean;
+  debugMode?: boolean;
+  systemPrompt?: string;
+}
+
+export interface ChatSession {
+  id: string;
+  title: string;
+  messages: OllamaMessage[];
+  attachedFiles: Map<string, AttachedFileContext>;
+  summaryMemory: string[];
+}
+
+export interface WebviewChatSummary {
+  id: string;
+  title: string;
+  messageCount: number;
+  attachmentCount: number;
+}
+
+export interface PersistedAttachedFileContext {
+  fsPath: string;
+  name: string;
+  content: string;
+  languageId: string;
+  readOnly?: boolean;
+}
+
+export interface PersistedChatSession {
+  id: string;
+  title: string;
+  messages: OllamaMessage[];
+  attachedFiles: PersistedAttachedFileContext[];
+  summaryMemory?: string[];
+}
+
+export interface PersistedChatState {
+  version: number;
+  activeChatId: string;
+  chatCounter: number;
+  chats: PersistedChatSession[];
+}
+
+export const DEFAULT_STORED_SETTINGS: Required<ManulAiStoredSettings> = {
+  ollamaModel: '',
+  ollamaBaseUrl: 'http://localhost:11434',
+  agentMode: true,
+  autoApprove: false,
+  debugMode: false,
+  systemPrompt: 'You are ManulAI, a privacy-first local coding assistant running inside VS Code. Work across any programming language. Prefer precise, minimal changes and explain results clearly.'
+};
+
 export interface ToolDefinition {
   type: 'function';
   function: {
