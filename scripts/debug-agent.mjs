@@ -361,6 +361,18 @@ When splitting a file into smaller modules:
 
 ---
 
+[FILE CREATION RULES]
+
+When creating new files from scratch (greenfield generation):
+
+1. Use create_or_edit_file for EACH file — call it immediately with real content.
+2. Do NOT describe the file content in text — call create_or_edit_file with the full code.
+3. After creating one file, immediately create the next one. Do NOT stop.
+4. Use execute_terminal_command for setup (npm init, install, etc.) when needed.
+5. Keep going until ALL files for the task are created.
+
+---
+
 [FILE EDITING RULES]
 
 - MUST read file before editing
@@ -1203,6 +1215,27 @@ function escapeJsonStringValues(s) {
   return result;
 }
 
+// Relaxed JSON parser: handles unquoted object keys like {command: "value"}
+function relaxedJsonParse(str) {
+  try {
+    return JSON.parse(str);
+  } catch {
+    try {
+      return JSON.parse(escapeJsonStringValues(str));
+    } catch { /* ignore */ }
+    // Try quoting unquoted keys: {key: "value"} → {"key": "value"}
+    try {
+      const fixed = str.replace(/([{,])\s*([A-Za-z_]\w*)\s*:/g, '$1"$2":');
+      return JSON.parse(fixed);
+    } catch {
+      try {
+        const fixed = str.replace(/([{,])\s*([A-Za-z_]\w*)\s*:/g, '$1"$2":');
+        return JSON.parse(escapeJsonStringValues(fixed));
+      } catch { return null; }
+    }
+  }
+}
+
 function parseToolCallsFromText(content) {
   const results = [];
 
@@ -1254,13 +1287,11 @@ function parseToolCallsFromText(content) {
   }
 
   // Match "Executing step N: tool_name with arguments {...}" — model announces instead of calling
-  const announcedPattern = /execut(?:e|ing)\s+step\s+\d+[:/]\s*(\w+)\s+(?:with\s+)?arguments?\s*(\{[\s\S]*?\})(?=\s*(?:```|$|\n\n))/gi;
+  const announcedPattern = /execut(?:e|ing)\s+step\s+\d+[:/]\s*(\w+)\s+(?:with\s+)?arguments?:?\s*(\{[\s\S]*?\})(?=\s*(?:```|$|\n\n))/gi;
   while ((match = announcedPattern.exec(content)) !== null) {
-    try {
-      const toolName = match[1];
-      const argsObj = JSON.parse(match[2]);
-      results.push({ function: { name: toolName, arguments: argsObj } });
-    } catch { /* ignore */ }
+    const toolName = match[1];
+    const argsObj = relaxedJsonParse(match[2]);
+    if (argsObj) results.push({ function: { name: toolName, arguments: argsObj } });
   }
 
   // Match tool_name("single string arg") or tool_name({...}) Python/JS-style calls
@@ -1287,22 +1318,34 @@ function parseToolCallsFromText(content) {
   }
 
   // Match "**Tool Call:** tool_name with arguments {...}" — markdown-annotated calls
-  const toolCallAnnotationPattern = /\*{0,2}tool\s+call\*{0,2}[:\s]+([\w_]+)\s+(?:with\s+)?arguments?\s*(\{[\s\S]*?\})/gi;
+  const toolCallAnnotationPattern = /\*{0,2}tool\s+call\*{0,2}[:\s]+([\w_]+)\s+(?:with\s+)?arguments?:?\s*(\{[\s\S]*?\})/gi;
   while ((match = toolCallAnnotationPattern.exec(content)) !== null) {
-    try {
-      const toolName = match[1];
-      const argsObj = JSON.parse(match[2]);
-      results.push({ function: { name: toolName, arguments: argsObj } });
-    } catch { /* ignore */ }
+    const toolName = match[1];
+    const argsObj = relaxedJsonParse(match[2]);
+    if (argsObj) results.push({ function: { name: toolName, arguments: argsObj } });
   }
 
-  // Match tool_name with arguments {...} (bare prefix, no markdown)
-  const bareWithArgsPattern = /^([\w_]+)\s+with\s+arguments?\s*(\{[\s\S]*?\})/gim;
-  while ((match = bareWithArgsPattern.exec(content)) !== null) {
-    if (!KNOWN_TOOLS.includes(match[1])) continue;
-    try {
-      results.push({ function: { name: match[1], arguments: JSON.parse(match[2]) } });
-    } catch { /* ignore */ }
+  // Match tool_name with arguments {...} (bare prefix, no markdown) — balanced brace + relaxed JSON
+  for (const toolName of KNOWN_TOOLS) {
+    const re = new RegExp(`\\b${toolName}\\s+with\\s+arguments?:?\\s*(\\{)`, 'gi');
+    let bm;
+    while ((bm = re.exec(content)) !== null) {
+      const start = bm.index + bm[0].length - 1;
+      let depth = 0, inStr = false, esc = false, end = -1;
+      for (let j = start; j < content.length; j++) {
+        const ch = content[j];
+        if (esc) { esc = false; continue; }
+        if (ch === '\\' && inStr) { esc = true; continue; }
+        if (ch === '"') { inStr = !inStr; continue; }
+        if (inStr) continue;
+        if (ch === '{') depth++;
+        if (ch === '}') { depth--; if (depth === 0) { end = j; break; } }
+      }
+      if (end !== -1) {
+        const args = relaxedJsonParse(content.substring(start, end + 1));
+        if (args) results.push({ function: { name: toolName, arguments: args } });
+      }
+    }
   }
 
   // Match ```sh/bash fenced code as execute_terminal_command
@@ -1438,10 +1481,14 @@ function analyzeResponse(content, recentMessages) {
     content.length > 60 &&
     !isAnnouncedButNotExecuted;
 
-  const requiresContinuation = isProgressOnly || isAnnouncedButNotExecuted || isPassingToUser || isHallucinatingToolResponse ||
-    (claimsDone && !hasToolResults) || isLong || mentionsToolButNotCalled;
+  // Broader plan detection: markdown heading + numbered bold items (matches provider's isPlanOnlyResponse)
+  const isPlanOnlyResponse = /^#{1,3}\s+(?:Plan|Steps?|Implementation|Approach)/mi.test(content) &&
+    /\d+\.\s+\*\*/.test(content);
 
-  return { isLong, isProgressOnly, isAnnouncedButNotExecuted, isPassingToUser, isHallucinatingToolResponse, claimsDone, mentionsToolButNotCalled, looksLikePlan, requiresContinuation };
+  const requiresContinuation = isProgressOnly || isAnnouncedButNotExecuted || isPassingToUser || isHallucinatingToolResponse ||
+    (claimsDone && !hasToolResults) || isLong || mentionsToolButNotCalled || isPlanOnlyResponse;
+
+  return { isLong, isProgressOnly, isAnnouncedButNotExecuted, isPassingToUser, isHallucinatingToolResponse, claimsDone, mentionsToolButNotCalled, looksLikePlan: looksLikePlan || isPlanOnlyResponse, requiresContinuation };
 }
 
 // Builds the reminder message injected after a new extraction file is created.
@@ -1551,13 +1598,19 @@ function buildNudge(analysis, lastToolWasError, ctx = {}) {
     if (lastRead) {
       return `Stop writing. You already read lines ${lastRead.startLine}–${lastRead.endLine}. Now call create_or_edit_file to create a new file with the extracted real code. Do not describe it — call the tool.`;
     }
-    return `Stop writing plans. Call a tool NOW — use read_file_slice on ${TARGET_FILE} to start.`;
+    return IS_SPLIT_TASK
+      ? `Stop writing plans. Call a tool NOW — use read_file_slice on ${TARGET_FILE} to start.`
+      : 'Stop writing plans. Call create_or_edit_file NOW with the file path and content. Do not describe what you will do — call the tool.';
   }
   if (analysis.isPassingToUser) {
-    return 'Do not ask the user anything. You have all the tools you need. Use read_file_slice to read the source file, copy the actual code, and call create_or_edit_file with that real code.';
+    return IS_SPLIT_TASK
+      ? 'Do not ask the user anything. You have all the tools you need. Use read_file_slice to read the source file, copy the actual code, and call create_or_edit_file with that real code.'
+      : 'Do not ask the user anything. You have all the tools you need. Call create_or_edit_file to create files, or execute_terminal_command to run setup commands.';
   }
   if (lastToolWasError) {
-    return 'The last tool call failed. Read the error, then call read_file_slice on the source file to get the actual code, and retry create_or_edit_file with the real extracted code (not placeholder comments).';
+    return IS_SPLIT_TASK
+      ? 'The last tool call failed. Read the error, then call read_file_slice on the source file to get the actual code, and retry create_or_edit_file with the real extracted code (not placeholder comments).'
+      : 'The last tool call failed. Read the error, adjust the arguments, and retry the tool call.';
   }
   if (analysis.isProgressOnly) {
     return 'Do not print progress text. Call a tool now — no preamble.';
@@ -1569,9 +1622,13 @@ function buildNudge(analysis, lastToolWasError, ctx = {}) {
     return 'You described a tool call in plain text but did not actually call it. Use the native tool-calling mechanism to call the tool now.';
   }
   if (REQUIRES_FILE_WRITE && !ctx.hadSuccessfulWrite) {
-    return 'This task requires a real file change, but no file write has succeeded yet. Call create_or_edit_file or replace_in_file now instead of describing the result in text.';
+    return IS_SPLIT_TASK
+      ? 'This task requires a real file change, but no file write has succeeded yet. Call create_or_edit_file or replace_in_file now instead of describing the result in text.'
+      : 'This task requires creating files, but no file has been written yet. Call create_or_edit_file now with the actual file content — do not describe what you will write, just call the tool.';
   }
-  return 'You described changes but did not call a tool. Call the appropriate tool now.';
+  return IS_SPLIT_TASK
+    ? 'You described changes but did not call a tool. Call the appropriate tool now.'
+    : 'You described what to do but did not call a tool. Call create_or_edit_file, execute_terminal_command, or the appropriate tool now.';
 }
 
 function inferReadRangeFromNarration(content, fallbackStart, fallbackEnd) {
@@ -1684,14 +1741,22 @@ async function main() {
   const messages = [
     {
       role: 'user',
-      content: 'You are an expert software developer. Call tools directly and immediately — do NOT output numbered plans, step lists, or descriptions of what you will do. ' +
-        'When asked to split a file: use read_file_slice to read a section, create_or_edit_file to create the new module file, then replace_in_file to replace the original block with the appropriate module reference or equivalent update. ' +
-        'After each successful file write, verify the project using the most appropriate command for the detected stack instead of assuming TypeScript.'
+      content: IS_SPLIT_TASK
+        ? 'You are an expert software developer. Call tools directly and immediately — do NOT output numbered plans, step lists, or descriptions of what you will do. ' +
+          'When asked to split a file: use read_file_slice to read a section, create_or_edit_file to create the new module file, then replace_in_file to replace the original block with the appropriate module reference or equivalent update. ' +
+          'After each successful file write, verify the project using the most appropriate command for the detected stack instead of assuming TypeScript.'
+        : 'You are an expert software developer. Call tools directly and immediately — do NOT output numbered plans, step lists, or descriptions of what you will do. ' +
+          'When asked to create files: use create_or_edit_file to write each file. When asked to modify existing files: use read_file_slice to read first, then replace_in_file or create_or_edit_file. ' +
+          'Use execute_terminal_command for setup commands (npm init, install dependencies, etc.). ' +
+          'After creating files, continue with the next file immediately. Do NOT stop after one file — keep going until the task is fully complete.'
     },
-    {
+    ...(IS_SPLIT_TASK ? [{
       role: 'user',
       content: `Primary target file for this run is ${TARGET_FILE}. Prefer this exact path, or exact sibling paths under ${TARGET_DIR === '.' ? wsRoot : TARGET_DIR}. Do NOT invent shortened or alternate directories for the target file.`
-    },
+    }] : [{
+      role: 'user',
+      content: `Workspace root is ${wsRoot}. Create all project files relative to this workspace root. Use list_workspace_files or project_scan first if you need to understand the existing project structure.`
+    }]),
     { role: 'user', content: userPrompt }
   ];
 
@@ -1709,6 +1774,7 @@ async function main() {
   let repeatedNarratedCallCount = 0;
   const recentReads = [];          // all successful read results (capped at 20) for reminder context
   const seenReadSigs = new Map(); // cross-turn dedup: sig -> read count (block after 2 reads)
+  let hadReadWorkspaceNotes = false; // short-circuit repeated reads
   dryRunFiles.clear(); // reset for this session
 
   const hasMetExtractionGoal = () => {
@@ -1938,6 +2004,8 @@ async function main() {
 
       // Collect reminder/continuation user messages to inject AFTER all tool results, not mid-loop
       const postToolMessages = [];
+      const INSPECTION_ONLY_TOOLS = new Set(['read_file_slice', 'read_specific_file', 'list_workspace_files', 'project_scan', 'read_workspace_notes']);
+      const toolNamesInBatch = [];
 
       for (const tc of resolvedToolCalls) {
         const toolName = tc.function?.name ?? 'unknown';
@@ -1946,6 +2014,7 @@ async function main() {
 
         label(B, `  → ${toolName}`, JSON.stringify(args).substring(0, 150));
         logEvent('tool_exec_start', { tool: toolName, args });
+        toolNamesInBatch.push(toolName);
 
         // Cross-turn dedup: skip repeated reads of the same file section (allow each section to be read at most twice)
         if (toolName === 'read_file_slice' || toolName === 'read_specific_file') {
@@ -1958,6 +2027,14 @@ async function main() {
           }
           seenReadSigs.set(readSig, readCount + 1);
         }
+
+        // Short-circuit repeated read_workspace_notes calls
+        if (toolName === 'read_workspace_notes' && hadReadWorkspaceNotes) {
+          label(Y, '  ⟳ SKIP', 'read_workspace_notes already called this session');
+          messages.push({ role: 'tool', content: JSON.stringify({ content: '(notes already read — proceed with your task using the tools)' }), tool_name: toolName });
+          continue;
+        }
+        if (toolName === 'read_workspace_notes') hadReadWorkspaceNotes = true;
 
         const result = await executeTool(toolName, args);
         const parsed = JSON.parse(result);
@@ -2069,7 +2146,11 @@ async function main() {
         messages.push(msg);
       }
 
-      retryCount = 0;
+      // Preserve retryCount when all tools were inspection-only (model isn't making progress)
+      const allInspectionOnly = toolNamesInBatch.length > 0 && toolNamesInBatch.every(t => INSPECTION_ONLY_TOOLS.has(t));
+      if (!allInspectionOnly) {
+        retryCount = 0;
+      }
       repeatedNarratedCallSignature = null;
       repeatedNarratedCallCount = 0;
       continue;
@@ -2085,6 +2166,12 @@ async function main() {
     if (content.trim().length === 0 || isTokenOverflow || isEchoOfUserMsg) {
       if (isTokenOverflow) label(Y, 'TOKEN OVERFLOW', 'Model returned a raw im_start token — treating as empty');
       if (isEchoOfUserMsg) label(Y, 'ECHO DETECTED', 'Model echoed a user message — treating as empty');
+      // For greenfield: empty after write = done (no extraction cycle gate)
+      if (!IS_SPLIT_TASK && hadSuccessfulWrite) {
+        label(G, 'DONE', 'Empty response after successful file write(s) — task complete.');
+        logEvent('session_done', { turn, reason: 'empty_after_greenfield_write' });
+        break;
+      }
       if (hadSuccessfulWrite && !pendingReplaceAfterCreate && !extractionContinuationPending && hasMetExtractionGoal()) {
         label(G, 'DONE', `Empty response after ${extractionCount} extraction cycles — task complete.`);
         logEvent('session_done', { turn, reason: 'empty_after_write', extractionCount });
@@ -2114,7 +2201,9 @@ async function main() {
           `Do NOT re-read those lines. Use that content to create a NEW sibling file (e.g. ${SUGGESTED_TYPES_FILE} or ${SUGGESTED_INTERFACES_FILE}) with the extracted real code — use create_or_edit_file. ` +
           `Do NOT attempt to overwrite ${TARGET_FILE}.`;
       } else {
-        emptyNudge = `Your response was empty. Call read_file_slice on ${TARGET_FILE} to read a section, then call create_or_edit_file to create a new module file with the extracted code.`;
+        emptyNudge = IS_SPLIT_TASK
+          ? `Your response was empty. Call read_file_slice on ${TARGET_FILE} to read a section, then call create_or_edit_file to create a new module file with the extracted code.`
+          : 'Your response was empty. Call create_or_edit_file to create the next file for this task, or execute_terminal_command if a setup command is needed. Do not output text — call a tool.';
       }
       label(Y, 'NUDGE', emptyNudge.substring(0, 300));
       messages.push({ role: 'assistant', content: '' });
@@ -2314,6 +2403,49 @@ async function main() {
     }
 
     if (retryCount >= 4) {
+      // Last-ditch: scan all recent assistant messages for extractable code blocks
+      const recentAssistantMsgs = messages.filter(m => m.role === 'assistant' && m.content && m.content.trim().length > 0).slice(-5);
+      const allCodeBlocks = [];
+      for (const msg of recentAssistantMsgs) {
+        const fenceRe = /```([a-zA-Z0-9_+-]*)\n([\s\S]*?)\n```/g;
+        let fm;
+        while ((fm = fenceRe.exec(msg.content)) !== null) {
+          const lang = String(fm[1] ?? '').trim().toLowerCase();
+          const code = fm[2].trim();
+          if (code.length < 50) continue;
+          if (['sh', 'bash', 'shell', 'cmd', 'json', 'diff'].includes(lang)) continue;
+          // Try to find filename from text near the block
+          const before = msg.content.substring(Math.max(0, fm.index - 300), fm.index);
+          const bt = String.fromCharCode(96);
+          const fnMatch =
+            before.match(/(?:file|path|named?|called|create|creating)\s+['"\`]?([\w\/.-]+\.[\w]+)['"\`]?/i) ||
+            before.match(new RegExp(bt + '([\\w\\/.-]+\\.[\\w]+)' + bt)) ||
+            code.match(/^\/\/\s+([\w\/.-]+\.[\w]+)\s*$/m);
+          if (fnMatch) {
+            allCodeBlocks.push({ filename: fnMatch[1].includes('/') ? fnMatch[1] : `src/${fnMatch[1]}`, content: code });
+          }
+        }
+      }
+      if (allCodeBlocks.length > 0) {
+        label(Y, 'LAST-DITCH EXTRACTION', `Found ${allCodeBlocks.length} code block(s) in recent messages — writing files`);
+        for (const block of allCodeBlocks) {
+          const fp = path.isAbsolute(block.filename) ? block.filename : path.join(wsRoot, block.filename);
+          const writeResult = await executeTool('create_or_edit_file', { filename: fp, content: block.content });
+          const parsedW = JSON.parse(writeResult);
+          if (!parsedW.error) {
+            hadSuccessfulWrite = true;
+            label(G, '  ✓ LAST-DITCH WRITE', `${path.basename(fp)} (${block.content.length} chars)`);
+            messages.push({ role: 'tool', content: writeResult, tool_name: 'create_or_edit_file' });
+          } else {
+            label(R, '  ✗ LAST-DITCH WRITE', parsedW.error);
+          }
+        }
+        if (hadSuccessfulWrite) {
+          retryCount = 0;
+          messages.push({ role: 'user', content: 'Files extracted from your code blocks have been written. Continue creating the remaining files for this task.' });
+          continue;
+        }
+      }
       label(R, 'RETRY LIMIT', `Gave up after ${retryCount} retries. Last: ${content.substring(0, 200)}`);
       logEvent('retry_limit', { turn, retryCount, contentPreview: content.substring(0, 200) });
       break;
