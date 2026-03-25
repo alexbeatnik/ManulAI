@@ -53,8 +53,8 @@ export function isTerminalReadOnlyInspectionCommand(command: string): boolean {
     return false;
   }
 
-  // Reject commands with shell control operators, redirections, or dangerous patterns
-  if (/[;&|<>`]|\$\(|\b-exec\b/.test(trimmed)) {
+  // Reject commands with shell control operators, redirections, newlines, or dangerous patterns
+  if (/[;&|<>`\n\r]|\$\(|\b-exec\b/.test(trimmed)) {
     return false;
   }
   if (/\bsed\b[^\n]*\s-i\b/.test(normalized)) {

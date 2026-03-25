@@ -101,7 +101,7 @@ for model in "${MODELS[@]}"; do
 
     # Check for specific failure patterns
     if grep -q 'OLLAMA ERROR' "$out_file" 2>/dev/null; then
-      if [ "$result" != "TIMEOUT" ]; then
+      if [ "$result" = "OK" ]; then
         fail=$((fail + 1))
         pass=$((pass - 1))
       fi

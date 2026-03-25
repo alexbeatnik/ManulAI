@@ -19,6 +19,10 @@ function escapeXmlAttr(s: string): string {
   return s.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
+function sanitizeEmbeddedContent(content: string, tagName: string): string {
+  return content.replace(new RegExp(`</${tagName}>`, 'gi'), `</${tagName}\u200B>`);
+}
+
 export function renderAttachmentContextMessage(
   attachedFiles: Map<string, AttachedFileContext>,
   workspaceRoot?: string
@@ -34,14 +38,14 @@ export function renderAttachmentContextMessage(
       if (file.languageId === '__folder__') {
         return [
           `<manulai_attached_folder name="${escapeXmlAttr(file.name)}" path="${escapeXmlAttr(filePath)}">`,
-          file.content,
+          sanitizeEmbeddedContent(file.content, 'manulai_attached_folder'),
           '</manulai_attached_folder>'
         ].join('\n');
       }
 
       return [
         `<manulai_attached_file file="${escapeXmlAttr(file.name)}" path="${escapeXmlAttr(filePath)}"${file.readOnly ? ' readonly="true"' : ''}>`,
-        file.content,
+        sanitizeEmbeddedContent(file.content, 'manulai_attached_file'),
         '</manulai_attached_file>'
       ].join('\n');
     })
