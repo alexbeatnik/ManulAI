@@ -1862,7 +1862,7 @@ async function main() {
         }
         if (toolName === 'create_or_edit_file' || toolName === 'replace_in_file') {
           hadSuccessfulWrite = true;
-          if (toolName === 'create_or_edit_file') {
+          if (IS_SPLIT_TASK && toolName === 'create_or_edit_file') {
             const createdPath = parsed.path ?? '';
             const isOriginal = createdPath.includes(TARGET_BASENAME);
             if (!isOriginal) {
@@ -1875,7 +1875,7 @@ async function main() {
               postToolMessages.push({ role: 'user', content: reminder, _type: 'reminder' });
             }
           }
-          if (toolName === 'replace_in_file') {
+          if (IS_SPLIT_TASK && toolName === 'replace_in_file') {
             pendingReplaceAfterCreate = false;
             extractionCount++;
             extractionContinuationPending = true;
@@ -2085,8 +2085,8 @@ async function main() {
           }
           if (toolName === 'create_or_edit_file' || toolName === 'replace_in_file') {
             hadSuccessfulWrite = true;
-            // After creating a NEW file (not the main refactor target), remind model to replace in original
-            if (toolName === 'create_or_edit_file') {
+            // After creating a NEW file (not the main refactor target), remind model to replace in original — SPLIT TASKS ONLY
+            if (IS_SPLIT_TASK && toolName === 'create_or_edit_file') {
               const createdPath = parsed.path ?? '';
               const isOriginal = createdPath.includes(TARGET_BASENAME);
               if (!isOriginal) {
@@ -2099,7 +2099,7 @@ async function main() {
                 postToolMessages.push({ role: 'user', content: reminder, _type: 'reminder' });
               }
             }
-            if (toolName === 'replace_in_file') {
+            if (IS_SPLIT_TASK && toolName === 'replace_in_file') {
               pendingReplaceAfterCreate = false; // replace succeeded — cycle complete
               extractionCount++;
               extractionContinuationPending = true; // wait for model to start next cycle
@@ -2166,8 +2166,8 @@ async function main() {
     if (content.trim().length === 0 || isTokenOverflow || isEchoOfUserMsg) {
       if (isTokenOverflow) label(Y, 'TOKEN OVERFLOW', 'Model returned a raw im_start token — treating as empty');
       if (isEchoOfUserMsg) label(Y, 'ECHO DETECTED', 'Model echoed a user message — treating as empty');
-      // For greenfield: empty after write = done (no extraction cycle gate)
-      if (!IS_SPLIT_TASK && hadSuccessfulWrite) {
+      // For greenfield: empty after write = done only if nudged at least once
+      if (!IS_SPLIT_TASK && hadSuccessfulWrite && retryCount >= 1) {
         label(G, 'DONE', 'Empty response after successful file write(s) — task complete.');
         logEvent('session_done', { turn, reason: 'empty_after_greenfield_write' });
         break;
