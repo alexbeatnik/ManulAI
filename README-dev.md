@@ -21,6 +21,7 @@ ManulAI is a local-first, privacy-focused coding agent for VS Code. All intellig
 
 - **UI Provider:** Built using `WebviewViewProvider` for the chat interface in the Secondary Sidebar.
 - **Agent Loop:** All context forwarding and tool results are handled by returning tool outputs directly to Ollama.
+- **Provider Split:** `src/ManulAiChatProvider.ts` remains the stateful orchestration layer, while `src/providerRefactorUtils.ts` contains pure large-refactor/bootstrap inference and generated-module validation helpers.
 - **Modes:** The extension supports tool-enabled Agent Mode and plain Chat Mode with separate system prompts.
 - **File System:** Uses `vscode.workspace.fs` for file inspection and edits.
 - **State:** Conversation history and file context remain available in memory during the VS Code session. They are not sent to any cloud provider.
@@ -163,11 +164,16 @@ Chats also persist a compact `summaryMemory` alongside the full transcript in `.
 - Recent successful reads are tracked separately from successful fix actions so a model cannot satisfy the loop just by listing files.
 - Replace failures like `old_text not found` are treated as incomplete work and should trigger a read-then-retry path.
 - Responses that claim commands ran, claim fixes were completed, or end on partial plans without executing the work should be nudged back into the tool loop.
+- Repeated narrated large-refactor steps can now be auto-bootstrapped into a real `read_file_slice`, `create_or_edit_file`, or `replace_in_file` call when the model keeps restating the same action instead of executing it.
 - If retry exhaustion is reached and the model still returns pseudo-progress or plan text, the backend should surface a deterministic failure message instead of leaking raw `Step 1/3`-style output into the final answer.
 - Large refactor requests should receive hidden guidance to inspect structure first, form a short module/file split plan, and then execute one concrete step at a time instead of attempting a whole-file rewrite.
 - When a file is large, bounded reads through `read_file_slice` are preferred over re-reading the entire file.
 - The system mandate explicitly treats unread files as unknown state: file edits require a prior read, project-structure assumptions require listing, and completion claims require successful tool confirmation.
 - If the task required changes and the model has not used tools, the response is considered wrong and should be nudged back into tool execution.
+
+## Release Notes
+
+- **0.0.5:** Split provider-side large-refactor/bootstrap helpers into `src/providerRefactorUtils.ts`. Production now matches the stronger repeated narrated-call bootstrap behavior already validated in the standalone harness, and Go/Rust extraction writes are screened for obviously invalid generated blocks before they hit disk.
 - Raw or malformed tool-call JSON leaked into assistant text must be treated as a failed tool invocation and retried; fallback file-write extractors must never treat that payload as file content.
 - Fallback file-write extraction must ignore shell-language fenced blocks and reject suspicious pseudo-filenames such as numeric dotted names or names with trailing dots.
 - Direct fast paths remain conservative and are limited to narrow cases such as Markdown title rename and LICENSE author rename.
