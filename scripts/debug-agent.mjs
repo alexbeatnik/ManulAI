@@ -42,9 +42,10 @@ if (targetFlagIndex >= 0) {
 
 // The large file to split. Use --target or TARGET_FILE env var to override.
 const TARGET_FILE = cliTargetFile ?? process.env.TARGET_FILE ?? 'src/ManulAiChatProvider.ts';
-const TARGET_BASENAME = path.basename(TARGET_FILE, '.ts'); // e.g. "ManulAiChatProvider"
+const TARGET_BASENAME = path.basename(TARGET_FILE, path.extname(TARGET_FILE));
 const TARGET_DIR = path.posix.dirname(TARGET_FILE.replace(/\\/g, '/'));
 const TARGET_EXTENSION = path.extname(TARGET_FILE) || '.txt';
+const TARGET_ABS_FILE = path.normalize(path.join(wsRoot, TARGET_FILE));
 const SUGGESTED_TYPES_FILE = TARGET_DIR === '.' ? `types${TARGET_EXTENSION}` : `${TARGET_DIR}/types${TARGET_EXTENSION}`;
 const SUGGESTED_INTERFACES_FILE = TARGET_DIR === '.' ? `interfaces${TARGET_EXTENSION}` : `${TARGET_DIR}/interfaces${TARGET_EXTENSION}`;
 const TARGET_LANGUAGE_ID = detectLanguageId(TARGET_FILE);
@@ -115,24 +116,96 @@ function detectCodeFenceLanguage(filepath) {
   return languageId;
 }
 
-function buildModuleReferenceExample(createdPath, exportNames) {
+function extractSymbolNamesFromContent(content, filepath = TARGET_FILE) {
+  const languageId = detectLanguageId(filepath);
+  const names = [];
+  const add = value => {
+    if (!value) return;
+    if (!names.includes(value)) names.push(value);
+  };
+  const patternsByLanguage = {
+    typescript: [
+      /^\s*export\s+(?:(?:type|interface|abstract|declare)\s+)*(?:function\s+|class\s+|const\s+|let\s+|var\s+|enum\s+)?([A-Za-z_][\w]*)/gm,
+      /^\s*(?:interface|type|class|enum|function)\s+([A-Za-z_][\w]*)/gm
+    ],
+    typescriptreact: [
+      /^\s*export\s+(?:(?:type|interface|abstract|declare)\s+)*(?:function\s+|class\s+|const\s+|let\s+|var\s+|enum\s+)?([A-Za-z_][\w]*)/gm,
+      /^\s*(?:interface|type|class|enum|function)\s+([A-Za-z_][\w]*)/gm
+    ],
+    javascript: [
+      /^\s*export\s+(?:async\s+)?(?:function\s+|class\s+|const\s+|let\s+|var\s+)?([A-Za-z_][\w]*)/gm,
+      /^\s*(?:async\s+)?function\s+([A-Za-z_][\w]*)/gm,
+      /^\s*class\s+([A-Za-z_][\w]*)/gm
+    ],
+    javascriptreact: [
+      /^\s*export\s+(?:async\s+)?(?:function\s+|class\s+|const\s+|let\s+|var\s+)?([A-Za-z_][\w]*)/gm,
+      /^\s*(?:async\s+)?function\s+([A-Za-z_][\w]*)/gm,
+      /^\s*class\s+([A-Za-z_][\w]*)/gm
+    ],
+    python: [
+      /^\s*(?:class|def)\s+([A-Za-z_][\w]*)/gm
+    ],
+    go: [
+      /^\s*type\s+([A-Za-z_][\w]*)\s+struct\b/gm,
+      /^\s*func\s+(?:\([^)]*\)\s*)?([A-Za-z_][\w]*)\s*\(/gm
+    ],
+    rust: [
+      /^\s*(?:pub\s+)?(?:struct|enum|trait|fn)\s+([A-Za-z_][\w]*)/gm,
+      /^\s*impl\s+([A-Za-z_][\w]*)/gm
+    ],
+    java: [
+      /^\s*(?:public\s+)?(?:class|interface|enum|record)\s+([A-Za-z_][\w]*)/gm,
+      /^\s*(?:public|private|protected)\s+(?:static\s+)?[A-Za-z_][\w<>\[\], ?]*\s+([A-Za-z_][\w]*)\s*\(/gm
+    ],
+    csharp: [
+      /^\s*(?:public|internal|private|protected)\s+(?:static\s+)?(?:class|interface|enum|record|struct)\s+([A-Za-z_][\w]*)/gm,
+      /^\s*(?:public|internal|private|protected)\s+(?:static\s+)?[A-Za-z_][\w<>\[\], ?]*\s+([A-Za-z_][\w]*)\s*\(/gm
+    ]
+  };
+  const patterns = patternsByLanguage[languageId] ?? [
+    /^\s*(?:class|interface|enum|record|struct|trait|type|def|fn|function)\s+([A-Za-z_][\w]*)/gm
+  ];
+  for (const pattern of patterns) {
+    for (const match of content.matchAll(pattern)) {
+      add(match[1]);
+    }
+  }
+  return names.slice(0, 10);
+}
+
+function buildExactModuleReference(createdPath, symbolNames) {
   const baseName = path.basename(createdPath, path.extname(createdPath));
   const ext = path.extname(createdPath).toLowerCase();
-  const names = exportNames.filter(Boolean);
-  if (names.length === 0) return 'update references to point at the new module file';
+  const names = symbolNames.filter(Boolean);
+  if (names.length === 0) return null;
   if (['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs'].includes(ext)) {
     return `import { ${names.join(', ')} } from './${baseName}';`;
   }
   if (ext === '.py') {
     return `from ${baseName} import ${names.join(', ')}`;
   }
-  if (ext === '.java') {
-    return `import ${baseName}.${names[0]};`;
+  return null;
+}
+
+function buildModuleReferenceExample(createdPath, exportNames) {
+  return buildExactModuleReference(createdPath, exportNames) ?? 'update the original file so it references or uses the new module file correctly';
+}
+
+function resolveFilepathInfo(fp, options = {}) {
+  if (!fp) return { path: '', recoveredToTarget: false, originalPath: '' };
+  const originalPath = String(fp);
+  const resolved = path.normalize(path.isAbsolute(originalPath) ? originalPath : path.join(wsRoot, originalPath));
+  const recoverTarget = options.recoverTarget === true;
+  if (!recoverTarget) {
+    return { path: resolved, recoveredToTarget: false, originalPath };
   }
-  if (ext === '.cs') {
-    return `using ${baseName};`;
+  const sameBasename = path.basename(resolved) === path.basename(TARGET_ABS_FILE);
+  const sameExtension = path.extname(resolved).toLowerCase() === path.extname(TARGET_ABS_FILE).toLowerCase();
+  const shouldRecover = resolved !== TARGET_ABS_FILE && !existsSync(resolved) && sameBasename && sameExtension;
+  if (shouldRecover) {
+    return { path: TARGET_ABS_FILE, recoveredToTarget: true, originalPath };
   }
-  return 'update references to point at the new module file';
+  return { path: resolved, recoveredToTarget: false, originalPath };
 }
 
 function findNearestProjectRoot(startPath) {
@@ -466,9 +539,7 @@ function getToolDefinitions() {
 
 // ─── Tool execution ──────────────────────────────────────────────────────────
 function resolveFilepath(fp) {
-  if (!fp) return '';
-  if (path.isAbsolute(fp)) return fp;
-  return path.join(wsRoot, fp);
+  return resolveFilepathInfo(fp).path;
 }
 
 async function executeTool(name, args) {
@@ -738,7 +809,8 @@ async function executeTool(name, args) {
     }
 
     case 'read_file_slice': {
-      const fp = resolveFilepath(args.filepath);
+      const pathInfo = resolveFilepathInfo(args.filepath, { recoverTarget: true });
+      const fp = pathInfo.path;
       try {
         // In DRY_RUN mode, serve from cache if file was written in this session
         const rawContent = dryRunFiles.has(fp)
@@ -751,13 +823,15 @@ async function executeTool(name, args) {
           path: fp, languageId: detectLanguageId(fp),
           startLine: start, endLine: end,
           totalLines: lines.length,
-          content: lines.slice(start - 1, end).join('\n')
+          content: lines.slice(start - 1, end).join('\n'),
+          ...(pathInfo.recoveredToTarget ? { note: `Recovered requested path ${pathInfo.originalPath} to exact target ${TARGET_FILE}. Use ${TARGET_FILE} for subsequent read and replace calls.` } : {})
         });
       } catch (e) { return JSON.stringify({ error: e.message }); }
     }
 
     case 'read_specific_file': {
-      const fp = resolveFilepath(args.filepath);
+      const pathInfo = resolveFilepathInfo(args.filepath, { recoverTarget: true });
+      const fp = pathInfo.path;
       try {
         // In DRY_RUN mode, serve from cache if file was written in this session
         const rawContent = dryRunFiles.has(fp)
@@ -770,6 +844,9 @@ async function executeTool(name, args) {
           startLine: 1, endLine: capped.length, totalLines: lines.length,
           content: capped.join('\n')
         };
+        if (pathInfo.recoveredToTarget) {
+          result.note = `Recovered requested path ${pathInfo.originalPath} to exact target ${TARGET_FILE}. Use ${TARGET_FILE} for subsequent read and replace calls.`;
+        }
         if (lines.length > 200) {
           result.warning = `File has ${lines.length} lines; only first 200 shown. Use read_file_slice for specific sections.`;
         }
@@ -791,7 +868,7 @@ async function executeTool(name, args) {
               error: `File already exists and is ${existing.split('\n').length} lines long. ` +
                 `Do NOT overwrite it with create_or_edit_file — use replace_in_file instead. ` +
                 `Read the section you want to extract with read_file_slice, create a NEW file for the extracted code, ` +
-                `then use replace_in_file on the original to replace that block with an import statement.`
+                `then use replace_in_file on the original to replace that block with the appropriate module reference or equivalent update.`
             });
           }
         } catch { /* file unreadable — let it proceed */ }
@@ -799,8 +876,10 @@ async function executeTool(name, args) {
 
       const nonEmptyLines = content.replace(/\r\n/g, '\n').split('\n').map(l => l.trim()).filter(Boolean);
       const isCodeLikeTarget = /\.(?:ts|tsx|js|jsx|mjs|cjs|py|go|rs|java|kt|cs|php|rb|swift|c|cpp|h|hpp)$/i.test(fp);
+      const looksLikePlaceholder = nonEmptyLines.length > 0 && nonEmptyLines.every(l =>
+        /^(?:\/\/|#|\/\*|\*|<!--)?\s*(?:code will be inserted here|todo|tbd|placeholder|stub|coming soon|implement me|fill me in)/i.test(l));
       // Placeholder guard should apply only to split/code extraction flows, not to markdown/text creation.
-      if (IS_SPLIT_TASK && isCodeLikeTarget) {
+      if (isCodeLikeTarget && (IS_SPLIT_TASK || looksLikePlaceholder)) {
         const codeLike = nonEmptyLines.filter(l =>
           !/^(?:\/\/|\/\*|\*|#)/.test(l) &&
           (/(?:^|\s)(?:export|import|const|let|var|function|class|interface|type|enum|async|return)\b/.test(l) || /[{}();=]/.test(l))
@@ -809,7 +888,7 @@ async function executeTool(name, args) {
           return JSON.stringify({
             error: 'Content is a placeholder or has no actual code — do NOT write placeholder comments. ' +
               'Copy the exact code blocks you want to extract directly into this new file. ' +
-              'Then call replace_in_file on the original file to replace that extracted block with an import statement.'
+              'Then call replace_in_file on the original file to replace that extracted block with the appropriate module reference or equivalent update.'
           });
         }
       }
@@ -853,7 +932,8 @@ async function executeTool(name, args) {
     }
 
     case 'replace_in_file': {
-      const fp = resolveFilepath(args.filepath ?? '');
+      const pathInfo = resolveFilepathInfo(args.filepath ?? '', { recoverTarget: true });
+      const fp = pathInfo.path;
       const oldText = String(args.old_text ?? '');
       const newText = String(args.new_text ?? '');
       if (!fp) return JSON.stringify({ error: 'filepath is required.' });
@@ -861,7 +941,7 @@ async function executeTool(name, args) {
       if (oldText.trim() === newText.trim()) {
         return JSON.stringify({
           error: 'old_text and new_text are identical — this replace would make no change. ' +
-            'To split the file, create a new file with the extracted code, then replace the block with an import statement.'
+            'To split the file, create a new file with the extracted code, then replace the block with the appropriate module reference or equivalent update.'
         });
       }
 
@@ -871,7 +951,7 @@ async function executeTool(name, args) {
       if (removedLines.length <= 1 && addedLines.length <= 1 && !/^\s*import\b/.test(newText)) {
         return JSON.stringify({
           error: 'Single-line rename without an import replacement is not a valid extraction step. ' +
-            'Extract a self-contained block (multiple lines) and replace it with an import statement.'
+            'Extract a self-contained block (multiple lines) and replace it with the appropriate module reference or equivalent update.'
         });
       }
 
@@ -895,11 +975,11 @@ async function executeTool(name, args) {
 
         if (DRY_RUN) {
           label(Y, 'DRY-RUN replace', `${path.basename(fp)}: ${rmCount} lines → ${addCount} lines\n  old: ${oldText.substring(0, 80)}\n  new: ${newText.substring(0, 80)}`);
-          return JSON.stringify({ path: fp, replacements: 1, diff, dryRun: true });
+          return JSON.stringify({ path: fp, replacements: 1, diff, dryRun: true, ...(pathInfo.recoveredToTarget ? { note: `Recovered requested path ${pathInfo.originalPath} to exact target ${TARGET_FILE}.` } : {}) });
         }
         const updated = current.replace(oldText, newText);
         writeFileSync(fp, updated, 'utf8');
-        return JSON.stringify({ path: fp, replacements: 1, diff });
+        return JSON.stringify({ path: fp, replacements: 1, diff, ...(pathInfo.recoveredToTarget ? { note: `Recovered requested path ${pathInfo.originalPath} to exact target ${TARGET_FILE}.` } : {}) });
       } catch (e) { return JSON.stringify({ error: e.message }); }
     }
 
@@ -920,34 +1000,74 @@ async function executeTool(name, args) {
 }
 
 // Extract likely exportable definitions from source code for recovery flows.
-function extractDefinitionsFromSource(source) {
-  const lines = source.split('\n');
-  const resultLines = [];
-  let depth = 0;
-  let capturing = false;
+function extractDefinitionsFromSource(source, filepath = TARGET_FILE) {
+  const normalized = source.replace(/\r\n/g, '\n').trim();
+  if (!normalized) return '';
+  const languageId = detectLanguageId(filepath);
+  const lines = normalized.split('\n');
 
-  for (const line of lines) {
-    const trimmed = line.trimStart();
-    const isDecl = /^(?:export\s+)?(?:type|interface|enum|class)\s+\w/.test(trimmed);
-    if (!capturing && isDecl) {
-      capturing = true;
-      depth = 0;
-    }
-    if (capturing) {
+  const captureBraceBlock = startIndex => {
+    const collected = [];
+    let depth = 0;
+    let seenOpen = false;
+    for (let i = startIndex; i < lines.length; i++) {
+      const line = lines[i];
+      collected.push(line);
       for (const ch of line) {
-        if (ch === '{') depth++;
-        else if (ch === '}') depth--;
+        if (ch === '{') {
+          depth++;
+          seenOpen = true;
+        } else if (ch === '}') {
+          depth--;
+        }
       }
-      // Auto-export if declaration line lacks it
-      const outLine = (!isDecl || /^export\b/.test(trimmed)) ? line : ('export ' + trimmed);
-      resultLines.push(outLine);
-      if (depth <= 0 && resultLines.length > 0) {
-        capturing = false;
-        resultLines.push('');
+      if (seenOpen && depth <= 0) {
+        return collected.join('\n').trim();
+      }
+      if (!seenOpen && /;\s*$/.test(line.trim())) {
+        return collected.join('\n').trim();
       }
     }
+    return collected.join('\n').trim();
+  };
+
+  const captureIndentedBlock = startIndex => {
+    const collected = [lines[startIndex]];
+    const baseIndent = (lines[startIndex].match(/^\s*/) ?? [''])[0].length;
+    for (let i = startIndex + 1; i < lines.length; i++) {
+      const line = lines[i];
+      const trimmed = line.trim();
+      if (!trimmed) {
+        collected.push(line);
+        continue;
+      }
+      const indent = (line.match(/^\s*/) ?? [''])[0].length;
+      if (indent <= baseIndent && !/^\s*@/.test(line)) break;
+      collected.push(line);
+    }
+    return collected.join('\n').trim();
+  };
+
+  const patternsByLanguage = {
+    python: [/^\s*(?:class|def)\s+[A-Za-z_][\w]*/],
+    go: [/^\s*type\s+[A-Za-z_][\w]*\s+struct\b/, /^\s*func\s+(?:\([^)]*\)\s*)?[A-Za-z_][\w]*\s*\(/],
+    rust: [/^\s*(?:pub\s+)?(?:struct|enum|trait|fn)\s+[A-Za-z_][\w]*/, /^\s*impl\s+[A-Za-z_][\w]*/],
+    java: [/^\s*(?:public\s+)?(?:class|interface|enum|record)\s+[A-Za-z_][\w]*/, /^\s*(?:public|private|protected)\s+(?:static\s+)?[A-Za-z_][\w<>\[\], ?]*\s+[A-Za-z_][\w]*\s*\(/],
+    csharp: [/^\s*(?:public|internal|private|protected)\s+(?:static\s+)?(?:class|interface|enum|record|struct)\s+[A-Za-z_][\w]*/, /^\s*(?:public|internal|private|protected)\s+(?:static\s+)?[A-Za-z_][\w<>\[\], ?]*\s+[A-Za-z_][\w]*\s*\(/],
+    typescript: [/^\s*(?:export\s+)?(?:interface|type|enum|class|function)\s+[A-Za-z_][\w]*/, /^\s*export\s+(?:const|let|var)\s+[A-Za-z_][\w]*/],
+    typescriptreact: [/^\s*(?:export\s+)?(?:interface|type|enum|class|function)\s+[A-Za-z_][\w]*/, /^\s*export\s+(?:const|let|var)\s+[A-Za-z_][\w]*/],
+    javascript: [/^\s*export\s+(?:async\s+)?(?:function|class|const|let|var)\s+[A-Za-z_][\w]*/, /^\s*(?:async\s+)?function\s+[A-Za-z_][\w]*/, /^\s*class\s+[A-Za-z_][\w]*/],
+    javascriptreact: [/^\s*export\s+(?:async\s+)?(?:function|class|const|let|var)\s+[A-Za-z_][\w]*/, /^\s*(?:async\s+)?function\s+[A-Za-z_][\w]*/, /^\s*class\s+[A-Za-z_][\w]*/]
+  };
+
+  const patterns = patternsByLanguage[languageId] ?? [/^\s*(?:class|interface|enum|record|struct|trait|type|def|fn|function)\s+[A-Za-z_][\w]*/];
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (!patterns.some(pattern => pattern.test(line))) continue;
+    return languageId === 'python' ? captureIndentedBlock(i) : captureBraceBlock(i);
   }
-  return resultLines.join('\n').trim();
+
+  return normalized.length <= 1200 ? normalized : lines.slice(0, Math.min(lines.length, 80)).join('\n').trim();
 }
 
 // ─── Text-based tool call parser (handles leaked JSON tool calls) ────────────
@@ -1217,13 +1337,9 @@ function analyzeResponse(content, recentMessages) {
 // Builds the reminder message injected after a new extraction file is created.
 // Includes actual read content so the model can copy old_text exactly.
 function buildReplaceReminder(createdPath, newFileContent, allRecentReads) {
-  const baseName = path.basename(createdPath, '.ts');
-  const exportNames = [...newFileContent.matchAll(/export\s+(?:(?:type|interface|abstract|declare)\s+)*(?:function\s+|class\s+|const\s+|let\s+|var\s+|enum\s+)?([A-Z][\w]*)/g)]
-    .map(m => m[1])
-    .filter(n => n && !['from', 'type', 'default', 'as', 'export', 'import', 'declare', 'abstract'].includes(n))
-    .slice(0, 10);
+  const exportNames = extractSymbolNamesFromContent(newFileContent, createdPath);
 
-  let msg = `File ${path.basename(createdPath)} created. Now call replace_in_file on ${TARGET_FILE} to replace the original ${exportNames[0] ?? 'block'} definition with an import statement.\n`;
+  let msg = `File ${path.basename(createdPath)} created. Now call replace_in_file on ${TARGET_FILE} to replace the original ${exportNames[0] ?? 'block'} definition with the appropriate module reference or equivalent update.\n`;
 
   // Find the read that actually contains the exported symbol name
   const allReads = Array.isArray(allRecentReads) ? allRecentReads : (allRecentReads ? [allRecentReads] : []);
@@ -1273,7 +1389,7 @@ function buildReplaceReminder(createdPath, newFileContent, allRecentReads) {
       msg += `Set old_text = ONLY the block that defines ${exportNames[0] ?? 'the extracted code'} (the definition or implementation body, NOT unrelated imports or headers).\n`;
     }
   } else {
-    msg += `Use read_file_slice to read the section of ${TARGET_BASENAME}.ts where ${exportNames[0] ?? 'the extracted code'} is defined, then set old_text to that exact block.\n`;
+    msg += `Use read_file_slice to read the section of ${path.basename(TARGET_FILE)} where ${exportNames[0] ?? 'the extracted code'} is defined, then set old_text to that exact block.\n`;
   }
 
   if (exportNames.length > 0) {
@@ -1304,7 +1420,7 @@ function buildNudge(analysis, lastToolWasError, ctx = {}) {
     const { pendingReplaceAfterCreate, lastCreatedFileState, extractionContinuationPending, lastSuccessfulRead, extractionCount } = ctx;
     if (pendingReplaceAfterCreate && lastCreatedFileState) {
       const names = lastCreatedFileState.exportNames?.join(', ') ?? 'the extracted types';
-      return `The tool result is already recorded. Do NOT echo tool results. Call replace_in_file on ${TARGET_FILE} now to replace the original ${names} block with an import statement.`;
+      return `The tool result is already recorded. Do NOT echo tool results. Call replace_in_file on ${TARGET_FILE} now to replace the original ${names} block with the appropriate module reference or equivalent update.`;
     }
     if (extractionContinuationPending) {
       const nextStart = (lastSuccessfulRead?.endLine ?? 120) + 1;
@@ -1316,7 +1432,7 @@ function buildNudge(analysis, lastToolWasError, ctx = {}) {
     const { pendingReplaceAfterCreate: pReplace, lastCreatedFileState: lastCreated, extractionContinuationPending: contPending, lastSuccessfulRead: lastRead } = ctx;
     if (pReplace && lastCreated) {
       const names = lastCreated.exportNames?.join(', ') ?? 'the extracted types';
-      return `Stop writing. Call replace_in_file NOW on ${TARGET_FILE} to replace the original ${names} block with an import statement. Do not describe it — call the tool.`;
+      return `Stop writing. Call replace_in_file NOW on ${TARGET_FILE} to replace the original ${names} block with the appropriate module reference or equivalent update. Do not describe it — call the tool.`;
     }
     if (contPending && lastRead) {
       const nextStart = lastRead.endLine + 1;
@@ -1359,8 +1475,12 @@ async function main() {
     {
       role: 'user',
       content: 'You are an expert software developer. Call tools directly and immediately — do NOT output numbered plans, step lists, or descriptions of what you will do. ' +
-        'When asked to split a file: use read_file_slice to read a section, create_or_edit_file to create the new module file, then replace_in_file to replace the original block with an import statement. ' +
+        'When asked to split a file: use read_file_slice to read a section, create_or_edit_file to create the new module file, then replace_in_file to replace the original block with the appropriate module reference or equivalent update. ' +
         'After each successful file write, verify the project using the most appropriate command for the detected stack instead of assuming TypeScript.'
+    },
+    {
+      role: 'user',
+      content: `Primary target file for this run is ${TARGET_FILE}. Prefer this exact path, or exact sibling paths under ${TARGET_DIR === '.' ? wsRoot : TARGET_DIR}. Do NOT invent shortened or alternate directories for the target file.`
     },
     { role: 'user', content: userPrompt }
   ];
@@ -1471,7 +1591,7 @@ async function main() {
           const readCount = seenReadSigs.get(readSig) ?? 0;
           if (readCount >= 2) {
             label(Y, `  \u27f3 SKIP DUPE READ`, `${toolName} same args already seen ${readCount}x`);
-            messages.push({ role: 'tool', content: JSON.stringify({ warning: `Duplicate read \u2014 you already read this exact section ${readCount} times. You already have this file content in your context. Do NOT re-read it. Create a NEW sibling file (e.g. ${SUGGESTED_TYPES_FILE}, NOT ${TARGET_FILE}) for the extracted code using create_or_edit_file, then use replace_in_file on ${TARGET_FILE} to replace that block with an import statement.` }), tool_name: toolName });
+                messages.push({ role: 'tool', content: JSON.stringify({ warning: `Duplicate read \u2014 you already read this exact section ${readCount} times. You already have this file content in your context. Do NOT re-read it. Create a NEW sibling file (e.g. ${SUGGESTED_TYPES_FILE}, NOT ${TARGET_FILE}) for the extracted code using create_or_edit_file, then use replace_in_file on ${TARGET_FILE} to replace that block with the correct module reference or equivalent update.` }), tool_name: toolName });
             continue;
           }
           seenReadSigs.set(readSig, readCount + 1);
@@ -1513,10 +1633,7 @@ async function main() {
               const isOriginal = createdPath.includes(TARGET_BASENAME);
               if (!isOriginal) {
                 const fileContent = args.content ?? '';
-                const exportNames = [...fileContent.matchAll(/export\s+(?:(?:type|interface|abstract|declare)\s+)*(?:function\s+|class\s+|const\s+|let\s+|var\s+|enum\s+)?([A-Z][\w]*)/g)]
-                  .map(m => m[1])
-                  .filter(n => n && !['from', 'type', 'default', 'as', 'export', 'import', 'declare', 'abstract'].includes(n))
-                  .slice(0, 10);
+                const exportNames = extractSymbolNamesFromContent(fileContent, createdPath);
                 lastCreatedFileState = { filePath: createdPath, content: fileContent, exportNames };
                 pendingReplaceAfterCreate = true;
                 const reminder = buildReplaceReminder(createdPath, fileContent, recentReads);
@@ -1611,7 +1728,7 @@ async function main() {
         emptyNudge = `Extraction ${extractionCount} complete. Read the NEXT section of ${TARGET_FILE} — use read_file_slice with lines ${nextStart}–${nextEnd} — then extract another self-contained block (interface, class, or utility functions).`;
       } else if (lastSuccessfulRead && lastSuccessfulRead.content) {
         emptyNudge = `You already read lines ${lastSuccessfulRead.startLine}–${lastSuccessfulRead.endLine} of ${path.basename(lastSuccessfulRead.filepath ?? '')}. ` +
-          `Do NOT re-read those lines. Use that content to create a NEW sibling file (e.g. ${SUGGESTED_TYPES_FILE} or ${SUGGESTED_INTERFACES_FILE}) with the extracted TypeScript code — use create_or_edit_file. ` +
+          `Do NOT re-read those lines. Use that content to create a NEW sibling file (e.g. ${SUGGESTED_TYPES_FILE} or ${SUGGESTED_INTERFACES_FILE}) with the extracted real code — use create_or_edit_file. ` +
           `Do NOT attempt to overwrite ${TARGET_FILE}.`;
       } else {
         emptyNudge = `Your response was empty. Call read_file_slice on ${TARGET_FILE} to read a section, then call create_or_edit_file to create a new module file with the extracted code.`;
@@ -1679,7 +1796,7 @@ async function main() {
               messages.push({ role: 'assistant', content: '' });
               messages.push({ role: 'tool', content: realResult, tool_name: 'read_file_slice' });
               const recoveryNudge = `Real read_file_slice result for lines ${fakeResult.startLine}–${fakeResult.endLine} is above. ` +
-                `Now create a new module file with the TypeScript definitions from those lines, then call replace_in_file on ${TARGET_FILE}.`;
+                `Now create a new module file with the real extracted code from those lines, then call replace_in_file on ${TARGET_FILE}.`;
               messages.push({ role: 'user', content: recoveryNudge });
               retryCount = 0;
               continue;
@@ -1691,7 +1808,7 @@ async function main() {
               !fakeResult.startLine && !fakeResult.endLine) {
             const rawContent = typeof fakeResult.content === 'string' && fakeResult.content.trim().length > 50
               ? fakeResult.content
-              : (lastSuccessfulRead?.content ? extractDefinitionsFromSource(lastSuccessfulRead.content) : null);
+              : (lastSuccessfulRead?.content ? extractDefinitionsFromSource(lastSuccessfulRead.content, lastSuccessfulRead.filepath || TARGET_FILE) : null);
             if (rawContent && rawContent.trim().length > 50) {
               const fp = resolveFilepath(fakeResult.path);
               const writeResult = await executeTool('create_or_edit_file', { filename: fp, content: rawContent });
@@ -1700,8 +1817,7 @@ async function main() {
                 label(Y, 'HALLUCINATION RECOVERY', `Model faked creation of ${path.basename(fp)}; executing real create`);
                 hadSuccessfulWrite = true;
                 pendingReplaceAfterCreate = true;
-                const exportNames = [...rawContent.matchAll(/export\s+(?:(?:type|interface|class|function|abstract|declare)\s+)*([A-Z][\w]*)/g)]
-                  .map(m => m[1]).filter(n => n && !['from', 'type', 'default', 'as'].includes(n)).slice(0, 10);
+                const exportNames = extractSymbolNamesFromContent(rawContent, fp);
                 lastCreatedFileState = { filePath: fp, content: rawContent, exportNames };
                 messages.push({ role: 'assistant', content: '' });
                 messages.push({ role: 'tool', content: writeResult, tool_name: 'create_or_edit_file' });
@@ -1719,11 +1835,17 @@ async function main() {
             const diffBlock = fakeResult.diff ?? '';
             const removedLines = (diffBlock.match(/^-(.*)$/gm) ?? []).map(l => l.slice(1)).join('\n');
             if (removedLines.trim().length > 0) {
-              const newText = `import { ${lastCreatedFileState.exportNames.join(', ')} } from './${path.basename(lastCreatedFileState.filePath, '.ts')}';`;
+              const newText = buildExactModuleReference(lastCreatedFileState.filePath, lastCreatedFileState.exportNames);
+              if (!newText) {
+                const fallbackNudge = `A replace step is still required for ${TARGET_FILE}. The new module file already exists at ${lastCreatedFileState.filePath}. Now call replace_in_file with the exact original block as old_text and the correct module reference or equivalent update as new_text.`;
+                messages.push({ role: 'user', content: fallbackNudge });
+                retryCount = 0;
+                continue;
+              }
               const replaceResult = await executeTool('replace_in_file', { filepath: fakeResult.path, old_text: removedLines, new_text: newText });
               const replaceParsed = JSON.parse(replaceResult);
               if (!replaceParsed.error) {
-                label(Y, 'HALLUCINATION RECOVERY', `Model faked replace in ${TARGET_BASENAME}.ts; executed real replace`);
+                label(Y, 'HALLUCINATION RECOVERY', `Model faked replace in ${TARGET_BASENAME}${TARGET_EXTENSION}; executed real replace`);
                 pendingReplaceAfterCreate = false;
                 extractionCount++;
                 extractionContinuationPending = true;
