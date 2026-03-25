@@ -5,6 +5,7 @@
  *
  * Usage:
  *   node scripts/debug-agent.mjs "your prompt"
+ *   node scripts/debug-agent.mjs --target src/debug-lab/SandboxTarget.ts "your prompt"
  *   node scripts/debug-agent.mjs  (uses default split-file prompt)
  *
  * Env vars:
@@ -31,9 +32,20 @@ const MODEL       = process.env.MANUL_MODEL ?? 'qwen2.5-coder:7b';
 const DRY_RUN     = process.env.DRY_RUN === 'true';
 const MAX_TURNS   = parseInt(process.env.MAX_TURNS ?? '30', 10);
 
-// The large file to split. Use TARGET_FILE env var to override.
-const TARGET_FILE = process.env.TARGET_FILE ?? 'src/ManulAiChatProvider.ts';
+const cliArgs = process.argv.slice(2);
+let cliTargetFile;
+const targetFlagIndex = cliArgs.indexOf('--target');
+if (targetFlagIndex >= 0) {
+  cliTargetFile = cliArgs[targetFlagIndex + 1];
+  cliArgs.splice(targetFlagIndex, 2);
+}
+
+// The large file to split. Use --target or TARGET_FILE env var to override.
+const TARGET_FILE = cliTargetFile ?? process.env.TARGET_FILE ?? 'src/ManulAiChatProvider.ts';
 const TARGET_BASENAME = path.basename(TARGET_FILE, '.ts'); // e.g. "ManulAiChatProvider"
+const TARGET_DIR = path.posix.dirname(TARGET_FILE.replace(/\\/g, '/'));
+const SUGGESTED_TYPES_FILE = TARGET_DIR === '.' ? 'types.ts' : `${TARGET_DIR}/types.ts`;
+const SUGGESTED_INTERFACES_FILE = TARGET_DIR === '.' ? 'interfaces.ts' : `${TARGET_DIR}/interfaces.ts`;
 
 const sessionId   = new Date().toISOString().replace(/[:.]/g, '-');
 const logDir      = path.join(wsRoot, '.manulai', 'logs');
@@ -42,14 +54,15 @@ const LOG_FILE    = process.env.LOG_FILE ?? path.join(logDir, `debug-${sessionId
 // In-session cache for DRY_RUN "written" files (module-level so executeTool can access it)
 const dryRunFiles = new Map();
 
-const userPrompt = process.argv[2];
+const userPrompt = cliArgs[0];
 if (!userPrompt) {
-  console.error('Usage: node scripts/debug-agent.mjs "your prompt"');
+  console.error('Usage: node scripts/debug-agent.mjs [--target path/to/file.ts] "your prompt"');
   process.exit(1);
 }
 
 // Detect whether this run is a file-splitting task — only then enforce extractionCount gate
 const IS_SPLIT_TASK = /розбий|split|refactor.*module|extract.*module/i.test(userPrompt);
+const REQUIRES_FILE_WRITE = /\b(?:create|write|edit|modify|update|add|append|change|rename|delete|remove|refactor|split|move)\b/i.test(userPrompt);
 
 // ─── Colours ───────────────────────────────────────────────────────────────
 const R = '\x1b[31m', G = '\x1b[32m', Y = '\x1b[33m', B = '\x1b[34m';
@@ -648,18 +661,21 @@ async function executeTool(name, args) {
         } catch { /* file unreadable — let it proceed */ }
       }
 
-      // Placeholder guard (same as extension)
       const nonEmptyLines = content.replace(/\r\n/g, '\n').split('\n').map(l => l.trim()).filter(Boolean);
-      const codeLike = nonEmptyLines.filter(l =>
-        !/^(?:\/\/|\/\*|\*|#)/.test(l) &&
-        (/(?:^|\s)(?:export|import|const|let|var|function|class|interface|type|enum|async|return)\b/.test(l) || /[{}();=]/.test(l))
-      );
-      if (codeLike.length === 0) {
-        return JSON.stringify({
-          error: 'Content is a placeholder or has no actual code — do NOT write placeholder comments. ' +
-            'Copy the exact TypeScript code blocks you want to extract directly into this new file. ' +
-            'Then call replace_in_file on the original file to replace that extracted block with an import statement.'
-        });
+      const isCodeLikeTarget = /\.(?:ts|tsx|js|jsx|mjs|cjs|py|go|rs|java|kt|cs|php|rb|swift|c|cpp|h|hpp)$/i.test(fp);
+      // Placeholder guard should apply only to split/code extraction flows, not to markdown/text creation.
+      if (IS_SPLIT_TASK && isCodeLikeTarget) {
+        const codeLike = nonEmptyLines.filter(l =>
+          !/^(?:\/\/|\/\*|\*|#)/.test(l) &&
+          (/(?:^|\s)(?:export|import|const|let|var|function|class|interface|type|enum|async|return)\b/.test(l) || /[{}();=]/.test(l))
+        );
+        if (codeLike.length === 0) {
+          return JSON.stringify({
+            error: 'Content is a placeholder or has no actual code — do NOT write placeholder comments. ' +
+              'Copy the exact code blocks you want to extract directly into this new file. ' +
+              'Then call replace_in_file on the original file to replace that extracted block with an import statement.'
+          });
+        }
       }
 
       // Import-shell guard: reject files whose only content is import / re-export lines (no actual definitions)
@@ -957,6 +973,39 @@ function parseToolCallsFromText(content) {
     results.push({ function: { name: match[1], arguments: { [argKey]: match[2] } } });
   }
 
+  // Match create_or_edit_file "filepath" "content" positional format.
+  const createOrEditPositionalRe = /\bcreate_or_edit_file\s+"([^"\n]+)"\s+("(?:[^"\\]|\\[\s\S])*?")/g;
+  while ((match = createOrEditPositionalRe.exec(content)) !== null) {
+    try {
+      results.push({
+        function: {
+          name: 'create_or_edit_file',
+          arguments: {
+            filename: match[1],
+            content: JSON.parse(match[2])
+          }
+        }
+      });
+    } catch { /* ignore */ }
+  }
+
+  // Match replace_in_file "filepath" "old_text" "new_text" positional format.
+  const replacePositionalRe = /\breplace_in_file\s+"([^"\n]+)"\s+("(?:[^"\\]|\\[\s\S])*?")\s+("(?:[^"\\]|\\[\s\S])*?")/g;
+  while ((match = replacePositionalRe.exec(content)) !== null) {
+    try {
+      results.push({
+        function: {
+          name: 'replace_in_file',
+          arguments: {
+            filepath: match[1],
+            old_text: JSON.parse(match[2]),
+            new_text: JSON.parse(match[3])
+          }
+        }
+      });
+    } catch { /* ignore */ }
+  }
+
   // Bare read_specific_file with no path argument — default to the primary source file.
   // Handles "Executing step 1: read_specific_file" style (model forgets to specify path).
   if (results.length === 0 &&
@@ -988,8 +1037,8 @@ function parseToolCallsFromText(content) {
       } else {
         // Auto-infer filename from exported symbol names in code
         const symbolNames = [...codeContent.matchAll(/(?:export\s+)?(?:interface|class|enum)\s+(\w+)/g)].map(m => m[1]);
-        if (symbolNames.length === 1) filename = `src/${symbolNames[0]}.ts`;
-        else if (symbolNames.length > 1) filename = 'src/types.ts';
+        if (symbolNames.length === 1) filename = (TARGET_DIR === '.' ? `${symbolNames[0]}.ts` : `${TARGET_DIR}/${symbolNames[0]}.ts`);
+        else if (symbolNames.length > 1) filename = SUGGESTED_TYPES_FILE;
       }
       if (filename) {
         results.push({ function: { name: 'create_or_edit_file', arguments: { filename, content: codeContent } } });
@@ -1155,6 +1204,9 @@ function buildNudge(analysis, lastToolWasError, ctx = {}) {
   if (analysis.mentionsToolButNotCalled) {
     return 'You described a tool call in plain text but did not actually call it. Use the native tool-calling mechanism to call the tool now.';
   }
+  if (REQUIRES_FILE_WRITE && !ctx.hadSuccessfulWrite) {
+    return 'This task requires a real file change, but no file write has succeeded yet. Call create_or_edit_file or replace_in_file now instead of describing the result in text.';
+  }
   return 'You described changes but did not call a tool. Call the appropriate tool now.';
 }
 
@@ -1281,7 +1333,7 @@ async function main() {
           const readCount = seenReadSigs.get(readSig) ?? 0;
           if (readCount >= 2) {
             label(Y, `  \u27f3 SKIP DUPE READ`, `${toolName} same args already seen ${readCount}x`);
-            messages.push({ role: 'tool', content: JSON.stringify({ warning: `Duplicate read \u2014 you already read this exact section ${readCount} times. You already have this file content in your context. Do NOT re-read it. Create a NEW file (e.g. src/types.ts, NOT ${TARGET_FILE}) for the extracted code using create_or_edit_file, then use replace_in_file on ${TARGET_FILE} to replace that block with an import statement.` }), tool_name: toolName });
+            messages.push({ role: 'tool', content: JSON.stringify({ warning: `Duplicate read \u2014 you already read this exact section ${readCount} times. You already have this file content in your context. Do NOT re-read it. Create a NEW sibling file (e.g. ${SUGGESTED_TYPES_FILE}, NOT ${TARGET_FILE}) for the extracted code using create_or_edit_file, then use replace_in_file on ${TARGET_FILE} to replace that block with an import statement.` }), tool_name: toolName });
             continue;
           }
           seenReadSigs.set(readSig, readCount + 1);
@@ -1396,7 +1448,7 @@ async function main() {
         emptyNudge = `Extraction ${extractionCount} complete. Read the NEXT section of ${TARGET_FILE} — use read_file_slice with lines ${nextStart}–${nextEnd} — then extract another self-contained block (interface, class, or utility functions).`;
       } else if (lastSuccessfulRead && lastSuccessfulRead.content) {
         emptyNudge = `You already read lines ${lastSuccessfulRead.startLine}–${lastSuccessfulRead.endLine} of ${path.basename(lastSuccessfulRead.filepath ?? '')}. ` +
-          `Do NOT re-read those lines. Use that content to create a NEW file (e.g. src/types.ts or src/interfaces.ts) with the extracted TypeScript code — use create_or_edit_file. ` +
+          `Do NOT re-read those lines. Use that content to create a NEW sibling file (e.g. ${SUGGESTED_TYPES_FILE} or ${SUGGESTED_INTERFACES_FILE}) with the extracted TypeScript code — use create_or_edit_file. ` +
           `Do NOT attempt to overwrite ${TARGET_FILE}.`;
       } else {
         emptyNudge = `Your response was empty. Call read_file_slice on ${TARGET_FILE} to read a section, then call create_or_edit_file to create a new module file with the extracted code.`;
@@ -1532,14 +1584,16 @@ async function main() {
     // If model claims done after actual write succeeded AND no pending tool call in text → accept done
     const textCallsInResponse = parseToolCallsFromText(content);
     const hasPendingTextCall = textCallsInResponse.length > 0;
+    const writeStillPending = REQUIRES_FILE_WRITE && !hadSuccessfulWrite;
     const isDoneAfterWrite = hadSuccessfulWrite && !analysis.isPassingToUser &&
       !analysis.isAnnouncedButNotExecuted && !analysis.isHallucinatingToolResponse &&
       !analysis.mentionsToolButNotCalled && !hasPendingTextCall &&
       (analysis.claimsDone || (analysis.isLong && !analysis.looksLikePlan));
     // For non-split tasks: a long, non-plan text response with no tool calls is the final answer
     const isNonSplitFinalAnswer = !IS_SPLIT_TASK && analysis.isLong && !analysis.looksLikePlan &&
-      !analysis.mentionsToolButNotCalled && !hasPendingTextCall && !analysis.isHallucinatingToolResponse;
-    if ((!analysis.requiresContinuation || isDoneAfterWrite || isNonSplitFinalAnswer) && !lastToolWasError) {
+      !analysis.mentionsToolButNotCalled && !hasPendingTextCall && !analysis.isHallucinatingToolResponse &&
+      (!REQUIRES_FILE_WRITE || hadSuccessfulWrite);
+    if ((!writeStillPending && (!analysis.requiresContinuation || isDoneAfterWrite || isNonSplitFinalAnswer)) && !lastToolWasError) {
       // Require at least 2 full extraction cycles before accepting a quiet finish — only for split tasks
       if (IS_SPLIT_TASK && extractionCount < 2) {
         const nextStart = (lastSuccessfulRead?.endLine ?? 120) + 1;
@@ -1562,7 +1616,7 @@ async function main() {
       break;
     }
 
-    const nudge = buildNudge(analysis, lastToolWasError, { pendingReplaceAfterCreate, lastSuccessfulRead, lastCreatedFileState, extractionContinuationPending, extractionCount });
+    const nudge = buildNudge(analysis, lastToolWasError, { pendingReplaceAfterCreate, lastSuccessfulRead, lastCreatedFileState, extractionContinuationPending, extractionCount, hadSuccessfulWrite });
     label(Y, 'NUDGE', nudge);
     logEvent('nudge', { kind: 'tool_continuation', turn, retryCount, nudge });
     messages.push({ role: 'assistant', content });

@@ -534,7 +534,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       attachmentContext: candidate.attachmentContext === true,
       activeEditorContext: candidate.activeEditorContext === true,
       revertOperationIds: Array.isArray(candidate.revertOperationIds)
-        ? candidate.revertOperationIds.filter((id): id is string => typeof id === 'string')
+        ? candidate.revertOperationIds.filter((id: unknown): id is string => typeof id === 'string')
         : undefined
     };
   }
@@ -1959,7 +1959,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         // Detect incomplete plan execution: model mentions "Step N/M" but hasn't reached the final step
         const stepMatch = finalContent.match(/step\s+(\d+)\s*[\/of]+\s*(\d+)/i);
         const announcedStepNumbers = Array.from(finalContent.matchAll(/\bstep\s+(\d+)\b/gi))
-          .map(match => parseInt(match[1], 10))
+          .map((match: RegExpMatchArray) => parseInt(match[1], 10))
           .filter(Number.isFinite);
         const hasSequentialStepNarration = announcedStepNumbers.length >= 2
           && Math.max(...announcedStepNumbers) > Math.min(...announcedStepNumbers);
@@ -1968,11 +1968,11 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         const hasExplicitNextSteps = /next steps?:/i.test(finalContent) && /\n\s*(?:2|3|4|5)\.\s+/i.test(finalContent);
         const progressLines = finalContent
           .split('\n')
-          .map(line => line.trim())
+          .map((line: string) => line.trim())
           .filter(Boolean);
         const isProgressOnlyResponse = progressLines.length > 0
           && finalContent.trim().length < 220
-          && progressLines.every(line => /^(?:step\s+\d+\s*(?:\/|of)\s*\d+[:\s-].*|step\s+\d+\s+completed[:\s-].*|execut(?:e|ing)\s+step\s+\d+[:\s-].*|reading (?:the )?file first\.{0,3}|reading and modifying .+|i(?:'| a)?ll read the file.*|i apologize for the oversight\.?|sorry for the oversight\.?)$/i.test(line));
+          && progressLines.every((line: string) => /^(?:step\s+\d+\s*(?:\/|of)\s*\d+[:\s-].*|step\s+\d+\s+completed[:\s-].*|execut(?:e|ing)\s+step\s+\d+[:\s-].*|reading (?:the )?file first\.{0,3}|reading and modifying .+|i(?:'| a)?ll read the file.*|i apologize for the oversight\.?|sorry for the oversight\.?)$/i.test(line));
 
         const recentExecutedCommands = recentToolMessages
           .filter(message => message.tool_name === 'execute_terminal_command')
@@ -1985,7 +1985,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
             }
           })
           .filter(Boolean);
-        const claimedCommands = Array.from(finalContent.matchAll(/`([^`]+)`/g)).map(match => match[1].trim().toLowerCase());
+        const claimedCommands = Array.from(finalContent.matchAll(/`([^`]+)`/g)).map((match: RegExpMatchArray) => match[1].trim().toLowerCase());
         const claimedButUnexecutedCommand = claimedCommands.some(command => {
           if (!/(?:^|\s)(?:npm|pnpm|yarn|bun|node|npx|python|pytest|pip|cargo|go|dotnet|gradle|mvn)\b/i.test(command)) {
             return false;
@@ -2173,10 +2173,10 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
             nudgeMessage = `This is a large refactor request for ${primaryTarget}. Do NOT ask the user which section to start with, and do NOT say that you will read the file later. Your next response must call read_file_slice immediately for ${primaryTarget} with startLine=1 and endLine=120. After that, continue with the next bounded slice or the next small extraction step.`;
           } else if (hasPostReadSummaryOnLargeRefactor) {
             const primaryTarget = largeRefactorTargets[0] ?? 'the target file';
-            const suggestedNewFile = primaryTarget.replace(/\.ts$/, 'Types.ts').replace(/src\//, 'src/');
+            const suggestedNewFile = path.join(path.dirname(primaryTarget), 'types.ts').replace(/\\/g, '/');
             nudgeMessage = suggestedNextSlice?.filepath && suggestedNextSlice.startLine && suggestedNextSlice.endLine
-              ? `STOP summarizing. You are performing file-splitting: extracting code from ${primaryTarget} into NEW separate files. Summarizing what you read is WRONG. You must NOW call create_or_edit_file. Example: create a new file at src/types.ts (or similar) containing the interfaces and types from the slice you just read. Then call replace_in_file on ${primaryTarget} with old_text=the exact extracted block and new_text=an import statement like "import { InterfaceName } from './types';". IMPORTANT: old_text and new_text must be DIFFERENT — never pass the same text to both. If you need more of the file first, call read_file_slice for ${suggestedNextSlice.filepath} with startLine=${suggestedNextSlice.startLine} and endLine=${suggestedNextSlice.endLine}. No prose. Tool calls only.`
-              : `STOP summarizing. You are performing file-splitting: extracting code from ${primaryTarget} into NEW separate files. Summarizing what you read is WRONG. You must NOW call create_or_edit_file. Create a new file at src/types.ts containing the interfaces and types from the slice you just read. Then call replace_in_file on ${primaryTarget} with old_text=the exact extracted code block and new_text=an import statement. IMPORTANT: old_text and new_text must be DIFFERENT. No prose. Tool calls only.`;
+              ? `STOP summarizing. You are performing file-splitting: extracting code from ${primaryTarget} into NEW separate files. Summarizing what you read is WRONG. You must NOW call create_or_edit_file. Example: create a new sibling file at ${suggestedNewFile} (or similar) containing the interfaces and types from the slice you just read. Then call replace_in_file on ${primaryTarget} with old_text=the exact extracted block and new_text=an import statement like "import { InterfaceName } from './types';". IMPORTANT: old_text and new_text must be DIFFERENT — never pass the same text to both. If you need more of the file first, call read_file_slice for ${suggestedNextSlice.filepath} with startLine=${suggestedNextSlice.startLine} and endLine=${suggestedNextSlice.endLine}. No prose. Tool calls only.`
+              : `STOP summarizing. You are performing file-splitting: extracting code from ${primaryTarget} into NEW separate files. Summarizing what you read is WRONG. You must NOW call create_or_edit_file. Create a new sibling file at ${suggestedNewFile} containing the interfaces and types from the slice you just read. Then call replace_in_file on ${primaryTarget} with old_text=the exact extracted code block and new_text=an import statement. IMPORTANT: old_text and new_text must be DIFFERENT. No prose. Tool calls only.`;
           } else if (hasModelRefusalResponse) {
             const primaryTarget = largeRefactorTargets[0] ?? 'the target file';
             nudgeMessage = suggestedNextSlice?.filepath && suggestedNextSlice.startLine && suggestedNextSlice.endLine
@@ -2467,7 +2467,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         continue;
       }
       // Compare: if >40% of the attached file's lines appear in the response, it's likely a file dump
-      const originalLines = file.content.split('\n').filter(l => l.trim().length > 20);
+      const originalLines = file.content.split('\n').filter((l: string) => l.trim().length > 20);
       if (originalLines.length < 5) {
         continue;
       }
@@ -6066,7 +6066,7 @@ If the user asks for a change but provides NO code:
     // For large refactors this commonly happens when the model confuses "extract" with "edit".
     if (oldText.trim() === newText.trim()) {
       return JSON.stringify({
-        error: 'old_text and new_text are identical — this replace would make no change to the file. This is wrong for a refactor task. To split the file into smaller modules, you must: (1) call create_or_edit_file with a new file path (e.g. src/types.ts) and the exact code block you are extracting; (2) call replace_in_file with old_text set to that extracted block and new_text set to an import statement. Never pass the same text as both old_text and new_text.'
+        error: 'old_text and new_text are identical — this replace would make no change to the file. This is wrong for a refactor task. To split the file into smaller modules, you must: (1) call create_or_edit_file with a new sibling file path such as types.ts next to the target file and the exact code block you are extracting; (2) call replace_in_file with old_text set to that extracted block and new_text set to an import statement. Never pass the same text as both old_text and new_text.'
       });
     }
 
