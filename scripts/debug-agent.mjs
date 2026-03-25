@@ -2546,7 +2546,12 @@ async function main() {
       break;
     }
 
-    if (retryCount >= 4) {
+    if (retryCount >= 4 || consecutiveIdenticalResponses >= 2) {
+      if (consecutiveIdenticalResponses >= 2) {
+        label(R, 'IDENTICAL LOOP', `Model produced identical response ${consecutiveIdenticalResponses + 1} times — aborting.`);
+        logEvent('retry_limit', { turn, retryCount, reason: 'identical_response_loop', consecutiveIdenticalResponses });
+        break;
+      }
       // Last-ditch: scan all recent assistant messages for extractable code blocks
       const recentAssistantMsgs = messages.filter(m => m.role === 'assistant' && m.content && m.content.trim().length > 0).slice(-5);
       const allCodeBlocks = [];
@@ -2599,10 +2604,24 @@ async function main() {
     const narratedBootstrapWarning = bootstrapCandidate && repeatedNarratedCallCount === 1
       ? `\nIf you describe the same tool call in plain text again instead of executing it, the harness will bootstrap ${bootstrapCandidate.toolCall.function?.name} automatically.`
       : '';
-    label(Y, 'NUDGE', `${nudge}${narratedBootstrapWarning}`);
-    logEvent('nudge', { kind: 'tool_continuation', turn, retryCount, nudge: `${nudge}${narratedBootstrapWarning}` });
+
+    // Track identical responses for escalation
+    const contentTrimmed = content.trim();
+    if (contentTrimmed && contentTrimmed === lastNudgedResponseContent) {
+      consecutiveIdenticalResponses++;
+    } else {
+      consecutiveIdenticalResponses = 0;
+    }
+    lastNudgedResponseContent = contentTrimmed;
+
+    const identicalPrefix = consecutiveIdenticalResponses >= 1
+      ? `CRITICAL: You have produced the EXACT SAME response ${consecutiveIdenticalResponses + 1} times in a row. Your current approach is not working. You MUST change strategy completely. `
+      : '';
+
+    label(Y, 'NUDGE', `${identicalPrefix}${nudge}${narratedBootstrapWarning}`);
+    logEvent('nudge', { kind: 'tool_continuation', turn, retryCount, consecutiveIdenticalResponses, nudge: `${identicalPrefix}${nudge}${narratedBootstrapWarning}` });
     messages.push({ role: 'assistant', content });
-    messages.push({ role: 'user', content: `${nudge}${narratedBootstrapWarning}` });
+    messages.push({ role: 'user', content: `${identicalPrefix}${nudge}${narratedBootstrapWarning}` });
     retryCount++;
   }
 
