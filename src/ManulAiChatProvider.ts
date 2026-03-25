@@ -1327,6 +1327,27 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
 
   private async processOllamaResponse(messages: OllamaMessage[], retryCount = 0): Promise<void> {
     this.throwIfRequestStopped();
+
+    // Context trimming: prevent overflow by keeping only recent messages
+    if (this.isAgentLike) {
+      const { maxMessages } = this.getModelContextLimits();
+      if (messages.length > maxMessages) {
+        // Keep first 2 messages (user prompt + plan nudge) and most recent ones
+        const headCount = 2;
+        const tailCount = maxMessages - headCount - 1; // -1 for the trim notice
+        const first = messages.slice(0, headCount);
+        const recent = messages.slice(-tailCount);
+        const trimNotice: OllamaMessage = {
+          role: 'user',
+          content: 'Context trimmed to prevent overflow. Continue with the task — execute the next required action.',
+          hiddenFromTranscript: true
+        };
+        messages.splice(0, messages.length, ...first, trimNotice, ...recent);
+        this.debugLog('context_trim', { maxMessages, trimmedTo: messages.length, model: this.getSelectedModel() });
+        this.postProgressStep(`Context trimmed to ${messages.length} messages`);
+      }
+    }
+
     this.postStatus(retryCount > 0 ? `Retry ${retryCount}: calling Ollama...` : 'Calling Ollama...');
     this.debugLog('ollama_request', { retryCount, messageCount: messages.length, model: this.getSelectedModel() });
     const responseData = await this.callOllama(messages);
@@ -2660,6 +2681,34 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     });
   }
 
+  /**
+   * Estimate context limits based on the model name/tag.
+   * Parses size hints like :7b, :14b, :30b, :70b from the model string.
+   * Returns { maxMessages, numCtx } tuned for the model's capacity.
+   */
+  private getModelContextLimits(): { maxMessages: number; numCtx: number } {
+    const model = this.getSelectedModel().toLowerCase();
+    // Try to extract parameter count from model tag (e.g. qwen3-coder:30b → 30)
+    const sizeMatch = model.match(/(\d+\.?\d*)b/);
+    const sizeB = sizeMatch ? parseFloat(sizeMatch[1]) : 0;
+
+    if (sizeB > 0 && sizeB <= 9) {
+      // 7B-class: very limited context, aggressive trim
+      return { maxMessages: 16, numCtx: 8192 };
+    } else if (sizeB > 9 && sizeB <= 16) {
+      // 14B-class
+      return { maxMessages: 24, numCtx: 12288 };
+    } else if (sizeB > 16 && sizeB <= 34) {
+      // 30B-class: moderate
+      return { maxMessages: 32, numCtx: 16384 };
+    } else if (sizeB > 34) {
+      // 70B+ class: generous
+      return { maxMessages: 48, numCtx: 32768 };
+    }
+    // Unknown size — conservative default
+    return { maxMessages: 32, numCtx: 16384 };
+  }
+
   private isDegenerateOutput(content: string): boolean {
     const trimmed = content.trim();
     if (trimmed.length < 80) { return false; }
@@ -3382,15 +3431,19 @@ If the user asks for a change but provides NO code:
       return { ...m };
     }));
 
+    const { numCtx } = this.getModelContextLimits();
+
     const body: {
       model: string;
       stream: false;
       messages: OllamaMessage[];
       tools?: ToolDefinition[];
+      options?: { num_ctx: number };
     } = {
       model,
       stream: false,
-      messages: requestMessages
+      messages: requestMessages,
+      options: { num_ctx: numCtx }
     };
 
     if (this.isAgentLike) {

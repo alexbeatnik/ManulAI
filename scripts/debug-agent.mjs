@@ -32,6 +32,18 @@ const MODEL       = process.env.MANUL_MODEL ?? 'qwen2.5-coder:7b';
 const DRY_RUN     = process.env.DRY_RUN === 'true';
 const MAX_TURNS   = parseInt(process.env.MAX_TURNS ?? '30', 10);
 
+// Model-based context limits: parse size hint from model tag (e.g. :7b, :30b)
+function getModelContextLimits(model) {
+  const m = model.toLowerCase().match(/(\d+\.?\d*)b/);
+  const sizeB = m ? parseFloat(m[1]) : 0;
+  if (sizeB > 0 && sizeB <= 9)  return { maxMessages: 16, numCtx: 8192 };
+  if (sizeB > 9 && sizeB <= 16) return { maxMessages: 24, numCtx: 12288 };
+  if (sizeB > 16 && sizeB <= 34) return { maxMessages: 32, numCtx: 16384 };
+  if (sizeB > 34) return { maxMessages: 48, numCtx: 32768 };
+  return { maxMessages: 32, numCtx: 16384 };
+}
+const MODEL_LIMITS = getModelContextLimits(MODEL);
+
 const cliArgs = process.argv.slice(2);
 
 // --planner flag or MANUL_MODE env var selects planner (condensed) mode
@@ -2089,20 +2101,21 @@ async function main() {
     label(C, `TURN ${turn}`, `retry=${retryCount} messages=${messages.length}`);
     logEvent('ollama_request', { turn, retryCount, messageCount: messages.length });
 
-    // Sliding window: prevent context overflow by trimming old tool results
-    if (messages.length > 22) {
+    // Sliding window: prevent context overflow based on model size
+    if (messages.length > MODEL_LIMITS.maxMessages) {
       const first2 = messages.slice(0, 2); // initial plan + user prompt
-      const recent = messages.slice(-14); // most recent 14 messages
-      const trimNotice = { role: 'user', content: `Context trimmed to prevent overflow. Continue splitting ${TARGET_FILE}: read the next un-extracted section and extract another module.` };
+      const tailCount = MODEL_LIMITS.maxMessages - 3; // 2 head + 1 trim notice
+      const recent = messages.slice(-tailCount);
+      const trimNotice = { role: 'user', content: `Context trimmed to prevent overflow. Continue with the task — execute the next required action.` };
       messages.splice(0, messages.length, ...first2, trimNotice, ...recent);
       seenReadSigs.clear(); // allow re-reads after context trim
-      label(Y, 'CONTEXT TRIM', `Trimmed to ${messages.length} messages`);
+      label(Y, 'CONTEXT TRIM', `Trimmed to ${messages.length} messages (limit ${MODEL_LIMITS.maxMessages} for model ${MODEL})`);
     }
 
     const body = {
       model: MODEL,
       stream: false,
-      options: { num_ctx: 16384 },
+      options: { num_ctx: MODEL_LIMITS.numCtx },
       messages: [
         { role: 'system', content: MANUL_MODE === 'planner' ? buildPlannerMandate() : buildAgentMandate() },
         ...messages
