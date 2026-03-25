@@ -3809,7 +3809,21 @@ If the user asks for a change but provides NO code:
           return calls;
         }
       } catch {
-        // JSON.parse failed — try repairing single-quoted JSON (common with weak models)
+        // JSON.parse failed — try escaping literal control chars inside string values
+        // (models like qwen2.5-coder output raw newlines in content fields)
+        const escaped = this.escapeJsonStringValues(candidate);
+        if (escaped !== candidate) {
+          try {
+            const parsed = JSON.parse(escaped) as unknown;
+            const calls = this.normalizeParsedToolCalls(parsed);
+            if (calls.length > 0 && calls.every(c => knownToolNames.has(c.function.name))) {
+              return calls;
+            }
+          } catch {
+            // fall through to single-quote repair
+          }
+        }
+        // Try repairing single-quoted JSON (common with weak models)
         const repaired = this.repairSingleQuotedJson(candidate);
         if (repaired) {
           try {
@@ -3826,6 +3840,30 @@ If the user asks for a change but provides NO code:
     }
 
     return [];
+  }
+
+  /**
+   * Escape literal control characters (newlines, tabs, carriage returns) that appear
+   * inside JSON string values. Structural whitespace outside strings is preserved.
+   * Fixes truncated/malformed JSON from models that output raw newlines in content fields.
+   */
+  private escapeJsonStringValues(s: string): string {
+    let result = '';
+    let inStr = false;
+    for (let i = 0; i < s.length; i++) {
+      const ch = s[i];
+      if (inStr) {
+        if (ch === '\\') { result += ch + (s[++i] ?? ''); continue; }
+        if (ch === '\r') { result += (s[i + 1] === '\n') ? (i++, '\\n') : '\\r'; continue; }
+        if (ch === '\n') { result += '\\n'; continue; }
+        if (ch === '\t') { result += '\\t'; continue; }
+        if (ch === '"') { inStr = false; }
+      } else {
+        if (ch === '"') { inStr = true; }
+      }
+      result += ch;
+    }
+    return result;
   }
 
   private parseTaggedToolCalls(content: string): ToolFunctionCall[] {
