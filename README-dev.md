@@ -107,6 +107,7 @@ Agent Mode currently exposes these tools to Ollama:
 - `write_to_file`
 - `replace_in_file`
 - `execute_terminal_command`
+- `launch_in_terminal`
 - `delete_file`
 - `list_workspace_files`
 - `project_scan`
@@ -116,6 +117,10 @@ Agent Mode currently exposes these tools to Ollama:
 Direct pre-agent handlers also exist for common fast-path edits such as Markdown title rename and LICENSE author rename.
 
 `read_file_slice` is the bounded-reader path for large files. It accepts a file path plus 1-based inclusive `startLine` and `endLine`, and should be preferred when the model only needs a local section instead of the entire file.
+
+`execute_terminal_command` runs a shell command via Node `exec()` and captures stdout/stderr. It has no stdin — interactive programs will hang and time out after 60 seconds. When a timeout occurs because the child process was killed, the error explicitly hints that stdin is unavailable and that interactive programs should not be retried.
+
+`launch_in_terminal` opens a visible VS Code integrated terminal via `vscode.window.createTerminal()` and sends the command to it. The user can interact with the program directly (type input, respond to prompts, play games). The tool returns immediately with `{ launched: true }` — the model does not see the terminal output. This is fire-and-forget by design.
 
 `project_scan` is the high-level orientation tool. It summarizes key files, likely entry points, language hints, project type hints, package manager signals, `frameworkHints`, and important top-level modules across common ecosystems without forcing the model to open many files first. Its manifest parsing is deeper for Python, Java, C#, Rust, and Go so the model can recover framework and runtime-entry signals before doing narrow file reads.
 
@@ -175,7 +180,7 @@ Chats also persist a compact `summaryMemory` alongside the full transcript in `.
 
 ## Release Notes
 
-- **0.0.5:** Added Planner Mode as the third working mode alongside Chat and Agent — uses the same tools as Agent Mode but with a condensed step-by-step mandate; can answer direct text questions without tool calls. Context trimming is now model-aware: sliding-window size and `num_ctx` are derived from the model size tag instead of hardcoded limits. Tool-call stripping was tightened so only `json`/`tool_call`/`tool` code blocks are removed instead of all fenced code blocks. Split provider-side helper logic out of `src/ManulAiChatProvider.ts` into `src/providerRefactorUtils.ts`, `src/providerSafetyUtils.ts`, `src/providerPersistenceUtils.ts`, `src/providerWebviewUtils.ts`, `src/providerToolParsingUtils.ts`, and `src/providerFileFallbackUtils.ts`. Production now matches the stronger repeated narrated-call bootstrap behavior already validated in the standalone harness, Go/Rust extraction writes are screened for obviously invalid generated blocks before they hit disk, tool-call parsing and malformed JSON recovery now live outside the main provider, and fallback file-write extraction heuristics are isolated from the orchestration layer. Test script tool definitions are aligned with the extension's real parameter names.
+- **0.0.5:** Added Planner Mode as the third working mode alongside Chat and Agent — uses the same tools as Agent Mode but with a condensed step-by-step mandate; can answer direct text questions without tool calls. Added `launch_in_terminal` tool for running interactive programs in a visible VS Code terminal; `execute_terminal_command` now detects timeout-killed processes and reports stdin unavailability. Context trimming is now model-aware: sliding-window size and `num_ctx` are derived from the model size tag instead of hardcoded limits. Tool-call stripping was tightened so only `json`/`tool_call`/`tool` code blocks are removed instead of all fenced code blocks. Split provider-side helper logic out of `src/ManulAiChatProvider.ts` into `src/providerRefactorUtils.ts`, `src/providerSafetyUtils.ts`, `src/providerPersistenceUtils.ts`, `src/providerWebviewUtils.ts`, `src/providerToolParsingUtils.ts`, and `src/providerFileFallbackUtils.ts`. Production now matches the stronger repeated narrated-call bootstrap behavior already validated in the standalone harness, Go/Rust extraction writes are screened for obviously invalid generated blocks before they hit disk, tool-call parsing and malformed JSON recovery now live outside the main provider, and fallback file-write extraction heuristics are isolated from the orchestration layer. Test script tool definitions are aligned with the extension's real parameter names.
 - Raw or malformed tool-call JSON leaked into assistant text must be treated as a failed tool invocation and retried; fallback file-write extractors must never treat that payload as file content.
 - Fallback file-write extraction must ignore shell-language fenced blocks and reject suspicious pseudo-filenames such as numeric dotted names or names with trailing dots.
 - Direct fast paths remain conservative and are limited to narrow cases such as Markdown title rename and LICENSE author rename.

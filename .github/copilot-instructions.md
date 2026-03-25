@@ -60,6 +60,8 @@ This repository contains a VS Code extension named ManulAI.
 - For large refactor requests, nudge the model toward short module/file plans and iterative execution instead of one-shot whole-file rewrites.
 - Keep context trimming model-aware; derive sliding-window size and `num_ctx` from the model size tag rather than using hardcoded limits.
 - Keep `num_ctx` always present in the Ollama request body so the runtime allocates an appropriate KV-cache window.
+- Keep `execute_terminal_command` documented as having no stdin; interactive programs must use `launch_in_terminal` which opens a real VS Code terminal.
+- When `execute_terminal_command` times out because the child process was killed, the error must hint that stdin is unavailable and the program should not be retried.
 
 ## Debug Script Parity
 
