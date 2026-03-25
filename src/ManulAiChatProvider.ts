@@ -1076,6 +1076,14 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       }
     }
 
+    if (this.agentMode) {
+      this.messages.push({
+        role: 'user',
+        content: 'Before taking any action, output a brief numbered plan (3–8 steps) describing what you will do. Keep it concise. After the plan, immediately start executing step 1 with the appropriate tool call — do NOT wait for confirmation. After each file modification, run the project build/compile check (for TypeScript: execute_terminal_command with "npx tsc --noEmit 2>&1 | head -30") to verify nothing is broken. Fix any errors before moving to the next step.',
+        hiddenFromTranscript: true
+      });
+    }
+
     this.postStateToWebview();
     await this.runAgentLoop();
   }
@@ -1491,6 +1499,46 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         });
       }
 
+      // --- Post-write build verification ---
+      // After any round that included a successful write tool, run a compile check.
+      // If the check passes, log progress. If it fails, inject errors into model context.
+      const writeToolNames = new Set(['replace_in_file', 'create_or_edit_file', 'write_to_file', 'delete_file']);
+      const hadSuccessfulWrite = resolvedToolCalls.some(tc => {
+        const n = tc.function?.name ?? '';
+        if (!writeToolNames.has(n)) {
+          return false;
+        }
+        // Check the corresponding tool result for absence of error
+        const result = [...messages].reverse().find((m): m is OllamaMessage & { tool_name: string } => m.role === 'tool' && m.tool_name === n);
+        if (!result) {
+          return false;
+        }
+        try {
+          const p = JSON.parse(result.content) as Record<string, unknown>;
+          return !p.error;
+        } catch {
+          return false;
+        }
+      });
+
+      if (hadSuccessfulWrite) {
+        const verifyResult = await this.tryRunBuildVerify(messages);
+        if (verifyResult !== null) {
+          if (verifyResult.ok) {
+            this.postProgressStep('Build check: OK');
+          } else {
+            this.postProgressStep('Build errors detected — sending to model...');
+            const verifyContent = `Build verification (compile check) after edit failed:\n${verifyResult.output || '(no output)'}\n\nFix all errors shown above before continuing. Then re-run the build check to confirm.`;
+            messages.push({
+              role: 'tool',
+              content: JSON.stringify({ tool: 'build_verify', result: verifyContent }),
+              tool_name: 'build_verify',
+              hiddenFromTranscript: false
+            });
+          }
+        }
+      }
+
       await this.processOllamaResponse(messages, 0);
       return;
     }
@@ -1832,6 +1880,36 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           return;
         }
 
+        // --- Fallback layer 6c: first-response plan display ---
+        // If the model produces a structured plan as its very first response (no tools called yet
+        // in this exchange), show it to the user then nudge it to start executing immediately.
+        {
+          const lastVisibleUserIdxPlan = this.getLastVisibleUserMessageIndex(messages);
+          const recentMsgsPlan = lastVisibleUserIdxPlan >= 0 ? messages.slice(lastVisibleUserIdxPlan) : messages;
+          const hasAnyToolResultYet = recentMsgsPlan.some(m => m.role === 'tool');
+          const looksLikePlan = !hasAnyToolResultYet
+            && retryCount === 0
+            && finalContent.length > 60
+            && (
+              /^\s*\d+\.\s+.{10,}/m.test(finalContent)         // numbered list item
+              || /^\s*[-*]\s+.{10,}/m.test(finalContent)       // bullet list item
+              || /(?:plan:|steps?:|крок\s*\d+|^step\s+\d+)/im.test(finalContent)
+            );
+          if (looksLikePlan) {
+            // Show the plan to the user as a visible assistant message
+            messages.push({ role: 'assistant', content: finalContent });
+            this.postStateToWebview();
+            messages.push({
+              role: 'user',
+              content: 'Plan noted. Now execute step 1 immediately with the appropriate tool call. Do not describe what you will do — actually call the tool.',
+              hiddenFromTranscript: true
+            });
+            this.postStatus('Plan received — starting execution...');
+            await this.processOllamaResponse(messages, 0);
+            return;
+          }
+        }
+
         // --- Fallback layer 6b: nudge the model to use tools if it didn't ---
         // If tools were already used in the CURRENT exchange (after the last user message),
         // the model's text response is a legitimate summary — don't nudge it.
@@ -1860,6 +1938,14 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
             const addedLines = Array.from(diff.matchAll(/^\+(.+)$/gm)).map(m => m[1].trim());
             if (removedLines.length > 0 && removedLines.length === addedLines.length
               && removedLines.every((line, i) => line === addedLines[i])) {
+              return false;
+            }
+            // In a large-refactor scenario, a trivial single-line rename without an import
+            // replacement is not a meaningful extraction step — only real block extractions
+            // (multi-line replaced by import, or import added) count.
+            if (this.isLargeRefactorScenario()
+              && removedLines.length <= 1 && addedLines.length <= 1
+              && !addedLines.some(l => /^\s*import\b/.test(l))) {
               return false;
             }
             return true;
@@ -3331,203 +3417,155 @@ ${wsRoot ? `Workspace root: ${wsRoot}\n` : ''}
 All file paths are relative to the workspace root unless absolute.
 
 ---
-[GOLDEN RULES]
 
-- Always read before write.
-- Never guess — verify with tools.
-- Use minimal edits, preserve structure.
-- Do not claim success unless tool confirms.
-- After each change, re-check the file or output.
-- Stop after 3 failed retries and report the reason.
+[PRIMARY DIRECTIVE]
 
----
+You are an ACTION agent.
 
-[CORE BEHAVIOR]
-
-- You are an ACTION agent, not a chat assistant.
-- If a task requires file edits or commands, you MUST use tools.
-- Do not describe fixes — APPLY them.
-- Do not ask the user to run commands — run them yourself.
-- If no tools are needed, respond concisely.
-- NEVER claim a file was modified unless a tool succeeded.
-- Avoid dumping full file contents unless explicitly requested.
+If a task can be solved using tools → USE TOOLS.
+Do NOT describe solutions. EXECUTE them.
 
 ---
 
-[PRIORITIES]
+[DECISION FLOW]
 
-1. Correctness over speed
-2. Safety over completeness
-3. Tool usage over assumptions
-4. Minimal change over refactoring
+Determine required action:
+
+1. File or code modification needed
+   → Use file tools
+
+2. Command execution needed
+   → Use execute_terminal_command
+
+3. Code understanding required
+   → Read files first
+
+4. No tools required
+   → Respond concisely
+
+Never skip required tool usage.
 
 ---
 
-[FLOW CONTROL]
+[EXECUTION MODES]
 
-For SIMPLE tasks:
-→ Act immediately using tools.
+SIMPLE TASK:
+→ Execute immediately using tools
 
-For NON-TRIVIAL tasks:
-1. Output a short numbered plan
-2. Execute step-by-step using tools
+NON-TRIVIAL TASK:
+1. Output short plan
+2. Execute steps sequentially
 3. Announce progress before each step
-4. End with a short factual summary
+4. Use tools per step
+5. Output final summary
 
-Example:
-Step 1/3: Reading project structure...
-
-Do NOT:
-- stop after planning
-- output partial plans
-- end with polite phrases
+Constraints:
+- Do NOT stop after planning
+- Do NOT skip steps
+- Do NOT partially execute plan
 
 ---
 
-[TOOL USAGE RULES]
+[REALITY MODEL]
 
-- ALWAYS use native tool-calling (never raw JSON text)
-- NEVER simulate edits in chat
-- Use:
-  - replace_in_file → for small changes
-  - create_or_edit_file → only if full rewrite is required
+- File contents are UNKNOWN until read
+- Project structure is UNKNOWN until listed
+- Results are UNKNOWN until tool confirms
 
-When fixing code:
-1. Read file
-2. Identify real issue
-3. Apply minimal fix
-
-If unsure:
-→ read more files, do NOT guess
-
-If a command is needed:
-→ use execute_terminal_command
-
----
-
-[WHEN NOT TO USE TOOLS]
-
-Do NOT use tools when:
-- answering conceptual questions
-- explaining behavior
-- no file or command interaction is required
-
-In those cases:
-→ respond concisely in plain text
-
----
-
-[REALITY CHECK]
-
-- You do NOT know file contents unless you read them
-- You do NOT know project structure unless you list it
-- You do NOT know if a fix worked unless a tool confirms it
-- Never assume — always verify
-
----
-
-[MANDATORY READ BEFORE WRITE]
-
-- You MUST read a file before modifying it
-- If you did not read it, you MUST NOT edit it
+Never assume. Always verify.
 
 ---
 
 [FILE EDITING RULES]
 
-- Make ONLY the requested change
-- NEVER remove unrelated content
-- NEVER rewrite entire file unless explicitly required
-- ALWAYS preserve structure
+MANDATORY:
 
-MULTI-STEP EDITS:
-- One tool call per change
-- Wait for result before next change
+- MUST read file before editing
+- MUST preserve all unrelated content
+- MUST apply minimal change only
+- MUST use replace_in_file for small edits
 
----
+FORBIDDEN:
 
-[ANTI-HALLUCINATION]
+- Full file overwrite unless explicitly required
+- Removing unknown code
+- Batch editing multiple changes at once
 
-- If unsure:
-  → read more files
-- NEVER guess
+EDITING PROCESS:
 
----
+1. Read file
+2. Identify exact issue
+3. Apply minimal fix
+4. Repeat if needed
 
-[ANTI-LOOP GUARD]
-
-- Do NOT repeat the same failed action more than twice
-- If repeated failure:
-  → change approach OR gather more context
+Multiple changes:
+→ ONE tool call per change
 
 ---
 
-[RETRY POLICY]
+[TOOL USAGE RULES]
 
-- Maximum 3 retries per failed action
-- After that:
-  → adjust strategy (do NOT blindly retry)
+- ALWAYS use native tool calls
+- NEVER output raw JSON
+- NEVER simulate edits in chat
+- NEVER output code instead of applying it
+
+If fix is known → APPLY immediately
 
 ---
 
 [FAILURE HANDLING]
 
 If a tool fails:
-1. Read error
+
+1. Analyze error
 2. Adjust approach
 3. Retry
 
-If still failing:
-→ gather more context using tools
+Do NOT stop after failure.
 
 ---
 
-[ITERATIVE EXECUTION]
+[ANTI-HALLUCINATION]
 
-- Never solve everything in one step
-- Break tasks into smaller steps
-- Execute sequentially
+If uncertain:
 
-Bad:
-→ one massive change
+→ Read more files
+→ Gather more context
 
-Good:
-→ read → fix → verify → continue
+DO NOT guess.
 
 ---
 
-[MINIMALISM RULE]
+[PROGRESS GUARANTEE]
 
-- Make the smallest correct change
-- Do not modify unrelated code
-- Avoid unnecessary improvements
+If a plan is created:
+→ ALL steps MUST be executed
+
+Stopping mid-plan is forbidden.
 
 ---
 
-[TASK COMPLETION]
+[COMPLETION RULE]
 
-A task is COMPLETE only if:
-- The requested change is applied
+Task is complete ONLY IF:
+
+- All required steps executed
 - All tool calls succeeded
-- No remaining errors are visible
 
-Before finishing:
-- Verify:
-  - Did I use tools if required?
-  - Did they succeed?
-  - Did I complete all steps?
-
-If all checks pass:
-→ output a short factual summary and STOP
+If not → continue working
 
 ---
 
 [OUTPUT RULES]
 
 - Keep responses minimal
+- Only:
+  - progress
+  - actions
+  - results
 - No unnecessary explanations
 - No polite endings
-- Only facts and progress
 `;
 
       if (workspaceInstructions) {
@@ -4585,8 +4623,21 @@ If the user asks for a change but provides NO code:
         }
         case 'read_file_slice':
           return await this.readFileSlice(String(args.filepath ?? ''), args.startLine, args.endLine);
-        case 'create_or_edit_file':
-          return await this.createOrEditFile(String(args.filename ?? args.filepath ?? ''), String(args.content ?? ''));
+        case 'create_or_edit_file': {
+          const createFilename = String(args.filename ?? args.filepath ?? '');
+          const createContent = String(args.content ?? '');
+          if (this.isLargeRefactorScenario()) {
+            const contentLines = createContent.replace(/\r\n/g, '\n').split('\n').map(l => l.trim()).filter(Boolean);
+            const codeLikeLines = contentLines.filter(l =>
+              !/^(?:\/\/|\/\*|\*|#)/.test(l)
+              && (/(?:^|\s)(?:export|import|const|let|var|function|class|interface|type|enum|async|return)\b/.test(l) || /[{}();=]/.test(l))
+            );
+            if (codeLikeLines.length === 0) {
+              return JSON.stringify({ error: 'Content is a placeholder or has no actual code — do NOT write placeholder comments. You must copy the exact TypeScript code blocks you want to extract (the interfaces, constants, or methods you just read from read_file_slice) directly into this new file. Then call replace_in_file on the original file to replace that extracted block with an import statement.' });
+            }
+          }
+          return await this.createOrEditFile(createFilename, createContent);
+        }
         case 'write_to_file':
           return await this.createOrEditFile(String(args.filepath ?? ''), String(args.content ?? ''));
         case 'replace_in_file':
@@ -4757,6 +4808,59 @@ If the user asks for a change but provides NO code:
       return false;
     }
     return this.looksLikeLargeRefactorRequest(latestUserRequest);
+  }
+
+  // Runs a compile/build check after a write tool succeeds.
+  // Returns { ok, output } if a check was performed, null if the workspace has no build config
+  // or the per-request verify cap (3) is reached.
+  private async tryRunBuildVerify(messages: OllamaMessage[]): Promise<{ ok: boolean; output: string } | null> {
+    const cap = 3;
+    const verifyCount = messages.filter(m => m.tool_name === 'build_verify').length;
+    if (verifyCount >= cap) {
+      return null;
+    }
+
+    const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri;
+    if (!workspaceRoot) {
+      return null;
+    }
+
+    // Detect build check command: prefer tsconfig.json → tsc --noEmit
+    let command: string | undefined;
+    try {
+      await vscode.workspace.fs.stat(vscode.Uri.joinPath(workspaceRoot, 'tsconfig.json'));
+      command = 'npx tsc --noEmit 2>&1 | head -30';
+    } catch {
+      // tsconfig not found — try package.json compile script as fallback
+      try {
+        const pkgBytes = await vscode.workspace.fs.readFile(vscode.Uri.joinPath(workspaceRoot, 'package.json'));
+        const pkg = JSON.parse(Buffer.from(pkgBytes).toString('utf8')) as Record<string, unknown>;
+        const scripts = pkg.scripts as Record<string, string> | undefined;
+        if (scripts?.compile) {
+          command = 'npm run compile 2>&1 | head -30';
+        } else if (scripts?.build) {
+          command = 'npm run build 2>&1 | head -30';
+        }
+      } catch {
+        // no package.json either
+      }
+    }
+
+    if (!command) {
+      return null;
+    }
+
+    try {
+      const raw = await this.executeTerminalCommand(command);
+      const parsed = JSON.parse(raw) as Record<string, unknown>;
+      const stdout = String(parsed.stdout ?? '').trim();
+      const stderr = String(parsed.stderr ?? '').trim();
+      const output = [stdout, stderr].filter(Boolean).join('\n').trim();
+      const exitCode = Number(parsed.exitCode ?? 1);
+      return { ok: exitCode === 0, output };
+    } catch {
+      return null;
+    }
   }
 
   // Returns a capped read result if the file exceeds maxLines, null otherwise (caller should do full read).
