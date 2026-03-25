@@ -50,6 +50,8 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   private totalReadOps = 0;
   private currentRequestRequiresWrite = true;
   private failedCommandCounts = new Map<string, number>();
+  private lastNudgedResponseContent = '';
+  private consecutiveIdenticalResponses = 0;
   private repeatedNarratedToolSignature: string | null = null;
   private repeatedNarratedToolCount = 0;
   private workspaceSettings: Partial<ManulAiStoredSettings> = {};
@@ -755,6 +757,34 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         : vscode.window.activeTextEditor?.document.uri.fsPath
     });
     this.messages.push({ role: 'user', content: text });
+
+    // If the user re-sent the exact same prompt (e.g. after switching models),
+    // trim the stale assistant/tool messages from the previous failed exchange
+    // so the new model starts from a clean slate.
+    {
+      const visibleUserMessages = this.messages
+        .map((m, i) => ({ m, i }))
+        .filter(({ m }) => m.role === 'user' && !m.hiddenFromTranscript && typeof m.content === 'string');
+      const thisIdx = visibleUserMessages.length - 1;
+      const prevIdx = thisIdx - 1;
+      if (prevIdx >= 0) {
+        const prevMsg = visibleUserMessages[prevIdx];
+        if (prevMsg.m.content === text) {
+          // Find the range of messages between the previous user message and this one
+          const startTrim = prevMsg.i + 1;
+          const endTrim = visibleUserMessages[thisIdx].i;
+          const staleCount = endTrim - startTrim;
+          if (staleCount > 0) {
+            this.debugLog('stale_exchange_trim', {
+              trimmedCount: staleCount,
+              reason: 'duplicate_user_prompt_after_model_switch'
+            });
+            this.messages.splice(startTrim, staleCount);
+          }
+        }
+      }
+    }
+
     const exchangeStartIndex = this.getLastVisibleUserMessageIndex(this.messages);
 
     if (this.agentMode && this.looksLikeFileMutationRequest(text)) {
@@ -802,6 +832,8 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     this.totalReadOps = 0;
     this.currentRequestRequiresWrite = /\b(?:create|write|edit|modify|update|add|append|change|rename|delete|remove|refactor|split|move)\b/i.test(text);
     this.failedCommandCounts.clear();
+    this.lastNudgedResponseContent = '';
+    this.consecutiveIdenticalResponses = 0;
     await this.runAgentLoop(exchangeStartIndex);
   }
 
@@ -2179,9 +2211,26 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           || (hasRecentToolErrors && (claimsDone || mentionsChange || isLazyAcknowledgment || hasIncompletePlan || hasExplicitNextSteps || isProgressOnlyResponse))
           || (!hasRecentSuccessfulAction && (isLongDump || hasLargeCodeBlocks || claimsDone || mentionsChange || isLazyAcknowledgment))
         );
+
+        // Detect identical verbatim responses — model is stuck in a loop
+        const contentTrimmed = finalContent.trim();
+        if (contentTrimmed && contentTrimmed === this.lastNudgedResponseContent) {
+          this.consecutiveIdenticalResponses++;
+        } else {
+          this.consecutiveIdenticalResponses = 0;
+        }
+        this.lastNudgedResponseContent = contentTrimmed;
+
+        // If model has repeated the exact same response 2+ times, cap retries to break the loop
+        const effectiveMaxNudgeRetries = this.consecutiveIdenticalResponses >= 2
+          ? Math.min(maxNudgeRetries, retryCount) // immediately stop
+          : this.consecutiveIdenticalResponses >= 1
+            ? Math.min(maxNudgeRetries, retryCount + 1) // one more chance with escalated nudge
+            : maxNudgeRetries;
+
         const shouldNudge = requiresToolContinuation
           && !canStopAfterTinyLargeRefactor
-          && retryCount < maxNudgeRetries;
+          && retryCount < effectiveMaxNudgeRetries;
         const shouldAutoBootstrapLargeRefactorRead = Boolean(
           shouldNudge
           && retryCount >= 1
@@ -2409,6 +2458,12 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
             ? `\nIf you describe the same tool call in plain text again instead of executing it, the system will auto-bootstrap ${bootstrapCandidate.toolCall.function?.name}.`
             : '';
 
+          // Escalate nudge when model is repeating the exact same response verbatim
+          if (this.consecutiveIdenticalResponses >= 1) {
+            nudgeMessage = `CRITICAL: You have produced the EXACT SAME response ${this.consecutiveIdenticalResponses + 1} times in a row. Your current approach is not working. You MUST change strategy completely. Do NOT repeat this response again. ` + nudgeMessage;
+            this.debugLog('identical_response_escalation', { consecutiveIdenticalResponses: this.consecutiveIdenticalResponses, retryCount });
+          }
+
           messages.push({
             role: 'user',
             content: `${nudgeMessage}${narratedBootstrapWarning}`,
@@ -2422,7 +2477,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         // --- Last-ditch code block extraction before giving up ---
         // If all nudges failed but the model dumped code blocks in any recent assistant response,
         // try extracting and creating files from those blocks synthetically.
-        if (requiresToolContinuation && retryCount >= maxNudgeRetries && !hasRecentMeaningfulWrite) {
+        if (requiresToolContinuation && retryCount >= effectiveMaxNudgeRetries && !hasRecentMeaningfulWrite) {
           // Scan all recent assistant messages (including hidden ones) for extractable code blocks
           const recentAssistantContents = recentMessages
             .filter(m => m.role === 'assistant' && typeof m.content === 'string')
@@ -2476,10 +2531,11 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           }
         }
 
-        if (requiresToolContinuation && retryCount >= maxNudgeRetries) {
+        if (requiresToolContinuation && retryCount >= effectiveMaxNudgeRetries) {
           this.debugLog('forced_tool_retry_stop', {
             retryCount,
-            maxNudgeRetries,
+            maxNudgeRetries: effectiveMaxNudgeRetries,
+            consecutiveIdenticalResponses: this.consecutiveIdenticalResponses,
             hasRecentToolResults,
             hasRecentSuccessfulAction,
             hasRecentMeaningfulWrite,
