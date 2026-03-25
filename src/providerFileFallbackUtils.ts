@@ -681,7 +681,22 @@ export function extractCodeBlockFileWrites(
       blocks.push({ fullMatch: match[0], filepath, fileContent });
     }
   }
-
+  // Detect code blocks where the first non-empty line is a bare path comment: // src/file.ts
+  const bareCommentPathPattern = /```(\w*)\s*\n\s*(?:\/\/|#)\s*((?:[\w.-]+\/)+[\w.-]+\.[a-zA-Z0-9]+)\s*\n([\s\S]*?)```/g;
+  while ((match = bareCommentPathPattern.exec(content)) !== null) {
+    const lang = (match[1] || '').toLowerCase();
+    const filepath = match[2].trim();
+    const fileContent = match[3];
+    if (shellLanguages.has(lang) || lang === 'diff' || lang === 'patch') {
+      continue;
+    }
+    if (options.looksLikeToolCallContent(fileContent)) {
+      continue;
+    }
+    if (filepath && fileContent.trim() && options.isLikelyFileReference(filepath) && !blocks.some(block => block.filepath === filepath) && !looksLikeDiffOutput(fileContent)) {
+      blocks.push({ fullMatch: match[0], filepath, fileContent });
+    }
+  }
   const precedingNamePattern = /(?:in|to|for|file|called|named|updated?|modified|created?|створ\w*|файл)\s+[`"']?([a-zA-Z0-9_\-\.\/]+)[`"']?[^`]{0,80}```(\w*)\n([\s\S]*?)```/gi;
   while ((match = precedingNamePattern.exec(content)) !== null) {
     const filepath = match[1].trim();

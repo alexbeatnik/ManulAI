@@ -1857,7 +1857,9 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         const recentToolErrors = recentToolResults
           .filter(({ index }) => index > lastSuccessfulActionIndex)
           .map(({ message, parsed }) => ({ toolName: message.tool_name ?? '', error: typeof parsed.error === 'string' ? parsed.error : '' }))
-          .filter(item => item.error);
+          .filter(item => item.error)
+          // Don't count harmless "no active editor" as a real tool error
+          .filter(item => !(item.toolName === 'read_active_file' && /no active/i.test(item.error)));
         const hasRecentToolErrors = recentToolErrors.length > 0;
         const latestBuildVerifyFailure = this.getLatestBuildVerifyFailure(recentToolResults);
         const hasRecentBuildVerifyFailure = Boolean(latestBuildVerifyFailure);
@@ -2342,6 +2344,63 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           this.postStatus(`Model did not use tools (attempt ${retryCount + 1}) — continuing...`);
           await this.processOllamaResponse(messages, retryCount + 1);
           return;
+        }
+
+        // --- Last-ditch code block extraction before giving up ---
+        // If all nudges failed but the model dumped code blocks in any recent assistant response,
+        // try extracting and creating files from those blocks synthetically.
+        if (requiresToolContinuation && retryCount >= maxNudgeRetries && !hasRecentMeaningfulWrite) {
+          // Scan all recent assistant messages (including hidden ones) for extractable code blocks
+          const recentAssistantContents = recentMessages
+            .filter(m => m.role === 'assistant' && typeof m.content === 'string')
+            .map(m => m.content as string);
+          let didExtract = false;
+          for (const assistantContent of recentAssistantContents) {
+            // Try code block file writes (layer 2 patterns)
+            const codeBlockWrites = this.extractCodeBlockFileWrites(assistantContent);
+            if (codeBlockWrites.length > 0) {
+              this.debugLog('last_ditch_code_block_extraction', { files: codeBlockWrites.map(b => b.filepath), source: 'code_block_file_writes' });
+              for (const block of codeBlockWrites) {
+                const writeApproved = this.autoApprove || await this.approveFileWrite([block.filepath]);
+                if (writeApproved) {
+                  const summary = await this.writeFileWithDiff(block.filepath, block.fileContent);
+                  if (!summary.summary.startsWith('Blocked write to ')) {
+                    this.postProgressStep(`Created ${path.basename(block.filepath)} (extracted from model response)`);
+                    messages.push(this.createAssistantMessage(summary.summary, summary.revertOperationId ? [summary.revertOperationId] : []));
+                    didExtract = true;
+                  }
+                }
+              }
+            }
+            if (didExtract) { break; }
+
+            // Try new file creation (layer 4c pattern)
+            const newFileWrite = this.extractNewFileCreation(assistantContent);
+            if (newFileWrite) {
+              this.debugLog('last_ditch_code_block_extraction', { file: newFileWrite.filepath, source: 'new_file_creation' });
+              const writeApproved = this.autoApprove || await this.approveFileWrite([newFileWrite.filepath]);
+              if (writeApproved) {
+                const summary = await this.writeFileWithDiff(newFileWrite.filepath, newFileWrite.fileContent);
+                if (!summary.summary.startsWith('Blocked write to ')) {
+                  this.postProgressStep(`Created ${path.basename(newFileWrite.filepath)} (extracted from model response)`);
+                  messages.push(this.createAssistantMessage(summary.summary, summary.revertOperationId ? [summary.revertOperationId] : []));
+                  didExtract = true;
+                }
+              }
+            }
+            if (didExtract) { break; }
+          }
+          if (didExtract) {
+            // Extraction succeeded — nudge model to continue with next file
+            messages.push({
+              role: 'user',
+              content: 'File created from your code block. Continue immediately with the next file. Call create_or_edit_file for each remaining file with the complete implementation code. Do NOT output a plan or describe steps — only tool calls.',
+              hiddenFromTranscript: true
+            });
+            this.postStatus('Extracted file from code block — continuing...');
+            await this.processOllamaResponse(messages, 0);
+            return;
+          }
         }
 
         if (requiresToolContinuation && retryCount >= maxNudgeRetries) {

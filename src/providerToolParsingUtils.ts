@@ -157,6 +157,21 @@ export function parseToolCallsFromContent(content: string, toolDefinitions: Tool
     }
   }
 
+  // Detect positional tool calls like: create_or_edit_file src/app.ts "content here"
+  // or: create_or_edit_file src/app.ts 'content here'
+  const positionalWriteTools = new Set(['create_or_edit_file', 'write_to_file', 'create_file', 'write_file']);
+  const positionalPattern = /^(create_or_edit_file|write_to_file|create_file|write_file)\s+([\w.\/-]+)\s+["'`]([\s\S]+)["'`]\s*$/m;
+  const positionalMatch = positionalPattern.exec(trimmed);
+  if (positionalMatch && positionalWriteTools.has(positionalMatch[1])) {
+    const toolName = remapWeakModelToolName(positionalMatch[1]);
+    const filepath = positionalMatch[2];
+    // Unescape common escapes from the content string
+    const rawContent = positionalMatch[3].replace(/\\n/g, '\n').replace(/\\t/g, '\t');
+    if (rawContent.trim().length > 10) {
+      return [{ type: 'function', function: { name: toolName, arguments: { filepath, content: rawContent } } }];
+    }
+  }
+
   for (const candidate of candidates) {
     try {
       const parsed = JSON.parse(candidate) as unknown;
