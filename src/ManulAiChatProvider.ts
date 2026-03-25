@@ -3143,6 +3143,7 @@ ${wsRoot ? `Workspace root: ${wsRoot}\n` : ''}
 - For tasks that require code changes or file operations: execute ONE tool call per response. No multi-step plans.
 - After each tool result you receive, decide the next single action.
 - Use file tools for reads/writes, execute_terminal_command for shell.
+- execute_terminal_command has no stdin. Never run interactive programs (input(), readline, read) — they will hang.
 - Keep text output minimal between tool calls.
 - NEVER output raw JSON as a substitute for a tool call.
 - Task is complete when all required changes are done. Output a one-line summary.
@@ -3183,7 +3184,7 @@ You are an ACTION agent. Execute tasks using tools. Never describe what you inte
 [DECISION FLOW]
 
 1. File or code modification needed → use file tools
-2. Command execution needed → use execute_terminal_command
+2. Command execution needed → use execute_terminal_command (no stdin — never run interactive programs)
 3. Code understanding required → read files first with read_file_slice
 4. No tools required → respond concisely
 
@@ -3869,7 +3870,7 @@ If the user asks for a change but provides NO code:
         type: 'function',
         function: {
           name: 'execute_terminal_command',
-          description: 'Execute a shell command in the workspace and return stdout and stderr.',
+          description: 'Execute a shell command in the workspace and return stdout/stderr. No stdin — do not run interactive programs (input(), readline, etc.) as they will hang and time out.',
           parameters: {
             type: 'object',
             properties: {
@@ -5917,12 +5918,18 @@ If the user asks for a change but provides NO code:
           ? (error as NodeJS.ErrnoException).code
           : (error ? 1 : 0);
 
+        let errorMessage = error ? error.message : undefined;
+        // Detect timeout (process killed by signal after timeout)
+        if (error && (error as NodeJS.ErrnoException & { killed?: boolean }).killed) {
+          errorMessage = 'Command timed out after 60 seconds. This terminal has no stdin — if the program expects interactive user input (e.g. input(), readline, scanf), it will always hang and time out. Do not retry interactive programs.';
+        }
+
         resolve(JSON.stringify({
           command: trimmed,
           exitCode,
           stdout,
           stderr,
-          error: error ? error.message : undefined
+          error: errorMessage
         }));
       });
     });

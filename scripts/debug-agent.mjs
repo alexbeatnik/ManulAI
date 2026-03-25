@@ -536,7 +536,7 @@ function getToolDefinitions() {
       type: 'function',
       function: {
         name: 'execute_terminal_command',
-        description: 'Execute a shell command in the workspace root.',
+        description: 'Execute a shell command in the workspace root. No stdin — do not run interactive programs.',
         parameters: {
           type: 'object',
           properties: { command: { type: 'string' } },
@@ -1136,7 +1136,11 @@ async function executeTool(name, args) {
         const { stdout, stderr } = await execAsync(cmd, { cwd: wsRoot, timeout: 30_000, maxBuffer: 1024 * 512 });
         return JSON.stringify({ command: cmd, exitCode: 0, stdout, stderr });
       } catch (e) {
-        return JSON.stringify({ command: cmd, exitCode: e.code ?? 1, stdout: e.stdout ?? '', stderr: e.stderr ?? '', error: e.message });
+        let errorMessage = e.message;
+        if (e.killed) {
+          errorMessage = 'Command timed out after 30 seconds. No stdin available — interactive programs (input(), readline) will always hang.';
+        }
+        return JSON.stringify({ command: cmd, exitCode: e.code ?? 1, stdout: e.stdout ?? '', stderr: e.stderr ?? '', error: errorMessage });
       }
     }
 
