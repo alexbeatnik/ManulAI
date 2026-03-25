@@ -1925,6 +1925,26 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         const isProgressOnlyResponse = progressLines.length > 0
           && finalContent.trim().length < 220
           && progressLines.every((line: string) => /^(?:step\s+\d+\s*(?:\/|of)\s*\d+[:\s-].*|step\s+\d+\s+completed[:\s-].*|execut(?:e|ing)\s+step\s+\d+[:\s-].*|reading (?:the )?file first\.{0,3}|reading and modifying .+|i(?:'| a)?ll read the file.*|i apologize for the oversight\.?|sorry for the oversight\.?)$/i.test(line));
+        const isTinyStepPlan = progressLines.length > 0
+          && finalContent.trim().length < 120
+          && progressLines.every((line: string) => /^(?:\d+\.\s+|[-*]\s+)?(?:create|set\s*up|setup|write|implement|generate|build|start|begin)\b/i.test(line));
+        const hasInspectionOnlyToolLoop = hasRecentToolResults
+          && !hasRecentSuccessfulAction
+          && recentToolResults.every(({ message, parsed }) => {
+            if (parsed.error) {
+              return false;
+            }
+
+            if (message.tool_name === 'execute_terminal_command') {
+              return isTerminalReadOnlyInspectionCommand(String(parsed.command ?? ''));
+            }
+
+            return message.tool_name === 'list_workspace_files'
+              || message.tool_name === 'project_scan'
+              || message.tool_name === 'read_active_file'
+              || message.tool_name === 'read_specific_file'
+              || message.tool_name === 'read_file_slice';
+          });
 
         const recentExecutedCommands = recentToolMessages
           .filter(message => message.tool_name === 'execute_terminal_command')
@@ -2028,6 +2048,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           || !!hasIncompletePlan
           || hasExplicitNextSteps
           || isProgressOnlyResponse
+          || (hasInspectionOnlyToolLoop && isTinyStepPlan)
           || claimedButUnexecutedCommand
           || hasLargeRefactorShellReadBypass
           || hasPreReadLargeRefactorNarration
@@ -2140,7 +2161,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
             && !hasPreReadLargeRefactorNarration
             && !isAskingUserForExactSlice
             && !(isLargeRefactorRequest && !hasRecentSuccessfulAction && (isLongDump || hasLargeCodeBlocks))
-            && (hasIncompletePlan || hasExplicitNextSteps || claimedButUnexecutedCommand || claimsDone || mentionsChange || isPassingToUser || isAnnouncedButNotExecuted)) {
+            && (hasIncompletePlan || hasExplicitNextSteps || isTinyStepPlan || claimedButUnexecutedCommand || claimsDone || mentionsChange || isPassingToUser || isAnnouncedButNotExecuted)) {
             const planText = finalContent.trim();
             if (planText) {
               messages.push({ role: 'assistant', content: planText });
@@ -2221,6 +2242,8 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
             nudgeMessage = stepMatch
               ? `You are on step ${stepMatch[1]} of ${stepMatch[2]} but stopped. Continue executing your plan in small consecutive edits. Proceed to the next step now with tools, and keep going function-by-function or block-by-block instead of stopping after a single step.`
               : 'You reported that one step was completed and announced the next step, but you stopped before executing it. Continue now by calling the next tool instead of narrating the plan. Keep the next change small and self-contained.';
+          } else if (hasInspectionOnlyToolLoop && isTinyStepPlan) {
+            nudgeMessage = 'You already inspected the workspace. Stop planning. Do NOT call list_workspace_files again unless the target path is still genuinely unknown. If the workspace is empty, that is allowed. Your next response must call create_or_edit_file or write_to_file with a concrete source file path under src/ and the real implementation code. Do not reply with another step list.';
           } else if (isLargeRefactorRequest) {
             const primaryTarget = largeRefactorTargets[0];
             if (primaryTarget && !hasRecentReadOfLargeRefactorTarget) {
