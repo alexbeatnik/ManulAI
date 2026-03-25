@@ -1913,6 +1913,8 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           .map(({ message, parsed }) => ({ toolName: message.tool_name ?? '', error: typeof parsed.error === 'string' ? parsed.error : '' }))
           .filter(item => item.error);
         const hasRecentToolErrors = recentToolErrors.length > 0;
+        const latestBuildVerifyFailure = this.getLatestBuildVerifyFailure(recentToolResults);
+        const hasRecentBuildVerifyFailure = Boolean(latestBuildVerifyFailure);
         const latestVisibleUserRequest = this.getLatestVisibleUserRequest(messages);
         const largeRefactorTargets = this.extractLikelyRequestFileTargets(latestVisibleUserRequest);
         const hasRecentReadOfLargeRefactorTarget = largeRefactorTargets.length > 0 && recentToolResults.some(({ message, parsed }) => {
@@ -2085,6 +2087,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           || hasModelRefusalResponse
           || hasLazyRefusalOnLargeRefactor
           || hasPostCreateRefactorNarration
+          || (hasRecentBuildVerifyFailure && (claimsDone || mentionsChange || isLazyAcknowledgment || hasIncompletePlan || hasExplicitNextSteps || isProgressOnlyResponse || isPassingToUser))
           || (isLargeRefactorRequest && hasRecentToolResults && (!hasRecentSuccessfulAction || !hasRecentReadOfLargeRefactorTarget || !hasRecentMeaningfulWrite))
           || (hasRecentReplaceNotFound && (mentionsChange || claimsDone || isLazyAcknowledgment || hasIncompletePlan || hasExplicitNextSteps || isPassingToUser || isProgressOnlyResponse))
           || (hasRecentToolErrors && (claimsDone || mentionsChange || isLazyAcknowledgment || hasIncompletePlan || hasExplicitNextSteps || isProgressOnlyResponse))
@@ -2133,7 +2136,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         }
 
         if (shouldNudge) {
-          this.debugLog('nudge', { retryCount, hasRecentToolResults, hasRecentSuccessfulAction, hasRecentMeaningfulWrite, latestCreatedFilePath, hasRecentReadOfLargeRefactorTarget, hasLargeRefactorShellReadBypass, hasPreReadLargeRefactorNarration, hasFakePreReadCodeDump, hasFakePostReadAnalysisDump, hasPostReadSummaryOnLargeRefactor, hasModelRefusalResponse, hasAnnouncedExtractionWithoutWrite, hasLazyRefusalOnLargeRefactor, isAskingUserForExactSlice, suggestedNextSlice, hasReadButNoWriteOnLargeRefactor, hasPostReadToolStall, hasPostCreateRefactorNarration, announcedNewFilePath, hasRecentToolErrors, hasRecentReplaceNotFound, replaceNotFoundFilepath, replaceNotFoundStartLine, replaceNotFoundEndLine, lastSuccessfulActionIndex, isLongDump, hasLargeCodeBlocks, claimsDone, mentionsChange, isLazyAcknowledgment, hasIncompletePlan: !!hasIncompletePlan, hasExplicitNextSteps, isProgressOnlyResponse, claimedButUnexecutedCommand, isPassingToUser, isAnnouncedButNotExecuted, isLargeRefactorRequest, contentPreview: finalContent.substring(0, 200) });
+          this.debugLog('nudge', { retryCount, hasRecentToolResults, hasRecentSuccessfulAction, hasRecentMeaningfulWrite, latestCreatedFilePath, hasRecentReadOfLargeRefactorTarget, hasLargeRefactorShellReadBypass, hasPreReadLargeRefactorNarration, hasFakePreReadCodeDump, hasFakePostReadAnalysisDump, hasPostReadSummaryOnLargeRefactor, hasModelRefusalResponse, hasAnnouncedExtractionWithoutWrite, hasLazyRefusalOnLargeRefactor, isAskingUserForExactSlice, suggestedNextSlice, hasReadButNoWriteOnLargeRefactor, hasPostReadToolStall, hasPostCreateRefactorNarration, announcedNewFilePath, hasRecentToolErrors, hasRecentBuildVerifyFailure, hasRecentReplaceNotFound, replaceNotFoundFilepath, replaceNotFoundStartLine, replaceNotFoundEndLine, lastSuccessfulActionIndex, isLongDump, hasLargeCodeBlocks, claimsDone, mentionsChange, isLazyAcknowledgment, hasIncompletePlan: !!hasIncompletePlan, hasExplicitNextSteps, isProgressOnlyResponse, claimedButUnexecutedCommand, isPassingToUser, isAnnouncedButNotExecuted, isLargeRefactorRequest, contentPreview: finalContent.substring(0, 200) });
           // Show plan/progress text to the user before nudging
           if (!isProgressOnlyResponse
             && !hasFakePreReadCodeDump
@@ -2240,6 +2243,8 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
             nudgeMessage = replaceNotFoundFilepath && replaceNotFoundStartLine && replaceNotFoundEndLine
               ? `Your replace_in_file call failed because old_text did not match the real file content. First call read_file_slice for ${replaceNotFoundFilepath} with startLine=${replaceNotFoundStartLine} and endLine=${replaceNotFoundEndLine}. Do NOT guess. Then call replace_in_file again using the exact current text including whitespace.`
               : `Your replace_in_file call failed because old_text did not match the real file content.${replaceNotFoundFilepath ? ` First call read_file_slice for ${replaceNotFoundFilepath} with startLine=1 and endLine=120 (or the section containing your target text).` : ' First call read_file_slice for that file with a bounded line range containing the section you want to edit.'} Do NOT guess. Do NOT ask the user to confirm. Read the slice now, then call replace_in_file again using the exact current text including whitespace and indentation.`;
+          } else if (hasRecentBuildVerifyFailure && latestBuildVerifyFailure) {
+            nudgeMessage = this.buildBuildVerifyFailureNudge(latestBuildVerifyFailure.stack, latestBuildVerifyFailure.result);
           } else if (hasRecentToolErrors) {
             const lastErr = recentToolErrors[recentToolErrors.length - 1];
             nudgeMessage = lastErr?.error
@@ -6267,6 +6272,72 @@ If the user asks for a change but provides NO code:
     }
 
     return fallbackRead;
+  }
+
+  private getLatestBuildVerifyFailure(
+    recentToolResults: Array<{ message: OllamaMessage & { role: 'tool' }; parsed: Record<string, unknown>; index: number }>
+  ): { stack: string; result: string } | undefined {
+    for (let index = recentToolResults.length - 1; index >= 0; index -= 1) {
+      const { message, parsed } = recentToolResults[index];
+      if (message.tool_name !== 'build_verify') {
+        continue;
+      }
+      const result = typeof parsed.result === 'string' ? parsed.result : '';
+      if (!/failed/i.test(result)) {
+        continue;
+      }
+      return {
+        stack: this.inferBuildVerifyStack(result),
+        result
+      };
+    }
+    return undefined;
+  }
+
+  private inferBuildVerifyStack(result: string): string {
+    const normalized = result.toLowerCase();
+    if (/cargo check|error\[e\d+\]|rustc|borrow checker/.test(normalized)) {
+      return 'rust';
+    }
+    if (/go test|\.go:\d+|undefined:|cannot use .* as type/.test(normalized)) {
+      return 'go';
+    }
+    if (/syntaxerror|indentationerror|modulenotfounderror|traceback|python -m compileall|\.py/.test(normalized)) {
+      return 'python';
+    }
+    if (/dotnet build|error cs\d+|\.csproj|\.sln|msbuild/.test(normalized)) {
+      return '.net';
+    }
+    if (/mvn|pom.xml|gradle|javac|\.java:\d+|cannot find symbol/.test(normalized)) {
+      return 'java';
+    }
+    if (/tsc|typescript|npm run|pnpm |yarn |bun run|\.tsx?:\d+/.test(normalized)) {
+      return 'javascript/typescript';
+    }
+    return 'project';
+  }
+
+  private buildBuildVerifyFailureNudge(stack: string, result: string): string {
+    const excerpt = result.substring(0, 500);
+    if (stack === 'python') {
+      return `Build verification failed for Python. Fix the Python syntax or import errors shown below by editing the indicated files, then continue until verification passes. Do NOT switch to unrelated files or ask the user to run commands manually.\n\n${excerpt}`;
+    }
+    if (stack === 'go') {
+      return `Build verification failed for Go. Fix the Go compile or test errors shown below in the referenced packages or files, then continue until verification passes. Do NOT describe a plan without editing the real files.\n\n${excerpt}`;
+    }
+    if (stack === 'rust') {
+      return `Build verification failed for Rust. Fix the Rust compiler errors shown below in the referenced modules, then continue until verification passes. Do NOT stop after a summary or ask the user to run cargo manually.\n\n${excerpt}`;
+    }
+    if (stack === 'java') {
+      return `Build verification failed for Java. Fix the Java or build-system errors shown below in the referenced source files or build files, then continue until verification passes. Do NOT switch away from the failing project files.\n\n${excerpt}`;
+    }
+    if (stack === '.net') {
+      return `Build verification failed for .NET. Fix the C# or project-build errors shown below in the referenced files, then continue until verification passes. Do NOT ask the user to run dotnet build manually.\n\n${excerpt}`;
+    }
+    if (stack === 'javascript/typescript') {
+      return `Build verification failed for the JavaScript/TypeScript project. Fix the build errors shown below in the referenced files, then continue until verification passes. Do NOT stop after describing the issue.\n\n${excerpt}`;
+    }
+    return `Build verification failed. Fix the errors shown below in the referenced files, then continue until verification passes. Do NOT describe a plan without making the required edits.\n\n${excerpt}`;
   }
 
   private isTerminalReadOnlyInspectionCommand(command: string): boolean {
