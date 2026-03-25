@@ -148,11 +148,9 @@ export function parseToolCallsFromContent(content: string, toolDefinitions: Tool
   if (bareMatch && knownToolNames.has(bareMatch[1])) {
     const argsStr = extractBalancedJson(bareMatch[2], 0);
     if (argsStr) {
-      try {
-        const argsObj = JSON.parse(argsStr) as Record<string, unknown>;
+      const argsObj = relaxedJsonParse(argsStr);
+      if (argsObj) {
         return [{ type: 'function', function: { name: bareMatch[1], arguments: argsObj } }];
-      } catch {
-        // Fall through.
       }
     }
   }
@@ -202,7 +200,16 @@ export function parseToolCallsFromContent(content: string, toolDefinitions: Tool
             return calls;
           }
         } catch {
-          // Give up on this candidate.
+          // Fall through.
+        }
+      }
+
+      // Try quoting unquoted keys: {command: "value"} → {"command": "value"}
+      const relaxed = relaxedJsonParse(candidate);
+      if (relaxed) {
+        const calls = normalizeParsedToolCalls(relaxed);
+        if (calls.length > 0 && calls.every(c => knownToolNames.has(c.function.name))) {
+          return calls;
         }
       }
     }
@@ -242,6 +249,20 @@ export function escapeJsonStringValues(value: string): string {
     result += char;
   }
   return result;
+}
+
+/** Try parsing JSON with cascading fallbacks: plain → escaped string values → unquoted keys → both. */
+export function relaxedJsonParse(str: string): Record<string, unknown> | null {
+  try { return JSON.parse(str) as Record<string, unknown>; } catch { /* fall through */ }
+  try { return JSON.parse(escapeJsonStringValues(str)) as Record<string, unknown>; } catch { /* fall through */ }
+  try {
+    const fixed = str.replace(/([{,])\s*([A-Za-z_]\w*)\s*:/g, '$1"$2":');
+    return JSON.parse(fixed) as Record<string, unknown>;
+  } catch { /* fall through */ }
+  try {
+    const fixed = str.replace(/([{,])\s*([A-Za-z_]\w*)\s*:/g, '$1"$2":');
+    return JSON.parse(escapeJsonStringValues(fixed)) as Record<string, unknown>;
+  } catch { return null; }
 }
 
 export function looksLikeToolCallContent(content: string, toolDefinitions: ToolDefinition[]): boolean {

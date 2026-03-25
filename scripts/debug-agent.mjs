@@ -1195,6 +1195,44 @@ function extractDefinitionsFromSource(source, filepath = TARGET_FILE) {
 // ─── Text-based tool call parser (handles leaked JSON tool calls) ────────────
 const KNOWN_TOOLS = ['list_workspace_files', 'project_scan', 'read_workspace_notes', 'write_workspace_notes', 'read_file_slice', 'read_specific_file', 'create_or_edit_file', 'replace_in_file', 'execute_terminal_command'];
 
+// Alias map: weak models often use alternative tool names
+const TOOL_ALIASES = {
+  write_file: 'write_to_file',
+  create_file: 'create_or_edit_file',
+  create_or_replace: 'create_or_edit_file',
+  create_or_overwrite: 'create_or_edit_file',
+  edit_file: 'replace_in_file',
+  replace_content: 'replace_in_file',
+  read_file: 'read_specific_file',
+  read_file_range: 'read_file_slice',
+  read_file_chunk: 'read_file_slice',
+  run_command: 'execute_terminal_command',
+  terminal_command: 'execute_terminal_command'
+};
+function remapToolName(name) {
+  return TOOL_ALIASES[name.trim().toLowerCase()] ?? name.trim();
+}
+
+// Alias map: weak models often use alternative argument keys
+const ARG_ALIASES = {
+  file_path: 'filepath', filePath: 'filepath', file_name: 'filename', file: 'filepath', path: 'filepath',
+  old_content: 'old_text', new_content: 'new_text', old_string: 'old_text', new_string: 'new_text',
+  old_code: 'old_text', new_code: 'new_text',
+  start_line: 'startLine', end_line: 'endLine', from_line: 'startLine', to_line: 'endLine',
+  cmd: 'command', dir: 'directory'
+};
+function remapArgs(args) {
+  if (!args || typeof args !== 'object') return args;
+  const out = {};
+  for (const [k, v] of Object.entries(args)) {
+    out[ARG_ALIASES[k] ?? k] = v;
+  }
+  return out;
+}
+
+// All names (canonical + aliases) that we should try to detect in text
+const ALL_TOOL_NAMES = [...KNOWN_TOOLS, ...Object.keys(TOOL_ALIASES)];
+
 // Escape literal control chars (newlines, tabs, etc.) that appear inside JSON string values only.
 // Applies only within "..." contexts so structural whitespace in pretty-printed JSON is preserved.
 function escapeJsonStringValues(s) {
@@ -1268,7 +1306,7 @@ function parseToolCallsFromText(content) {
           } catch { /* ignore */ }
         }
         if (obj?.name && obj?.arguments !== undefined) {
-          results.push({ function: { name: obj.name, arguments: obj.arguments } });
+          results.push({ function: { name: remapToolName(obj.name), arguments: remapArgs(typeof obj.arguments === 'string' ? relaxedJsonParse(obj.arguments) ?? {} : obj.arguments) } });
         }
       }
     }
@@ -1279,9 +1317,9 @@ function parseToolCallsFromText(content) {
   let match;
   while ((match = fencedPattern.exec(content)) !== null) {
     try {
-      const obj = JSON.parse(match[1].trim());
-      if (obj.name && obj.arguments !== undefined) {
-        results.push({ function: { name: obj.name, arguments: obj.arguments } });
+      const obj = relaxedJsonParse(match[1].trim());
+      if (obj?.name && obj?.arguments !== undefined) {
+        results.push({ function: { name: remapToolName(obj.name), arguments: remapArgs(typeof obj.arguments === 'string' ? relaxedJsonParse(obj.arguments) ?? {} : obj.arguments) } });
       }
     } catch { /* ignore */ }
   }
@@ -1289,30 +1327,44 @@ function parseToolCallsFromText(content) {
   // Match "Executing step N: tool_name with arguments {...}" — model announces instead of calling
   const announcedPattern = /execut(?:e|ing)\s+step\s+\d+[:/]\s*(\w+)\s+(?:with\s+)?arguments?:?\s*(\{[\s\S]*?\})(?=\s*(?:```|$|\n\n))/gi;
   while ((match = announcedPattern.exec(content)) !== null) {
-    const toolName = match[1];
+    const toolName = remapToolName(match[1]);
     const argsObj = relaxedJsonParse(match[2]);
-    if (argsObj) results.push({ function: { name: toolName, arguments: argsObj } });
+    if (argsObj) results.push({ function: { name: toolName, arguments: remapArgs(argsObj) } });
+  }
+
+  // Match <function=tool_name><parameter=key>value</parameter></function> tagged calls
+  const functionTagRe = /<function=([a-zA-Z0-9_]+)>\s*([\s\S]*?)<\/function>/g;
+  while ((match = functionTagRe.exec(content)) !== null) {
+    const toolName = remapToolName(match[1]);
+    const args = {};
+    const paramRe = /<parameter=([a-zA-Z0-9_]+)>\s*([\s\S]*?)\s*<\/parameter>/g;
+    let pm;
+    while ((pm = paramRe.exec(match[2])) !== null) {
+      args[pm[1].trim()] = pm[2];
+    }
+    results.push({ function: { name: toolName, arguments: remapArgs(args) } });
   }
 
   // Match tool_name("single string arg") or tool_name({...}) Python/JS-style calls
-  for (const toolName of KNOWN_TOOLS) {
+  for (const toolName of ALL_TOOL_NAMES) {
     const callRe = new RegExp(`${toolName}\\s*\\(\\s*("(?:[^"\\\\]|\\\\.)*"|\\{[\\s\\S]*?\\})\\s*\\)`, 'g');
     while ((match = callRe.exec(content)) !== null) {
       try {
         const argStr = match[1].trim();
+        const mappedName = remapToolName(toolName);
         let args;
         if (argStr.startsWith('"')) {
           const val = JSON.parse(argStr);
           // Skip double-wrapped calls like execute_terminal_command("execute_terminal_command(...)")
-          if (typeof val === 'string' && KNOWN_TOOLS.some(t => val.startsWith(t + '('))) continue;
-          if (toolName === 'execute_terminal_command') args = { command: val };
-          else if (toolName === 'read_specific_file') args = { filepath: val };
-          else if (toolName === 'list_workspace_files') args = { directory: val };
+          if (typeof val === 'string' && ALL_TOOL_NAMES.some(t => val.startsWith(t + '('))) continue;
+          if (mappedName === 'execute_terminal_command') args = { command: val };
+          else if (mappedName === 'read_specific_file') args = { filepath: val };
+          else if (mappedName === 'list_workspace_files') args = { directory: val };
           else args = { filepath: val };
         } else {
-          args = JSON.parse(argStr);
+          args = relaxedJsonParse(argStr) ?? JSON.parse(argStr);
         }
-        results.push({ function: { name: toolName, arguments: args } });
+        results.push({ function: { name: mappedName, arguments: remapArgs(args) } });
       } catch { /* ignore */ }
     }
   }
@@ -1320,13 +1372,13 @@ function parseToolCallsFromText(content) {
   // Match "**Tool Call:** tool_name with arguments {...}" — markdown-annotated calls
   const toolCallAnnotationPattern = /\*{0,2}tool\s+call\*{0,2}[:\s]+([\w_]+)\s+(?:with\s+)?arguments?:?\s*(\{[\s\S]*?\})/gi;
   while ((match = toolCallAnnotationPattern.exec(content)) !== null) {
-    const toolName = match[1];
+    const toolName = remapToolName(match[1]);
     const argsObj = relaxedJsonParse(match[2]);
-    if (argsObj) results.push({ function: { name: toolName, arguments: argsObj } });
+    if (argsObj) results.push({ function: { name: toolName, arguments: remapArgs(argsObj) } });
   }
 
   // Match tool_name with arguments {...} (bare prefix, no markdown) — balanced brace + relaxed JSON
-  for (const toolName of KNOWN_TOOLS) {
+  for (const toolName of ALL_TOOL_NAMES) {
     const re = new RegExp(`\\b${toolName}\\s+with\\s+arguments?:?\\s*(\\{)`, 'gi');
     let bm;
     while ((bm = re.exec(content)) !== null) {
@@ -1343,7 +1395,7 @@ function parseToolCallsFromText(content) {
       }
       if (end !== -1) {
         const args = relaxedJsonParse(content.substring(start, end + 1));
-        if (args) results.push({ function: { name: toolName, arguments: args } });
+        if (args) results.push({ function: { name: remapToolName(toolName), arguments: remapArgs(args) } });
       }
     }
   }
@@ -1375,40 +1427,45 @@ function parseToolCallsFromText(content) {
     results.push({ function: { name: 'read_file_slice', arguments: { filepath: match[1], startLine: parseInt(match[2]), endLine: parseInt(match[3]) } } });
   }
 
-  // Match read_specific_file "filepath" or list_workspace_files "dir"
-  const singleQuoteArgRe = /\b(read_specific_file|list_workspace_files)\s+"([^"]+)"/g;
-  while ((match = singleQuoteArgRe.exec(content)) !== null) {
+  // Match read_specific_file "filepath"/path or list_workspace_files "dir"/dir
+  const singleArgRe = /\b(read_specific_file|list_workspace_files)\s+(?:"([^"]+)"|([^\s,(){}[\]"'`]+))/g;
+  while ((match = singleArgRe.exec(content)) !== null) {
     const argKey = match[1] === 'list_workspace_files' ? 'directory' : 'filepath';
-    results.push({ function: { name: match[1], arguments: { [argKey]: match[2] } } });
+    const argVal = match[2] || match[3];
+    // Skip if value looks like a keyword rather than a path (e.g. "with", "and", "then")
+    if (/^(?:with|and|then|to|for|the|is|of|at|in|on|as|if|so)$/i.test(argVal)) continue;
+    results.push({ function: { name: match[1], arguments: { [argKey]: argVal } } });
   }
 
-  // Match create_or_edit_file "filepath" "content" positional format.
-  const createOrEditPositionalRe = /\bcreate_or_edit_file\s+"([^"\n]+)"\s+("(?:[^"\\]|\\[\s\S])*?")/g;
+  // Match create_or_edit_file "filepath" "content" or create_or_edit_file path "content" positional format.
+  const createOrEditPositionalRe = /\bcreate_or_edit_file\s+(?:"([^"\n]+)"|(\S+))\s+("(?:[^"\\]|\\[\s\S])*?")/g;
   while ((match = createOrEditPositionalRe.exec(content)) !== null) {
     try {
+      const filepath = match[1] || match[2];
       results.push({
         function: {
           name: 'create_or_edit_file',
           arguments: {
-            filename: match[1],
-            content: JSON.parse(match[2])
+            filename: filepath,
+            content: JSON.parse(match[3])
           }
         }
       });
     } catch { /* ignore */ }
   }
 
-  // Match replace_in_file "filepath" "old_text" "new_text" positional format.
-  const replacePositionalRe = /\breplace_in_file\s+"([^"\n]+)"\s+("(?:[^"\\]|\\[\s\S])*?")\s+("(?:[^"\\]|\\[\s\S])*?")/g;
+  // Match replace_in_file "filepath" "old_text" "new_text" or replace_in_file path "old_text" "new_text" positional format.
+  const replacePositionalRe = /\breplace_in_file\s+(?:"([^"\n]+)"|(\S+))\s+("(?:[^"\\]|\\[\s\S])*?")\s+("(?:[^"\\]|\\[\s\S])*?")/g;
   while ((match = replacePositionalRe.exec(content)) !== null) {
     try {
+      const filepath = match[1] || match[2];
       results.push({
         function: {
           name: 'replace_in_file',
           arguments: {
-            filepath: match[1],
-            old_text: JSON.parse(match[2]),
-            new_text: JSON.parse(match[3])
+            filepath: filepath,
+            old_text: JSON.parse(match[3]),
+            new_text: JSON.parse(match[4])
           }
         }
       });
@@ -1472,7 +1529,7 @@ function analyzeResponse(content, recentMessages) {
   const isPassingToUser = /(?:please (?:execute|run|proceed|confirm|provide|read)|would you like me to|shall i (?:proceed|continue)|can you (?:provide|share)|could you (?:provide|share))/i.test(content) && content.length < 800;
   const claimsDone = /(?:step \d+ completed|successfully applied|file (?:created|updated)|has been (?:created|moved|split)|(?<!\w)done\b(?![\s]*[:;{,=(])|(?:all (?:required )?)?tool calls? (?:have )?succeeded|(?:file )?splitting is complete|task(?:s)? (?:is |are )?complete)/i.test(content);  // Mentions a known tool name but parseToolCallsFromText couldn't extract a valid call
   const parsedFromContent = parseToolCallsFromText(content);
-  const mentionsToolButNotCalled = parsedFromContent.length === 0 && KNOWN_TOOLS.some(t => content.includes(t));  // looksLikePlan: numbered list. After tool results, also fire when content ends with an execute instruction.
+  const mentionsToolButNotCalled = parsedFromContent.length === 0 && ALL_TOOL_NAMES.some(t => content.includes(t));  // looksLikePlan: numbered list. After tool results, also fire when content ends with an execute instruction.
   const endsWithExecute = /execut(?:e|ing)\s+step\s+\d+/i.test(content);
   const looksLikePlan = (
     !hasToolResults || endsWithExecute
