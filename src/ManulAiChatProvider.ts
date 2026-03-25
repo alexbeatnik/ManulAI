@@ -5253,10 +5253,54 @@ If the user asks for a change but provides NO code:
       return JSON.stringify({ error: 'No workspace open.' });
     }
 
+    const readTextIfExists = async (relativePath: string): Promise<string | undefined> => {
+      try {
+        const bytes = await vscode.workspace.fs.readFile(vscode.Uri.joinPath(workspaceRoot, relativePath));
+        return Buffer.from(bytes).toString('utf8');
+      } catch {
+        return undefined;
+      }
+    };
+
+    const extractTomlAssignments = (text: string, sectionNames: string[]): Array<{ key: string; value: string }> => {
+      const sections = new Set(sectionNames.map(name => name.toLowerCase()));
+      const results: Array<{ key: string; value: string }> = [];
+      let activeSection = '';
+      for (const rawLine of text.split(/\r?\n/)) {
+        const line = rawLine.trim();
+        if (!line || line.startsWith('#')) {
+          continue;
+        }
+        const sectionMatch = line.match(/^\[(.+?)\]$/);
+        if (sectionMatch) {
+          activeSection = sectionMatch[1].trim().toLowerCase();
+          continue;
+        }
+        if (!sections.has(activeSection)) {
+          continue;
+        }
+        const assignmentMatch = line.match(/^([A-Za-z0-9_.-]+)\s*=\s*["']?([^"']+)["']?$/);
+        if (assignmentMatch) {
+          results.push({ key: assignmentMatch[1], value: assignmentMatch[2].trim() });
+        }
+      }
+      return results;
+    };
+
+    const addUniqueMatches = (target: Set<string>, values: Iterable<string>): void => {
+      for (const value of values) {
+        const trimmed = value.trim();
+        if (trimmed) {
+          target.add(trimmed);
+        }
+      }
+    };
+
     const topLevelEntries = await vscode.workspace.fs.readDirectory(workspaceRoot);
     const topLevelNames = new Set(topLevelEntries.map(([name]) => name));
     const projectTypes = new Set<string>();
     const languageHints = new Set<string>();
+    const frameworkHints = new Set<string>();
     const keyFiles: string[] = [];
     const entryPoints = new Set<string>();
     const importantModules = new Set<string>();
@@ -5322,6 +5366,11 @@ If the user asks for a change but provides NO code:
       try {
         const packageBytes = await vscode.workspace.fs.readFile(vscode.Uri.joinPath(workspaceRoot, 'package.json'));
         const pkg = JSON.parse(Buffer.from(packageBytes).toString('utf8')) as Record<string, unknown>;
+        const dependencies = {
+          ...((pkg.dependencies && typeof pkg.dependencies === 'object' && !Array.isArray(pkg.dependencies)) ? pkg.dependencies as Record<string, unknown> : {}),
+          ...((pkg.devDependencies && typeof pkg.devDependencies === 'object' && !Array.isArray(pkg.devDependencies)) ? pkg.devDependencies as Record<string, unknown> : {})
+        };
+        const dependencyNames = Object.keys(dependencies);
         if (typeof pkg.main === 'string') {
           entryPoints.add(pkg.main);
         }
@@ -5341,14 +5390,29 @@ If the user asks for a change but provides NO code:
         if (Array.isArray(pkg.activationEvents)) {
           projectTypes.add('tool-driven-extension');
         }
-        if (pkg.dependencies && typeof pkg.dependencies === 'object' && !Array.isArray(pkg.dependencies)) {
-          const dependencyNames = Object.keys(pkg.dependencies as Record<string, unknown>);
-          if (dependencyNames.some(name => ['react', 'next', 'vite', 'vue', 'svelte', 'angular'].includes(name))) {
-            projectTypes.add('webapp');
-          }
-          if (dependencyNames.some(name => ['express', 'fastify', 'koa', 'nest', '@nestjs/core'].includes(name))) {
-            projectTypes.add('backend-service');
-          }
+        if (dependencyNames.some(name => ['react', 'next', 'vite', 'vue', 'svelte', 'angular'].includes(name))) {
+          projectTypes.add('webapp');
+        }
+        if (dependencyNames.some(name => ['express', 'fastify', 'koa', 'nest', '@nestjs/core'].includes(name))) {
+          projectTypes.add('backend-service');
+        }
+        if (dependencyNames.includes('react')) {
+          frameworkHints.add('react');
+        }
+        if (dependencyNames.includes('next')) {
+          frameworkHints.add('next');
+        }
+        if (dependencyNames.includes('@nestjs/core')) {
+          frameworkHints.add('nestjs');
+        }
+        if (dependencyNames.includes('vue')) {
+          frameworkHints.add('vue');
+        }
+        if (dependencyNames.includes('svelte')) {
+          frameworkHints.add('svelte');
+        }
+        if (dependencyNames.includes('angular') || dependencyNames.includes('@angular/core')) {
+          frameworkHints.add('angular');
         }
         if (pkg.scripts && typeof pkg.scripts === 'object' && !Array.isArray(pkg.scripts)) {
           const scriptNames = Object.keys(pkg.scripts as Record<string, unknown>);
@@ -5363,6 +5427,7 @@ If the user asks for a change but provides NO code:
 
     if (topLevelNames.has('pyproject.toml')) {
       projectTypes.add('python-project');
+      languageHints.add('python');
     }
     if (topLevelNames.has('requirements.txt')) {
       languageHints.add('python');
@@ -5392,6 +5457,134 @@ If the user asks for a change but provides NO code:
     if (Array.from(topLevelNames).some(name => name.endsWith('.sln') || name.endsWith('.csproj'))) {
       projectTypes.add('.net-project');
       languageHints.add('c#');
+    }
+
+    const pyprojectText = await readTextIfExists('pyproject.toml');
+    if (pyprojectText) {
+      if (/\bdjango\b/i.test(pyprojectText)) {
+        frameworkHints.add('django');
+      }
+      if (/\bfastapi\b/i.test(pyprojectText)) {
+        frameworkHints.add('fastapi');
+      }
+      if (/\bflask\b/i.test(pyprojectText)) {
+        frameworkHints.add('flask');
+      }
+      const scriptAssignments = extractTomlAssignments(pyprojectText, ['project.scripts', 'tool.poetry.scripts']);
+      addUniqueMatches(entryPoints, scriptAssignments.map(item => `${item.key} -> ${item.value}`));
+      const packageNameMatch = pyprojectText.match(/^[ \t]*name\s*=\s*["']([^"']+)["']/m);
+      if (packageNameMatch) {
+        notes.push(`pyproject package: ${packageNameMatch[1]}`);
+      }
+    }
+
+    const requirementsText = await readTextIfExists('requirements.txt');
+    if (requirementsText) {
+      const requirementNames = requirementsText
+        .split(/\r?\n/)
+        .map(line => line.replace(/#.*/, '').trim())
+        .filter(Boolean)
+        .map(line => line.split(/[<>=!~\[]/, 1)[0].trim().toLowerCase());
+      if (requirementNames.includes('django')) {
+        frameworkHints.add('django');
+      }
+      if (requirementNames.includes('fastapi')) {
+        frameworkHints.add('fastapi');
+      }
+      if (requirementNames.includes('flask')) {
+        frameworkHints.add('flask');
+      }
+    }
+
+    const pomFiles = await vscode.workspace.findFiles('**/pom.xml', '**/{node_modules,dist,build,out,.git,.manulai}/**', 6);
+    for (const pomFile of pomFiles) {
+      try {
+        const pomText = Buffer.from(await vscode.workspace.fs.readFile(pomFile)).toString('utf8');
+        if (/spring-boot|org\.springframework/i.test(pomText)) {
+          frameworkHints.add('spring');
+        }
+        const mainClassMatches = Array.from(pomText.matchAll(/<(?:start-class|mainClass)>\s*([^<]+)\s*<\//g)).map(match => match[1].trim());
+        addUniqueMatches(entryPoints, mainClassMatches);
+        const moduleMatches = Array.from(pomText.matchAll(/<module>\s*([^<]+)\s*<\/module>/g)).map(match => match[1].trim());
+        addUniqueMatches(importantModules, moduleMatches.map(module => `module:${module}`));
+      } catch {
+        // ignore unreadable pom.xml
+      }
+    }
+
+    const gradleFiles = await vscode.workspace.findFiles('**/build.gradle*', '**/{node_modules,dist,build,out,.git,.manulai}/**', 8);
+    for (const gradleFile of gradleFiles) {
+      try {
+        const gradleText = Buffer.from(await vscode.workspace.fs.readFile(gradleFile)).toString('utf8');
+        if (/spring-boot|org\.springframework/i.test(gradleText)) {
+          frameworkHints.add('spring');
+        }
+        const mainClassMatches = Array.from(gradleText.matchAll(/mainClass(?:Name)?(?:\.set)?\s*[=\(]\s*["']([^"']+)["']/g)).map(match => match[1].trim());
+        addUniqueMatches(entryPoints, mainClassMatches);
+      } catch {
+        // ignore unreadable build.gradle
+      }
+    }
+
+    const solutionFiles = await vscode.workspace.findFiles('**/*.{csproj,sln}', '**/{node_modules,dist,build,out,.git,.manulai}/**', 10);
+    for (const solutionFile of solutionFiles) {
+      try {
+        const solutionText = Buffer.from(await vscode.workspace.fs.readFile(solutionFile)).toString('utf8');
+        if (/Microsoft\.NET\.Sdk\.Web|AspNetCore/i.test(solutionText)) {
+          frameworkHints.add('aspnet');
+        }
+        if (solutionFile.fsPath.endsWith('.csproj')) {
+          const relative = path.relative(workspaceRoot.fsPath, solutionFile.fsPath).replace(/\\/g, '/');
+          importantModules.add(relative);
+        }
+      } catch {
+        // ignore unreadable solution files
+      }
+    }
+
+    const cargoText = await readTextIfExists('Cargo.toml');
+    if (cargoText) {
+      const packageNameMatch = cargoText.match(/^name\s*=\s*["']([^"']+)["']/m);
+      if (packageNameMatch) {
+        notes.push(`cargo package: ${packageNameMatch[1]}`);
+      }
+      const binPathMatches = Array.from(cargoText.matchAll(/^path\s*=\s*["']([^"']+)["']/gm)).map(match => match[1].trim());
+      addUniqueMatches(entryPoints, binPathMatches);
+      const workspaceMembersMatch = cargoText.match(/members\s*=\s*\[([\s\S]*?)\]/m);
+      if (workspaceMembersMatch) {
+        const members = Array.from(workspaceMembersMatch[1].matchAll(/["']([^"']+)["']/g)).map(match => match[1].trim());
+        addUniqueMatches(importantModules, members.map(member => `crate:${member}`));
+      }
+      if (/\baxum\b/i.test(cargoText)) {
+        frameworkHints.add('axum');
+      }
+      if (/\bactix-web\b/i.test(cargoText)) {
+        frameworkHints.add('actix-web');
+      }
+      if (/\brocket\b/i.test(cargoText)) {
+        frameworkHints.add('rocket');
+      }
+    }
+
+    const goModText = await readTextIfExists('go.mod');
+    if (goModText) {
+      const moduleMatch = goModText.match(/^module\s+(.+)$/m);
+      if (moduleMatch) {
+        notes.push(`go module: ${moduleMatch[1].trim()}`);
+        importantModules.add(moduleMatch[1].trim());
+      }
+      if (/github\.com\/gin-gonic\/gin/i.test(goModText)) {
+        frameworkHints.add('gin');
+      }
+      if (/github\.com\/gofiber\/fiber/i.test(goModText)) {
+        frameworkHints.add('fiber');
+      }
+      if (/github\.com\/labstack\/echo/i.test(goModText)) {
+        frameworkHints.add('echo');
+      }
+      if (/github\.com\/go-chi\/chi/i.test(goModText)) {
+        frameworkHints.add('chi');
+      }
     }
 
     const candidateEntries = [
@@ -5448,6 +5641,7 @@ If the user asks for a change but provides NO code:
     const tree = await this.buildCompactWorkspaceTree();
     const summary = [
       languageHints.size > 0 ? `languages: ${Array.from(languageHints).join(', ')}` : undefined,
+      frameworkHints.size > 0 ? `frameworks: ${Array.from(frameworkHints).join(', ')}` : undefined,
       projectTypes.size > 0 ? `project type hints: ${Array.from(projectTypes).join(', ')}` : undefined,
       packageManager !== 'unknown' ? `package manager: ${packageManager}` : undefined,
       entryPoints.size > 0 ? `entry points: ${Array.from(entryPoints).slice(0, 8).join(', ')}` : undefined,
@@ -5458,6 +5652,7 @@ If the user asks for a change but provides NO code:
       workspaceRoot: workspaceRoot.fsPath,
       packageManager,
       languages: Array.from(languageHints),
+      frameworkHints: Array.from(frameworkHints),
       projectTypes: Array.from(projectTypes),
       keyFiles,
       entryPoints: Array.from(entryPoints),

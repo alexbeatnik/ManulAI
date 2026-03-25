@@ -369,12 +369,37 @@ async function executeTool(name, args) {
 
     case 'project_scan': {
       try {
+        const readTextIfExists = rel => {
+          const fp = path.join(wsRoot, rel);
+          return existsSync(fp) ? readFileSync(fp, 'utf8') : undefined;
+        };
+        const extractTomlAssignments = (text, sectionNames) => {
+          const sections = new Set(sectionNames.map(name => name.toLowerCase()));
+          const results = [];
+          let activeSection = '';
+          for (const rawLine of text.split(/\r?\n/)) {
+            const line = rawLine.trim();
+            if (!line || line.startsWith('#')) continue;
+            const sectionMatch = line.match(/^\[(.+?)\]$/);
+            if (sectionMatch) {
+              activeSection = sectionMatch[1].trim().toLowerCase();
+              continue;
+            }
+            if (!sections.has(activeSection)) continue;
+            const assignmentMatch = line.match(/^([A-Za-z0-9_.-]+)\s*=\s*["']?([^"']+)["']?$/);
+            if (assignmentMatch) {
+              results.push({ key: assignmentMatch[1], value: assignmentMatch[2].trim() });
+            }
+          }
+          return results;
+        };
         const notes = [];
         const topLevel = existsSync(wsRoot) ? (await import('fs')).readdirSync(wsRoot, { withFileTypes: true }) : [];
         const topLevelNames = new Set(topLevel.map(ent => ent.name));
         const keyFiles = ['package.json', 'tsconfig.json', 'README.md', 'README-dev.md', 'Cargo.toml', 'go.mod', 'pyproject.toml', 'requirements.txt', 'Gemfile', 'pom.xml', 'build.gradle', 'build.gradle.kts', 'composer.json', 'Package.swift', 'CMakeLists.txt']
           .filter(name => topLevelNames.has(name));
         const languages = [];
+        const frameworkHints = [];
         let packageManager = 'unknown';
         if (topLevelNames.has('pnpm-lock.yaml')) { packageManager = 'pnpm'; languages.push('javascript', 'typescript'); }
         else if (topLevelNames.has('yarn.lock')) { packageManager = 'yarn'; languages.push('javascript', 'typescript'); }
@@ -395,14 +420,21 @@ async function executeTool(name, args) {
         if (topLevelNames.has('package.json')) {
           try {
             const pkg = JSON.parse(readFileSync(path.join(wsRoot, 'package.json'), 'utf8'));
-            if (typeof pkg.main === 'string') entryPoints.push(pkg.main);
-            if (typeof pkg.module === 'string') entryPoints.push(pkg.module);
-            if (typeof pkg.types === 'string') { importantModules.push(pkg.types); languages.push('typescript'); }
-            if (pkg.engines?.vscode) projectTypes.push('vscode-extension');
             const deps = { ...(pkg.dependencies ?? {}), ...(pkg.devDependencies ?? {}) };
             const depNames = Object.keys(deps);
+            if (typeof pkg.main === 'string') entryPoints.push(pkg.main);
+            if (typeof pkg.module === 'string') entryPoints.push(pkg.module);
+            if (typeof pkg.browser === 'string') entryPoints.push(pkg.browser);
+            if (typeof pkg.types === 'string') { importantModules.push(pkg.types); languages.push('typescript'); }
+            if (pkg.engines?.vscode) projectTypes.push('vscode-extension');
             if (depNames.some(name => ['react', 'next', 'vite', 'vue', 'svelte', 'angular'].includes(name))) projectTypes.push('webapp');
             if (depNames.some(name => ['express', 'fastify', 'koa', 'nest', '@nestjs/core'].includes(name))) projectTypes.push('backend-service');
+            if (depNames.includes('react')) frameworkHints.push('react');
+            if (depNames.includes('next')) frameworkHints.push('next');
+            if (depNames.includes('@nestjs/core')) frameworkHints.push('nestjs');
+            if (depNames.includes('vue')) frameworkHints.push('vue');
+            if (depNames.includes('svelte')) frameworkHints.push('svelte');
+            if (depNames.includes('angular') || depNames.includes('@angular/core')) frameworkHints.push('angular');
             if (pkg.scripts && typeof pkg.scripts === 'object') notes.push(`package.json scripts: ${Object.keys(pkg.scripts).slice(0, 8).join(', ')}`);
           } catch {
             notes.push('package.json exists but could not be parsed');
@@ -417,6 +449,74 @@ async function executeTool(name, args) {
         if (topLevelNames.has('Package.swift')) projectTypes.push('swift-project');
         if (topLevelNames.has('CMakeLists.txt') || topLevelNames.has('meson.build')) { projectTypes.push('native-project'); languages.push('c/c++'); }
         if ([...topLevelNames].some(name => name.endsWith('.sln') || name.endsWith('.csproj'))) { projectTypes.push('.net-project'); languages.push('c#'); }
+
+        const pyprojectText = readTextIfExists('pyproject.toml');
+        if (pyprojectText) {
+          if (/\bdjango\b/i.test(pyprojectText)) frameworkHints.push('django');
+          if (/\bfastapi\b/i.test(pyprojectText)) frameworkHints.push('fastapi');
+          if (/\bflask\b/i.test(pyprojectText)) frameworkHints.push('flask');
+          const scriptAssignments = extractTomlAssignments(pyprojectText, ['project.scripts', 'tool.poetry.scripts']);
+          for (const item of scriptAssignments) entryPoints.push(`${item.key} -> ${item.value}`);
+          const packageNameMatch = pyprojectText.match(/^[ \t]*name\s*=\s*["']([^"']+)["']/m);
+          if (packageNameMatch) notes.push(`pyproject package: ${packageNameMatch[1]}`);
+        }
+
+        const requirementsText = readTextIfExists('requirements.txt');
+        if (requirementsText) {
+          const requirementNames = requirementsText.split(/\r?\n/).map(line => line.replace(/#.*/, '').trim()).filter(Boolean).map(line => line.split(/[<>=!~\[]/, 1)[0].trim().toLowerCase());
+          if (requirementNames.includes('django')) frameworkHints.push('django');
+          if (requirementNames.includes('fastapi')) frameworkHints.push('fastapi');
+          if (requirementNames.includes('flask')) frameworkHints.push('flask');
+        }
+
+        const pomFiles = (await import('fs')).readdirSync(wsRoot, { withFileTypes: true }).flatMap(ent => ent.isFile() && ent.name === 'pom.xml' ? [path.join(wsRoot, ent.name)] : []);
+        for (const pomFile of pomFiles) {
+          const pomText = readFileSync(pomFile, 'utf8');
+          if (/spring-boot|org\.springframework/i.test(pomText)) frameworkHints.push('spring');
+          for (const match of pomText.matchAll(/<(?:start-class|mainClass)>\s*([^<]+)\s*<\//g)) entryPoints.push(match[1].trim());
+          for (const match of pomText.matchAll(/<module>\s*([^<]+)\s*<\/module>/g)) importantModules.push(`module:${match[1].trim()}`);
+        }
+
+        for (const gradleName of ['build.gradle', 'build.gradle.kts']) {
+          const gradleText = readTextIfExists(gradleName);
+          if (!gradleText) continue;
+          if (/spring-boot|org\.springframework/i.test(gradleText)) frameworkHints.push('spring');
+          for (const match of gradleText.matchAll(/mainClass(?:Name)?(?:\.set)?\s*[=\(]\s*["']([^"']+)["']/g)) entryPoints.push(match[1].trim());
+        }
+
+        const solutionFiles = topLevel.filter(ent => ent.isFile() && (ent.name.endsWith('.csproj') || ent.name.endsWith('.sln'))).map(ent => path.join(wsRoot, ent.name));
+        for (const solutionFile of solutionFiles) {
+          const solutionText = readFileSync(solutionFile, 'utf8');
+          if (/Microsoft\.NET\.Sdk\.Web|AspNetCore/i.test(solutionText)) frameworkHints.push('aspnet');
+          if (solutionFile.endsWith('.csproj')) importantModules.push(path.basename(solutionFile));
+        }
+
+        const cargoText = readTextIfExists('Cargo.toml');
+        if (cargoText) {
+          const packageNameMatch = cargoText.match(/^name\s*=\s*["']([^"']+)["']/m);
+          if (packageNameMatch) notes.push(`cargo package: ${packageNameMatch[1]}`);
+          for (const match of cargoText.matchAll(/^path\s*=\s*["']([^"']+)["']/gm)) entryPoints.push(match[1].trim());
+          const workspaceMembersMatch = cargoText.match(/members\s*=\s*\[([\s\S]*?)\]/m);
+          if (workspaceMembersMatch) {
+            for (const member of workspaceMembersMatch[1].matchAll(/["']([^"']+)["']/g)) importantModules.push(`crate:${member[1].trim()}`);
+          }
+          if (/\baxum\b/i.test(cargoText)) frameworkHints.push('axum');
+          if (/\bactix-web\b/i.test(cargoText)) frameworkHints.push('actix-web');
+          if (/\brocket\b/i.test(cargoText)) frameworkHints.push('rocket');
+        }
+
+        const goModText = readTextIfExists('go.mod');
+        if (goModText) {
+          const moduleMatch = goModText.match(/^module\s+(.+)$/m);
+          if (moduleMatch) {
+            notes.push(`go module: ${moduleMatch[1].trim()}`);
+            importantModules.push(moduleMatch[1].trim());
+          }
+          if (/github\.com\/gin-gonic\/gin/i.test(goModText)) frameworkHints.push('gin');
+          if (/github\.com\/gofiber\/fiber/i.test(goModText)) frameworkHints.push('fiber');
+          if (/github\.com\/labstack\/echo/i.test(goModText)) frameworkHints.push('echo');
+          if (/github\.com\/go-chi\/chi/i.test(goModText)) frameworkHints.push('chi');
+        }
 
         for (const candidate of ['src/extension.ts', 'src/extension.js', 'src/index.ts', 'src/index.js', 'src/main.ts', 'src/main.js', 'src/App.tsx', 'src/app.ts', 'app.py', 'main.py', 'manage.py', 'wsgi.py', 'asgi.py', 'server.ts', 'server.js', 'main.go', 'cmd/main.go', 'src/main.rs', 'main.rs', 'src/main/java/Main.java', 'src/main/kotlin/Main.kt', 'Program.cs', 'src/Program.cs', 'index.php', 'public/index.php', 'config/routes.rb', 'main.swift', 'Sources/main.swift', 'src/main.c', 'src/main.cpp']) {
           if (existsSync(path.join(wsRoot, candidate))) entryPoints.push(candidate);
@@ -449,6 +549,7 @@ async function executeTool(name, args) {
           workspaceRoot: wsRoot,
           packageManager,
           languages: [...new Set(languages)],
+          frameworkHints: [...new Set(frameworkHints)],
           projectTypes: [...new Set(projectTypes)],
           keyFiles,
           entryPoints: [...new Set(entryPoints)],
@@ -456,6 +557,7 @@ async function executeTool(name, args) {
           notes,
           summary: [
             languages.length ? `languages: ${[...new Set(languages)].join(', ')}` : '',
+            frameworkHints.length ? `frameworks: ${[...new Set(frameworkHints)].join(', ')}` : '',
             projectTypes.length ? `project type hints: ${[...new Set(projectTypes)].join(', ')}` : '',
             packageManager !== 'unknown' ? `package manager: ${packageManager}` : '',
             entryPoints.length ? `entry points: ${[...new Set(entryPoints)].slice(0, 8).join(', ')}` : '',

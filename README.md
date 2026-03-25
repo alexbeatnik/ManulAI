@@ -100,7 +100,7 @@ Agent Mode currently exposes these tools to Ollama:
 
 These cover the main local coding tasks: reading files, targeted edits, full rewrites when necessary, file creation, file deletion, listing workspace directories, and running local shell commands.
 
-`project_scan` returns a higher-level summary of the workspace, including likely entry points, key files, package manager hints, language hints, project type hints, and important modules across common ecosystems such as JavaScript/TypeScript, Python, Go, Rust, Java/Kotlin, C#, PHP, Ruby, Swift, and C/C++.
+`project_scan` returns a higher-level summary of the workspace, including likely entry points, key files, package manager hints, language hints, project type hints, `frameworkHints`, and important modules across common ecosystems such as JavaScript/TypeScript, Python, Go, Rust, Java/Kotlin, C#, PHP, Ruby, Swift, and C/C++. It also does deeper manifest parsing for Python, Java, C#, Rust, and Go to recover framework and entry-point signals from their manifest files.
 
 `read_workspace_notes` and `write_workspace_notes` persist compact project memory under `.manulai/notes.md` so important architectural facts and recent completed-task notes survive across VS Code restarts.
 

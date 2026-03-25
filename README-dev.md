@@ -116,7 +116,7 @@ Direct pre-agent handlers also exist for common fast-path edits such as Markdown
 
 `read_file_slice` is the bounded-reader path for large files. It accepts a file path plus 1-based inclusive `startLine` and `endLine`, and should be preferred when the model only needs a local section instead of the entire file.
 
-`project_scan` is the high-level orientation tool. It summarizes key files, likely entry points, language hints, project type hints, package manager signals, and important top-level modules across common ecosystems without forcing the model to open many files first.
+`project_scan` is the high-level orientation tool. It summarizes key files, likely entry points, language hints, project type hints, package manager signals, `frameworkHints`, and important top-level modules across common ecosystems without forcing the model to open many files first. Its manifest parsing is deeper for Python, Java, C#, Rust, and Go so the model can recover framework and runtime-entry signals before doing narrow file reads.
 
 `read_workspace_notes` and `write_workspace_notes` persist project memory in `.manulai/notes.md`. The provider can auto-append short notes after completed tasks so important discoveries survive beyond the active request.
 
