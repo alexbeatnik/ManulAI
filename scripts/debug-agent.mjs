@@ -48,6 +48,9 @@ if (!userPrompt) {
   process.exit(1);
 }
 
+// Detect whether this run is a file-splitting task — only then enforce extractionCount gate
+const IS_SPLIT_TASK = /розбий|split|refactor.*module|extract.*module/i.test(userPrompt);
+
 // ─── Colours ───────────────────────────────────────────────────────────────
 const R = '\x1b[31m', G = '\x1b[32m', Y = '\x1b[33m', B = '\x1b[34m';
 const C = '\x1b[36m', W = '\x1b[37m', BOLD = '\x1b[1m', RESET = '\x1b[0m';
@@ -669,7 +672,7 @@ function parseToolCallsFromText(content) {
   if (results.length === 0 &&
       /\bread_specific_file\b/.test(content) &&
       !results.some(r => r.function?.name === 'read_specific_file')) {
-    results.push({ function: { name: 'read_specific_file', arguments: { filepath: 'src/ChatProviderRefactor.ts' } } });
+    results.push({ function: { name: 'read_specific_file', arguments: { filepath: TARGET_FILE } } });
   }
 
   // Match ```typescript blocks — model showing code it intends to write.
@@ -1243,12 +1246,15 @@ async function main() {
       !analysis.isAnnouncedButNotExecuted && !analysis.isHallucinatingToolResponse &&
       !analysis.mentionsToolButNotCalled && !hasPendingTextCall &&
       (analysis.claimsDone || (analysis.isLong && !analysis.looksLikePlan));
-    if ((!analysis.requiresContinuation || isDoneAfterWrite) && !lastToolWasError) {
-      // Require at least 2 full extraction cycles before accepting a quiet finish
-      if (extractionCount < 2) {
+    // For non-split tasks: a long, non-plan text response with no tool calls is the final answer
+    const isNonSplitFinalAnswer = !IS_SPLIT_TASK && analysis.isLong && !analysis.looksLikePlan &&
+      !analysis.mentionsToolButNotCalled && !hasPendingTextCall && !analysis.isHallucinatingToolResponse;
+    if ((!analysis.requiresContinuation || isDoneAfterWrite || isNonSplitFinalAnswer) && !lastToolWasError) {
+      // Require at least 2 full extraction cycles before accepting a quiet finish — only for split tasks
+      if (IS_SPLIT_TASK && extractionCount < 2) {
         const nextStart = (lastSuccessfulRead?.endLine ?? 120) + 1;
         const tooFewNudge = `Only ${extractionCount} module(s) extracted so far — need at least 2. ` +
-          `Read the next section of src/ChatProviderRefactor.ts (lines ${nextStart}–${nextStart + 119}) and extract another self-contained block.`;
+          `Read the next section of ${TARGET_FILE} (lines ${nextStart}–${nextStart + 119}) and extract another self-contained block.`;
         label(Y, 'NUDGE (too few extractions)', tooFewNudge);
         messages.push({ role: 'assistant', content });
         messages.push({ role: 'user', content: tooFewNudge });

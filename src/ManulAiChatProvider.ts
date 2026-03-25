@@ -2120,7 +2120,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         const hasFakePostReadAnalysisDump = Boolean(
           hasReadButNoWriteOnLargeRefactor
           && (isLongDump || hasLargeCodeBlocks)
-          && /(?:```json\s*\{\s*"response"|"function_name"\s*:\s*"extract_code_snippet"|\[tool_response\]|successfully processed the request|this code snippet appears to be|class, named `?(?:ollamaextension|ollamaassistant)`?|"class_name"\s*:\s*"(?:OllamaAssistant|OllamaExtension)"|here(?:'|’)s a breakdown of some key functionalities)/i.test(finalContent)
+          && /(?:```json\s*\{\s*"response"|"function_name"\s*:\s*"extract_code_snippet"|<tool_response>|\[tool_response\]|successfully processed the request|this code snippet appears to be|class, named `?(?:ollamaextension|ollamaassistant)`?|"class_name"\s*:\s*"(?:OllamaAssistant|OllamaExtension)"|here(?:'|’)s a breakdown of some key functionalities)/i.test(finalContent)
         );
         const hasAnnouncedExtractionWithoutWrite = Boolean(
           hasReadButNoWriteOnLargeRefactor
