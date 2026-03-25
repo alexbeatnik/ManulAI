@@ -1,1 +1,0 @@
-{"root":["./src/ManulAiChatProvider.ts","./src/extension.ts","./src/providerFileFallbackUtils.ts","./src/providerPersistenceUtils.ts","./src/providerRefactorUtils.ts","./src/providerSafetyUtils.ts","./src/providerToolParsingUtils.ts","./src/providerWebviewUtils.ts","./src/types.ts","./src/debug-lab/SandboxTarget.ts","./src/debug-lab/SandboxTypes.ts"],"version":"5.9.3"}
