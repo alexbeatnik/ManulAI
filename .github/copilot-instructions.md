@@ -57,6 +57,12 @@ This repository contains a VS Code extension named ManulAI.
 - If retry exhaustion is reached and the model still returns pseudo-progress or plan text, surface a deterministic backend failure message instead of leaking raw `Step 1/3`-style output.
 - For large refactor requests, nudge the model toward short module/file plans and iterative execution instead of one-shot whole-file rewrites.
 
+## Debug Script Parity
+
+- `scripts/debug-agent.mjs` is the standalone test harness for the agent loop. Fixes validated there must be ported to `src/ManulAiChatProvider.ts` in the same change or immediately after.
+- When a behavioral fix (hallucination detection, JSON parsing, fallback logic, nudge conditions) proves correct in `debug-agent.mjs`, treat it as a required backport — do not leave the production provider diverged.
+- Keep helper logic (e.g. `escapeJsonStringValues`, analysis flags, done-condition guards) in sync between the two files; if a helper is added or changed in the debug script, update the provider counterpart.
+
 ## Documentation
 
 - Keep README accurate when behavior or setup changes.
