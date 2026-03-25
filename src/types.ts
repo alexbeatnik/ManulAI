@@ -94,7 +94,7 @@ export interface PersistedChatState {
 export const DEFAULT_STORED_SETTINGS: Required<ManulAiStoredSettings> = {
   ollamaModel: '',
   ollamaBaseUrl: 'http://localhost:11434',
-  agentMode: 'agent' as AgentModeValue,
+  agentMode: 'agent',
   autoApprove: false,
   debugMode: false,
   systemPrompt: 'You are ManulAI, a privacy-first local coding assistant running inside VS Code. Work across any programming language. Prefer precise, minimal changes and explain results clearly.'

@@ -15,6 +15,10 @@ export function getDisplayPath(file: AttachedFileContext, workspaceRoot?: string
   return fsPath;
 }
 
+function escapeXmlAttr(s: string): string {
+  return s.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
 export function renderAttachmentContextMessage(
   attachedFiles: Map<string, AttachedFileContext>,
   workspaceRoot?: string
@@ -29,14 +33,14 @@ export function renderAttachmentContextMessage(
 
       if (file.languageId === '__folder__') {
         return [
-          `<manulai_attached_folder name="${file.name}" path="${filePath}">`,
+          `<manulai_attached_folder name="${escapeXmlAttr(file.name)}" path="${escapeXmlAttr(filePath)}">`,
           file.content,
           '</manulai_attached_folder>'
         ].join('\n');
       }
 
       return [
-        `<manulai_attached_file file="${file.name}" path="${filePath}"${file.readOnly ? ' readonly="true"' : ''}>`,
+        `<manulai_attached_file file="${escapeXmlAttr(file.name)}" path="${escapeXmlAttr(filePath)}"${file.readOnly ? ' readonly="true"' : ''}>`,
         file.content,
         '</manulai_attached_file>'
       ].join('\n');

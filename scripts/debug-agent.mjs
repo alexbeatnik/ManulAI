@@ -1961,7 +1961,11 @@ async function main() {
     for (const tc of toolCalls) {
       const toolName = tc.function?.name ?? 'unknown';
       const rawArgs = tc.function?.arguments ?? {};
-      const args = typeof rawArgs === 'string' ? JSON.parse(rawArgs) : rawArgs;
+let args = rawArgs;
+        if (typeof rawArgs === 'string') {
+          try { args = JSON.parse(rawArgs); }
+          catch { label(Y, 'TOOL ARG PARSE ERROR', `Tool "${toolName}" received non-JSON arguments; falling back to {}. Raw: ${String(rawArgs).substring(0, 200)}`); args = {}; }
+        }
 
       label(B, `  → ${toolName}`, JSON.stringify(args).substring(0, 150));
       logEvent('tool_exec_start', { tool: toolName, args });

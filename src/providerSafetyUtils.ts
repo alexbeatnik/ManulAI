@@ -47,8 +47,17 @@ export function buildBuildVerifyFailureNudge(stack: string, result: string): str
 }
 
 export function isTerminalReadOnlyInspectionCommand(command: string): boolean {
-  const normalized = command.trim().toLowerCase();
+  const trimmed = command.trim();
+  const normalized = trimmed.toLowerCase();
   if (!normalized) {
+    return false;
+  }
+
+  // Reject commands with shell control operators, redirections, or dangerous patterns
+  if (/[;&|<>`]|\$\(|\b-exec\b/.test(trimmed)) {
+    return false;
+  }
+  if (/\bsed\b[^\n]*\s-i\b/.test(normalized)) {
     return false;
   }
 

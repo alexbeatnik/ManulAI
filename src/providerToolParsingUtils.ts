@@ -77,10 +77,10 @@ export function extractToolCalls(message: { content: string; tool_calls?: ToolFu
 
 export function stripToolCallsFromContent(content: string): string {
   let stripped = content;
-  stripped = stripped.replace(/```(?:json|tool_call|tool)\s*\n?[\s\S]*?```/g, '');
-  stripped = stripped.replace(/<tool_call>\s*[\s\S]*?\s*<\/tool_call>/g, '');
+  stripped = stripped.replace(/```(?:json|tool_call|tool)\s*\n?[\s\S]*?```/gi, '');
+  stripped = stripped.replace(/<tool_call>\s*[\s\S]*?\s*<\/tool_call>/gi, '');
   stripped = stripped.replace(/<function=[^>]+>\s*[\s\S]*?<\/function>/g, '');
-  stripped = stripped.replace(/<\/?tool_call>/g, '');
+  stripped = stripped.replace(/<\/?tool_call>/gi, '');
   const toolNamePattern = /\{\s*"(?:name|function_name|function)"\s*:\s*"/g;
   let match: RegExpExecArray | null;
   while ((match = toolNamePattern.exec(stripped)) !== null) {
@@ -161,7 +161,7 @@ export function parseToolCallsFromContent(content: string, toolDefinitions: Tool
       const argsStr = extractBalancedJson(trimmed, start);
       if (argsStr) {
         const args = relaxedJsonParse(argsStr);
-        if (args && typeof args === 'object') {
+        if (args && typeof args === 'object' && !Array.isArray(args)) {
           // Skip {name, arguments} wrappers — those are handled by the blob parser above
           if (args.name && args.arguments !== undefined) { continue; }
           directJsonResults.push({

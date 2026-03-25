@@ -531,6 +531,9 @@ export async function extractDescribedFileDump(
   if (blockLanguage === 'diff' || blockLanguage === 'patch' || looksLikeDiffOutput(fileContent)) {
     return undefined;
   }
+  if (blockLanguage === 'json' || blockLanguage === 'tool' || blockLanguage === 'tool_call') {
+    return undefined;
+  }
 
   const mentionedFile = await options.findMentionedFileInContent(content);
   if (mentionedFile) {
@@ -609,7 +612,15 @@ export function extractNewFileCreation(
     return undefined;
   }
 
-  const blockContent = codeBlock[0].replace(/^```[\w.+-]*\n/, '').replace(/\n?```$/, '');
+  const rawBlock = codeBlock[0];
+  const langMatch = /^```([\w.+-]*)/i.exec(rawBlock);
+  const blockLang = langMatch && langMatch[1] ? langMatch[1].toLowerCase() : '';
+  const shellLangs = new Set(['sh', 'bash', 'zsh', 'shell', 'powershell', 'pwsh']);
+  if (blockLang === 'diff' || blockLang === 'patch' || shellLangs.has(blockLang) ||
+      blockLang === 'json' || blockLang === 'tool' || blockLang === 'tool_call') {
+    return undefined;
+  }
+  const blockContent = rawBlock.replace(/^```[\w.+-]*\n/, '').replace(/\n?```$/, '');
   if (!blockContent.trim()) {
     return undefined;
   }
