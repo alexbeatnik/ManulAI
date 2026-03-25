@@ -1499,6 +1499,25 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     let finalContent = assistantMessage.content ?? '';
     this.debugLog('ollama_response', { contentLength: finalContent.length, hasToolCalls: resolvedToolCalls.length > 0, contentPreview: finalContent.substring(0, 300) });
 
+    // Detect degenerate/repetitive output (e.g., "node node node" loops from overwhelmed models)
+    if (this.isDegenerateOutput(finalContent)) {
+      this.debugLog('degenerate_output', { contentLength: finalContent.length, retryCount, contentPreview: finalContent.substring(0, 200) });
+      // Do NOT push the garbage to message history — it poisons future context.
+      // Also trim any recently pushed degenerate hidden messages from the current exchange.
+      for (let i = messages.length - 1; i >= 0; i--) {
+        const m = messages[i];
+        if (m.role === 'user' && !m.hiddenFromTranscript) { break; }
+        if (m.role === 'assistant' && m.hiddenFromTranscript && typeof m.content === 'string' && this.isDegenerateOutput(m.content)) {
+          messages.splice(i, 1);
+        }
+      }
+      messages.push({
+        role: 'assistant',
+        content: 'The model produced incoherent/repetitive output. This usually means the prompt is too complex for this model size. Try a larger model or simplify the request.'
+      });
+      return;
+    }
+
     if (!this.agentMode) {
       // Chat mode: display the model response as-is, no file-write fallback processing.
       finalContent = this.truncateLargeCodeBlocks(finalContent);
@@ -2615,6 +2634,31 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     });
   }
 
+  private isDegenerateOutput(content: string): boolean {
+    const trimmed = content.trim();
+    if (trimmed.length < 80) { return false; }
+    // Strip markdown formatting and punctuation, then tokenize
+    const cleaned = trimmed.replace(/[*_~`#>|\-—=\[\](){}]/g, ' ');
+    const words = cleaned.split(/\s+/).map(w => w.toLowerCase().replace(/[^a-z0-9]/g, '')).filter(w => w.length > 0);
+    if (words.length < 20) { return false; }
+    // Count word frequencies
+    const freq = new Map<string, number>();
+    for (const w of words) {
+      freq.set(w, (freq.get(w) ?? 0) + 1);
+    }
+    // If any single word dominates (>50% of all tokens and appears 15+ times)
+    for (const [, count] of freq) {
+      if (count >= 15 && count / words.length > 0.5) {
+        return true;
+      }
+    }
+    // Ultra-low vocabulary: <5% unique words among 50+ words
+    if (words.length >= 50 && freq.size / words.length < 0.05) {
+      return true;
+    }
+    return false;
+  }
+
   private extractMarkerFileWrite(content: string): { fullMatch: string; filepath: string; fileContent: string } | undefined {
     return extractMarkerFileWriteHelper(content, this.attachedFiles);
   }
@@ -3269,7 +3313,13 @@ If the user asks for a change but provides NO code:
       requestMessages.push({ role: 'system', content: systemPrompt, hiddenFromTranscript: true });
     }
 
-    requestMessages.push(...messages.filter(m => !m.localOnly).map(m => ({ ...m })));
+    requestMessages.push(...messages.filter(m => !m.localOnly).map(m => {
+      // Sanitize any degenerate assistant content that leaked into history (prevents context poisoning)
+      if (m.role === 'assistant' && typeof m.content === 'string' && this.isDegenerateOutput(m.content)) {
+        return { ...m, content: '[incoherent output removed]' };
+      }
+      return { ...m };
+    }));
 
     const body: {
       model: string;

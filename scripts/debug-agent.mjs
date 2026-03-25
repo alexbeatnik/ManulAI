@@ -1552,6 +1552,32 @@ function parseToolCallsFromText(content) {
   return results;
 }
 
+// ─── Degenerate output detection (repetitive garbage like "node node node") ──
+function isDegenerateOutput(content) {
+  const trimmed = content.trim();
+  if (trimmed.length < 80) return false;
+  // Strip markdown formatting and punctuation, then tokenize
+  const cleaned = trimmed.replace(/[*_~`#>|\-\u2014=[\](){}]/g, ' ');
+  const words = cleaned.split(/\s+/).map(w => w.toLowerCase().replace(/[^a-z0-9]/g, '')).filter(w => w.length > 0);
+  if (words.length < 20) return false;
+  // Count word frequencies
+  const freq = new Map();
+  for (const w of words) {
+    freq.set(w, (freq.get(w) ?? 0) + 1);
+  }
+  // If any single word dominates (>50% of all tokens and appears 15+ times)
+  for (const [, count] of freq) {
+    if (count >= 15 && count / words.length > 0.5) {
+      return true;
+    }
+  }
+  // Ultra-low vocabulary: <5% unique words among 50+ words
+  if (words.length >= 50 && freq.size / words.length < 0.05) {
+    return true;
+  }
+  return false;
+}
+
 // ─── Simple nudge analysis (matches key detectors in processOllamaResponse) ──
 function analyzeResponse(content, recentMessages) {
   const hasToolResults = recentMessages.some(m => m.role === 'tool');
@@ -2304,6 +2330,21 @@ async function main() {
     // Detect echo: model parroted back a recent user message verbatim
     const lastUserMsgs = messages.filter(m => m.role === 'user').slice(-3).map(m => m.content.trim());
     const isEchoOfUserMsg = content.trim().length > 30 && lastUserMsgs.some(um => um.length > 30 && um === content.trim());
+
+    // Detect degenerate/repetitive output (e.g., "node node node" loops from overwhelmed models)
+    if (isDegenerateOutput(content)) {
+      label(R, 'DEGENERATE OUTPUT', `Model produced incoherent repetitive output (${content.length} chars) — aborting.`);
+      logEvent('degenerate_output', { turn, retryCount, contentLength: content.length, contentPreview: content.substring(0, 200) });
+      // Trim any recently pushed degenerate hidden messages to keep history clean
+      for (let i = messages.length - 1; i >= 0; i--) {
+        if (messages[i].role === 'user' && !messages[i].hiddenFromTranscript) break;
+        if (messages[i].role === 'assistant' && typeof messages[i].content === 'string' && isDegenerateOutput(messages[i].content)) {
+          messages.splice(i, 1);
+        }
+      }
+      break;
+    }
+
     // Empty response — model has nothing to say; treat as done if wrote something, else nudge once more
     if (content.trim().length === 0 || isTokenOverflow || isEchoOfUserMsg) {
       if (isTokenOverflow) label(Y, 'TOKEN OVERFLOW', 'Model returned a raw im_start token — treating as empty');
