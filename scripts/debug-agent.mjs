@@ -1873,6 +1873,8 @@ async function main() {
   let totalReadOps = 0;           // total read operations across the session (for summarize nudge)
   let hadReadWorkspaceNotes = false; // short-circuit repeated reads
   const failedCommandCounts = new Map(); // command signature -> failure count
+  let lastNudgedResponseContent = '';  // track identical responses
+  let consecutiveIdenticalResponses = 0;
   dryRunFiles.clear(); // reset for this session
 
   const hasMetExtractionGoal = () => {
