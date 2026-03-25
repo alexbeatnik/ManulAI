@@ -1303,6 +1303,18 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       for (const toolCall of resolvedToolCalls) {
         this.throwIfRequestStopped();
         const toolName = toolCall.function?.name || 'unknown_tool';
+
+        // Short-circuit repeated read_workspace_notes calls — notes don't change within a single exchange.
+        if (toolName === 'read_workspace_notes') {
+          const alreadyRead = messages.some(m => m.role === 'tool' && m.tool_name === 'read_workspace_notes');
+          if (alreadyRead) {
+            const shortCircuit = JSON.stringify({ content: '(notes already read — stop reading and proceed with create_or_edit_file to write actual code now)' });
+            this.debugLog('tool_exec_result', { tool: toolName, result: shortCircuit, shortCircuited: true });
+            messages.push({ role: 'tool', content: shortCircuit, tool_name: toolName, hiddenFromTranscript: true });
+            continue;
+          }
+        }
+
         this.postProgressStep(this.describeToolExecution(toolCall));
         this.debugLog('tool_exec_start', { tool: toolName, args: toolCall.function?.arguments });
         const toolResult = await this.executeToolCall(toolCall);
@@ -1357,8 +1369,25 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         }
       }
 
+      // If all executed tools were inspection-only (no writes), preserve retryCount
+      // so nudge counter isn't reset by useless read-only tool calls.
+      const inspectionOnlyToolSet = new Set([
+        'read_workspace_notes', 'list_workspace_files', 'project_scan',
+        'read_active_file', 'read_specific_file', 'read_file_slice'
+      ]);
+      const allToolsWereInspectionOnly = resolvedToolCalls.every(tc => {
+        const n = tc.function?.name ?? '';
+        if (inspectionOnlyToolSet.has(n)) { return true; }
+        if (n === 'execute_terminal_command') {
+          const args = tc.function?.arguments;
+          const cmd = typeof args === 'object' && args !== null ? String((args as Record<string, unknown>).command ?? '') : '';
+          return isTerminalReadOnlyInspectionCommand(cmd);
+        }
+        return false;
+      });
+
       this.resetNarratedBootstrapState();
-      await this.processOllamaResponse(messages, 0);
+      await this.processOllamaResponse(messages, allToolsWereInspectionOnly && !hadSuccessfulWrite ? retryCount : 0);
       return;
     }
 
@@ -1928,6 +1957,11 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         const isTinyStepPlan = progressLines.length > 0
           && finalContent.trim().length < 120
           && progressLines.every((line: string) => /^(?:\d+\.\s+|[-*]\s+)?(?:create|set\s*up|setup|write|implement|generate|build|start|begin)\b/i.test(line));
+        // Detect longer plan-only responses ("### Plan\n1. **Read**..." with no actual tool work)
+        const isPlanOnlyResponse = !isTinyStepPlan
+          && /^#{1,4}\s*plan\b/im.test(finalContent)
+          && /^\s*\d+\.\s+\*\*/m.test(finalContent)
+          && !hasRecentMeaningfulWrite;
         const hasInspectionOnlyToolLoop = hasRecentToolResults
           && !hasRecentSuccessfulAction
           && recentToolResults.every(({ message, parsed }) => {
@@ -1943,7 +1977,8 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
               || message.tool_name === 'project_scan'
               || message.tool_name === 'read_active_file'
               || message.tool_name === 'read_specific_file'
-              || message.tool_name === 'read_file_slice';
+              || message.tool_name === 'read_file_slice'
+              || message.tool_name === 'read_workspace_notes';
           });
 
         const recentExecutedCommands = recentToolMessages
@@ -2041,6 +2076,8 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
             ? 5
           : hasFakePostReadAnalysisDump || hasAnnouncedExtractionWithoutWrite || hasReadButNoWriteOnLargeRefactor || hasLazyRefusalOnLargeRefactor || hasModelRefusalResponse || hasPostReadSummaryOnLargeRefactor
             ? 4
+          : (!hasRecentSuccessfulAction && !hasRecentMeaningfulWrite && hasRecentToolResults)
+            ? 4
             : 2;
         const requiresToolContinuation = (
           isPassingToUser
@@ -2049,6 +2086,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           || hasExplicitNextSteps
           || isProgressOnlyResponse
           || (hasInspectionOnlyToolLoop && isTinyStepPlan)
+          || (hasInspectionOnlyToolLoop && isPlanOnlyResponse)
           || claimedButUnexecutedCommand
           || hasLargeRefactorShellReadBypass
           || hasPreReadLargeRefactorNarration
@@ -2154,7 +2192,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         }
 
         if (shouldNudge) {
-          this.debugLog('nudge', { retryCount, hasRecentToolResults, hasRecentSuccessfulAction, hasRecentMeaningfulWrite, latestCreatedFilePath, hasRecentReadOfLargeRefactorTarget, latestLargeRefactorTargetTotalLines, latestLargeRefactorTargetRemainingLines, canStopAfterTinyLargeRefactor, hasLargeRefactorShellReadBypass, hasPreReadLargeRefactorNarration, hasFakePreReadCodeDump, hasFakePostReadAnalysisDump, hasPostReadSummaryOnLargeRefactor, hasModelRefusalResponse, hasAnnouncedExtractionWithoutWrite, hasLazyRefusalOnLargeRefactor, isAskingUserForExactSlice, suggestedNextSlice, hasReadButNoWriteOnLargeRefactor, hasPostReadToolStall, hasPostCreateRefactorNarration, announcedNewFilePath, hasRecentToolErrors, hasRecentBuildVerifyFailure, hasRecentReplaceNotFound, replaceNotFoundFilepath, replaceNotFoundStartLine, replaceNotFoundEndLine, lastSuccessfulActionIndex, isLongDump, hasLargeCodeBlocks, claimsDone, mentionsChange, isLazyAcknowledgment, hasIncompletePlan: !!hasIncompletePlan, hasExplicitNextSteps, isProgressOnlyResponse, claimedButUnexecutedCommand, isPassingToUser, isAnnouncedButNotExecuted, isLargeRefactorRequest, contentPreview: finalContent.substring(0, 200) });
+          this.debugLog('nudge', { retryCount, hasRecentToolResults, hasRecentSuccessfulAction, hasRecentMeaningfulWrite, latestCreatedFilePath, hasRecentReadOfLargeRefactorTarget, latestLargeRefactorTargetTotalLines, latestLargeRefactorTargetRemainingLines, canStopAfterTinyLargeRefactor, hasLargeRefactorShellReadBypass, hasPreReadLargeRefactorNarration, hasFakePreReadCodeDump, hasFakePostReadAnalysisDump, hasPostReadSummaryOnLargeRefactor, hasModelRefusalResponse, hasAnnouncedExtractionWithoutWrite, hasLazyRefusalOnLargeRefactor, isAskingUserForExactSlice, suggestedNextSlice, hasReadButNoWriteOnLargeRefactor, hasPostReadToolStall, hasPostCreateRefactorNarration, announcedNewFilePath, hasRecentToolErrors, hasRecentBuildVerifyFailure, hasRecentReplaceNotFound, replaceNotFoundFilepath, replaceNotFoundStartLine, replaceNotFoundEndLine, lastSuccessfulActionIndex, isLongDump, hasLargeCodeBlocks, claimsDone, mentionsChange, isLazyAcknowledgment, hasIncompletePlan: !!hasIncompletePlan, hasExplicitNextSteps, isProgressOnlyResponse, claimedButUnexecutedCommand, isPassingToUser, isAnnouncedButNotExecuted, isPlanOnlyResponse, isLargeRefactorRequest, contentPreview: finalContent.substring(0, 200) });
           // Show plan/progress text to the user before nudging
           if (!isProgressOnlyResponse
             && !hasFakePreReadCodeDump
@@ -2242,8 +2280,8 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
             nudgeMessage = stepMatch
               ? `You are on step ${stepMatch[1]} of ${stepMatch[2]} but stopped. Continue executing your plan in small consecutive edits. Proceed to the next step now with tools, and keep going function-by-function or block-by-block instead of stopping after a single step.`
               : 'You reported that one step was completed and announced the next step, but you stopped before executing it. Continue now by calling the next tool instead of narrating the plan. Keep the next change small and self-contained.';
-          } else if (hasInspectionOnlyToolLoop && isTinyStepPlan) {
-            nudgeMessage = 'You already inspected the workspace. Stop planning. Do NOT call list_workspace_files again unless the target path is still genuinely unknown. If the workspace is empty, that is allowed. Your next response must call create_or_edit_file or write_to_file with a concrete source file path under src/ and the real implementation code. Do not reply with another step list.';
+          } else if (hasInspectionOnlyToolLoop && (isTinyStepPlan || isPlanOnlyResponse)) {
+            nudgeMessage = 'You already inspected the workspace and read notes. STOP PLANNING. Do NOT call read_workspace_notes or list_workspace_files again. Your next response MUST be a create_or_edit_file tool call with a concrete file path and the complete implementation code. No prose, no plan, no step list — only a tool call.';
           } else if (isLargeRefactorRequest) {
             const primaryTarget = largeRefactorTargets[0];
             if (primaryTarget && !hasRecentReadOfLargeRefactorTarget) {
@@ -2279,7 +2317,9 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           } else if (claimedButUnexecutedCommand) {
             nudgeMessage = 'You claimed that a command or action was completed, but there is no matching tool execution in this exchange. Do not claim completion without actually running the command. Execute it now with execute_terminal_command or continue the remaining scan steps.';
           } else if (isAnnouncedButNotExecuted) {
-            nudgeMessage = 'You announced an action but did not execute it. Do not describe what you will do — actually do it now by calling the appropriate tool. Use execute_terminal_command for commands or replace_in_file for edits.';
+            nudgeMessage = hasRecentMeaningfulWrite
+              ? 'You announced an action but did not execute it. Do not describe what you will do — actually do it now by calling the appropriate tool. Use execute_terminal_command for commands or replace_in_file for edits.'
+              : 'You announced an action but did not execute it. Do NOT plan or describe — call create_or_edit_file now with a concrete file path and the complete implementation code. Do not call read_workspace_notes again.';
           } else if (isPassingToUser) {
             nudgeMessage = 'Do not ask the user to run commands or make changes manually. You have tools available. Use execute_terminal_command to run commands and replace_in_file or create_or_edit_file to edit files. Do it yourself now.';
           } else if (isLazyAcknowledgment) {
