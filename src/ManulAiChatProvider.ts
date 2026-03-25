@@ -849,7 +849,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     } else if (this.agentMode === 'planner') {
       this.messages.push({
         role: 'user',
-        content: 'You are in Planner mode. The extension will orchestrate your execution step-by-step. Focus on ONE action at a time. Call exactly ONE tool per response. After each tool result, decide the single next tool call. Do NOT output plans or multiple steps — just execute the next action immediately. Keep your text output minimal between tool calls.',
+        content: 'You are in Planner mode. If the user asks a question or wants an explanation, answer directly — no tool calls needed. For tasks requiring code changes: focus on ONE action at a time. Call exactly ONE tool per response. After each tool result, decide the single next tool call. Do NOT output multi-step plans — just execute the next action immediately.',
         hiddenFromTranscript: true
       });
     }
@@ -3136,7 +3136,8 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
 You are ManulAI, a local VS Code coding agent in Planner mode.
 ${wsRoot ? `Workspace root: ${wsRoot}\n` : ''}
 [RULES]
-- Execute ONE tool call per response. No multi-step plans.
+- If the user asks a question, explains a concept, or requests information — answer directly in text. No tool calls needed.
+- For tasks that require code changes or file operations: execute ONE tool call per response. No multi-step plans.
 - After each tool result you receive, decide the next single action.
 - Use file tools for reads/writes, execute_terminal_command for shell.
 - Keep text output minimal between tool calls.

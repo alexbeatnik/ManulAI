@@ -447,7 +447,8 @@ Workspace root: ${wsRoot}
 All file paths are relative to the workspace root unless absolute.
 
 [RULES]
-- Execute ONE tool call per response. No multi-step plans.
+- If the user asks a question, explains a concept, or requests information — answer directly in text. No tool calls needed.
+- For tasks that require code changes or file operations: execute ONE tool call per response. No multi-step plans.
 - After each tool result you receive, decide the next single action.
 - Use file tools for reads/writes, execute_terminal_command for shell.
 - Keep text output minimal between tool calls.
