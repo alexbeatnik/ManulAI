@@ -1232,7 +1232,7 @@ const KNOWN_TOOLS = ['list_workspace_files', 'project_scan', 'read_workspace_not
 
 // Alias map: weak models often use alternative tool names
 const TOOL_ALIASES = {
-  write_file: 'write_to_file',
+  write_file: 'create_or_edit_file',
   create_file: 'create_or_edit_file',
   create_or_replace: 'create_or_edit_file',
   create_or_overwrite: 'create_or_edit_file',

@@ -6,7 +6,7 @@ import { AttachedFileContext, OllamaMessage, WebviewActiveFileState, WebviewRend
 
 export function getDisplayPath(file: AttachedFileContext, workspaceRoot?: string): string {
   const fsPath = file.uri.fsPath;
-  if (workspaceRoot && fsPath.startsWith(workspaceRoot + '/')) {
+  if (workspaceRoot && fsPath.startsWith(workspaceRoot + path.sep)) {
     return fsPath.slice(workspaceRoot.length + 1);
   }
   if (fsPath.startsWith('/dropped/') || fsPath.startsWith('/attached/')) {
