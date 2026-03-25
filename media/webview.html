@@ -1299,6 +1299,45 @@
       text-overflow: ellipsis;
     }
 
+    .mode-select {
+      font-size: 8px;
+      font-weight: 600;
+      letter-spacing: 0.03em;
+      text-transform: capitalize;
+      padding: 0 16px 0 6px;
+      height: var(--control-height);
+      min-height: var(--control-height);
+      border: 1px solid var(--border-muted);
+      border-radius: 999px;
+      background: color-mix(in srgb, var(--panel-strong) 84%, transparent);
+      color: var(--text);
+      cursor: pointer;
+      appearance: none;
+      -webkit-appearance: none;
+      outline: none;
+      flex-shrink: 0;
+      min-width: 0;
+      max-width: 80px;
+      background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='8' viewBox='0 0 8 8'%3E%3Cpath d='M1 2.5L4 5.5L7 2.5' stroke='%23999' stroke-width='1.2' fill='none'/%3E%3C/svg%3E");
+      background-repeat: no-repeat;
+      background-position: right 5px center;
+    }
+
+    .mode-select:focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: 2px;
+    }
+
+    .mode-select:disabled {
+      opacity: 0.5;
+      cursor: default;
+    }
+
+    .mode-select option {
+      background: var(--panel-strong);
+      color: var(--text);
+    }
+
     .toggle-switch.icon-toggle .toggle-label {
       display: none;
     }
@@ -1794,11 +1833,11 @@
           <div class="composer-actions">
             <div class="composer-buttons">
               <div class="composer-toggles">
-                <label class="toggle-switch toolbar-toggle" title="Enable Agent Mode so Ollama can call local tools automatically">
-                  <input type="checkbox" id="agentModeToggle" />
-                  <span class="toggle-slider"></span>
-                  <span id="agentModeLabel" class="toggle-label">Agent</span>
-                </label>
+                <select id="agentModeSelect" class="mode-select" title="Choose execution mode: Chat (no tools), Agent (full tools), or Planner (step-by-step orchestration)">
+                  <option value="chat">Chat</option>
+                  <option value="agent" selected>Agent</option>
+                  <option value="planner">Planner</option>
+                </select>
                 <label class="toggle-switch toolbar-toggle" title="Auto-approve tool execution without asking for confirmation">
                   <input type="checkbox" id="autoApproveToggle" />
                   <span class="toggle-slider"></span>
@@ -1850,8 +1889,7 @@
     const chatSelectEl = document.getElementById('chatSelect');
     const newChatEl = document.getElementById('newChat');
     const deleteChatEl = document.getElementById('deleteChat');
-    const agentModeToggle = document.getElementById('agentModeToggle');
-    const agentModeLabel = document.getElementById('agentModeLabel');
+    const agentModeSelect = document.getElementById('agentModeSelect');
     const autoApproveToggle = document.getElementById('autoApproveToggle');
     const autoApproveLabel = document.getElementById('autoApproveLabel');
     const debugModeToggle = document.getElementById('debugModeToggle');
@@ -1868,7 +1906,7 @@
     let chats = [];
     let activeChatId = '';
     let dragDepth = 0;
-    let agentMode = true;
+    let agentMode = 'agent';
     let autoApprove = false;
     let debugMode = false;
     let activeFile = null;
@@ -2164,8 +2202,8 @@
       refreshModelsEl.disabled = busy;
       clearChatEl.disabled = busy;
       sendEl.setAttribute('aria-busy', String(busy));
-      agentModeToggle.checked = agentMode;
-      agentModeLabel.textContent = 'Agent';
+      agentModeSelect.value = agentMode;
+      agentModeSelect.disabled = busy;
       autoApproveToggle.checked = autoApprove;
       autoApproveLabel.textContent = 'Auto';
       debugModeToggle.checked = debugMode;
@@ -2476,8 +2514,8 @@
       vscode.postMessage({ command: 'attachActiveFile' });
     });
 
-    agentModeToggle.addEventListener('change', () => {
-      vscode.postMessage({ command: 'toggleAgentMode', value: agentModeToggle.checked });
+    agentModeSelect.addEventListener('change', () => {
+      vscode.postMessage({ command: 'setAgentMode', value: agentModeSelect.value });
     });
 
     autoApproveToggle.addEventListener('change', () => {
@@ -2577,6 +2615,8 @@
         currentModel = payload.currentModel ?? null;
         ollamaReachable = payload.ollamaReachable !== undefined ? payload.ollamaReachable : ollamaReachable;
         agentMode = payload.agentMode !== undefined ? payload.agentMode : agentMode;
+        if (agentMode === true) agentMode = 'agent';
+        if (agentMode === false) agentMode = 'chat';
         autoApprove = payload.autoApprove !== undefined ? payload.autoApprove : autoApprove;
         debugMode = payload.debugMode !== undefined ? payload.debugMode : debugMode;
         pendingApproval = payload.pendingApproval || null;

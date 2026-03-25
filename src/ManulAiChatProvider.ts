@@ -3,7 +3,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as vscode from 'vscode';
 
-import { AttachedFileContext, ChatRole, ChatSession, DEFAULT_STORED_SETTINGS, ManulAiStoredSettings, OllamaMessage, OllamaResponse, ParsedToolCall, PersistedChatState, ToolDefinition, ToolFunctionCall, WebviewActiveFileState, WebviewChatSummary, WebviewInboundMessage, WebviewPendingApprovalState, WebviewRenderableMessage } from './types';
+import { AgentModeValue, AttachedFileContext, ChatRole, ChatSession, DEFAULT_STORED_SETTINGS, ManulAiStoredSettings, OllamaMessage, OllamaResponse, ParsedToolCall, PersistedChatState, ToolDefinition, ToolFunctionCall, WebviewActiveFileState, WebviewChatSummary, WebviewInboundMessage, WebviewPendingApprovalState, WebviewRenderableMessage } from './types';
 import { deserializeAttachedFileContext as deserializePersistedAttachedFileContext, deserializeChatMessage as deserializePersistedChatMessage, deserializeChatSession as deserializePersistedChatSession, getChatStorageDirUri as getPersistedChatStorageDirUri, getChatStorageUri as getPersistedChatStorageUri, getWorkspaceSettingsDirUri as getPersistedWorkspaceSettingsDirUri, getWorkspaceSettingsUri as getPersistedWorkspaceSettingsUri, normalizePersistedChatSession as normalizeRestoredChatSession, normalizeStoredSettings as normalizePersistedSettings, restorePersistedChats as restorePersistedChatState, serializeChatState as serializePersistedChatState } from './providerPersistenceUtils';
 import { extractCodeBlockFileWrites as extractCodeBlockFileWritesHelper, extractDescribedFileDump as extractDescribedFileDumpHelper, extractDescribedReplacements as extractDescribedReplacementsHelper, extractInlineFileBlocks as extractInlineFileBlocksHelper, extractMarkerFileWrite as extractMarkerFileWriteHelper, extractNewFileCreation as extractNewFileCreationHelper, extractTrustedFullFileContent as extractTrustedFullFileContentHelper, extractUnifiedDiffWrite as extractUnifiedDiffWriteHelper, findAttachedFileForReplacements as findAttachedFileForReplacementsHelper, findMentionedFileForReplacements as findMentionedFileForReplacementsHelper, findMentionedFileInContent as findMentionedFileInContentHelper, isLikelyFileReference as isLikelyFileReferenceHelper, looksLikeChangeSummary as looksLikeChangeSummaryHelper, looksLikeDiffOutput as looksLikeDiffOutputHelper, matchResponseToActiveFile as matchResponseToActiveFileHelper, matchResponseToAttachedFile as matchResponseToAttachedFileHelper, sanitizeGeneratedFileContent as sanitizeGeneratedFileContentHelper, stripDiffPrefixes as stripDiffPrefixesHelper, truncateLargeCodeBlocks as truncateLargeCodeBlocksHelper } from './providerFileFallbackUtils';
 import { extractSymbolNamesFromGeneratedContent, inferRepeatedNarratedBootstrapToolCall, validateGeneratedModuleContent } from './providerRefactorUtils';
@@ -34,7 +34,13 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   private chatCounter = 0;
   private availableModels: string[] = [];
   private ollamaReachable = false;
-  private agentMode = true;
+  private agentMode: AgentModeValue = 'agent';
+
+  /** True when tools are available (agent or planner mode). */
+  private get isAgentLike(): boolean {
+    return this.agentMode !== 'chat';
+  }
+
   private autoApprove = false;
   private debugMode = false;
   private requestInFlight = false;
@@ -72,7 +78,8 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       this.debugMode = DEFAULT_STORED_SETTINGS.debugMode;
     } else {
       const config = vscode.workspace.getConfiguration('manulai');
-      this.agentMode = Boolean(config.get('agentMode', DEFAULT_STORED_SETTINGS.agentMode));
+      const rawAgentMode = config.get('agentMode', DEFAULT_STORED_SETTINGS.agentMode);
+      this.agentMode = (typeof rawAgentMode === 'boolean') ? (rawAgentMode ? 'agent' : 'chat') : (rawAgentMode as AgentModeValue) || 'agent';
       this.autoApprove = Boolean(config.get('autoApprove', DEFAULT_STORED_SETTINGS.autoApprove));
       this.debugMode = Boolean(config.get('debugMode', DEFAULT_STORED_SETTINGS.debugMode));
     }
@@ -306,7 +313,8 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     await this.ensureChatStorageLoaded();
 
     const previousDebugMode = this.debugMode;
-    this.agentMode = this.getBooleanSetting('agentMode', DEFAULT_STORED_SETTINGS.agentMode);
+    const rawAgentMode = this.workspaceSettings.agentMode;
+    this.agentMode = rawAgentMode && ['chat', 'agent', 'planner'].includes(rawAgentMode) ? rawAgentMode : DEFAULT_STORED_SETTINGS.agentMode;
     this.autoApprove = this.getBooleanSetting('autoApprove', DEFAULT_STORED_SETTINGS.autoApprove);
     this.debugMode = this.getBooleanSetting('debugMode', DEFAULT_STORED_SETTINGS.debugMode);
 
@@ -692,14 +700,26 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       case 'attachProject':
         await this.attachWorkspaceAsContext();
         return;
-      case 'toggleAgentMode':
-        await this.setAgentMode(message.value);
+      case 'toggleAgentMode': {
+        // Backward compat: boolean from old webview
+        const v = message.value;
+        if (typeof v === 'boolean') {
+          await this.setAgentMode(v ? 'agent' : 'chat');
+        } else if (typeof v === 'string') {
+          await this.setAgentMode(v as AgentModeValue);
+        }
+        return;
+      }
+      case 'setAgentMode':
+        if (typeof message.value === 'string' && ['chat', 'agent', 'planner'].includes(message.value)) {
+          await this.setAgentMode(message.value as AgentModeValue);
+        }
         return;
       case 'toggleAutoApprove':
-        await this.setAutoApprove(message.value);
+        await this.setAutoApprove(typeof message.value === 'boolean' ? message.value : undefined);
         return;
       case 'toggleDebugMode':
-        await this.setDebugMode(message.value);
+        await this.setDebugMode(typeof message.value === 'boolean' ? message.value : undefined);
         return;
       default:
         return;
@@ -722,7 +742,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
 
     this.synchronizeActiveEditorContextMessage(text);
 
-    if (this.agentMode && this.looksLikeProjectScanRequest(text)) {
+    if (this.isAgentLike && this.looksLikeProjectScanRequest(text)) {
       await this.attachWorkspaceAsContext();
       this.messages.push({
         role: 'user',
@@ -787,13 +807,13 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
 
     const exchangeStartIndex = this.getLastVisibleUserMessageIndex(this.messages);
 
-    if (this.agentMode && this.looksLikeFileMutationRequest(text)) {
+    if (this.isAgentLike && this.looksLikeFileMutationRequest(text)) {
       await this.autoAttachLikelyRequestFiles(text);
     }
 
     this.synchronizeAttachmentContextMessage();
 
-    if (this.agentMode && this.looksLikeLargeRefactorRequest(text)) {
+    if (this.isAgentLike && this.looksLikeLargeRefactorRequest(text)) {
       this.messages.push({
         role: 'user',
         content: 'This is a large refactor request. Do NOT try to rewrite or summarize the whole file in one pass. First inspect structure with list_workspace_files and read_file_slice for bounded sections when the file is large. Then refactor in many small consecutive steps if needed: function-by-function, type-by-type, or one small self-contained block at a time. A long plan is acceptable, but do not stop after planning or after the first step. Keep using tools and continue the refactor across multiple consecutive small edits until the whole task is done or you are genuinely blocked by missing exact file context.',
@@ -809,7 +829,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         }
     }
 
-    if (this.agentMode) {
+    if (this.isAgentLike) {
       const directSummary = await this.tryHandleDirectLicenseAuthorRename(text)
         || await this.tryHandleDirectTitleRename(text);
       if (directSummary) {
@@ -820,10 +840,16 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       }
     }
 
-    if (this.agentMode) {
+    if (this.agentMode === 'agent') {
       this.messages.push({
         role: 'user',
         content: 'Before taking any action, output a brief numbered plan (3–8 steps) describing what you will do. Keep it concise. After the plan, immediately start executing step 1 with the appropriate tool call — do NOT wait for confirmation. After each file modification, make sure the project verification/build check passes. Prefer the project\'s own verification command for the detected stack. If the system injects a build_verify tool result with errors, fix those errors before moving to the next step.',
+        hiddenFromTranscript: true
+      });
+    } else if (this.agentMode === 'planner') {
+      this.messages.push({
+        role: 'user',
+        content: 'You are in Planner mode. The extension will orchestrate your execution step-by-step. Focus on ONE action at a time. Call exactly ONE tool per response. After each tool result, decide the single next tool call. Do NOT output plans or multiple steps — just execute the next action immediately. Keep your text output minimal between tool calls.',
         hiddenFromTranscript: true
       });
     }
@@ -1311,7 +1337,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       throw new Error('Ollama returned no message payload.');
     }
 
-    const resolvedToolCalls = this.agentMode ? this.extractToolCalls(assistantMessage) : [];
+    const resolvedToolCalls = this.isAgentLike ? this.extractToolCalls(assistantMessage) : [];
 
     if (resolvedToolCalls.length > 0) {
       const wasNative = (assistantMessage.tool_calls?.length ?? 0) > 0;
@@ -1518,7 +1544,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       return;
     }
 
-    if (!this.agentMode) {
+    if (!this.isAgentLike) {
       // Chat mode: display the model response as-is, no file-write fallback processing.
       finalContent = this.truncateLargeCodeBlocks(finalContent);
       if (!finalContent.trim()) {
@@ -1831,7 +1857,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         } catch {}
       }
 
-      if (this.agentMode) {
+      if (this.isAgentLike) {
         // --- Fallback layer 6a: retry blocked writes ---
         // If a fallback layer tried to write a file but detectDestructiveWrite blocked it,
         // nudge the model to use replace_in_file instead of rewriting the whole file.
@@ -2622,7 +2648,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       finalContent = this.truncateLongResponse(finalContent);
 
       if (!finalContent.trim()) {
-        finalContent = this.agentMode
+        finalContent = this.isAgentLike
           ? 'The model completed the request but returned no final text response. If file changes were expected, try the request again or switch to a model with stronger tool-calling support.'
           : 'No files were changed. Chat mode can only provide a proposed patch or instructions.';
       }
@@ -3049,11 +3075,45 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
 
     const requestMessages: OllamaMessage[] = [];
 
-    if (this.agentMode) {
+    if (this.isAgentLike) {
       const workspaceInstructions = await this.getWorkspaceInstructions();
       const recentChatSummaries = this.buildRecentChatSummaryContext();
 
       const wsRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? '';
+
+    if (this.agentMode === 'planner') {
+      // Planner mode: condensed system prompt to reduce token overhead for weaker models
+      let plannerMandate = `[IDENTITY]
+You are ManulAI, a local VS Code coding agent in Planner mode.
+${wsRoot ? `Workspace root: ${wsRoot}\n` : ''}
+[RULES]
+- Execute ONE tool call per response. No multi-step plans.
+- After each tool result you receive, decide the next single action.
+- Use file tools for reads/writes, execute_terminal_command for shell.
+- Keep text output minimal between tool calls.
+- NEVER output raw JSON as a substitute for a tool call.
+- Task is complete when all required changes are done. Output a one-line summary.
+`;
+
+      const workspaceTree = await this.buildCompactWorkspaceTree();
+      if (workspaceTree) {
+        plannerMandate += '\n[WORKSPACE STRUCTURE]\n' + workspaceTree;
+      }
+
+      const notesResult = await this.readWorkspaceNotes();
+      try {
+        const { content: notesContent } = JSON.parse(notesResult) as { content: string };
+        if (notesContent && !notesContent.startsWith('(no notes') && !notesContent.startsWith('(empty)') && !notesContent.startsWith('(no workspace')) {
+          plannerMandate += '\n[WORKSPACE NOTES]\n' + notesContent;
+        }
+      } catch { /* ignore parse errors */ }
+
+      requestMessages.push({
+        role: 'system',
+        content: plannerMandate,
+        hiddenFromTranscript: true
+      });
+    } else {
     let agentMandate = `[IDENTITY]
 You are ManulAI, a local VS Code coding agent.
 ${wsRoot ? `Workspace root: ${wsRoot}\n` : ''}
@@ -3212,6 +3272,7 @@ If steps remain → continue with the next tool call.
         content: agentMandate,
         hiddenFromTranscript: true
       });
+    } // end agent mandate else block
     } else {
       requestMessages.push({
   role: 'system',
@@ -3332,7 +3393,7 @@ If the user asks for a change but provides NO code:
       messages: requestMessages
     };
 
-    if (this.agentMode) {
+    if (this.isAgentLike) {
       body.tools = this.getToolDefinitions();
     }
 
@@ -6041,15 +6102,16 @@ If the user asks for a change but provides NO code:
     this.postStatus(`Scanned ${listedFiles.length} project files and attached ${collected.length} full file contents from ${folderName} as persistent context.`);
   }
 
-  private async setAgentMode(value: boolean | undefined): Promise<void> {
-    this.agentMode = value !== undefined ? value : !this.agentMode;
+  private async setAgentMode(value: AgentModeValue): Promise<void> {
+    this.agentMode = value;
     await this.persistStoredSetting('agentMode', this.agentMode);
     this.postStateToWebview();
-    this.postStatus(
-      this.agentMode
-        ? 'Agent Mode enabled. Ollama can call local tools and continue the loop automatically.'
-        : 'Agent Mode disabled. Requests run as plain chat without any tools.'
-    );
+    const labels: Record<AgentModeValue, string> = {
+      chat: 'Chat Mode: Requests run as plain chat without any tools.',
+      agent: 'Agent Mode: Ollama can call local tools and continue the loop automatically.',
+      planner: 'Planner Mode: Extension orchestrates step-by-step execution with reduced tool context per step.'
+    };
+    this.postStatus(labels[this.agentMode]);
   }
 
   private async setAutoApprove(value: boolean | undefined): Promise<void> {

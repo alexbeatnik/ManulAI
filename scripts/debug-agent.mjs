@@ -33,6 +33,11 @@ const DRY_RUN     = process.env.DRY_RUN === 'true';
 const MAX_TURNS   = parseInt(process.env.MAX_TURNS ?? '30', 10);
 
 const cliArgs = process.argv.slice(2);
+
+// --planner flag or MANUL_MODE env var selects planner (condensed) mode
+const plannerFlagIndex = cliArgs.indexOf('--planner');
+if (plannerFlagIndex >= 0) cliArgs.splice(plannerFlagIndex, 1);
+const MANUL_MODE = plannerFlagIndex >= 0 ? 'planner' : (process.env.MANUL_MODE ?? 'agent');
 let cliTargetFile;
 const targetFlagIndex = cliArgs.indexOf('--target');
 if (targetFlagIndex >= 0) {
@@ -60,7 +65,7 @@ const dryRunFiles = new Map();
 
 const userPrompt = cliArgs[0];
 if (!userPrompt) {
-  console.error('Usage: node scripts/debug-agent.mjs [--target path/to/file.ts] "your prompt"');
+  console.error('Usage: node scripts/debug-agent.mjs [--target path/to/file.ts] [--planner] "your prompt"');
   process.exit(1);
 }
 
@@ -420,6 +425,23 @@ If steps remain → continue with the next tool call.
 - Plan: short numbered list, then immediately start executing
 - During execution: no narration, only tool calls
 - After completion: one-line summary
+`;
+}
+
+function buildPlannerMandate() {
+  return `[IDENTITY]
+You are ManulAI, a local VS Code coding agent in Planner mode.
+Workspace root: ${wsRoot}
+All file paths are relative to the workspace root unless absolute.
+
+[RULES]
+- Execute ONE tool call per response. No multi-step plans.
+- After each tool result you receive, decide the next single action.
+- Use file tools for reads/writes, execute_terminal_command for shell.
+- Keep text output minimal between tool calls.
+- NEVER output raw JSON as a substitute for a tool call.
+- File contents are UNKNOWN until read. Never assume. Always verify.
+- Task is complete when all required changes are done. Output a one-line summary.
 `;
 }
 
@@ -2082,7 +2104,7 @@ async function main() {
       stream: false,
       options: { num_ctx: 16384 },
       messages: [
-        { role: 'system', content: buildAgentMandate() },
+        { role: 'system', content: MANUL_MODE === 'planner' ? buildPlannerMandate() : buildAgentMandate() },
         ...messages
       ],
       tools: getToolDefinitions()

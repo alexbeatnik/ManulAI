@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
 
-import { AttachedFileContext, ChatSession, ManulAiStoredSettings, OllamaMessage, PersistedAttachedFileContext, PersistedChatSession, PersistedChatState } from './types';
+import { AgentModeValue, AttachedFileContext, ChatSession, ManulAiStoredSettings, OllamaMessage, PersistedAttachedFileContext, PersistedChatSession, PersistedChatState } from './types';
 
 export function getWorkspaceSettingsDirUri(workspaceRoot?: vscode.Uri): vscode.Uri | undefined {
   if (!workspaceRoot) {
@@ -38,8 +38,10 @@ export function normalizeStoredSettings(value: unknown): Partial<ManulAiStoredSe
   if (typeof candidate.ollamaBaseUrl === 'string') {
     normalized.ollamaBaseUrl = candidate.ollamaBaseUrl;
   }
-  if (typeof candidate.agentMode === 'boolean') {
-    normalized.agentMode = candidate.agentMode;
+  if (typeof candidate.agentMode === 'string' && ['chat', 'agent', 'planner'].includes(candidate.agentMode)) {
+    normalized.agentMode = candidate.agentMode as AgentModeValue;
+  } else if (typeof candidate.agentMode === 'boolean') {
+    normalized.agentMode = candidate.agentMode ? 'agent' : 'chat';
   }
   if (typeof candidate.autoApprove === 'boolean') {
     normalized.autoApprove = candidate.autoApprove;

@@ -42,10 +42,12 @@ export interface AttachedFileContext {
   readOnly?: boolean;
 }
 
+export type AgentModeValue = 'chat' | 'agent' | 'planner';
+
 export interface ManulAiStoredSettings {
   ollamaModel?: string;
   ollamaBaseUrl?: string;
-  agentMode?: boolean;
+  agentMode?: AgentModeValue;
   autoApprove?: boolean;
   debugMode?: boolean;
   systemPrompt?: string;
@@ -92,7 +94,7 @@ export interface PersistedChatState {
 export const DEFAULT_STORED_SETTINGS: Required<ManulAiStoredSettings> = {
   ollamaModel: '',
   ollamaBaseUrl: 'http://localhost:11434',
-  agentMode: true,
+  agentMode: 'agent' as AgentModeValue,
   autoApprove: false,
   debugMode: false,
   systemPrompt: 'You are ManulAI, a privacy-first local coding assistant running inside VS Code. Work across any programming language. Prefer precise, minimal changes and explain results clearly.'
@@ -130,13 +132,14 @@ export interface WebviewInboundMessage {
     | 'browseFolder'
     | 'attachProject'
     | 'toggleAgentMode'
+    | 'setAgentMode'
     | 'toggleAutoApprove'
     | 'toggleDebugMode';
   text?: string;
   path?: string;
   paths?: string[];
   model?: string;
-  value?: boolean;
+  value?: boolean | string;
   autoApprove?: boolean;
   operationIds?: string[];
   filename?: string;
