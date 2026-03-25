@@ -150,6 +150,11 @@
       box-shadow: 0 0 0 4px color-mix(in srgb, var(--vscode-terminal-ansiGreen) 14%, transparent);
     }
 
+    .status-pill.disconnected::before {
+      background: color-mix(in srgb, var(--vscode-errorForeground, #f44747) 76%, #f77 24%);
+      box-shadow: 0 0 0 4px color-mix(in srgb, var(--vscode-errorForeground, #f44747) 14%, transparent);
+    }
+
     body.busy .status-pill {
       color: var(--text);
       border-color: color-mix(in srgb, var(--accent) 38%, transparent);
@@ -1859,6 +1864,7 @@
     let attachedFiles = [];
     let availableModels = [];
     let currentModel = null;
+    let ollamaReachable = false;
     let chats = [];
     let activeChatId = '';
     let dragDepth = 0;
@@ -1930,6 +1936,7 @@
         ? '<span class="thinking-inline">Thinking<span class="dots"><span></span><span></span><span></span></span></span>'
         : 'Idle';
       statusPillEl.textContent = busy ? `Thinking with ${currentModel || 'no model'}` : `Model: ${currentModel || 'none'}`;
+      statusPillEl.classList.toggle('disconnected', !currentModel || !ollamaReachable);
       document.body.classList.toggle('busy', busy);
     }
 
@@ -2568,6 +2575,7 @@
         activeChatId = payload.activeChatId || '';
         availableModels = payload.availableModels || [];
         currentModel = payload.currentModel ?? null;
+        ollamaReachable = payload.ollamaReachable !== undefined ? payload.ollamaReachable : ollamaReachable;
         agentMode = payload.agentMode !== undefined ? payload.agentMode : agentMode;
         autoApprove = payload.autoApprove !== undefined ? payload.autoApprove : autoApprove;
         debugMode = payload.debugMode !== undefined ? payload.debugMode : debugMode;

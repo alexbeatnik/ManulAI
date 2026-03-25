@@ -33,6 +33,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   private activeChatId = '';
   private chatCounter = 0;
   private availableModels: string[] = [];
+  private ollamaReachable = false;
   private agentMode = true;
   private autoApprove = false;
   private debugMode = false;
@@ -251,8 +252,15 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         .sort((left, right) => left.localeCompare(right));
 
       this.availableModels = Array.from(new Set([currentModel, ...names].filter(Boolean)));
+      this.ollamaReachable = true;
+
+      // Auto-select the only available model when none is currently chosen
+      if (!currentModel && names.length === 1) {
+        await this.setSelectedModel(names[0]);
+      }
     } catch (error) {
       this.availableModels = Array.from(new Set([currentModel, ...this.availableModels].filter(Boolean)));
+      this.ollamaReachable = false;
 
       if (postStatusOnError) {
         const message = error instanceof Error ? error.message : 'Failed to load Ollama models.';
@@ -6323,6 +6331,7 @@ If the user asks for a change but provides NO code:
       activeChatId: this.activeChatId,
       currentModel: this.getSelectedModel() || null,
       availableModels: this.availableModels,
+      ollamaReachable: this.ollamaReachable,
       agentMode: this.agentMode,
       autoApprove: this.autoApprove,
       debugMode: this.debugMode,
