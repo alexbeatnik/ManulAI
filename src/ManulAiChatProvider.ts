@@ -2073,7 +2073,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           || hasPostCreateRefactorNarration
           || (isLargeRefactorRequest && hasRecentToolResults && (!hasRecentSuccessfulAction || !hasRecentReadOfLargeRefactorTarget || !hasRecentMeaningfulWrite))
           || (hasRecentReplaceNotFound && (mentionsChange || claimsDone || isLazyAcknowledgment || hasIncompletePlan || hasExplicitNextSteps || isPassingToUser || isProgressOnlyResponse))
-          || (hasRecentToolErrors && (claimsDone || mentionsChange || isLazyAcknowledgment))
+          || (hasRecentToolErrors && (claimsDone || mentionsChange || isLazyAcknowledgment || hasIncompletePlan || hasExplicitNextSteps || isProgressOnlyResponse))
           || (!hasRecentSuccessfulAction && (isLongDump || hasLargeCodeBlocks || claimsDone || mentionsChange || isLazyAcknowledgment))
         );
         const shouldNudge = requiresToolContinuation && retryCount < maxNudgeRetries;
@@ -2226,6 +2226,11 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
             nudgeMessage = replaceNotFoundFilepath && replaceNotFoundStartLine && replaceNotFoundEndLine
               ? `Your replace_in_file call failed because old_text did not match the real file content. First call read_file_slice for ${replaceNotFoundFilepath} with startLine=${replaceNotFoundStartLine} and endLine=${replaceNotFoundEndLine}. Do NOT guess. Then call replace_in_file again using the exact current text including whitespace.`
               : `Your replace_in_file call failed because old_text did not match the real file content.${replaceNotFoundFilepath ? ` First call read_file_slice for ${replaceNotFoundFilepath} with startLine=1 and endLine=120 (or the section containing your target text).` : ' First call read_file_slice for that file with a bounded line range containing the section you want to edit.'} Do NOT guess. Do NOT ask the user to confirm. Read the slice now, then call replace_in_file again using the exact current text including whitespace and indentation.`;
+          } else if (hasRecentToolErrors) {
+            const lastErr = recentToolErrors[recentToolErrors.length - 1];
+            nudgeMessage = lastErr?.error
+              ? `Your last tool call (${lastErr.toolName}) failed with: "${lastErr.error.substring(0, 300)}". Do NOT repeat the same call or describe a plan. Adapt: if a file was not found, call list_workspace_files first to locate it; if a path is wrong, verify with list_workspace_files. Then retry with corrected parameters.`
+              : 'Your last tool call failed. Do NOT describe a plan or repeat the same call. Adapt your approach: use list_workspace_files to verify the file structure, then retry with correct parameters.';
           } else if (isProgressOnlyResponse) {
             nudgeMessage = 'Do not print progress updates like "Step 3/3" without taking action. Call a tool now. If you need the current file content, use read_specific_file first, then continue with replace_in_file or another appropriate tool.';
           } else if (claimedButUnexecutedCommand) {
@@ -3688,6 +3693,23 @@ If the user asks for a change but provides NO code:
       if (jsonStr) { candidates.push(jsonStr); }
     }
 
+    // Bare format: `toolname {json}` — some models output the tool name as a word then args as JSON.
+    // e.g. `list_workspace_files {"directory": "src"}` or `read_specific_file {"filepath": "..."}`
+    const knownNames = new Set(this.getToolDefinitions().map(t => t.function.name));
+    const bareToolPattern = /^([a-z][a-z0-9_]+)\s+(\{[\s\S]*)/m;
+    const bareMatch = bareToolPattern.exec(trimmed);
+    if (bareMatch && knownNames.has(bareMatch[1])) {
+      const argsStr = this.extractBalancedJson(bareMatch[2], 0);
+      if (argsStr) {
+        try {
+          const argsObj = JSON.parse(argsStr) as Record<string, unknown>;
+          return [{ type: 'function', function: { name: bareMatch[1], arguments: argsObj } }];
+        } catch {
+          // fall through
+        }
+      }
+    }
+
     for (const candidate of candidates) {
       try {
         const parsed = JSON.parse(candidate) as unknown;
@@ -4684,11 +4706,29 @@ If the user asks for a change but provides NO code:
     }
 
     const { document } = editor;
-    return JSON.stringify({
-      path: document.uri.fsPath,
+    const fsPath = document.uri.fsPath;
+    const ext = path.extname(fsPath).toLowerCase();
+    // Non-source files (logs, JSONL, generated JSON, lock files) should not be
+    // treated as the user's project source. Warn the model so it uses list_workspace_files
+    // to find the real source files instead.
+    const isNonSource = /\.(?:jsonl|log|lock|map)$/.test(ext)
+      || /(?:package-lock\.json|yarn\.lock|pnpm-lock\.yaml|\.manulai[\/\\])/.test(fsPath);
+    const base = JSON.stringify({
+      path: fsPath,
       languageId: document.languageId,
       content: document.getText()
     });
+    if (isNonSource) {
+      const warning = `WARNING: The active file is "${path.basename(fsPath)}" which is a system/log file, not a project source file. Do NOT try to edit or split this file. Call list_workspace_files to find the actual project source files and work on those instead.`;
+      try {
+        const parsed = JSON.parse(base) as Record<string, unknown>;
+        parsed.warning = warning;
+        return JSON.stringify(parsed);
+      } catch {
+        return base;
+      }
+    }
+    return base;
   }
 
   private isLargeRefactorScenario(): boolean {
