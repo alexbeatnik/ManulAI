@@ -3144,6 +3144,7 @@ ${wsRoot ? `Workspace root: ${wsRoot}\n` : ''}
 - After each tool result you receive, decide the next single action.
 - Use file tools for reads/writes, execute_terminal_command for shell.
 - execute_terminal_command has no stdin. Never run interactive programs (input(), readline, read) — they will hang.
+- For interactive programs (games, REPLs, scripts that need user input), use launch_in_terminal instead.
 - Keep text output minimal between tool calls.
 - NEVER output raw JSON as a substitute for a tool call.
 - Task is complete when all required changes are done. Output a one-line summary.
@@ -3185,6 +3186,7 @@ You are an ACTION agent. Execute tasks using tools. Never describe what you inte
 
 1. File or code modification needed → use file tools
 2. Command execution needed → use execute_terminal_command (no stdin — never run interactive programs)
+   For interactive programs (games, REPLs, scripts with user input) → use launch_in_terminal
 3. Code understanding required → read files first with read_file_slice
 4. No tools required → respond concisely
 
@@ -3887,6 +3889,24 @@ If the user asks for a change but provides NO code:
       {
         type: 'function',
         function: {
+          name: 'launch_in_terminal',
+          description: 'Open an interactive program in a visible VS Code terminal. Use this for programs that need user input (games, REPLs, interactive scripts). Returns immediately — the user interacts with the program directly.',
+          parameters: {
+            type: 'object',
+            properties: {
+              command: {
+                type: 'string',
+                description: 'The command to run in the interactive terminal.'
+              }
+            },
+            required: ['command'],
+            additionalProperties: false
+          }
+        }
+      },
+      {
+        type: 'function',
+        function: {
           name: 'delete_file',
           description: 'Delete a file from the workspace.',
           parameters: {
@@ -4060,6 +4080,8 @@ If the user asks for a change but provides NO code:
           return await this.replaceInFile(String(args.filepath ?? ''), String(args.old_text ?? ''), String(args.new_text ?? ''));
         case 'execute_terminal_command':
           return await this.executeTerminalCommand(String(args.command ?? ''));
+        case 'launch_in_terminal':
+          return this.launchInTerminal(String(args.command ?? ''));
         case 'delete_file':
           return await this.deleteFile(String(args.filepath ?? ''));
         case 'list_workspace_files': {
@@ -5935,6 +5957,33 @@ If the user asks for a change but provides NO code:
     });
   }
 
+  private launchInTerminal(command: string): string {
+    const trimmed = command.trim();
+
+    if (!trimmed) {
+      return JSON.stringify({ error: 'command is required.' });
+    }
+
+    const forbiddenFragments = ['rm -rf /', 'sudo ', 'shutdown', 'reboot', 'mkfs', ':(){:|:&};:'];
+    if (forbiddenFragments.some(fragment => trimmed.includes(fragment))) {
+      return JSON.stringify({ error: 'Command rejected by basic safety policy.' });
+    }
+
+    const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    const terminal = vscode.window.createTerminal({
+      name: `ManulAI: ${trimmed.length > 40 ? trimmed.substring(0, 37) + '...' : trimmed}`,
+      cwd
+    });
+    terminal.show();
+    terminal.sendText(trimmed);
+
+    return JSON.stringify({
+      launched: true,
+      command: trimmed,
+      note: 'Program launched in a visible VS Code terminal. The user can interact with it directly.'
+    });
+  }
+
   private async addFileContext(rawPath: string): Promise<void> {
     try {
       const uri = this.parseDroppedUri(rawPath);
@@ -6851,6 +6900,8 @@ If the user asks for a change but provides NO code:
         return `Deleting ${formatPath(args.filepath)}`;
       case 'execute_terminal_command':
         return `Running ${String(args.command ?? '').trim() || 'terminal command'}`;
+      case 'launch_in_terminal':
+        return `Launching in terminal: ${String(args.command ?? '').trim() || 'interactive program'}`;
       default:
         return `Executing ${toolName}`;
     }

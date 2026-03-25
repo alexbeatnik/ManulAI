@@ -547,6 +547,18 @@ function getToolDefinitions() {
     {
       type: 'function',
       function: {
+        name: 'launch_in_terminal',
+        description: 'Open an interactive program in a visible terminal. Use for programs that need user input (games, REPLs, interactive scripts). Returns immediately.',
+        parameters: {
+          type: 'object',
+          properties: { command: { type: 'string' } },
+          required: ['command']
+        }
+      }
+    },
+    {
+      type: 'function',
+      function: {
         name: 'project_scan',
         description: 'Build a structured project summary with key files, entry points, package manager, project type hints, and important modules.',
         parameters: {
@@ -1144,6 +1156,13 @@ async function executeTool(name, args) {
       }
     }
 
+    case 'launch_in_terminal': {
+      const cmd = String(args.command ?? '');
+      if (!cmd) return JSON.stringify({ error: 'command is required.' });
+      console.log(`[LAUNCH_IN_TERMINAL] ${cmd}`);
+      return JSON.stringify({ launched: true, command: cmd, note: 'In debug mode, interactive launch is simulated. In VS Code, this opens a real terminal.' });
+    }
+
     default:
       return JSON.stringify({ error: `Unknown tool: ${name}` });
   }
@@ -1232,7 +1251,7 @@ function extractDefinitionsFromSource(source, filepath = TARGET_FILE) {
 }
 
 // ─── Text-based tool call parser (handles leaked JSON tool calls) ────────────
-const KNOWN_TOOLS = ['list_workspace_files', 'project_scan', 'read_workspace_notes', 'write_workspace_notes', 'read_file_slice', 'read_specific_file', 'create_or_edit_file', 'replace_in_file', 'execute_terminal_command'];
+const KNOWN_TOOLS = ['list_workspace_files', 'project_scan', 'read_workspace_notes', 'write_workspace_notes', 'read_file_slice', 'read_specific_file', 'create_or_edit_file', 'replace_in_file', 'execute_terminal_command', 'launch_in_terminal'];
 
 // Alias map: weak models often use alternative tool names
 const TOOL_ALIASES = {
@@ -1246,7 +1265,9 @@ const TOOL_ALIASES = {
   read_file_range: 'read_file_slice',
   read_file_chunk: 'read_file_slice',
   run_command: 'execute_terminal_command',
-  terminal_command: 'execute_terminal_command'
+  terminal_command: 'execute_terminal_command',
+  open_terminal: 'launch_in_terminal',
+  run_in_terminal: 'launch_in_terminal'
 };
 function remapToolName(name) {
   return TOOL_ALIASES[name.trim().toLowerCase()] ?? name.trim();

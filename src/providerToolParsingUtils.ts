@@ -13,7 +13,9 @@ export function remapWeakModelToolName(name: string): string {
     read_file_range: 'read_file_slice',
     read_file_chunk: 'read_file_slice',
     run_command: 'execute_terminal_command',
-    terminal_command: 'execute_terminal_command'
+    terminal_command: 'execute_terminal_command',
+    open_terminal: 'launch_in_terminal',
+    run_in_terminal: 'launch_in_terminal'
   };
   return aliases[normalized.toLowerCase()] ?? normalized;
 }
