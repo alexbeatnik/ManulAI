@@ -2155,7 +2155,7 @@
       modelSelectEl.innerHTML = '';
       chatSelectEl.innerHTML = '';
 
-      const visibleChats = chats.length > 0 ? chats : [{ id: activeChatId || 'default', title: 'Chat 1' }];
+      const visibleChats = chats.length > 0 ? chats : [{ id: activeChatId || 'default', title: 'Chat' }];
       if (visibleChats.length === 0) {
         const placeholder = document.createElement('option');
         placeholder.value = '';

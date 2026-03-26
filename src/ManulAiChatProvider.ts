@@ -106,7 +106,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     const chatNumber = ++this.chatCounter;
     const chat: ChatSession = {
       id: `chat-${Date.now()}-${chatNumber}`,
-      title: title?.trim() || `Chat ${chatNumber}`,
+      title: title?.trim() || 'Chat',
       messages: [],
       attachedFiles: new Map<string, AttachedFileContext>(),
       summaryMemory: []
