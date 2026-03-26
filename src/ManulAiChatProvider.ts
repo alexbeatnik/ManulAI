@@ -4411,14 +4411,17 @@ If the user asks for a change but provides NO code:
       return JSON.stringify({ error: 'filepath is required.' });
     }
 
+    // Default startLine to 1 and endLine to 200 when the model omits them
     const normalizedStartLine = Number(startLine);
     const normalizedEndLine = Number(endLine);
-    if (!Number.isFinite(normalizedStartLine) || !Number.isFinite(normalizedEndLine)) {
+    const hasStart = Number.isFinite(normalizedStartLine);
+    const hasEnd = Number.isFinite(normalizedEndLine);
+    if (!hasStart && !hasEnd) {
       return JSON.stringify({ error: 'startLine and endLine must be numbers.' });
     }
 
-    const start = Math.max(1, Math.floor(normalizedStartLine));
-    const end = Math.max(1, Math.floor(normalizedEndLine));
+    const start = Math.max(1, Math.floor(hasStart ? normalizedStartLine : 1));
+    const end = Math.max(1, Math.floor(hasEnd ? normalizedEndLine : start + 199));
     if (end < start) {
       return JSON.stringify({ error: 'endLine must be greater than or equal to startLine.' });
     }
