@@ -4441,17 +4441,21 @@ If the user asks for a change but provides NO code:
       return JSON.stringify({ error: 'filepath is required.' });
     }
 
-    // Default startLine to 1 and endLine to 200 when the model omits them
-    const normalizedStartLine = Number(startLine);
-    const normalizedEndLine = Number(endLine);
-    const hasStart = Number.isFinite(normalizedStartLine);
-    const hasEnd = Number.isFinite(normalizedEndLine);
-    if (!hasStart && !hasEnd) {
+    // Default startLine to 1 and endLine to start+199 when the model omits them.
+    // Number(undefined) → NaN, Number(null) → 0, Number('') → 0.
+    // Treat NaN as "omitted"; error only when a param is present but not numeric.
+    const rawStart = startLine === undefined || startLine === null || startLine === '' ? undefined : Number(startLine);
+    const rawEnd = endLine === undefined || endLine === null || endLine === '' ? undefined : Number(endLine);
+    const hasStart = rawStart !== undefined && Number.isFinite(rawStart);
+    const hasEnd = rawEnd !== undefined && Number.isFinite(rawEnd);
+    const startIsInvalid = rawStart !== undefined && !Number.isFinite(rawStart);
+    const endIsInvalid = rawEnd !== undefined && !Number.isFinite(rawEnd);
+    if (startIsInvalid || endIsInvalid) {
       return JSON.stringify({ error: 'startLine and endLine must be numbers.' });
     }
 
-    const start = Math.max(1, Math.floor(hasStart ? normalizedStartLine : 1));
-    const end = Math.max(1, Math.floor(hasEnd ? normalizedEndLine : start + 199));
+    const start = Math.max(1, Math.floor(hasStart ? rawStart : 1));
+    const end = Math.max(1, Math.floor(hasEnd ? rawEnd : start + 199));
     if (end < start) {
       return JSON.stringify({ error: 'endLine must be greater than or equal to startLine.' });
     }
