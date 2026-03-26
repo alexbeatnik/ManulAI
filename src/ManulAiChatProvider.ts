@@ -191,6 +191,12 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     const deletedChat = this.chats[currentIndex];
     this.chats.splice(currentIndex, 1);
 
+    // Delete per-chat notes file
+    const notesUri = this.getChatNotesUri(deletedChat.id);
+    if (notesUri) {
+      vscode.workspace.fs.delete(notesUri).then(undefined, () => { /* file may not exist */ });
+    }
+
     if (this.chats.length === 0) {
       this.createChatSession();
     } else {
@@ -3983,7 +3989,7 @@ If the user asks for a change but provides NO code:
         type: 'function',
         function: {
           name: 'read_workspace_notes',
-          description: 'Read persistent notes about this project saved by the model in a previous session. Always call this at the start of a new task to recall prior discoveries, decisions, and project context.',
+          description: 'Read persistent notes for this chat saved by the model in a previous session. Always call this at the start of a new task to recall prior discoveries, decisions, and project context.',
           parameters: {
             type: 'object',
             properties: {},
@@ -3995,7 +4001,7 @@ If the user asks for a change but provides NO code:
         type: 'function',
         function: {
           name: 'write_workspace_notes',
-          description: 'Save notes about this project to persistent memory (.manulai/notes.md). Use mode="append" to add new facts without erasing previous notes. Use mode="overwrite" only to fully replace notes. Call this after completing a task to record key facts: file roles, architecture decisions, repeated patterns, or anything needed to avoid re-reading files next time.',
+          description: 'Save notes for this chat to persistent memory. Notes are scoped to the current chat and deleted when the chat is deleted. Use mode="append" to add new facts without erasing previous notes. Use mode="overwrite" only to fully replace notes. Call this after completing a task to record key facts: file roles, architecture decisions, repeated patterns, or anything needed to avoid re-reading files next time.',
           parameters: {
             type: 'object',
             properties: {
@@ -4717,11 +4723,17 @@ If the user asks for a change but provides NO code:
     return this.workspaceSnapshotCache;
   }
 
-  private async readWorkspaceNotes(): Promise<string> {
+  private getChatNotesUri(chatId?: string): vscode.Uri | undefined {
     const dir = this.getWorkspaceSettingsDirUri();
-    if (!dir) { return JSON.stringify({ content: '(no workspace open)' }); }
+    if (!dir) { return undefined; }
+    const id = chatId ?? this.activeChatId;
+    return vscode.Uri.joinPath(dir, 'notes', `${id}.md`);
+  }
+
+  private async readWorkspaceNotes(): Promise<string> {
+    const uri = this.getChatNotesUri();
+    if (!uri) { return JSON.stringify({ content: '(no workspace open)' }); }
     try {
-      const uri = vscode.Uri.joinPath(dir, 'notes.md');
       const bytes = await vscode.workspace.fs.readFile(uri);
       const content = Buffer.from(bytes).toString('utf8');
       return JSON.stringify({ content: content || '(empty)' });
@@ -4732,10 +4744,10 @@ If the user asks for a change but provides NO code:
 
   private async writeWorkspaceNotes(content: string, mode: string): Promise<string> {
     const dir = this.getWorkspaceSettingsDirUri();
-    if (!dir) { return JSON.stringify({ error: 'No workspace open.' }); }
+    const uri = this.getChatNotesUri();
+    if (!dir || !uri) { return JSON.stringify({ error: 'No workspace open.' }); }
     try {
-      await vscode.workspace.fs.createDirectory(dir);
-      const uri = vscode.Uri.joinPath(dir, 'notes.md');
+      await vscode.workspace.fs.createDirectory(vscode.Uri.joinPath(dir, 'notes'));
       let finalContent = content;
       if (mode === 'append') {
         let existing = '';
@@ -4746,7 +4758,7 @@ If the user asks for a change but provides NO code:
         finalContent = existing ? existing.trimEnd() + '\n\n' + content : content;
       }
       await vscode.workspace.fs.writeFile(uri, Buffer.from(finalContent, 'utf8'));
-      return JSON.stringify({ success: true, note: 'Notes saved to .manulai/notes.md' });
+      return JSON.stringify({ success: true, note: 'Notes saved for this chat.' });
     } catch (error) {
       return JSON.stringify({ error: error instanceof Error ? error.message : 'Failed to write notes.' });
     }
