@@ -194,7 +194,18 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     // Delete per-chat notes file
     const notesUri = this.getChatNotesUri(deletedChat.id);
     if (notesUri) {
-      vscode.workspace.fs.delete(notesUri).then(undefined, () => { /* file may not exist */ });
+      void vscode.workspace.fs.delete(notesUri).then(
+        undefined,
+        (err) => {
+          if (err instanceof vscode.FileSystemError && err.code === 'FileNotFound') {
+            return;
+          }
+          this.debugLog('chat_notes_delete_failed', {
+            chatId: deletedChat.id,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        },
+      );
     }
 
     if (this.chats.length === 0) {
@@ -4442,8 +4453,8 @@ If the user asks for a change but provides NO code:
     }
 
     // Default startLine to 1 and endLine to start+199 when the model omits them.
-    // Number(undefined) → NaN, Number(null) → 0, Number('') → 0.
-    // Treat NaN as "omitted"; error only when a param is present but not numeric.
+    // Treat undefined|null|'' as "omitted" so we never generate NaN for missing params.
+    // Any other non-numeric value becomes NaN and is treated as invalid, returning an error.
     const rawStart = startLine === undefined || startLine === null || startLine === '' ? undefined : Number(startLine);
     const rawEnd = endLine === undefined || endLine === null || endLine === '' ? undefined : Number(endLine);
     const hasStart = rawStart !== undefined && Number.isFinite(rawStart);
@@ -4742,7 +4753,7 @@ If the user asks for a change but provides NO code:
       const content = Buffer.from(bytes).toString('utf8');
       return JSON.stringify({ content: content || '(empty)' });
     } catch {
-      return JSON.stringify({ content: '(no notes yet — use write_workspace_notes to save notes about this project)' });
+      return JSON.stringify({ content: '(no notes yet — use write_workspace_notes to save notes for this chat)' });
     }
   }
 
