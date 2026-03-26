@@ -2113,7 +2113,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         const isConversationalUserMessage = (
           /^(?:привіт|вітаю|здоров|доброго дня|добрий день|добрий ранок|добрий вечір|як справи|як ти|що нового|hello|hi|hey|howdy|yo|hola|good morning|good evening|good afternoon|how are you|what'?s up|sup|greetings|thanks|thank you|дякую|спасибі)\b/i.test(userMsgTrimmed)
           || (userMsgTrimmed.length > 0 && userMsgTrimmed.length < 60
-            && !/(?:[.\\/](?:ts|js|py|rs|go|c|cpp|h|java|rb|sh|json|yaml|yml|toml|md|html|css|vue|jsx|tsx)\b|creat|edit|fix|refactor|chang|modif|updat|replac|delet|remov|build|compil|run|execut|install|implement|add|write|read|scan|check|review|debug|test|move|renam|split|merge|зроби|створи|виправ|зміни|додай|напиши|видали|перейменуй)/i.test(userMsgTrimmed)
+            && !/(?:[.\\/](?:ts|js|py|rs|go|c|cpp|h|java|rb|sh|json|yaml|yml|toml|md|html|css|vue|jsx|tsx)\b|\b(?:creat|edit|fix|refactor|chang|modif|updat|replac|delet|remov|build|compil|run|execut|install|implement|add|write|read|scan|check|review|debug|test|move|renam|split|merge|зроби|створи|виправ|зміни|додай|напиши|видали|перейменуй))/i.test(userMsgTrimmed)
             && !/```/.test(userMsgTrimmed))
         );
 
