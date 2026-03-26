@@ -124,7 +124,7 @@ Direct pre-agent handlers also exist for common fast-path edits such as Markdown
 
 `project_scan` is the high-level orientation tool. It summarizes key files, likely entry points, language hints, project type hints, package manager signals, `frameworkHints`, and important top-level modules across common ecosystems without forcing the model to open many files first. Its manifest parsing is deeper for Python, Java, C#, Rust, and Go so the model can recover framework and runtime-entry signals before doing narrow file reads.
 
-`read_workspace_notes` and `write_workspace_notes` persist project memory in `.manulai/notes.md`. The provider can auto-append short notes after completed tasks so important discoveries survive beyond the active request.
+`read_workspace_notes` and `write_workspace_notes` persist per-chat project memory under `.manulai/notes/<chatId>.md`. Each chat has its own notes file, and notes are automatically deleted when the chat is deleted. The provider can auto-append short notes after completed tasks so important discoveries survive beyond the active request.
 
 Chats also persist a compact `summaryMemory` alongside the full transcript in `.manulai/chats.json`; those summaries are injected back into the agent mandate as short dialog memory so the model can reuse prior outcomes without replaying the entire conversation.
 
@@ -153,7 +153,7 @@ Chats also persist a compact `summaryMemory` alongside the full transcript in `.
 ## Multi-Chat Behavior
 
 - The webview can create, switch, clear, and delete multiple chats during one VS Code session.
-- Each chat keeps its own `messages` collection and attached file context.
+- Each chat keeps its own `messages` collection, attached file context, and per-chat notes file under `.manulai/notes/<chatId>.md`.
 - Chat switching is blocked while a request is in flight so a running tool loop cannot drift into a different transcript.
 - Chat session state is persisted and restored across extension-host restarts.
 - Persistence writes are debounced and stored in `.manulai/chats.json` for file-backed workspaces.
@@ -177,9 +177,11 @@ Chats also persist a compact `summaryMemory` alongside the full transcript in `.
 - When a file is large, bounded reads through `read_file_slice` are preferred over re-reading the entire file.
 - The system mandate explicitly treats unread files as unknown state: file edits require a prior read, project-structure assumptions require listing, and completion claims require successful tool confirmation.
 - If the task required changes and the model has not used tools, the response is considered wrong and should be nudged back into tool execution.
+- When the latest user message is conversational (greeting, short non-actionable text) and no tools were called in the current exchange, action-forcing nudges are suppressed so the model can respond naturally instead of executing stale tasks from earlier context.
 
 ## Release Notes
 
+- **0.0.6:** Workspace notes are now per-chat, stored under `.manulai/notes/<chatId>.md` instead of a shared `.manulai/notes.md`. Notes are deleted when the owning chat is deleted. The nudge system now detects conversational user messages (greetings, small talk) and bypasses action-forcing nudges so the model responds naturally to greetings instead of executing stale tasks from earlier context. Packaging version updated to `0.0.6`.
 - **0.0.5:** Added Planner Mode as the third working mode alongside Chat and Agent — uses the same tools as Agent Mode but with a condensed step-by-step mandate; can answer direct text questions without tool calls. Added `launch_in_terminal` tool for running interactive programs in a visible VS Code terminal; `execute_terminal_command` now detects timeout-killed processes and reports stdin unavailability. Context trimming is now model-aware: sliding-window size and `num_ctx` are derived from the model size tag instead of hardcoded limits. Tool-call stripping was tightened so only `json`/`tool_call`/`tool` code blocks are removed instead of all fenced code blocks. Split provider-side helper logic out of `src/ManulAiChatProvider.ts` into `src/providerRefactorUtils.ts`, `src/providerSafetyUtils.ts`, `src/providerPersistenceUtils.ts`, `src/providerWebviewUtils.ts`, `src/providerToolParsingUtils.ts`, and `src/providerFileFallbackUtils.ts`. Production now matches the stronger repeated narrated-call bootstrap behavior already validated in the standalone harness, Go/Rust extraction writes are screened for obviously invalid generated blocks before they hit disk, tool-call parsing and malformed JSON recovery now live outside the main provider, and fallback file-write extraction heuristics are isolated from the orchestration layer. Test script tool definitions are aligned with the extension's real parameter names.
 - Raw or malformed tool-call JSON leaked into assistant text must be treated as a failed tool invocation and retried; fallback file-write extractors must never treat that payload as file content.
 - Fallback file-write extraction must ignore shell-language fenced blocks and reject suspicious pseudo-filenames such as numeric dotted names or names with trailing dots.

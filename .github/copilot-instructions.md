@@ -62,6 +62,8 @@ This repository contains a VS Code extension named ManulAI.
 - Keep `num_ctx` always present in the Ollama request body so the runtime allocates an appropriate KV-cache window.
 - Keep `execute_terminal_command` documented as having no stdin; interactive programs must use `launch_in_terminal` which opens a real VS Code terminal.
 - When `execute_terminal_command` times out because the child process was killed, the error must hint that stdin is unavailable and the program should not be retried.
+- Keep workspace notes per-chat: store under `.manulai/notes/<chatId>.md` and delete the notes file when the chat is deleted.
+- When the latest user message is conversational (greeting, small talk) and no tools were called in the current exchange, do not nudge the model to execute stale tasks from earlier context; let it respond naturally.
 
 ## Debug Script Parity
 

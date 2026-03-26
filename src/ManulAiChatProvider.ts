@@ -106,7 +106,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     const chatNumber = ++this.chatCounter;
     const chat: ChatSession = {
       id: `chat-${Date.now()}-${chatNumber}`,
-      title: title?.trim() || `Chat ${chatNumber}`,
+      title: title?.trim() || 'Chat',
       messages: [],
       attachedFiles: new Map<string, AttachedFileContext>(),
       summaryMemory: []
@@ -190,6 +190,23 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
 
     const deletedChat = this.chats[currentIndex];
     this.chats.splice(currentIndex, 1);
+
+    // Delete per-chat notes file
+    const notesUri = this.getChatNotesUri(deletedChat.id);
+    if (notesUri) {
+      void vscode.workspace.fs.delete(notesUri).then(
+        undefined,
+        (err) => {
+          if (err instanceof vscode.FileSystemError && err.code === 'FileNotFound') {
+            return;
+          }
+          this.debugLog('chat_notes_delete_failed', {
+            chatId: deletedChat.id,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        },
+      );
+    }
 
     if (this.chats.length === 0) {
       this.createChatSession();
@@ -2090,11 +2107,22 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         const replaceNotFoundEndLine = replaceNotFoundContext?.endLine;
         const replaceNeverPresentInTarget = replaceNotFoundContext?.neverPresentInTarget === true;
 
+        // Detect when the latest user message is a greeting or short conversational text
+        // that does not require tool execution — suppress action-forcing nudges in this case.
+        const userMsgTrimmed = latestVisibleUserRequest.trim();
+        const isConversationalUserMessage = (
+          /^(?:привіт|вітаю|здоров|доброго дня|добрий день|добрий ранок|добрий вечір|як справи|як ти|що нового|hello|hi|hey|howdy|yo|hola|good morning|good evening|good afternoon|how are you|what'?s up|sup|greetings|thanks|thank you|дякую|спасибі)\b/i.test(userMsgTrimmed)
+          || (userMsgTrimmed.length > 0 && userMsgTrimmed.length < 60
+            && !/(?:[.\\/](?:ts|js|py|rs|go|c|cpp|h|java|rb|sh|json|yaml|yml|toml|md|html|css|vue|jsx|tsx)\b|\b(?:creat|edit|fix|refactor|chang|modif|updat|replac|delet|remov|build|compil|run|execut|install|implement|add|write|read|scan|check|review|debug|test|move|renam|split|merge|зроби|створи|виправ|зміни|додай|напиши|видали|перейменуй))/i.test(userMsgTrimmed)
+            && !/```/.test(userMsgTrimmed))
+        );
+
         const isLongDump = finalContent.length > 300;
         const hasLargeCodeBlocks = /```[\w]*\n[\s\S]{100,}?```/.test(finalContent);
         const claimsDone = /(?:зробив|замінив|оновив|готово|i've made|i have made|i have updated|i updated|i fixed|i removed|i verified|i confirmed|i corrected|i aligned|successfully applied|successfully saved|has been removed|has been moved|addressed the|fixed the|removed the|updated the|verified the|confirmed the|corrected the|aligned the|summary of the changes|summary:)/i.test(finalContent);
         const mentionsChange = /(?:змін|зроби|оновл|replac|chang|updat|modif|address|fix(?:ed)?|remov(?:e|ed)|verif(?:y|ied)|confirm(?:ed)?|correct(?:ed)?|align(?:ed)?)/i.test(finalContent);
-        const isLazyAcknowledgment = (/^(?:understood|sure|ok|okay|got it|i will|let me know|i can help|i'll make sure)\b/i.test(finalContent.trim())
+        const isLazyAcknowledgment = !isConversationalUserMessage
+          && (/^(?:understood|sure|ok|okay|got it|i will|let me know|i can help|i'll make sure)\b/i.test(finalContent.trim())
           || /no (?:immediate|obvious) (?:file changes|issues|errors|problems)/i.test(finalContent)
           || /further debugging (?:would be|is) needed/i.test(finalContent))
           && finalContent.trim().length < 500;
@@ -2299,7 +2327,20 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
 
         const shouldNudge = requiresToolContinuation
           && !canStopAfterTinyLargeRefactor
+          // When the user's latest message is conversational (greeting, small talk)
+          // and no tools were called in this exchange, accept the model's text response
+          // as-is — do not push it to execute stale tasks from earlier context.
+          && !(isConversationalUserMessage && !hasRecentToolResults)
           && retryCount < effectiveMaxNudgeRetries;
+        if (isConversationalUserMessage && requiresToolContinuation && !shouldNudge) {
+          this.debugLog('conversational_nudge_bypass', {
+            userMessage: userMsgTrimmed.substring(0, 80),
+            requiresToolContinuation,
+            hasRecentToolResults,
+            isLazyAcknowledgment,
+            contentPreview: finalContent.substring(0, 200)
+          });
+        }
         const shouldAutoBootstrapLargeRefactorRead = Boolean(
           shouldNudge
           && retryCount >= 1
@@ -2385,7 +2426,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         }
 
         if (shouldNudge) {
-          this.debugLog('nudge', { retryCount, hasRecentToolResults, hasRecentSuccessfulAction, hasRecentMeaningfulWrite, latestCreatedFilePath, hasRecentReadOfLargeRefactorTarget, latestLargeRefactorTargetTotalLines, latestLargeRefactorTargetRemainingLines, canStopAfterTinyLargeRefactor, hasLargeRefactorShellReadBypass, hasPreReadLargeRefactorNarration, hasFakePreReadCodeDump, hasFakePostReadAnalysisDump, hasPostReadSummaryOnLargeRefactor, hasModelRefusalResponse, hasAnnouncedExtractionWithoutWrite, hasLazyRefusalOnLargeRefactor, isAskingUserForExactSlice, suggestedNextSlice, hasReadButNoWriteOnLargeRefactor, hasPostReadToolStall, hasPostCreateRefactorNarration, announcedNewFilePath, hasRecentToolErrors, hasRecentBuildVerifyFailure, hasRecentReplaceNotFound, replaceNotFoundFilepath, replaceNotFoundStartLine, replaceNotFoundEndLine, lastSuccessfulActionIndex, isLongDump, hasLargeCodeBlocks, claimsDone, mentionsChange, isLazyAcknowledgment, hasIncompletePlan: !!hasIncompletePlan, hasExplicitNextSteps, isProgressOnlyResponse, claimedButUnexecutedCommand, isPassingToUser, isAnnouncedButNotExecuted, isPlanOnlyResponse, isLargeRefactorRequest, contentPreview: finalContent.substring(0, 200) });
+          this.debugLog('nudge', { retryCount, isConversationalUserMessage, hasRecentToolResults, hasRecentSuccessfulAction, hasRecentMeaningfulWrite, latestCreatedFilePath, hasRecentReadOfLargeRefactorTarget, latestLargeRefactorTargetTotalLines, latestLargeRefactorTargetRemainingLines, canStopAfterTinyLargeRefactor, hasLargeRefactorShellReadBypass, hasPreReadLargeRefactorNarration, hasFakePreReadCodeDump, hasFakePostReadAnalysisDump, hasPostReadSummaryOnLargeRefactor, hasModelRefusalResponse, hasAnnouncedExtractionWithoutWrite, hasLazyRefusalOnLargeRefactor, isAskingUserForExactSlice, suggestedNextSlice, hasReadButNoWriteOnLargeRefactor, hasPostReadToolStall, hasPostCreateRefactorNarration, announcedNewFilePath, hasRecentToolErrors, hasRecentBuildVerifyFailure, hasRecentReplaceNotFound, replaceNotFoundFilepath, replaceNotFoundStartLine, replaceNotFoundEndLine, lastSuccessfulActionIndex, isLongDump, hasLargeCodeBlocks, claimsDone, mentionsChange, isLazyAcknowledgment, hasIncompletePlan: !!hasIncompletePlan, hasExplicitNextSteps, isProgressOnlyResponse, claimedButUnexecutedCommand, isPassingToUser, isAnnouncedButNotExecuted, isPlanOnlyResponse, isLargeRefactorRequest, contentPreview: finalContent.substring(0, 200) });
           // Show plan/progress text to the user before nudging
           if (!isProgressOnlyResponse
             && !hasFakePreReadCodeDump
@@ -3959,7 +4000,7 @@ If the user asks for a change but provides NO code:
         type: 'function',
         function: {
           name: 'read_workspace_notes',
-          description: 'Read persistent notes about this project saved by the model in a previous session. Always call this at the start of a new task to recall prior discoveries, decisions, and project context.',
+          description: 'Read persistent notes for this chat saved by the model in a previous session. Always call this at the start of a new task to recall prior discoveries, decisions, and project context.',
           parameters: {
             type: 'object',
             properties: {},
@@ -3971,7 +4012,7 @@ If the user asks for a change but provides NO code:
         type: 'function',
         function: {
           name: 'write_workspace_notes',
-          description: 'Save notes about this project to persistent memory (.manulai/notes.md). Use mode="append" to add new facts without erasing previous notes. Use mode="overwrite" only to fully replace notes. Call this after completing a task to record key facts: file roles, architecture decisions, repeated patterns, or anything needed to avoid re-reading files next time.',
+          description: 'Save notes for this chat to persistent memory. Notes are scoped to the current chat and deleted when the chat is deleted. Use mode="append" to add new facts without erasing previous notes. Use mode="overwrite" only to fully replace notes. Call this after completing a task to record key facts: file roles, architecture decisions, repeated patterns, or anything needed to avoid re-reading files next time.',
           parameters: {
             type: 'object',
             properties: {
@@ -4411,14 +4452,21 @@ If the user asks for a change but provides NO code:
       return JSON.stringify({ error: 'filepath is required.' });
     }
 
-    const normalizedStartLine = Number(startLine);
-    const normalizedEndLine = Number(endLine);
-    if (!Number.isFinite(normalizedStartLine) || !Number.isFinite(normalizedEndLine)) {
+    // Default startLine to 1 and endLine to start+199 when the model omits them.
+    // Treat undefined|null|'' as "omitted" so we never generate NaN for missing params.
+    // Any other non-numeric value becomes NaN and is treated as invalid, returning an error.
+    const rawStart = startLine === undefined || startLine === null || startLine === '' ? undefined : Number(startLine);
+    const rawEnd = endLine === undefined || endLine === null || endLine === '' ? undefined : Number(endLine);
+    const hasStart = rawStart !== undefined && Number.isFinite(rawStart);
+    const hasEnd = rawEnd !== undefined && Number.isFinite(rawEnd);
+    const startIsInvalid = rawStart !== undefined && !Number.isFinite(rawStart);
+    const endIsInvalid = rawEnd !== undefined && !Number.isFinite(rawEnd);
+    if (startIsInvalid || endIsInvalid) {
       return JSON.stringify({ error: 'startLine and endLine must be numbers.' });
     }
 
-    const start = Math.max(1, Math.floor(normalizedStartLine));
-    const end = Math.max(1, Math.floor(normalizedEndLine));
+    const start = Math.max(1, Math.floor(hasStart ? rawStart : 1));
+    const end = Math.max(1, Math.floor(hasEnd ? rawEnd : start + 199));
     if (end < start) {
       return JSON.stringify({ error: 'endLine must be greater than or equal to startLine.' });
     }
@@ -4690,25 +4738,31 @@ If the user asks for a change but provides NO code:
     return this.workspaceSnapshotCache;
   }
 
-  private async readWorkspaceNotes(): Promise<string> {
+  private getChatNotesUri(chatId?: string): vscode.Uri | undefined {
     const dir = this.getWorkspaceSettingsDirUri();
-    if (!dir) { return JSON.stringify({ content: '(no workspace open)' }); }
+    if (!dir) { return undefined; }
+    const id = chatId ?? this.activeChatId;
+    return vscode.Uri.joinPath(dir, 'notes', `${id}.md`);
+  }
+
+  private async readWorkspaceNotes(): Promise<string> {
+    const uri = this.getChatNotesUri();
+    if (!uri) { return JSON.stringify({ content: '(no workspace open)' }); }
     try {
-      const uri = vscode.Uri.joinPath(dir, 'notes.md');
       const bytes = await vscode.workspace.fs.readFile(uri);
       const content = Buffer.from(bytes).toString('utf8');
       return JSON.stringify({ content: content || '(empty)' });
     } catch {
-      return JSON.stringify({ content: '(no notes yet — use write_workspace_notes to save notes about this project)' });
+      return JSON.stringify({ content: '(no notes yet — use write_workspace_notes to save notes for this chat)' });
     }
   }
 
   private async writeWorkspaceNotes(content: string, mode: string): Promise<string> {
     const dir = this.getWorkspaceSettingsDirUri();
-    if (!dir) { return JSON.stringify({ error: 'No workspace open.' }); }
+    const uri = this.getChatNotesUri();
+    if (!dir || !uri) { return JSON.stringify({ error: 'No workspace open.' }); }
     try {
-      await vscode.workspace.fs.createDirectory(dir);
-      const uri = vscode.Uri.joinPath(dir, 'notes.md');
+      await vscode.workspace.fs.createDirectory(vscode.Uri.joinPath(dir, 'notes'));
       let finalContent = content;
       if (mode === 'append') {
         let existing = '';
@@ -4719,7 +4773,7 @@ If the user asks for a change but provides NO code:
         finalContent = existing ? existing.trimEnd() + '\n\n' + content : content;
       }
       await vscode.workspace.fs.writeFile(uri, Buffer.from(finalContent, 'utf8'));
-      return JSON.stringify({ success: true, note: 'Notes saved to .manulai/notes.md' });
+      return JSON.stringify({ success: true, note: 'Notes saved for this chat.' });
     } catch (error) {
       return JSON.stringify({ error: error instanceof Error ? error.message : 'Failed to write notes.' });
     }
