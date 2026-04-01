@@ -62,6 +62,7 @@ This repository contains a VS Code extension named ManulAI.
 - Keep prompt/context simplification model-aware too: ultra-small models should receive shorter mandates, less injected workspace memory, tighter retry budgets, and fewer tools when that improves reliability.
 - For ultra-small model tiers, prefer no-plan execution: one immediate bounded action instead of showing or accepting a plan.
 - Raw function-call assistant text such as `tool_name(...)` must not be accepted as a final answer; route it through native-tool recovery or continue nudging until a real tool call happens.
+- If a small or medium local model produces degenerate repetitive output, do not fail immediately on the first hit; strip the bad output and retry once with a stricter one-step recovery nudge.
 - Keep `num_ctx` always present in the Ollama request body so the runtime allocates an appropriate KV-cache window.
 - Keep `execute_terminal_command` documented as having no stdin; interactive programs must use `launch_in_terminal` which opens a real VS Code terminal.
 - When `execute_terminal_command` times out because the child process was killed, the error must hint that stdin is unavailable and the program should not be retried.

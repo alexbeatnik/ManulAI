@@ -1386,6 +1386,83 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     return this.writeFileWithDiff(targetUri.fsPath, sanitizedContent);
   }
 
+  private async tryRecoverFromDegenerateOutput(messages: OllamaMessage[], finalContent: string, retryCount: number): Promise<boolean> {
+    if (!this.isAgentLike) {
+      return false;
+    }
+
+    const capabilityProfile = this.getModelCapabilityProfile();
+    if (capabilityProfile.tier === 'large' || capabilityProfile.tier === 'xlarge') {
+      return false;
+    }
+
+    const degenerateNudgeCount = messages.filter(
+      message => message.role === 'user'
+        && message.hiddenFromTranscript
+        && typeof message.content === 'string'
+        && message.content.includes('Your last response was incoherent or repetitive')
+    ).length;
+    if (degenerateNudgeCount >= 1) {
+      return false;
+    }
+
+    const latestVisibleUserRequest = this.getLatestVisibleUserRequest(messages);
+    const starterFilepath = this.inferDegenerateRecoveryStarterFilepath(latestVisibleUserRequest);
+    const writeRecovery = this.currentRequestRequiresWrite;
+    const nudgeMessage = writeRecovery
+      ? `Your last response was incoherent or repetitive. Reset completely. Do NOT explain, summarize, or plan. Call exactly ONE tool now.${starterFilepath ? ` For this greenfield create task, start by calling create_or_edit_file for ${starterFilepath} with the complete working implementation.` : ' For a create request, your next response should usually be create_or_edit_file with a concrete file path and the full implementation.'} Do not output prose before the tool call.`
+      : 'Your last response was incoherent or repetitive. Reset completely. Do NOT explain or plan. Either answer briefly in plain text now, or call exactly ONE read tool if you truly need file context first.';
+
+    this.debugLog('degenerate_output_retry', {
+      retryCount,
+      tier: capabilityProfile.tier,
+      starterFilepath: starterFilepath ?? null,
+      requiresWrite: writeRecovery
+    });
+
+    messages.push({
+      role: 'assistant',
+      content: finalContent,
+      hiddenFromTranscript: true
+    });
+    messages.push({
+      role: 'user',
+      content: nudgeMessage,
+      hiddenFromTranscript: true
+    });
+
+    this.postStatus('Model produced incoherent output — retrying once with a stricter one-step recovery...');
+    await this.processOllamaResponse(messages, retryCount + 1);
+    return true;
+  }
+
+  private inferDegenerateRecoveryStarterFilepath(text: string): string | undefined {
+    const explicitTargets = this.extractLikelyRequestFileTargets(text);
+    if (explicitTargets.length > 0) {
+      return explicitTargets[0];
+    }
+
+    const normalized = text.trim().toLowerCase();
+    if (!this.looksLikeFileMutationRequest(text) && !/\b(?:create|write|add|build|make|створи|создай|зроби|сделай)\b/i.test(normalized)) {
+      return undefined;
+    }
+
+    if (/\bpython\b|\bpy\b|\bпайтон\b|\bпіто?н\b/i.test(normalized)) {
+      return 'main.py';
+    }
+    if (/\btypescript\b|\btype script\b|\bts\b/i.test(normalized)) {
+      return 'main.ts';
+    }
+    if (/\bjavascript\b|\bnode\b|\bjs\b/i.test(normalized)) {
+      return 'main.js';
+    }
+    if (/\bhtml\b|\bweb\s*page\b|\blanding\b/i.test(normalized)) {
+      return 'index.html';
+    }
+
+    return 'main.txt';
+  }
+
   private async tryAutoRecoverDeterministicReadFailure(messages: OllamaMessage[], toolName: string, toolResult: string): Promise<boolean> {
     if (toolName !== 'read_file_slice' && toolName !== 'read_specific_file') {
       return false;
@@ -1870,6 +1947,9 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         if (m.role === 'assistant' && m.hiddenFromTranscript && typeof m.content === 'string' && this.isDegenerateOutput(m.content)) {
           messages.splice(i, 1);
         }
+      }
+      if (await this.tryRecoverFromDegenerateOutput(messages, finalContent, retryCount)) {
+        return;
       }
       messages.push({
         role: 'assistant',

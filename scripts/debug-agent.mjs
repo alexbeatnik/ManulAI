@@ -1441,6 +1441,19 @@ function getDeterministicReadRecoveryTargetFromPrompt(text) {
   return undefined;
 }
 
+function inferDegenerateRecoveryStarterFilepath(text) {
+  const explicitTargets = extractLikelyRequestFileTargets(text);
+  if (explicitTargets.length > 0) return explicitTargets[0];
+
+  const normalized = text.trim().toLowerCase();
+  if (!/\b(?:create|write|add|build|make|створи|создай|зроби|сделай)\b/i.test(normalized)) return undefined;
+  if (/\bpython\b|\bpy\b|\bпайтон\b|\bпіто?н\b/i.test(normalized)) return 'main.py';
+  if (/\btypescript\b|\btype script\b|\bts\b/i.test(normalized)) return 'main.ts';
+  if (/\bjavascript\b|\bnode\b|\bjs\b/i.test(normalized)) return 'main.js';
+  if (/\bhtml\b|\bweb\s*page\b|\blanding\b/i.test(normalized)) return 'index.html';
+  return 'main.txt';
+}
+
 async function tryUltraSmallDeterministicFastPath() {
   if (MODEL_LIMITS.tier !== 'micro') return false;
 
@@ -2011,6 +2024,30 @@ function isDegenerateOutput(content) {
     return true;
   }
   return false;
+}
+
+async function tryRecoverFromDegenerateOutput(messages, content, retryCount, turn) {
+  if (!IS_AGENT_LIKE) return false;
+  if (MODEL_LIMITS.tier === 'large' || MODEL_LIMITS.tier === 'xlarge') return false;
+
+  const degenerateNudgeCount = messages.filter(
+    message => message.role === 'user'
+      && typeof message.content === 'string'
+      && message.content.includes('Your last response was incoherent or repetitive')
+  ).length;
+  if (degenerateNudgeCount >= 1) return false;
+
+  const starterFilepath = inferDegenerateRecoveryStarterFilepath(userPrompt);
+  const writeRecovery = REQUIRES_FILE_WRITE;
+  const nudge = writeRecovery
+    ? `Your last response was incoherent or repetitive. Reset completely. Do NOT explain, summarize, or plan. Call exactly ONE tool now.${starterFilepath ? ` For this greenfield create task, start by calling create_or_edit_file for ${starterFilepath} with the complete working implementation.` : ' For a create request, your next response should usually be create_or_edit_file with a concrete file path and the full implementation.'} Do not output prose before the tool call.`
+    : 'Your last response was incoherent or repetitive. Reset completely. Do NOT explain or plan. Either answer briefly in plain text now, or call exactly ONE read tool if you truly need file context first.';
+
+  label(Y, 'DEGENERATE RETRY', nudge.substring(0, 220));
+  logEvent('degenerate_output_retry', { turn, retryCount, tier: MODEL_LIMITS.tier, starterFilepath: starterFilepath ?? null, requiresWrite: writeRecovery });
+  messages.push({ role: 'assistant', content, hiddenFromTranscript: true });
+  messages.push({ role: 'user', content: nudge });
+  return true;
 }
 
 // ─── Simple nudge analysis (matches key detectors in processOllamaResponse) ──
@@ -2796,7 +2833,7 @@ let args = rawArgs;
 
     // Detect degenerate/repetitive output (e.g., "node node node" loops from overwhelmed models)
     if (isDegenerateOutput(content)) {
-      label(R, 'DEGENERATE OUTPUT', `Model produced incoherent repetitive output (${content.length} chars) — aborting.`);
+      label(R, 'DEGENERATE OUTPUT', `Model produced incoherent repetitive output (${content.length} chars).`);
       logEvent('degenerate_output', { turn, retryCount, contentLength: content.length, contentPreview: content.substring(0, 200) });
       // Trim any recently pushed degenerate hidden messages to keep history clean
       for (let i = messages.length - 1; i >= 0; i--) {
@@ -2804,6 +2841,10 @@ let args = rawArgs;
         if (messages[i].role === 'assistant' && typeof messages[i].content === 'string' && isDegenerateOutput(messages[i].content)) {
           messages.splice(i, 1);
         }
+      }
+      if (await tryRecoverFromDegenerateOutput(messages, content, retryCount, turn)) {
+        retryCount++;
+        continue;
       }
       break;
     }
