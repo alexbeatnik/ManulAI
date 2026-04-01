@@ -868,7 +868,8 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
 
     if (this.isAgentLike) {
       const directSummary = await this.tryHandleDirectLicenseAuthorRename(text)
-        || await this.tryHandleDirectTitleRename(text);
+        || await this.tryHandleDirectTitleRename(text)
+        || await this.tryHandleUltraSmallDeterministicTask(text);
       if (directSummary) {
         this.messages.push(this.createAssistantMessage(directSummary.summary, directSummary.revertOperationId ? [directSummary.revertOperationId] : []));
         await this.persistCompletedExchangeMemory(exchangeStartIndex);
@@ -1323,6 +1324,270 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     return this.writeFileWithDiff(targetPath, updated);
   }
 
+  private async tryHandleUltraSmallDeterministicTask(text: string): Promise<FileWriteSummary | undefined> {
+    if (this.getModelCapabilityProfile().tier !== 'micro') {
+      return undefined;
+    }
+
+    return await this.tryHandleUltraSmallPackageJsonRead(text)
+      || await this.tryHandleUltraSmallReadmeTitleRead(text)
+      || await this.tryHandleUltraSmallExactLineReplace(text)
+      || await this.tryHandleUltraSmallSingleFileCreate(text);
+  }
+
+  private async tryHandleUltraSmallPackageJsonRead(text: string): Promise<FileWriteSummary | undefined> {
+    const normalized = text.trim().toLowerCase();
+    if (!normalized.includes('package.json')) {
+      return undefined;
+    }
+    if (!/(?:\bread\b|\bshow\b|\banswer\b|\bскажи\b|\bпокажи\b|\bпрочитай\b)/i.test(text)) {
+      return undefined;
+    }
+    if (!/\bname\b/i.test(text) || !/\bversion\b/i.test(text)) {
+      return undefined;
+    }
+
+    try {
+      const packageJsonText = await this.readWorkspaceText(this.resolveWorkspaceUri('package.json'));
+      const packageJson = JSON.parse(packageJsonText) as { name?: string; version?: string };
+      const name = String(packageJson.name ?? '').trim();
+      const version = String(packageJson.version ?? '').trim();
+      if (!name && !version) {
+        return { summary: 'package.json is missing both name and version.' };
+      }
+      return { summary: [name, version].filter(Boolean).join(' ').trim() };
+    } catch (error) {
+      return { summary: `Unable to read package.json: ${error instanceof Error ? error.message : 'unknown error'}` };
+    }
+  }
+
+  private async tryHandleUltraSmallSingleFileCreate(text: string): Promise<FileWriteSummary | undefined> {
+    const request = this.extractDeterministicSingleFileCreateRequest(text);
+    if (!request) {
+      return undefined;
+    }
+
+    const approved = this.autoApprove || await this.approveFileWrite([request.filepath]);
+    if (!approved) {
+      return { summary: `[File write denied by user: ${path.basename(request.filepath)}]` };
+    }
+
+    const targetUri = await this.resolveWorkspaceUriForOperation(request.filepath, true);
+    const pathGuardError = await this.validateRequestScopedCreatePath(request.filepath, targetUri.fsPath);
+    if (pathGuardError) {
+      return { summary: pathGuardError };
+    }
+
+    let sanitizedContent = this.sanitizeGeneratedFileContent(request.content);
+    if (this.looksLikeDiffOutput(sanitizedContent)) {
+      sanitizedContent = this.stripDiffPrefixes(sanitizedContent);
+    }
+
+    return this.writeFileWithDiff(targetUri.fsPath, sanitizedContent);
+  }
+
+  private async tryAutoRecoverDeterministicReadFailure(messages: OllamaMessage[], toolName: string, toolResult: string): Promise<boolean> {
+    if (toolName !== 'read_file_slice' && toolName !== 'read_specific_file') {
+      return false;
+    }
+
+    let parsedResult: Record<string, unknown>;
+    try {
+      parsedResult = JSON.parse(toolResult) as Record<string, unknown>;
+    } catch {
+      return false;
+    }
+
+    if (!parsedResult.error) {
+      return false;
+    }
+
+    const tier = this.getModelCapabilityProfile().tier;
+    if (tier !== 'micro' && tier !== 'small' && tier !== 'medium') {
+      return false;
+    }
+
+    const latestVisibleUserRequest = this.getLatestVisibleUserRequest(messages);
+    const recoveryTarget = this.getDeterministicReadRecoveryTarget(latestVisibleUserRequest);
+    if (!recoveryTarget) {
+      return false;
+    }
+
+    const attemptedPath = String(parsedResult.path ?? parsedResult.filepath ?? '').trim();
+    if (attemptedPath && attemptedPath.toLowerCase().endsWith(recoveryTarget.filepath.toLowerCase())) {
+      return false;
+    }
+
+    const recoveredResult = await this.readSpecificFile(recoveryTarget.filepath);
+    this.debugLog('deterministic_read_recovery', {
+      failedTool: toolName,
+      failedPath: attemptedPath || null,
+      recoveredPath: recoveryTarget.filepath,
+      reason: recoveryTarget.reason
+    });
+
+    messages.push({
+      role: 'tool',
+      content: recoveredResult,
+      tool_name: 'read_specific_file',
+      hiddenFromTranscript: true,
+      revertOperationIds: this.extractToolResultRevertOperationIds(recoveredResult)
+    });
+    messages.push({
+      role: 'user',
+      content: `The previous read used the wrong target. Continue from ${recoveryTarget.filepath}, which was read for you. ${recoveryTarget.reason}`,
+      hiddenFromTranscript: true
+    });
+
+    await this.processOllamaResponse(messages, 0);
+    return true;
+  }
+
+  private getDeterministicReadRecoveryTarget(text: string): { filepath: string; reason: string } | undefined {
+    const normalized = text.trim().toLowerCase();
+
+    if (normalized.includes('package.json')
+      && /\bname\b/i.test(text)
+      && /\bversion\b/i.test(text)
+      && /(?:\bread\b|\bshow\b|\banswer\b|\bпокажи\b|\bпрочитай\b|\bскажи\b)/i.test(text)) {
+      return {
+        filepath: 'package.json',
+        reason: 'The user asked for package.json name/version, so do not fall back to an unrelated file.'
+      };
+    }
+
+    if (/(?:\breadme\b|readme\.md)/i.test(normalized)
+      && /(?:\btitle\b|\bheading\b|\bheadline\b|\bзаголовок\b|\bтайтл\b)/i.test(text)
+      && /(?:\bread\b|\bshow\b|\bwhat\b|\banswer\b|\bпокажи\b|\bпрочитай\b|\bскажи\b)/i.test(text)) {
+      return {
+        filepath: 'README.md',
+        reason: 'The user asked for the README title, so retry against README.md directly.'
+      };
+    }
+
+    return undefined;
+  }
+
+  private async tryHandleUltraSmallReadmeTitleRead(text: string): Promise<FileWriteSummary | undefined> {
+    const normalized = text.trim().toLowerCase();
+    if (!/(?:\bread\b|\bshow\b|\bwhat\b|\banswer\b|\bскажи\b|\bпокажи\b|\bпрочитай\b)/i.test(text)) {
+      return undefined;
+    }
+    if (!/(?:\btitle\b|\bheading\b|\bheadline\b|\bзаголовок\b|\bтайтл\b)/i.test(text)) {
+      return undefined;
+    }
+    if (!/(?:\breadme\b|readme\.md)/i.test(normalized)) {
+      return undefined;
+    }
+
+    try {
+      const readmeText = await this.readWorkspaceText(this.resolveWorkspaceUri('README.md'));
+      const titleMatch = readmeText.match(/^#\s+(.+)$/m);
+      return { summary: titleMatch ? titleMatch[1].trim() : 'README.md has no H1 title.' };
+    } catch (error) {
+      return { summary: `Unable to read README.md: ${error instanceof Error ? error.message : 'unknown error'}` };
+    }
+  }
+
+  private async tryHandleUltraSmallExactLineReplace(text: string): Promise<FileWriteSummary | undefined> {
+    const match = text.match(/replace\s+(?:the\s+)?exact\s+line\s+["'`](.+?)["'`]\s+with\s+["'`](.+?)["'`](?:\s+in\s+(\S+))?/i);
+    if (!match) {
+      return undefined;
+    }
+
+    const oldLine = match[1]?.trim();
+    const newLine = match[2]?.trim();
+    const explicitFile = match[3]?.trim();
+    if (!oldLine || !newLine) {
+      return undefined;
+    }
+
+    const candidateTargets = explicitFile ? [explicitFile] : this.extractLikelyRequestFileTargets(text);
+    const targetPath = await this.resolveDeterministicKnownFilePath(candidateTargets);
+    if (!targetPath) {
+      return { summary: 'Unable to resolve the target file for exact-line replacement.' };
+    }
+
+    const content = await this.readWorkspaceText(vscode.Uri.file(targetPath));
+    const oldLinePattern = new RegExp(`^${this.escapeRegexForRegExp(oldLine)}$`, 'm');
+    if (!oldLinePattern.test(content)) {
+      return { summary: `Exact line not found in ${path.basename(targetPath)}.` };
+    }
+
+    const updated = content.replace(oldLinePattern, newLine);
+    if (updated === content) {
+      return { summary: `${path.basename(targetPath)} already matches the requested line.` };
+    }
+
+    const approved = this.autoApprove || await this.approveFileWrite([targetPath]);
+    if (!approved) {
+      return { summary: `[File write denied by user: ${path.basename(targetPath)}]` };
+    }
+
+    return this.writeFileWithDiff(targetPath, updated);
+  }
+
+  private async resolveDeterministicKnownFilePath(candidates: string[]): Promise<string | undefined> {
+    for (const candidate of candidates) {
+      const resolved = await this.findBestWorkspaceMatchForRequestTarget(candidate);
+      if (resolved) {
+        return resolved;
+      }
+    }
+
+    const commonKnownFiles = ['README.md', 'README', 'LICENSE', 'package.json', 'tsconfig.json'];
+    for (const candidate of commonKnownFiles) {
+      const resolved = await this.findBestWorkspaceMatchForRequestTarget(candidate);
+      if (resolved) {
+        return resolved;
+      }
+    }
+
+    return undefined;
+  }
+
+  private escapeRegexForRegExp(value: string): string {
+    return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  }
+
+  private extractDeterministicSingleFileCreateRequest(text: string): { filepath: string; content: string } | undefined {
+    const match = text.match(/\b(?:create|write|add)\s+((?:[A-Za-z]:)?[A-Za-z0-9_./\\-]+\.(?:ts|tsx|js|jsx|json|md|css|html|py|yml|yaml|txt|sh))\b/i);
+    if (!match || !match[1]) {
+      return undefined;
+    }
+
+    const filepath = match[1].replace(/\\/g, '/');
+    const codeBlockMatch = text.match(/```[\w+-]*\n([\s\S]*?)```/);
+    let content = codeBlockMatch?.[1]?.trim() ?? '';
+
+    if (!content) {
+      const matchStart = match.index ?? 0;
+      const remainder = text.slice(matchStart + match[0].length)
+        .replace(/^\s*(?:with\s+(?:content|code)\s*:|containing\s+|that\s+contains\s+)/i, '')
+        .replace(/^\s*exporting\s+/i, 'export ')
+        .replace(/\bdo\s+not\s+modify\s+any\s+other\s+file\b[.!]?/i, '')
+        .trim();
+      content = remainder.replace(/[\s.]+$/, '').trim();
+    }
+
+    if (!content) {
+      return undefined;
+    }
+
+    const normalizedContent = content.startsWith('export ') || content.startsWith('import ') || content.startsWith('const ') || content.startsWith('function ') || content.startsWith('class ')
+      ? content
+      : content;
+    const looksLikeCode = /(?:\bexport\b|\bfunction\b|=>|\bclass\b|\binterface\b|\bconst\b|\blet\b|\breturn\b|[{};])/m.test(normalizedContent);
+    if (!looksLikeCode) {
+      return undefined;
+    }
+
+    return {
+      filepath,
+      content: normalizedContent.endsWith('\n') ? normalizedContent : `${normalizedContent}\n`
+    };
+  }
+
   private clearChat(): void {
     if (this.requestInFlight) {
       this.postStatus('Cannot clear chat while a request is running. Wait for the current response to finish.');
@@ -1464,6 +1729,10 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           hiddenFromTranscript: true,
           revertOperationIds: this.extractToolResultRevertOperationIds(toolResult)
         });
+
+        if (await this.tryAutoRecoverDeterministicReadFailure(messages, toolName, toolResult)) {
+          return;
+        }
 
         // Count read operations for read-loop nudge
         if (toolName === 'read_file_slice' || toolName === 'read_specific_file') {
@@ -1947,10 +2216,12 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         // If the model produces a structured plan as its very first response (no tools called yet
         // in this exchange), show it to the user then nudge it to start executing immediately.
         {
+          const capabilityProfile = this.getModelCapabilityProfile();
           const lastVisibleUserIdxPlan = this.getLastVisibleUserMessageIndex(messages);
           const recentMsgsPlan = lastVisibleUserIdxPlan >= 0 ? messages.slice(lastVisibleUserIdxPlan) : messages;
           const hasAnyToolResultYet = recentMsgsPlan.some(m => m.role === 'tool');
-          const looksLikePlan = !hasAnyToolResultYet
+          const looksLikePlan = !capabilityProfile.preferStepwiseExecution
+            && !hasAnyToolResultYet
             && retryCount === 0
             && finalContent.length > 60
             && (

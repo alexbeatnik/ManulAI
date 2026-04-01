@@ -118,6 +118,11 @@ export function parseToolCallsFromContent(content: string, toolDefinitions: Tool
     return taggedCalls;
   }
 
+  const parenthesizedCalls = parseParenthesizedToolCalls(trimmed, toolDefinitions);
+  if (parenthesizedCalls.length > 0) {
+    return parenthesizedCalls;
+  }
+
   const knownToolNames = new Set(toolDefinitions.map(t => t.function.name));
   const candidates: string[] = [];
   const codeBlockPattern = /```(?:json|tool_call|tool)?\s*\n?([\s\S]*?)```/g;
@@ -255,6 +260,269 @@ export function parseToolCallsFromContent(content: string, toolDefinitions: Tool
   }
 
   return [];
+}
+
+function parseParenthesizedToolCalls(content: string, toolDefinitions: ToolDefinition[]): ToolFunctionCall[] {
+  const results: ToolFunctionCall[] = [];
+  const knownToolNames = new Set(toolDefinitions.map(tool => tool.function.name));
+  const candidateNames = new Set<string>([
+    ...knownToolNames,
+    'write_file', 'create_file', 'create_or_replace', 'create_or_overwrite',
+    'edit_file', 'replace_content', 'read_file', 'read_file_range', 'read_file_chunk',
+    'run_command', 'terminal_command', 'open_terminal', 'run_in_terminal'
+  ]);
+
+  for (const rawToolName of candidateNames) {
+    const pattern = new RegExp(`\\b${escapeRegex(rawToolName)}\\s*\\(`, 'gi');
+    let match: RegExpExecArray | null;
+    while ((match = pattern.exec(content)) !== null) {
+      const openParenIndex = match.index + match[0].length - 1;
+      const argsSource = extractBalancedParentheses(content, openParenIndex);
+      if (!argsSource) {
+        continue;
+      }
+
+      const mappedToolName = remapWeakModelToolName(rawToolName);
+      if (!knownToolNames.has(mappedToolName)) {
+        continue;
+      }
+
+      const argsBody = argsSource.slice(1, -1).trim();
+      const inferredArgs = inferParenthesizedArguments(mappedToolName, argsBody);
+      if (!inferredArgs) {
+        continue;
+      }
+
+      results.push({
+        type: 'function',
+        function: {
+          name: mappedToolName,
+          arguments: inferredArgs
+        }
+      });
+    }
+  }
+
+  return dedupeToolCalls(results);
+}
+
+function inferParenthesizedArguments(toolName: string, argsBody: string): Record<string, unknown> | undefined {
+  if (!argsBody) {
+    if (toolName === 'list_workspace_files' || toolName === 'project_scan' || toolName === 'read_workspace_notes' || toolName === 'read_active_file') {
+      return {};
+    }
+    return undefined;
+  }
+
+  if (argsBody.startsWith('{') && argsBody.endsWith('}')) {
+    const parsed = relaxedJsonParse(argsBody);
+    if (parsed) {
+      return remapWeakModelArgumentAliases(parsed);
+    }
+  }
+
+  const args = splitTopLevelArguments(argsBody);
+  const values = args.map(parseParenthesizedArgumentValue);
+
+  if (toolName === 'execute_terminal_command' || toolName === 'launch_in_terminal') {
+    return typeof values[0] === 'string' ? { command: values[0] } : undefined;
+  }
+
+  if (toolName === 'read_specific_file') {
+    return typeof values[0] === 'string' ? { filepath: values[0] } : undefined;
+  }
+
+  if (toolName === 'list_workspace_files') {
+    return values.length === 0 ? {} : (typeof values[0] === 'string' ? { directory: values[0] } : undefined);
+  }
+
+  if (toolName === 'delete_file') {
+    return typeof values[0] === 'string' ? { filepath: values[0] } : undefined;
+  }
+
+  if (toolName === 'read_file_slice') {
+    return typeof values[0] === 'string' && typeof values[1] === 'number' && typeof values[2] === 'number'
+      ? { filepath: values[0], startLine: values[1], endLine: values[2] }
+      : undefined;
+  }
+
+  if (toolName === 'create_or_edit_file' || toolName === 'write_to_file') {
+    return typeof values[0] === 'string' && typeof values[1] === 'string'
+      ? { filepath: values[0], filename: values[0], content: values[1] }
+      : undefined;
+  }
+
+  if (toolName === 'replace_in_file') {
+    return typeof values[0] === 'string' && typeof values[1] === 'string' && typeof values[2] === 'string'
+      ? { filepath: values[0], old_text: values[1], new_text: values[2] }
+      : undefined;
+  }
+
+  if (toolName === 'write_workspace_notes') {
+    return typeof values[0] === 'string' && typeof values[1] === 'string'
+      ? { content: values[0], mode: values[1] }
+      : undefined;
+  }
+
+  return undefined;
+}
+
+function parseParenthesizedArgumentValue(token: string): string | number | boolean | null {
+  const trimmed = token.trim();
+  const quoted = parseQuotedString(trimmed);
+  if (quoted !== undefined) {
+    return quoted;
+  }
+  if (/^-?\d+$/.test(trimmed)) {
+    return Number.parseInt(trimmed, 10);
+  }
+  if (/^-?\d+\.\d+$/.test(trimmed)) {
+    return Number.parseFloat(trimmed);
+  }
+  if (/^(?:true|false)$/i.test(trimmed)) {
+    return trimmed.toLowerCase() === 'true';
+  }
+  if (/^null$/i.test(trimmed)) {
+    return null;
+  }
+  return trimmed;
+}
+
+function parseQuotedString(value: string): string | undefined {
+  if (value.length < 2) {
+    return undefined;
+  }
+  const quote = value[0];
+  if ((quote !== '"' && quote !== '\'' && quote !== '`') || value[value.length - 1] !== quote) {
+    return undefined;
+  }
+  if (quote === '"') {
+    try {
+      return JSON.parse(value) as string;
+    } catch {
+      return undefined;
+    }
+  }
+
+  return value.slice(1, -1)
+    .replace(/\\n/g, '\n')
+    .replace(/\\r/g, '\r')
+    .replace(/\\t/g, '\t')
+    .replace(/\\\\/g, '\\')
+    .replace(new RegExp(`\\\\${escapeRegex(quote)}`, 'g'), quote);
+}
+
+function splitTopLevelArguments(value: string): string[] {
+  const parts: string[] = [];
+  let current = '';
+  let parenDepth = 0;
+  let braceDepth = 0;
+  let bracketDepth = 0;
+  let quote: string | null = null;
+  let escaped = false;
+
+  for (let index = 0; index < value.length; index += 1) {
+    const char = value[index];
+    if (quote) {
+      current += char;
+      if (escaped) {
+        escaped = false;
+      } else if (char === '\\') {
+        escaped = true;
+      } else if (char === quote) {
+        quote = null;
+      }
+      continue;
+    }
+
+    if (char === '"' || char === '\'' || char === '`') {
+      quote = char;
+      current += char;
+      continue;
+    }
+
+    if (char === '(') {
+      parenDepth += 1;
+    } else if (char === ')') {
+      parenDepth = Math.max(0, parenDepth - 1);
+    } else if (char === '{') {
+      braceDepth += 1;
+    } else if (char === '}') {
+      braceDepth = Math.max(0, braceDepth - 1);
+    } else if (char === '[') {
+      bracketDepth += 1;
+    } else if (char === ']') {
+      bracketDepth = Math.max(0, bracketDepth - 1);
+    }
+
+    if (char === ',' && parenDepth === 0 && braceDepth === 0 && bracketDepth === 0) {
+      const trimmed = current.trim();
+      if (trimmed) {
+        parts.push(trimmed);
+      }
+      current = '';
+      continue;
+    }
+
+    current += char;
+  }
+
+  const tail = current.trim();
+  if (tail) {
+    parts.push(tail);
+  }
+  return parts;
+}
+
+function extractBalancedParentheses(value: string, startIndex: number): string | undefined {
+  if (value[startIndex] !== '(') {
+    return undefined;
+  }
+  let depth = 0;
+  let quote: string | null = null;
+  let escaped = false;
+  for (let index = startIndex; index < value.length; index += 1) {
+    const char = value[index];
+    if (quote) {
+      if (escaped) {
+        escaped = false;
+      } else if (char === '\\') {
+        escaped = true;
+      } else if (char === quote) {
+        quote = null;
+      }
+      continue;
+    }
+    if (char === '"' || char === '\'' || char === '`') {
+      quote = char;
+      continue;
+    }
+    if (char === '(') {
+      depth += 1;
+    } else if (char === ')') {
+      depth -= 1;
+      if (depth === 0) {
+        return value.slice(startIndex, index + 1);
+      }
+    }
+  }
+  return undefined;
+}
+
+function dedupeToolCalls(toolCalls: ToolFunctionCall[]): ToolFunctionCall[] {
+  const seen = new Set<string>();
+  return toolCalls.filter(toolCall => {
+    const signature = `${toolCall.function.name}|${JSON.stringify(toolCall.function.arguments ?? {})}`;
+    if (seen.has(signature)) {
+      return false;
+    }
+    seen.add(signature);
+    return true;
+  });
+}
+
+function escapeRegex(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 export function escapeJsonStringValues(value: string): string {

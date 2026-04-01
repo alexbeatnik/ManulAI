@@ -1389,6 +1389,149 @@ function remapArgs(args) {
   return out;
 }
 
+function extractDeterministicSingleFileCreateRequest(text) {
+  const match = text.match(/\b(?:create|write|add)\s+((?:[A-Za-z]:)?[A-Za-z0-9_./\\-]+\.(?:ts|tsx|js|jsx|json|md|css|html|py|yml|yaml|txt|sh))\b/i);
+  if (!match || !match[1]) return undefined;
+  const filepath = match[1].replace(/\\/g, '/');
+  const codeBlockMatch = text.match(/```[\w+-]*\n([\s\S]*?)```/);
+  let content = codeBlockMatch?.[1]?.trim() ?? '';
+  if (!content) {
+    content = text.slice(match.index + match[0].length)
+      .replace(/^\s*(?:with\s+(?:content|code)\s*:|containing\s+|that\s+contains\s+)/i, '')
+      .replace(/^\s*exporting\s+/i, 'export ')
+      .replace(/\bdo\s+not\s+modify\s+any\s+other\s+file\b[.!]?/i, '')
+      .trim()
+      .replace(/[\s.]+$/, '')
+      .trim();
+  }
+  if (!content) return undefined;
+  if (!/(?:\bexport\b|\bfunction\b|=>|\bclass\b|\binterface\b|\bconst\b|\blet\b|\breturn\b|[{};])/m.test(content)) return undefined;
+  return { filepath, content: content.endsWith('\n') ? content : `${content}\n` };
+}
+
+function extractLikelyRequestFileTargets(text) {
+  const candidates = new Set();
+  for (const match of text.matchAll(/\bin\s+([A-Za-z0-9_./\\-]+\.[A-Za-z0-9]+)\b/gi)) {
+    const value = String(match[1] ?? '').trim();
+    if (value) candidates.add(value.replace(/\\/g, '/'));
+  }
+  return [...candidates];
+}
+
+function resolveDeterministicKnownFilePath(candidates = []) {
+  for (const candidate of candidates) {
+    const resolved = resolveFilepath(candidate);
+    if (resolved && existsSync(resolved)) return resolved;
+  }
+  for (const candidate of ['README.md', 'README', 'LICENSE', 'package.json', 'tsconfig.json']) {
+    const resolved = resolveFilepath(candidate);
+    if (resolved && existsSync(resolved)) return resolved;
+  }
+  return undefined;
+}
+
+function getDeterministicReadRecoveryTargetFromPrompt(text) {
+  const normalized = text.trim().toLowerCase();
+  if (normalized.includes('package.json') && /\bname\b/i.test(text) && /\bversion\b/i.test(text) && /(?:\bread\b|\bshow\b|\banswer\b|\bпокажи\b|\bпрочитай\b|\bскажи\b)/i.test(text)) {
+    return { filepath: 'package.json', reason: 'package.json name/version request' };
+  }
+  if (/(?:\breadme\b|readme\.md)/i.test(normalized) && /(?:\btitle\b|\bheading\b|\bheadline\b|\bзаголовок\b|\bтайтл\b)/i.test(text) && /(?:\bread\b|\bshow\b|\bwhat\b|\banswer\b|\bпокажи\b|\bпрочитай\b|\bскажи\b)/i.test(text)) {
+    return { filepath: 'README.md', reason: 'README title request' };
+  }
+  return undefined;
+}
+
+async function tryUltraSmallDeterministicFastPath() {
+  if (MODEL_LIMITS.tier !== 'micro') return false;
+
+  if (/package\.json/i.test(userPrompt) && /\bname\b/i.test(userPrompt) && /\bversion\b/i.test(userPrompt) && /(?:\bread\b|\bshow\b|\banswer\b)/i.test(userPrompt)) {
+    try {
+      const packageJson = JSON.parse(readFileSync(path.join(wsRoot, 'package.json'), 'utf8'));
+      const summary = [String(packageJson.name ?? '').trim(), String(packageJson.version ?? '').trim()].filter(Boolean).join(' ').trim();
+      label(G, 'FAST-PATH', `package.json -> ${summary || '(missing name/version)'}`);
+      logEvent('session_done', { reason: 'ultra_small_fast_path_package_json', summary });
+      return true;
+    } catch (error) {
+      label(R, 'FAST-PATH ERROR', error instanceof Error ? error.message : String(error));
+      logEvent('fast_path_error', { reason: 'package_json', error: error instanceof Error ? error.message : String(error) });
+      return true;
+    }
+  }
+
+  if (/(?:\breadme\b|readme\.md)/i.test(userPrompt) && /(?:\btitle\b|\bheading\b|\bheadline\b|\bзаголовок\b|\bтайтл\b)/i.test(userPrompt) && /(?:\bread\b|\bshow\b|\bwhat\b|\banswer\b|\bпокажи\b|\bпрочитай\b|\bскажи\b)/i.test(userPrompt)) {
+    try {
+      const readmeText = readFileSync(path.join(wsRoot, 'README.md'), 'utf8');
+      const title = readmeText.match(/^#\s+(.+)$/m)?.[1]?.trim() || 'README.md has no H1 title.';
+      label(G, 'FAST-PATH', `README title -> ${title}`);
+      logEvent('session_done', { reason: 'ultra_small_fast_path_readme_title', title });
+      return true;
+    } catch (error) {
+      label(R, 'FAST-PATH ERROR', error instanceof Error ? error.message : String(error));
+      logEvent('fast_path_error', { reason: 'readme_title', error: error instanceof Error ? error.message : String(error) });
+      return true;
+    }
+  }
+
+  const exactLineReplaceMatch = userPrompt.match(/replace\s+(?:the\s+)?exact\s+line\s+["'`](.+?)["'`]\s+with\s+["'`](.+?)["'`](?:\s+in\s+(\S+))?/i);
+  if (exactLineReplaceMatch) {
+    const oldLine = String(exactLineReplaceMatch[1] ?? '').trim();
+    const newLine = String(exactLineReplaceMatch[2] ?? '').trim();
+    const explicitFile = String(exactLineReplaceMatch[3] ?? '').trim();
+    const targetPath = resolveDeterministicKnownFilePath(explicitFile ? [explicitFile] : extractLikelyRequestFileTargets(userPrompt));
+
+    if (!targetPath) {
+      label(R, 'FAST-PATH ERROR', 'Unable to resolve target file for exact-line replace');
+      logEvent('fast_path_error', { reason: 'exact_line_replace', error: 'resolve_target_failed' });
+      return true;
+    }
+
+    try {
+      const current = readFileSync(targetPath, 'utf8');
+      const oldLinePattern = new RegExp(`^${escapeRegex(oldLine)}$`, 'm');
+      if (!oldLinePattern.test(current)) {
+        label(R, 'FAST-PATH ERROR', `Exact line not found in ${path.basename(targetPath)}`);
+        logEvent('fast_path_error', { reason: 'exact_line_replace', error: 'line_not_found', filepath: targetPath });
+        return true;
+      }
+
+      const result = await executeTool('replace_in_file', {
+        filepath: targetPath,
+        old_text: oldLine,
+        new_text: newLine
+      });
+      const parsed = JSON.parse(result);
+      if (parsed.error) {
+        label(R, 'FAST-PATH ERROR', parsed.error);
+        logEvent('fast_path_error', { reason: 'exact_line_replace', error: parsed.error, filepath: targetPath });
+      } else {
+        label(G, 'FAST-PATH', `Replaced exact line in ${path.basename(targetPath)}`);
+        logEvent('session_done', { reason: 'ultra_small_fast_path_exact_line_replace', filepath: targetPath });
+      }
+      return true;
+    } catch (error) {
+      label(R, 'FAST-PATH ERROR', error instanceof Error ? error.message : String(error));
+      logEvent('fast_path_error', { reason: 'exact_line_replace', error: error instanceof Error ? error.message : String(error), filepath: targetPath });
+      return true;
+    }
+  }
+
+  const createRequest = extractDeterministicSingleFileCreateRequest(userPrompt);
+  if (createRequest) {
+    const result = await executeTool('create_or_edit_file', { filename: createRequest.filepath, content: createRequest.content });
+    const parsed = JSON.parse(result);
+    if (parsed.error) {
+      label(R, 'FAST-PATH ERROR', parsed.error);
+      logEvent('fast_path_error', { reason: 'single_file_create', error: parsed.error, filepath: createRequest.filepath });
+    } else {
+      label(G, 'FAST-PATH', `Created ${createRequest.filepath}`);
+      logEvent('session_done', { reason: 'ultra_small_fast_path_single_file_create', filepath: createRequest.filepath });
+    }
+    return true;
+  }
+
+  return false;
+}
+
 // All names (canonical + aliases) that we should try to detect in text
 const ALL_TOOL_NAMES = [...KNOWN_TOOLS, ...Object.keys(TOOL_ALIASES)];
 
@@ -1433,8 +1576,141 @@ function relaxedJsonParse(str) {
   }
 }
 
+function escapeRegex(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function parseQuotedString(value) {
+  if (value.length < 2) return undefined;
+  const quote = value[0];
+  if (!['"', '\'', '`'].includes(quote) || value[value.length - 1] !== quote) return undefined;
+  if (quote === '"') {
+    try { return JSON.parse(value); } catch { return undefined; }
+  }
+  return value.slice(1, -1)
+    .replace(/\\n/g, '\n')
+    .replace(/\\r/g, '\r')
+    .replace(/\\t/g, '\t')
+    .replace(/\\\\/g, '\\')
+    .replace(new RegExp(`\\\\${escapeRegex(quote)}`, 'g'), quote);
+}
+
+function splitTopLevelArguments(value) {
+  const parts = [];
+  let current = '';
+  let parenDepth = 0;
+  let braceDepth = 0;
+  let bracketDepth = 0;
+  let quote = null;
+  let escaped = false;
+
+  for (let index = 0; index < value.length; index++) {
+    const char = value[index];
+    if (quote) {
+      current += char;
+      if (escaped) escaped = false;
+      else if (char === '\\') escaped = true;
+      else if (char === quote) quote = null;
+      continue;
+    }
+    if (char === '"' || char === '\'' || char === '`') {
+      quote = char;
+      current += char;
+      continue;
+    }
+    if (char === '(') parenDepth++;
+    else if (char === ')') parenDepth = Math.max(0, parenDepth - 1);
+    else if (char === '{') braceDepth++;
+    else if (char === '}') braceDepth = Math.max(0, braceDepth - 1);
+    else if (char === '[') bracketDepth++;
+    else if (char === ']') bracketDepth = Math.max(0, bracketDepth - 1);
+
+    if (char === ',' && parenDepth === 0 && braceDepth === 0 && bracketDepth === 0) {
+      const trimmed = current.trim();
+      if (trimmed) parts.push(trimmed);
+      current = '';
+      continue;
+    }
+    current += char;
+  }
+
+  const tail = current.trim();
+  if (tail) parts.push(tail);
+  return parts;
+}
+
+function extractBalancedParentheses(value, startIndex) {
+  if (value[startIndex] !== '(') return undefined;
+  let depth = 0;
+  let quote = null;
+  let escaped = false;
+  for (let index = startIndex; index < value.length; index++) {
+    const char = value[index];
+    if (quote) {
+      if (escaped) escaped = false;
+      else if (char === '\\') escaped = true;
+      else if (char === quote) quote = null;
+      continue;
+    }
+    if (char === '"' || char === '\'' || char === '`') {
+      quote = char;
+      continue;
+    }
+    if (char === '(') depth++;
+    else if (char === ')') {
+      depth--;
+      if (depth === 0) return value.slice(startIndex, index + 1);
+    }
+  }
+  return undefined;
+}
+
+function parseParenthesizedArgValue(token) {
+  const trimmed = token.trim();
+  const quoted = parseQuotedString(trimmed);
+  if (quoted !== undefined) return quoted;
+  if (/^-?\d+$/.test(trimmed)) return parseInt(trimmed, 10);
+  if (/^-?\d+\.\d+$/.test(trimmed)) return parseFloat(trimmed);
+  if (/^(?:true|false)$/i.test(trimmed)) return trimmed.toLowerCase() === 'true';
+  if (/^null$/i.test(trimmed)) return null;
+  return trimmed;
+}
+
+function inferParenthesizedArgs(toolName, argsBody) {
+  if (!argsBody) {
+    if (['list_workspace_files', 'project_scan', 'read_workspace_notes', 'read_active_file'].includes(toolName)) return {};
+    return undefined;
+  }
+  if (argsBody.startsWith('{') && argsBody.endsWith('}')) {
+    const parsed = relaxedJsonParse(argsBody);
+    if (parsed) return remapArgs(parsed);
+  }
+  const values = splitTopLevelArguments(argsBody).map(parseParenthesizedArgValue);
+  if (toolName === 'execute_terminal_command' || toolName === 'launch_in_terminal') return typeof values[0] === 'string' ? { command: values[0] } : undefined;
+  if (toolName === 'read_specific_file') return typeof values[0] === 'string' ? { filepath: values[0] } : undefined;
+  if (toolName === 'list_workspace_files') return values.length === 0 ? {} : (typeof values[0] === 'string' ? { directory: values[0] } : undefined);
+  if (toolName === 'delete_file') return typeof values[0] === 'string' ? { filepath: values[0] } : undefined;
+  if (toolName === 'read_file_slice') return typeof values[0] === 'string' && typeof values[1] === 'number' && typeof values[2] === 'number' ? { filepath: values[0], startLine: values[1], endLine: values[2] } : undefined;
+  if (toolName === 'create_or_edit_file' || toolName === 'write_to_file') return typeof values[0] === 'string' && typeof values[1] === 'string' ? { filename: values[0], filepath: values[0], content: values[1] } : undefined;
+  if (toolName === 'replace_in_file') return typeof values[0] === 'string' && typeof values[1] === 'string' && typeof values[2] === 'string' ? { filepath: values[0], old_text: values[1], new_text: values[2] } : undefined;
+  if (toolName === 'write_workspace_notes') return typeof values[0] === 'string' && typeof values[1] === 'string' ? { content: values[0], mode: values[1] } : undefined;
+  return undefined;
+}
+
 function parseToolCallsFromText(content) {
   const results = [];
+
+  for (const toolName of ALL_TOOL_NAMES) {
+    const callRe = new RegExp(`\\b${escapeRegex(toolName)}\\s*\\(`, 'gi');
+    let callMatch;
+    while ((callMatch = callRe.exec(content)) !== null) {
+      const argsSource = extractBalancedParentheses(content, callMatch.index + callMatch[0].length - 1);
+      if (!argsSource) continue;
+      const mappedName = remapToolName(toolName);
+      const args = inferParenthesizedArgs(mappedName, argsSource.slice(1, -1).trim());
+      if (args) results.push({ function: { name: mappedName, arguments: args } });
+    }
+  }
 
   // Match {"name": "tool_name", "arguments": {...}} — use balanced-brace finder for nested objects
   // Handles both compact {"name":"x"} and indented/pretty-printed JSON from the model
@@ -1749,7 +2025,8 @@ function analyzeResponse(content, recentMessages) {
   const isPassingToUser = /(?:please (?:execute|run|proceed|confirm|provide|read)|would you like me to|shall i (?:proceed|continue)|can you (?:provide|share)|could you (?:provide|share))/i.test(content) && content.length < 800;
   const claimsDone = /(?:step \d+ completed|successfully applied|file (?:created|updated)|has been (?:created|moved|split)|(?<!\w)done\b(?![\s]*[:;{,=(])|(?:all (?:required )?)?tool calls? (?:have )?succeeded|(?:file )?splitting is complete|task(?:s)? (?:is |are )?complete)/i.test(content);  // Mentions a known tool name but parseToolCallsFromText couldn't extract a valid call
   const parsedFromContent = parseToolCallsFromText(content);
-  const mentionsToolButNotCalled = parsedFromContent.length === 0 && ALL_TOOL_NAMES.some(t => content.includes(t));  // looksLikePlan: numbered list. After tool results, also fire when content ends with an execute instruction.
+  const lowerContent = content.toLowerCase();
+  const mentionsToolButNotCalled = parsedFromContent.length === 0 && ALL_TOOL_NAMES.some(t => lowerContent.includes(t.toLowerCase()));  // looksLikePlan: numbered list. After tool results, also fire when content ends with an execute instruction.
   const endsWithExecute = /execut(?:e|ing)\s+step\s+\d+/i.test(content);
   const looksLikePlan = (
     !hasToolResults || endsWithExecute
@@ -2015,6 +2292,11 @@ async function main() {
   label(B, 'PROMPT', userPrompt);
   logEvent('session_start', { model: MODEL, dryRun: DRY_RUN, prompt: userPrompt });
 
+  if (await tryUltraSmallDeterministicFastPath()) {
+    label(B, 'SUMMARY', `Fast path completed | Log: ${LOG_FILE}`);
+    return;
+  }
+
   const messages = [
     {
       role: 'user',
@@ -2111,6 +2393,21 @@ let args = rawArgs;
 
       if (parsed.error) {
         label(R, `  ✗ ${toolName}`, parsed.error);
+        if (toolName === 'read_file_slice' || toolName === 'read_specific_file') {
+          const recoveryTarget = getDeterministicReadRecoveryTargetFromPrompt(userPrompt);
+          const attemptedPath = String(parsed.path ?? parsed.filepath ?? args.filepath ?? '').trim();
+          if (recoveryTarget && (!attemptedPath || path.basename(attemptedPath).toLowerCase() !== path.basename(recoveryTarget.filepath).toLowerCase())) {
+            const recoveredResult = await executeTool('read_specific_file', { filepath: recoveryTarget.filepath });
+            const recoveredParsed = JSON.parse(recoveredResult);
+            if (!recoveredParsed.error) {
+              label(Y, '  RECOVERY', `Deterministic retry -> ${recoveryTarget.filepath}`);
+              logEvent('deterministic_read_recovery', { failedTool: toolName, failedPath: attemptedPath || null, recoveredPath: recoveryTarget.filepath, reason: recoveryTarget.reason });
+              messages.push({ role: 'tool', content: recoveredResult, tool_name: 'read_specific_file' });
+              messages.push({ role: 'user', content: `The previous read used the wrong target. Continue from ${recoveryTarget.filepath}, which was read for you. ${recoveryTarget.reason}` });
+              continue;
+            }
+          }
+        }
         if (toolName === 'create_or_edit_file') {
           seenReadSigs.clear();
         }
@@ -2607,6 +2904,14 @@ let args = rawArgs;
 
     // Show plan to console then nudge
     if (analysis.looksLikePlan) {
+      if (MODEL_LIMITS.compactMandate) {
+        const nudge = 'Do NOT output a plan. Call exactly one tool now.';
+        label(Y, 'NUDGE (no-plan)', nudge);
+        messages.push({ role: 'assistant', content });
+        messages.push({ role: 'user', content: nudge });
+        retryCount = 0;
+        continue;
+      }
       label(G, 'PLAN', content);
       messages.push({ role: 'assistant', content });
       const nudge = 'Plan noted. Now execute step 1 immediately with the appropriate tool call. Do not describe what you will do — call the tool.';
