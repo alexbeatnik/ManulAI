@@ -49,6 +49,24 @@ ManulAI is designed for developers who already want Ollama as the model runtime 
 - the built-in model picker is intentionally curated toward the currently reliable local agent models: `phi4-mini:3.8b`, `llama3.1:8b`, and `qwen3-coder:30b`
 - if no local model is selected, the UI stays empty instead of showing a fake fallback model
 
+### Tested Local Models
+
+These results come from direct Ollama `/api/chat` checks plus the standalone ManulAI debug harness on simple greenfield coding tasks such as creating a Python console dice game. This is not a universal benchmark for every prompt, but it is the current practical baseline for agent use inside ManulAI.
+
+- `qwen3-coder:30b` is the strongest tested model so far. It produces the most reliable native tool calls, usually starts greenfield tasks by creating the first concrete file immediately, and is the least likely to fall into repetitive or malformed output.
+- `llama3.1:8b` is usable and generally coherent. Raw coding output is solid, and it behaves much better than the weaker `qwen2.5-coder` tiers, but it is still not as consistent as `qwen3-coder:30b` for multi-step agent loops.
+- `phi4-mini:3.8b` is also usable and much better than the weak small models, especially for short direct coding tasks. Its main weakness is tool-call formatting: it can still leak pseudo-tool text or need recovery more often than `qwen3-coder:30b`.
+- `qwen2.5-coder:7b` is not reliable enough for the built-in picker. It can produce partially reasonable raw English coding output, but in planner or agent loops it still tends to degrade into broken, repetitive, or malformed responses too often.
+- `qwen2.5-coder:1.5b` is not currently viable for dependable agent behavior here. In testing it collapsed into low-quality repetitive output even on simple generation tasks.
+- `qwen2.5-coder:0.5b` is not currently viable for real agent use. It regularly fails even before the tool loop matters, so the product no longer treats this class as a reliable default model.
+
+In practical terms, the difference is mostly this:
+
+- stronger models can follow the tool loop, choose a sane first action, and keep moving without getting trapped in scans, malformed tool syntax, or repetitive garbage
+- weaker models may still answer something, but they are much more likely to narrate instead of acting, emit broken tool-call text, repeat themselves, or fail after the first write step
+
+That is why the built-in picker is intentionally narrowed to the currently validated families instead of exposing every local Ollama model as if all of them were equally agent-capable.
+
 ### Agent Mode And Chat Mode
 
 ManulAI has three working modes:

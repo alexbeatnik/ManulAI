@@ -217,6 +217,21 @@ function looksLikeGreenfieldCreateTask(text) {
 }
 
 const REQUIRES_FILE_WRITE = looksLikeWriteIntent(userPrompt);
+const SHOULD_BLOCK_IMMEDIATE_DRY_RUN_TERMINAL = DRY_RUN
+  && isPreferredSupportedModel(MODEL)
+  && looksLikeGreenfieldCreateTask(userPrompt)
+  && !IS_SPLIT_TASK;
+
+function buildDryRunTerminalBlockResult(command, filePath) {
+  const targetPath = filePath ? ` after creating ${filePath}` : '';
+  return JSON.stringify({
+    command,
+    exitCode: 0,
+    blocked: true,
+    skipped: true,
+    note: `execute_terminal_command was skipped in DRY_RUN greenfield smoke${targetPath}. Continue with file creation, another file/tool step, or finalization instead of executing the new file.`
+  });
+}
 
 function detectLanguageId(filepath) {
   const ext = path.extname(filepath).toLowerCase();
@@ -2469,6 +2484,7 @@ async function main() {
   const failedCommandCounts = new Map(); // command signature -> failure count
   let lastNudgedResponseContent = '';  // track identical responses
   let consecutiveIdenticalResponses = 0;
+  let blockImmediateTerminalAfterWrite = false;
   dryRunFiles.clear(); // reset for this session
 
   const hasMetExtractionGoal = () => {
@@ -2502,6 +2518,19 @@ let args = rawArgs;
 
       label(B, `  → ${toolName}`, JSON.stringify(args).substring(0, 150));
       logEvent('tool_exec_start', { tool: toolName, args });
+
+      if (toolName !== 'execute_terminal_command' && toolName !== 'launch_in_terminal' && toolName !== 'create_or_edit_file') {
+        blockImmediateTerminalAfterWrite = false;
+      }
+
+      if (toolName === 'execute_terminal_command' && SHOULD_BLOCK_IMMEDIATE_DRY_RUN_TERMINAL && blockImmediateTerminalAfterWrite) {
+        const blockedResult = buildDryRunTerminalBlockResult(String(args.command ?? ''), lastSuccessfulWritePath);
+        label(Y, '  SKIP TERMINAL', 'Blocked immediate execute_terminal_command after create_or_edit_file in DRY_RUN greenfield smoke');
+        logEvent('tool_exec_blocked', { tool: toolName, args, reason: 'dry_run_greenfield_post_create_guard', path: lastSuccessfulWritePath });
+        messages.push({ role: 'tool', content: blockedResult, tool_name: toolName });
+        messages.push({ role: 'user', content: 'Do not run terminal commands immediately after creating a file in this DRY_RUN greenfield smoke. Continue with the next file/tool step or finish the task based on the code you already wrote.' });
+        continue;
+      }
 
       if (toolName === 'read_file_slice' || toolName === 'read_specific_file') {
         const readSig = toolName + '|' + JSON.stringify(args);
@@ -2577,6 +2606,9 @@ let args = rawArgs;
         if (toolName === 'create_or_edit_file' || toolName === 'replace_in_file') {
           hadSuccessfulWrite = true;
           lastSuccessfulWritePath = String(parsed.path ?? args.filename ?? args.filepath ?? lastSuccessfulWritePath ?? '');
+          if (toolName === 'create_or_edit_file' && SHOULD_BLOCK_IMMEDIATE_DRY_RUN_TERMINAL) {
+            blockImmediateTerminalAfterWrite = true;
+          }
           if (IS_SPLIT_TASK && toolName === 'create_or_edit_file') {
             const createdPath = parsed.path ?? '';
             const isOriginal = createdPath.includes(TARGET_BASENAME);
@@ -2609,6 +2641,10 @@ let args = rawArgs;
       const verifyTargetPath = lastSuccessfulWritePath || lastCreatedFileState?.filePath || resolveFilepath(TARGET_FILE);
       const verifyConfig = pickVerifyCommandForPath(verifyTargetPath);
       if (verifyConfig) {
+        if (SHOULD_BLOCK_IMMEDIATE_DRY_RUN_TERMINAL && blockImmediateTerminalAfterWrite) {
+          label(Y, 'VERIFY SKIP', 'Skipped immediate auto-verify after create_or_edit_file in DRY_RUN greenfield smoke');
+          logEvent('verify_skipped', { reason: 'dry_run_greenfield_post_create_guard', stack: verifyConfig.stack, command: verifyConfig.command, projectRoot: verifyConfig.projectRoot });
+        } else {
         label(B, 'VERIFY', `${verifyConfig.stack}: ${verifyConfig.command}`);
         const verifyResult = await executeTool('execute_terminal_command', { command: `cd ${JSON.stringify(verifyConfig.projectRoot)} && ${verifyConfig.command}` });
         const parsedVerify = JSON.parse(verifyResult);
@@ -2627,6 +2663,7 @@ let args = rawArgs;
           }),
           tool_name: 'build_verify'
         });
+        }
       }
     }
 
@@ -2744,6 +2781,19 @@ let args = rawArgs;
         logEvent('tool_exec_start', { tool: toolName, args });
         toolNamesInBatch.push(toolName);
 
+        if (toolName !== 'execute_terminal_command' && toolName !== 'launch_in_terminal' && toolName !== 'create_or_edit_file') {
+          blockImmediateTerminalAfterWrite = false;
+        }
+
+        if (toolName === 'execute_terminal_command' && SHOULD_BLOCK_IMMEDIATE_DRY_RUN_TERMINAL && blockImmediateTerminalAfterWrite) {
+          const blockedResult = buildDryRunTerminalBlockResult(String(args.command ?? ''), lastSuccessfulWritePath);
+          label(Y, '  SKIP TERMINAL', 'Blocked immediate execute_terminal_command after create_or_edit_file in DRY_RUN greenfield smoke');
+          logEvent('tool_exec_blocked', { tool: toolName, args, reason: 'dry_run_greenfield_post_create_guard', path: lastSuccessfulWritePath });
+          messages.push({ role: 'tool', content: blockedResult, tool_name: toolName });
+          messages.push({ role: 'user', content: 'Do not run terminal commands immediately after creating a file in this DRY_RUN greenfield smoke. Continue with the next file/tool step or finish the task based on the code you already wrote.' });
+          continue;
+        }
+
         // Cross-turn dedup: skip repeated reads of the same file section (allow each section to be read at most twice)
         if (toolName === 'read_file_slice' || toolName === 'read_specific_file') {
           const readSig = toolName + '|' + JSON.stringify(args);
@@ -2815,6 +2865,9 @@ let args = rawArgs;
           if (toolName === 'create_or_edit_file' || toolName === 'replace_in_file') {
             hadSuccessfulWrite = true;
             lastSuccessfulWritePath = String(parsed.path ?? args.filename ?? args.filepath ?? lastSuccessfulWritePath ?? '');
+            if (toolName === 'create_or_edit_file' && SHOULD_BLOCK_IMMEDIATE_DRY_RUN_TERMINAL) {
+              blockImmediateTerminalAfterWrite = true;
+            }
             // After creating a NEW file (not the main refactor target), remind model to replace in original — SPLIT TASKS ONLY
             if (IS_SPLIT_TASK && toolName === 'create_or_edit_file') {
               const createdPath = parsed.path ?? '';
@@ -2868,6 +2921,10 @@ let args = rawArgs;
         const verifyTargetPath = lastSuccessfulWritePath || lastCreatedFileState?.filePath || resolveFilepath(TARGET_FILE);
         const verifyConfig = pickVerifyCommandForPath(verifyTargetPath);
         if (verifyConfig) {
+          if (SHOULD_BLOCK_IMMEDIATE_DRY_RUN_TERMINAL && blockImmediateTerminalAfterWrite) {
+            label(Y, 'VERIFY SKIP', 'Skipped immediate auto-verify after create_or_edit_file in DRY_RUN greenfield smoke');
+            logEvent('verify_skipped', { reason: 'dry_run_greenfield_post_create_guard', stack: verifyConfig.stack, command: verifyConfig.command, projectRoot: verifyConfig.projectRoot });
+          } else {
           label(B, 'VERIFY', `${verifyConfig.stack}: ${verifyConfig.command}`);
           const verifyResult = await executeTool('execute_terminal_command', { command: `cd ${JSON.stringify(verifyConfig.projectRoot)} && ${verifyConfig.command}` });
           const parsedVerify = JSON.parse(verifyResult);
@@ -2886,6 +2943,7 @@ let args = rawArgs;
             }),
             tool_name: 'build_verify'
           });
+          }
         }
       }
 

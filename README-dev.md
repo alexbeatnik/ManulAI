@@ -148,6 +148,18 @@ Chats also persist a compact `summaryMemory` alongside the full transcript in `.
 - Every debug event includes the extension version and session identifier, not only the session-start record.
 - User prompts are logged as explicit debug events before hidden scan nudges, auto-attachments, or tool-loop retries modify the request context.
 
+## Tested Model Baseline
+
+The current model policy is based on direct `/api/chat` checks against Ollama plus standalone `scripts/debug-agent.mjs` runs on simple greenfield coding tasks, especially single-file creation tasks such as a Python console dice game.
+
+- `qwen3-coder:30b` is the strongest validated model in this project so far. It is the most reliable at emitting native tool calls, starting with a concrete file write, and staying coherent across multi-step agent execution.
+- `llama3.1:8b` is also viable. Raw coding output is solid and it is much more stable than the weak `qwen2.5-coder` tiers, but it still trails `qwen3-coder:30b` in tool-loop consistency.
+- `phi4-mini:3.8b` is viable for agent use and much better than the weak small models, but it still needs more recovery help around pseudo-tool text and malformed tool-call formatting.
+- `qwen2.5-coder:7b` is not treated as reliable enough for the built-in picker. It can produce partially acceptable raw coding output in English, but in planner/agent loops it still degrades too often into malformed, repetitive, or incoherent responses.
+- `qwen2.5-coder:1.5b` and `qwen2.5-coder:0.5b` are not considered dependable agent models for this runtime. In current tests they collapse too early, often before the tool loop is even the main problem.
+
+The practical difference between the working and non-working groups is not just code quality in plain text. The stronger models are better at selecting the next tool, creating the first concrete file without stalling, and surviving the loop after the first write. The weaker models are much more likely to narrate instead of acting, leak malformed tool text, repeat themselves, or fail immediately after one partial step.
+
 ## Transcript And Tool Feedback
 
 - Tool results are rendered back into the chat transcript instead of staying hidden in backend-only messages.
