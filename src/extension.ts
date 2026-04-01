@@ -151,6 +151,32 @@ export function activate(context: vscode.ExtensionContext): void {
   );
 
   context.subscriptions.push(
+    vscode.commands.registerCommand('manulai.devSendPrompt', async (promptArg?: unknown, optionsArg?: unknown) => {
+      let prompt = typeof promptArg === 'string' ? promptArg.trim() : '';
+      const options = typeof optionsArg === 'object' && optionsArg !== null
+        ? optionsArg as { autoApprove?: boolean }
+        : undefined;
+
+      if (!prompt) {
+        const entered = await vscode.window.showInputBox({
+          title: 'ManulAI Dev/Test Prompt',
+          prompt: 'Send a prompt directly into the installed ManulAI provider flow',
+          placeHolder: 'Enter a prompt to run through the extension',
+          ignoreFocusOut: true
+        });
+        prompt = entered?.trim() ?? '';
+      }
+
+      if (!prompt) {
+        return;
+      }
+
+      await openChat();
+      await provider.submitPromptForTesting(prompt, options?.autoApprove);
+    })
+  );
+
+  context.subscriptions.push(
     vscode.workspace.onDidChangeConfiguration(async event => {
       if (event.affectsConfiguration('manulai')) {
         await provider.handleConfigurationChange();

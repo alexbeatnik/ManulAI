@@ -189,6 +189,7 @@ const LOG_FILE    = process.env.LOG_FILE ?? path.join(logDir, `debug-${sessionId
 
 // In-session cache for DRY_RUN "written" files (module-level so executeTool can access it)
 const dryRunFiles = new Map();
+let preferredGreenfieldSuccessfulWriteCount = 0;
 
 const userPrompt = cliArgs[0];
 if (!userPrompt) {
@@ -248,9 +249,34 @@ function detectInsufficientGreenfieldCreateContent(filepath, content) {
   const nonCommentLines = nonEmptyLines.filter(line => !/^(?:\/\/|\/\*|\*|#|<!--)/.test(line));
   const placeholderPattern = /(?:your\s+\w+\s+here|your game logic here|game logic here|logic here|implementation here|code here|placeholder|stub|todo|tbd|coming soon|implement me|fill (?:me|this) in|to be implemented)/i;
   const hasPlaceholderLine = nonEmptyLines.some(line => placeholderPattern.test(line));
+  const nonImportLines = nonCommentLines.filter(line => !/^(?:import\s+.+|from\s+\S+\s+import\s+.+|using\s+.+;?|package\s+[\w.]+;?|namespace\s+[\w.]+;?|export\s+\{.*\};?)$/.test(line));
+  const looksLikePythonGreenfield = (/(?:\bpython\b|\bpy\b)/i.test(userPrompt)
+    || userPrompt.toLowerCase().includes('пайтон')
+    || userPrompt.toLowerCase().includes('питон')
+    || userPrompt.toLowerCase().includes('піто'))
+    && ext === '.py'
+    && preferredGreenfieldSuccessfulWriteCount === 0;
+  if (looksLikePythonGreenfield) {
+    const strongGameSignals = nonImportLines.filter(line => /(?:\binput\s*\(|\brandom\b|\brandint\b|\bchoice\b|\bwhile\b|\bfor\b|\bif\b|\belif\b|\bscore\b|\broll\b|\bdice\b|\bкост)/i.test(line));
+    const trivialBoilerplatePattern = /^(?:def\s+main\s*\(\s*\)\s*:|if\s+__name__\s*==\s*['"]__main__['"]\s*:|main\s*\(\s*\)\s*|print\s*\(.+\)\s*|time\.sleep\s*\(.+\)\s*|return\b.*|pass\b|import\s+(?:os|time)(?:\s+as\s+\w+)?\s*|from\s+time\s+import\s+.+|from\s+os\s+import\s+.+)$/;
+    const commentOnlyGamePlaceholderPattern = /(?:game logic here|logic here|console game|welcome to our console game|game over|thanks for playing)/i;
+    const hasOnlyTrivialBoilerplate = nonEmptyLines.every(line => {
+      const trimmed = line.trim();
+      if (!trimmed) return true;
+      if (/^(?:#|\/\/|\/\*|\*)/.test(trimmed)) {
+        return commentOnlyGamePlaceholderPattern.test(trimmed) || placeholderPattern.test(trimmed);
+      }
+      return trivialBoilerplatePattern.test(trimmed);
+    });
+    const isTooThinPythonStarter = strongGameSignals.length === 0
+      && (hasOnlyTrivialBoilerplate || nonImportLines.length <= 6);
+    if (isTooThinPythonStarter) {
+      return 'Blocked write: the first Python file for this greenfield task is too thin to be a real starting implementation. Do not stop at one print statement or a placeholder comment. Write a minimal but working first version with actual game flow, functions, and input/roll logic.';
+    }
+  }
+
   if (!hasPlaceholderLine) return undefined;
 
-  const nonImportLines = nonCommentLines.filter(line => !/^(?:import\s+.+|from\s+\S+\s+import\s+.+|using\s+.+;?|package\s+[\w.]+;?|namespace\s+[\w.]+;?|export\s+\{.*\};?)$/.test(line));
   const hasImplementationLine = nonImportLines.some(line => /(?:\bdef\b|\bclass\b|\bfunction\b|\bconst\b|\blet\b|\bvar\b|\bif\b|\bfor\b|\bwhile\b|\breturn\b|\bprint\s*\(|\bconsole\.log\s*\(|\bmain\s*\(|=>|[{}();=])/.test(line));
   if (hasImplementationLine) return undefined;
 
@@ -2514,6 +2540,7 @@ async function main() {
   let lastNudgedResponseContent = '';  // track identical responses
   let consecutiveIdenticalResponses = 0;
   let blockImmediateTerminalAfterWrite = false;
+  preferredGreenfieldSuccessfulWriteCount = 0;
   dryRunFiles.clear(); // reset for this session
 
   const hasMetExtractionGoal = () => {
@@ -2636,6 +2663,7 @@ let args = rawArgs;
           hadSuccessfulWrite = true;
           lastSuccessfulWritePath = String(parsed.path ?? args.filename ?? args.filepath ?? lastSuccessfulWritePath ?? '');
           if (toolName === 'create_or_edit_file' && SHOULD_BLOCK_IMMEDIATE_DRY_RUN_TERMINAL) {
+            preferredGreenfieldSuccessfulWriteCount++;
             blockImmediateTerminalAfterWrite = true;
           }
           if (IS_SPLIT_TASK && toolName === 'create_or_edit_file') {
@@ -2895,6 +2923,7 @@ let args = rawArgs;
             hadSuccessfulWrite = true;
             lastSuccessfulWritePath = String(parsed.path ?? args.filename ?? args.filepath ?? lastSuccessfulWritePath ?? '');
             if (toolName === 'create_or_edit_file' && SHOULD_BLOCK_IMMEDIATE_DRY_RUN_TERMINAL) {
+              preferredGreenfieldSuccessfulWriteCount++;
               blockImmediateTerminalAfterWrite = true;
             }
             // After creating a NEW file (not the main refactor target), remind model to replace in original — SPLIT TASKS ONLY

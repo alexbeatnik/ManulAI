@@ -75,7 +75,7 @@ ManulAI has three working modes:
 - `Agent Mode` enables local tools and lets Ollama continue the tool loop automatically
 - `Planner Mode` uses the same tools as Agent Mode but with a condensed system mandate focused on step-by-step planning and execution; it can also answer direct text questions without requiring tool calls
 - tiny local models are simplified automatically by model size: smaller context windows, shorter mandates, fewer hidden notes/summaries, and a reduced tool menu for ultra-small models so even `0.5b`-class models have a chance to stay on task
-- the currently preferred agent-capable models also get extra tuning: `phi4-mini`, `llama3.1`, and `qwen3-coder` are biased toward one-step execution and a smaller core tool set so they spend less time on unnecessary scans and more time on concrete file work; for greenfield create tasks they also reject obvious placeholder scaffolds and avoid jumping straight into non-interactive terminal execution right after the first file create
+- the currently preferred agent-capable models also get extra tuning: `phi4-mini`, `llama3.1`, and `qwen3-coder` are biased toward one-step execution and a smaller core tool set so they spend less time on unnecessary scans and more time on concrete file work; for greenfield create tasks they also reject obvious placeholder scaffolds, block overly thin first Python files, and avoid jumping straight into non-interactive terminal execution right after the first file create
 - in chat-only mode, ManulAI should not claim that files were changed
 - `Auto-Approve` can be turned on to execute tools immediately or off to require confirmation for every tool call
 
@@ -187,6 +187,7 @@ The extension contributes these VS Code commands:
 - `Attach to ManulAI Chat`
 - `Attach Active File to ManulAI Chat`
 - `Attach Explorer Selection to ManulAI Chat`
+- `ManulAI: Send Prompt (Dev/Test)`
 
 ---
 

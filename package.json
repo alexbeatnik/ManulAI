@@ -61,6 +61,12 @@
         "title": "Attach Folder to ManulAI Chat",
         "category": "ManulAI",
         "icon": "$(file-directory)"
+      },
+      {
+        "command": "manulai.devSendPrompt",
+        "title": "ManulAI: Send Prompt (Dev/Test)",
+        "category": "ManulAI",
+        "icon": "$(beaker)"
       }
     ],
     "menus": {
