@@ -145,7 +145,16 @@ if (!userPrompt) {
 
 // Detect whether this run is a file-splitting task — only then enforce extractionCount gate
 const IS_SPLIT_TASK = /розбий|split|refactor.*module|extract.*module/i.test(userPrompt);
-const REQUIRES_FILE_WRITE = /\b(?:create|write|edit|modify|update|add|append|change|rename|delete|remove|refactor|split|move)\b/i.test(userPrompt);
+
+function looksLikeWriteIntent(text) {
+  const normalized = text.trim().toLowerCase();
+  if (!normalized) return false;
+  const englishWritePattern = /\b(?:create|write|edit|modify|update|add|append|change|rename|delete|remove|refactor|split|move|build|make|generate)\b/i;
+  const cyrillicWritePattern = /(?:^|[\s"'`([{])(?:поміняй|зміни|измени|поменяй|онови|обнови|заміни|замени|відредагуй|редагуй|перепиши|додай|добавь|видали|удали|створи|создай|зроби|сделай|напиши|виправ|исправь|згенеруй|сгенерируй|побудуй|собери)(?=$|[\s"'`)\]},.!?:;])/i;
+  return englishWritePattern.test(normalized) || cyrillicWritePattern.test(normalized);
+}
+
+const REQUIRES_FILE_WRITE = looksLikeWriteIntent(userPrompt);
 
 function detectLanguageId(filepath) {
   const ext = path.extname(filepath).toLowerCase();
@@ -1446,8 +1455,8 @@ function inferDegenerateRecoveryStarterFilepath(text) {
   if (explicitTargets.length > 0) return explicitTargets[0];
 
   const normalized = text.trim().toLowerCase();
-  if (!/\b(?:create|write|add|build|make|створи|создай|зроби|сделай)\b/i.test(normalized)) return undefined;
-  if (/\bpython\b|\bpy\b|\bпайтон\b|\bпіто?н\b/i.test(normalized)) return 'main.py';
+  if (!looksLikeWriteIntent(text)) return undefined;
+  if (/\bpython\b|\bpy\b/i.test(normalized) || normalized.includes('пайтон') || normalized.includes('питон') || normalized.includes('піто')) return 'main.py';
   if (/\btypescript\b|\btype script\b|\bts\b/i.test(normalized)) return 'main.ts';
   if (/\bjavascript\b|\bnode\b|\bjs\b/i.test(normalized)) return 'main.js';
   if (/\bhtml\b|\bweb\s*page\b|\blanding\b/i.test(normalized)) return 'index.html';

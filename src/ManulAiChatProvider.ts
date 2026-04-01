@@ -898,11 +898,23 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
 
     this.postStateToWebview();
     this.totalReadOps = 0;
-    this.currentRequestRequiresWrite = /\b(?:create|write|edit|modify|update|add|append|change|rename|delete|remove|refactor|split|move)\b/i.test(text);
+    this.currentRequestRequiresWrite = this.looksLikeWriteIntent(text);
     this.failedCommandCounts.clear();
     this.lastNudgedResponseContent = '';
     this.consecutiveIdenticalResponses = 0;
     await this.runAgentLoop(exchangeStartIndex);
+  }
+
+  private looksLikeWriteIntent(text: string): boolean {
+    const normalized = text.trim().toLowerCase();
+    if (!normalized) {
+      return false;
+    }
+
+    const englishWritePattern = /\b(?:create|write|edit|modify|update|add|append|change|rename|delete|remove|refactor|split|move|build|make|generate)\b/i;
+    const cyrillicWritePattern = /(?:^|[\s"'`([{])(?:поміняй|зміни|измени|поменяй|онови|обнови|заміни|замени|відредагуй|редагуй|перепиши|додай|добавь|видали|удали|створи|создай|зроби|сделай|напиши|виправ|исправь|згенеруй|сгенерируй|побудуй|собери)(?=$|[\s"'`)\]},.!?:;])/i;
+
+    return englishWritePattern.test(normalized) || cyrillicWritePattern.test(normalized);
   }
 
   private looksLikeFileMutationRequest(text: string): boolean {
@@ -914,7 +926,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     const editVerbPattern = /\b(change|edit|modify|update|rewrite|rename|replace|fix|refactor|add|remove|delete|create|write|insert|patch)\b|(?:^|\s)(?:поміняй|зміни|измени|поменяй|онови|обнови|заміни|замени|відредагуй|редагуй|перепиши|додай|добавь|видали|удали|створи|создай|виправ|исправь)(?:\s|$)/i;
     const fileTargetPattern = /\b(file|files|readme|license|package\.json|tsconfig|title|header|line|code|text)\b|(?:^|\s)(?:тайтл|заголовок|хедер|ридми|рідмі|файл|код|текст)(?:\s|$)|(?:^|\s)[.\w\-/]+\.(?:ts|tsx|js|jsx|json|md|css|html|py|yml|yaml)(?:\s|$)/i;
 
-    return editVerbPattern.test(normalized) && fileTargetPattern.test(normalized);
+    return (editVerbPattern.test(normalized) || this.looksLikeWriteIntent(normalized)) && fileTargetPattern.test(normalized);
   }
 
   private looksLikeProjectScanRequest(text: string): boolean {
@@ -1443,11 +1455,11 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     }
 
     const normalized = text.trim().toLowerCase();
-    if (!this.looksLikeFileMutationRequest(text) && !/\b(?:create|write|add|build|make|створи|создай|зроби|сделай)\b/i.test(normalized)) {
+    if (!this.looksLikeFileMutationRequest(text) && !this.looksLikeWriteIntent(text)) {
       return undefined;
     }
 
-    if (/\bpython\b|\bpy\b|\bпайтон\b|\bпіто?н\b/i.test(normalized)) {
+    if (/\bpython\b|\bpy\b/i.test(normalized) || normalized.includes('пайтон') || normalized.includes('питон') || normalized.includes('піто')) {
       return 'main.py';
     }
     if (/\btypescript\b|\btype script\b|\bts\b/i.test(normalized)) {
