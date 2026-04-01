@@ -132,7 +132,7 @@ export function activate(context: vscode.ExtensionContext): void {
       }));
 
       if (availableModels.length === 0) {
-        void vscode.window.showWarningMessage('No Ollama models were found. Check the local Ollama server and try again.');
+        void vscode.window.showWarningMessage('No supported Ollama models were found. ManulAI is currently tuned for phi4-mini, llama3.1, and qwen3-coder local models.');
         return;
       }
 

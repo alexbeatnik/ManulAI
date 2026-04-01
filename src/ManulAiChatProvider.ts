@@ -279,6 +279,17 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     this.webviewView?.show(preserveFocus);
   }
 
+  private isPreferredSupportedModel(model: string): boolean {
+    const normalized = model.trim().toLowerCase();
+    return /^phi4-mini(?:[:]|$)/.test(normalized)
+      || /^llama3\.1(?:[:]|$)/.test(normalized)
+      || /^qwen3-coder(?:[:]|$)/.test(normalized);
+  }
+
+  private filterPreferredSupportedModels(models: string[]): string[] {
+    return models.filter(model => this.isPreferredSupportedModel(model));
+  }
+
   public async refreshModelCatalog(postStatusOnError = false): Promise<void> {
     const currentModel = this.getSelectedModel();
 
@@ -295,9 +306,10 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       const names = (payload.models ?? [])
         .map(model => String(model.name ?? '').trim())
         .filter(Boolean)
+        .filter(model => this.isPreferredSupportedModel(model))
         .sort((left, right) => left.localeCompare(right));
 
-      this.availableModels = Array.from(new Set([currentModel, ...names].filter(Boolean)));
+      this.availableModels = Array.from(new Set(this.filterPreferredSupportedModels(names)));
       this.ollamaReachable = true;
 
       // Auto-select the only available model when none is currently chosen
@@ -305,7 +317,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         await this.setSelectedModel(names[0]);
       }
     } catch (error) {
-      this.availableModels = Array.from(new Set([currentModel, ...this.availableModels].filter(Boolean)));
+      this.availableModels = Array.from(new Set(this.filterPreferredSupportedModels(this.availableModels)));
       this.ollamaReachable = false;
 
       if (postStatusOnError) {
@@ -896,6 +908,17 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       });
     }
 
+    if (this.isAgentLike
+      && this.isPreferredSupportedModel(this.getSelectedModel())
+      && this.looksLikeGreenfieldCreateTask(text)) {
+      const starterFilepath = this.inferDegenerateRecoveryStarterFilepath(text);
+      this.messages.push({
+        role: 'user',
+        content: `This is a greenfield creation task. Do NOT call project_scan, list_workspace_files, read_workspace_notes, or write_workspace_notes unless the user explicitly asked about the existing project structure.${starterFilepath ? ` Start by creating one concrete file immediately, preferably ${starterFilepath}, with the complete first working implementation.` : ' Start by creating one concrete file immediately with the first working implementation.'} After that, continue with only the next required file or verification step.`,
+        hiddenFromTranscript: true
+      });
+    }
+
     this.postStateToWebview();
     this.totalReadOps = 0;
     this.currentRequestRequiresWrite = this.looksLikeWriteIntent(text);
@@ -915,6 +938,25 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     const cyrillicWritePattern = /(?:^|[\s"'`([{])(?:поміняй|зміни|измени|поменяй|онови|обнови|заміни|замени|відредагуй|редагуй|перепиши|додай|добавь|видали|удали|створи|создай|зроби|сделай|напиши|виправ|исправь|згенеруй|сгенерируй|побудуй|собери)(?=$|[\s"'`)\]},.!?:;])/i;
 
     return englishWritePattern.test(normalized) || cyrillicWritePattern.test(normalized);
+  }
+
+  private looksLikeGreenfieldCreateTask(text: string): boolean {
+    const normalized = text.trim().toLowerCase();
+    if (!normalized || !this.looksLikeWriteIntent(text)) {
+      return false;
+    }
+
+    if (this.looksLikeProjectScanRequest(text) || this.looksLikeLargeRefactorRequest(text)) {
+      return false;
+    }
+
+    const explicitTargets = this.extractLikelyRequestFileTargets(text);
+    if (explicitTargets.length > 0) {
+      return false;
+    }
+
+    return /(?:\bfrom scratch\b|\bconsole\b|\bcli\b|\bgame\b|\bapp\b|\bscript\b|\btool\b|\bprogram\b|\bservice\b|\bбот\b|\bгра\b|\bгру\b|\bскрипт\b|\bдодаток\b|\bутиліт)/i.test(normalized)
+      || !this.looksLikeFileMutationRequest(text);
   }
 
   private looksLikeFileMutationRequest(text: string): boolean {
@@ -3127,7 +3169,76 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   }
 
   private getModelCapabilityProfile(): ModelCapabilityProfile {
+    const selectedModel = this.getSelectedModel().toLowerCase();
     const sizeB = this.getModelSizeInBillions();
+    const preferredToolNames = [
+      'read_active_file',
+      'read_specific_file',
+      'read_file_slice',
+      'create_or_edit_file',
+      'replace_in_file',
+      'execute_terminal_command',
+      'launch_in_terminal',
+      'delete_file',
+      'list_workspace_files'
+    ];
+
+    if (/^phi4-mini(?:[:]|$)/.test(selectedModel)) {
+      return {
+        tier: 'medium',
+        maxMessages: 14,
+        numCtx: 10240,
+        workspaceTreeMaxDepth: 2,
+        workspaceTreeFileCap: 120,
+        summaryContextLimit: 4,
+        includeWorkspaceInstructions: true,
+        includeWorkspaceNotes: false,
+        includeRecentChatSummaries: true,
+        useCompactMandate: true,
+        preferStepwiseExecution: true,
+        maxNudgeRetriesCap: 4,
+        maxReadOpsWithoutWrite: 2,
+        toolNames: preferredToolNames
+      };
+    }
+
+    if (/^llama3\.1(?:[:]|$)/.test(selectedModel)) {
+      return {
+        tier: 'medium',
+        maxMessages: 20,
+        numCtx: 12288,
+        workspaceTreeMaxDepth: 3,
+        workspaceTreeFileCap: 150,
+        summaryContextLimit: 5,
+        includeWorkspaceInstructions: true,
+        includeWorkspaceNotes: false,
+        includeRecentChatSummaries: true,
+        useCompactMandate: false,
+        preferStepwiseExecution: true,
+        maxNudgeRetriesCap: 4,
+        maxReadOpsWithoutWrite: 2,
+        toolNames: preferredToolNames
+      };
+    }
+
+    if (/^qwen3-coder(?:[:]|$)/.test(selectedModel)) {
+      return {
+        tier: 'large',
+        maxMessages: 28,
+        numCtx: 16384,
+        workspaceTreeMaxDepth: 3,
+        workspaceTreeFileCap: 180,
+        summaryContextLimit: 6,
+        includeWorkspaceInstructions: true,
+        includeWorkspaceNotes: false,
+        includeRecentChatSummaries: true,
+        useCompactMandate: false,
+        preferStepwiseExecution: true,
+        maxNudgeRetriesCap: 5,
+        maxReadOpsWithoutWrite: 2,
+        toolNames: preferredToolNames
+      };
+    }
 
     if (sizeB > 0 && sizeB <= 1.5) {
       return {
@@ -4795,6 +4906,20 @@ If the user asks for a change but provides NO code:
       }
     };
 
+    const latestWriteRaw = [...messages].reverse().find(message =>
+      message.role === 'tool'
+      && (message.tool_name === 'create_or_edit_file' || message.tool_name === 'replace_in_file' || message.tool_name === 'write_to_file')
+    )?.content;
+    let latestWriteExt = '';
+    if (latestWriteRaw) {
+      try {
+        const parsed = JSON.parse(latestWriteRaw) as Record<string, unknown>;
+        latestWriteExt = path.extname(String(parsed.path ?? '')).toLowerCase();
+      } catch {
+        latestWriteExt = '';
+      }
+    }
+
     const pickPackageManager = async (): Promise<'npm' | 'pnpm' | 'yarn' | 'bun'> => {
       if (await exists('pnpm-lock.yaml')) {
         return 'pnpm';
@@ -4807,6 +4932,35 @@ If the user asks for a change but provides NO code:
       }
       return 'npm';
     };
+
+    const hasPythonProjectMarkers = async (): Promise<boolean> => (
+      await exists('pyproject.toml') || await exists('requirements.txt') || await exists('setup.py')
+    );
+
+    const hasJavaProjectMarkers = async (): Promise<boolean> => (
+      await exists('pom.xml') || await exists('build.gradle') || await exists('build.gradle.kts')
+    );
+
+    const hasDotnetProjectMarkers = async (): Promise<boolean> => {
+      const dotnetProjects = await vscode.workspace.findFiles('**/*.{sln,csproj}', '**/{node_modules,dist,build,out,.git,.manulai}/**', 1);
+      return dotnetProjects.length > 0;
+    };
+
+    if (latestWriteExt === '.py' && !(await hasPythonProjectMarkers())) {
+      return null;
+    }
+    if (latestWriteExt === '.go' && !(await exists('go.mod'))) {
+      return null;
+    }
+    if (latestWriteExt === '.rs' && !(await exists('Cargo.toml'))) {
+      return null;
+    }
+    if ((latestWriteExt === '.java' || latestWriteExt === '.kt') && !(await hasJavaProjectMarkers())) {
+      return null;
+    }
+    if (latestWriteExt === '.cs' && !(await hasDotnetProjectMarkers())) {
+      return null;
+    }
 
     const scriptCommand = (pm: 'npm' | 'pnpm' | 'yarn' | 'bun', scriptName: string): string => {
       if (pm === 'npm') {
@@ -4852,7 +5006,7 @@ If the user asks for a change but provides NO code:
     if (!command && await exists('go.mod')) {
       command = 'go test ./... 2>&1 | head -30';
     }
-    if (!command && (await exists('pyproject.toml') || await exists('requirements.txt') || await exists('setup.py'))) {
+    if (!command && await hasPythonProjectMarkers()) {
       command = 'python -m compileall -q . 2>&1 | head -30';
     }
     if (!command && await exists('pom.xml')) {
@@ -4863,11 +5017,8 @@ If the user asks for a change but provides NO code:
         ? './gradlew -q build -x test 2>&1 | head -30'
         : 'gradle -q build -x test 2>&1 | head -30';
     }
-    if (!command) {
-      const dotnetProjects = await vscode.workspace.findFiles('**/*.{sln,csproj}', '**/{node_modules,dist,build,out,.git,.manulai}/**', 1);
-      if (dotnetProjects.length > 0) {
-        command = 'dotnet build -nologo 2>&1 | head -30';
-      }
+    if (!command && await hasDotnetProjectMarkers()) {
+      command = 'dotnet build -nologo 2>&1 | head -30';
     }
 
     if (!command) {

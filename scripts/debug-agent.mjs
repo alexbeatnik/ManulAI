@@ -37,8 +37,55 @@ function getModelSizeInBillions(model) {
   return m ? parseFloat(m[1]) : 0;
 }
 
+function isPreferredSupportedModel(model) {
+  const normalized = model.trim().toLowerCase();
+  return /^phi4-mini(?:[:]|$)/.test(normalized)
+    || /^llama3\.1(?:[:]|$)/.test(normalized)
+    || /^qwen3-coder(?:[:]|$)/.test(normalized);
+}
+
 function getModelCapabilityProfile(model) {
+  const normalizedModel = model.trim().toLowerCase();
   const sizeB = getModelSizeInBillions(model);
+  const preferredToolNames = ['read_active_file', 'read_specific_file', 'read_file_slice', 'create_or_edit_file', 'replace_in_file', 'execute_terminal_command', 'launch_in_terminal', 'delete_file', 'list_workspace_files'];
+
+  if (/^phi4-mini(?:[:]|$)/.test(normalizedModel)) {
+    return {
+      tier: 'medium',
+      maxMessages: 14,
+      numCtx: 10240,
+      maxReadOpsWithoutWrite: 2,
+      maxNudgeRetriesCap: 4,
+      toolNames: preferredToolNames,
+      compactMandate: true,
+      preferStepwiseExecution: true,
+    };
+  }
+  if (/^llama3\.1(?:[:]|$)/.test(normalizedModel)) {
+    return {
+      tier: 'medium',
+      maxMessages: 20,
+      numCtx: 12288,
+      maxReadOpsWithoutWrite: 2,
+      maxNudgeRetriesCap: 4,
+      toolNames: preferredToolNames,
+      compactMandate: false,
+      preferStepwiseExecution: true,
+    };
+  }
+  if (/^qwen3-coder(?:[:]|$)/.test(normalizedModel)) {
+    return {
+      tier: 'large',
+      maxMessages: 28,
+      numCtx: 16384,
+      maxReadOpsWithoutWrite: 2,
+      maxNudgeRetriesCap: 5,
+      toolNames: preferredToolNames,
+      compactMandate: false,
+      preferStepwiseExecution: true,
+    };
+  }
+
   if (sizeB > 0 && sizeB <= 1.5) {
     return {
       tier: 'micro',
@@ -48,6 +95,7 @@ function getModelCapabilityProfile(model) {
       maxNudgeRetriesCap: 1,
       toolNames: ['read_specific_file', 'read_file_slice', 'create_or_edit_file', 'replace_in_file', 'list_workspace_files'],
       compactMandate: true,
+      preferStepwiseExecution: true,
     };
   }
   if (sizeB > 1.5 && sizeB <= 3.5) {
@@ -59,6 +107,7 @@ function getModelCapabilityProfile(model) {
       maxNudgeRetriesCap: 2,
       toolNames: ['read_active_file', 'read_specific_file', 'read_file_slice', 'create_or_edit_file', 'replace_in_file', 'list_workspace_files', 'execute_terminal_command'],
       compactMandate: true,
+      preferStepwiseExecution: true,
     };
   }
   if (sizeB > 0 && sizeB <= 9) {
@@ -70,6 +119,7 @@ function getModelCapabilityProfile(model) {
       maxNudgeRetriesCap: 3,
       toolNames: null,
       compactMandate: false,
+      preferStepwiseExecution: false,
     };
   }
   if (sizeB > 9 && sizeB <= 16) {
@@ -81,6 +131,7 @@ function getModelCapabilityProfile(model) {
       maxNudgeRetriesCap: 4,
       toolNames: null,
       compactMandate: false,
+      preferStepwiseExecution: false,
     };
   }
   if (sizeB > 16 && sizeB <= 34) {
@@ -92,6 +143,7 @@ function getModelCapabilityProfile(model) {
       maxNudgeRetriesCap: 4,
       toolNames: null,
       compactMandate: false,
+      preferStepwiseExecution: false,
     };
   }
   return {
@@ -102,6 +154,7 @@ function getModelCapabilityProfile(model) {
     maxNudgeRetriesCap: 5,
     toolNames: null,
     compactMandate: false,
+    preferStepwiseExecution: false,
   };
 }
 const MODEL_LIMITS = getModelCapabilityProfile(MODEL);
@@ -152,6 +205,15 @@ function looksLikeWriteIntent(text) {
   const englishWritePattern = /\b(?:create|write|edit|modify|update|add|append|change|rename|delete|remove|refactor|split|move|build|make|generate)\b/i;
   const cyrillicWritePattern = /(?:^|[\s"'`([{])(?:поміняй|зміни|измени|поменяй|онови|обнови|заміни|замени|відредагуй|редагуй|перепиши|додай|добавь|видали|удали|створи|создай|зроби|сделай|напиши|виправ|исправь|згенеруй|сгенерируй|побудуй|собери)(?=$|[\s"'`)\]},.!?:;])/i;
   return englishWritePattern.test(normalized) || cyrillicWritePattern.test(normalized);
+}
+
+function looksLikeGreenfieldCreateTask(text) {
+  const normalized = text.trim().toLowerCase();
+  if (!normalized || !looksLikeWriteIntent(text)) return false;
+  if (/\b(?:scan|inspect|analy[sz]e|read)\s+(?:the\s+)?(?:project|workspace|repo|repository|codebase)\b/i.test(normalized)) return false;
+  if (/розбий|split|refactor.*module|extract.*module/i.test(normalized)) return false;
+  if (extractLikelyRequestFileTargets(text).length > 0) return false;
+  return /(?:\bfrom scratch\b|\bconsole\b|\bcli\b|\bgame\b|\bapp\b|\bscript\b|\btool\b|\bprogram\b|\bservice\b|\bбот\b|\bгра\b|\bгру\b|\bскрипт\b|\bдодаток\b|\bутиліт)/i.test(normalized);
 }
 
 const REQUIRES_FILE_WRITE = looksLikeWriteIntent(userPrompt);
@@ -329,6 +391,17 @@ function scriptCommand(pm, scriptName) {
 
 function pickVerifyCommandForPath(targetPath) {
   const projectRoot = findNearestProjectRoot(targetPath);
+  const latestExt = path.extname(targetPath || '').toLowerCase();
+  const hasPythonProjectMarkers = existsSync(path.join(projectRoot, 'pyproject.toml')) || existsSync(path.join(projectRoot, 'requirements.txt')) || existsSync(path.join(projectRoot, 'setup.py'));
+  const hasJavaProjectMarkers = existsSync(path.join(projectRoot, 'pom.xml')) || existsSync(path.join(projectRoot, 'build.gradle')) || existsSync(path.join(projectRoot, 'build.gradle.kts'));
+  const hasDotnetProjectMarkers = existsSync(projectRoot) && readdirSafe(projectRoot).some(name => name.endsWith('.sln') || name.endsWith('.csproj'));
+
+  if (latestExt === '.py' && !hasPythonProjectMarkers) return null;
+  if (latestExt === '.go' && !existsSync(path.join(projectRoot, 'go.mod'))) return null;
+  if (latestExt === '.rs' && !existsSync(path.join(projectRoot, 'Cargo.toml'))) return null;
+  if ((latestExt === '.java' || latestExt === '.kt') && !hasJavaProjectMarkers) return null;
+  if (latestExt === '.cs' && !hasDotnetProjectMarkers) return null;
+
   const packageJsonPath = path.join(projectRoot, 'package.json');
   if (existsSync(packageJsonPath)) {
     try {
@@ -345,13 +418,12 @@ function pickVerifyCommandForPath(targetPath) {
   if (existsSync(path.join(projectRoot, 'tsconfig.json'))) return { command: 'npx tsc --noEmit 2>&1 | head -30', projectRoot, stack: 'typescript' };
   if (existsSync(path.join(projectRoot, 'Cargo.toml'))) return { command: 'cargo check --quiet 2>&1 | head -30', projectRoot, stack: 'rust' };
   if (existsSync(path.join(projectRoot, 'go.mod'))) return { command: 'go test ./... 2>&1 | head -30', projectRoot, stack: 'go' };
-  if (existsSync(path.join(projectRoot, 'pyproject.toml')) || existsSync(path.join(projectRoot, 'requirements.txt')) || existsSync(path.join(projectRoot, 'setup.py'))) return { command: 'python -m compileall -q . 2>&1 | head -30', projectRoot, stack: 'python' };
+  if (hasPythonProjectMarkers) return { command: 'python -m compileall -q . 2>&1 | head -30', projectRoot, stack: 'python' };
   if (existsSync(path.join(projectRoot, 'pom.xml'))) return { command: 'mvn -q -DskipTests compile 2>&1 | head -30', projectRoot, stack: 'java' };
   if (existsSync(path.join(projectRoot, 'build.gradle')) || existsSync(path.join(projectRoot, 'build.gradle.kts'))) {
     return { command: existsSync(path.join(projectRoot, 'gradlew')) ? './gradlew -q build -x test 2>&1 | head -30' : 'gradle -q build -x test 2>&1 | head -30', projectRoot, stack: 'java/gradle' };
   }
-  const hasDotnet = existsSync(projectRoot) && readdirSafe(projectRoot).some(name => name.endsWith('.sln') || name.endsWith('.csproj'));
-  if (hasDotnet) return { command: 'dotnet build -nologo 2>&1 | head -30', projectRoot, stack: '.net' };
+  if (hasDotnetProjectMarkers) return { command: 'dotnet build -nologo 2>&1 | head -30', projectRoot, stack: '.net' };
   return null;
 }
 
@@ -2369,9 +2441,18 @@ async function main() {
     { role: 'user', content: userPrompt }
   ];
 
+  if (isPreferredSupportedModel(MODEL) && looksLikeGreenfieldCreateTask(userPrompt)) {
+    const starterFilepath = inferDegenerateRecoveryStarterFilepath(userPrompt);
+    messages.splice(messages.length - 1, 0, {
+      role: 'user',
+      content: `This is a greenfield creation task. Do NOT call project_scan, list_workspace_files, read_workspace_notes, or write_workspace_notes unless the user explicitly asked about the existing project structure.${starterFilepath ? ` Start by creating one concrete file immediately, preferably ${starterFilepath}, with the complete first working implementation.` : ' Start by creating one concrete file immediately with the first working implementation.'} After that, continue with only the next required file or verification step.`
+    });
+  }
+
   let turn = 0;
   let retryCount = 0;
   let hadSuccessfulWrite = false; // tracks if any create_or_edit_file / replace_in_file succeeded
+  let lastSuccessfulWritePath = null;
   let pendingReplaceAfterCreate = false; // set after new-file create; cleared after successful replace_in_file
   let lastSuccessfulRead = null;   // { filepath, startLine, endLine, content } — last successful read_file_slice result
   let lastCreatedFileState = null; // { filePath, content, exportNames } — last successfully created extraction file
@@ -2495,6 +2576,7 @@ let args = rawArgs;
         }
         if (toolName === 'create_or_edit_file' || toolName === 'replace_in_file') {
           hadSuccessfulWrite = true;
+          lastSuccessfulWritePath = String(parsed.path ?? args.filename ?? args.filepath ?? lastSuccessfulWritePath ?? '');
           if (IS_SPLIT_TASK && toolName === 'create_or_edit_file') {
             const createdPath = parsed.path ?? '';
             const isOriginal = createdPath.includes(TARGET_BASENAME);
@@ -2524,7 +2606,7 @@ let args = rawArgs;
     }
 
     if (hadSuccessfulWrite) {
-      const verifyTargetPath = lastCreatedFileState?.filePath || resolveFilepath(TARGET_FILE);
+      const verifyTargetPath = lastSuccessfulWritePath || lastCreatedFileState?.filePath || resolveFilepath(TARGET_FILE);
       const verifyConfig = pickVerifyCommandForPath(verifyTargetPath);
       if (verifyConfig) {
         label(B, 'VERIFY', `${verifyConfig.stack}: ${verifyConfig.command}`);
@@ -2732,6 +2814,7 @@ let args = rawArgs;
           }
           if (toolName === 'create_or_edit_file' || toolName === 'replace_in_file') {
             hadSuccessfulWrite = true;
+            lastSuccessfulWritePath = String(parsed.path ?? args.filename ?? args.filepath ?? lastSuccessfulWritePath ?? '');
             // After creating a NEW file (not the main refactor target), remind model to replace in original — SPLIT TASKS ONLY
             if (IS_SPLIT_TASK && toolName === 'create_or_edit_file') {
               const createdPath = parsed.path ?? '';
@@ -2782,7 +2865,7 @@ let args = rawArgs;
       }
 
       if (hadSuccessfulWrite) {
-        const verifyTargetPath = lastCreatedFileState?.filePath || resolveFilepath(TARGET_FILE);
+        const verifyTargetPath = lastSuccessfulWritePath || lastCreatedFileState?.filePath || resolveFilepath(TARGET_FILE);
         const verifyConfig = pickVerifyCommandForPath(verifyTargetPath);
         if (verifyConfig) {
           label(B, 'VERIFY', `${verifyConfig.stack}: ${verifyConfig.command}`);
