@@ -32,17 +32,79 @@ const MODEL       = process.env.MANUL_MODEL ?? 'qwen2.5-coder:7b';
 const DRY_RUN     = process.env.DRY_RUN === 'true';
 const MAX_TURNS   = parseInt(process.env.MAX_TURNS ?? '30', 10);
 
-// Model-based context limits: parse size hint from model tag (e.g. :7b, :30b)
-function getModelContextLimits(model) {
+function getModelSizeInBillions(model) {
   const m = model.toLowerCase().match(/(\d+\.?\d*)b/);
-  const sizeB = m ? parseFloat(m[1]) : 0;
-  if (sizeB > 0 && sizeB <= 9)  return { maxMessages: 16, numCtx: 8192 };
-  if (sizeB > 9 && sizeB <= 16) return { maxMessages: 24, numCtx: 12288 };
-  if (sizeB > 16 && sizeB <= 34) return { maxMessages: 32, numCtx: 16384 };
-  if (sizeB > 34) return { maxMessages: 48, numCtx: 32768 };
-  return { maxMessages: 32, numCtx: 16384 };
+  return m ? parseFloat(m[1]) : 0;
 }
-const MODEL_LIMITS = getModelContextLimits(MODEL);
+
+function getModelCapabilityProfile(model) {
+  const sizeB = getModelSizeInBillions(model);
+  if (sizeB > 0 && sizeB <= 1.5) {
+    return {
+      tier: 'micro',
+      maxMessages: 8,
+      numCtx: 4096,
+      maxReadOpsWithoutWrite: 2,
+      maxNudgeRetriesCap: 1,
+      toolNames: ['read_specific_file', 'read_file_slice', 'create_or_edit_file', 'replace_in_file', 'list_workspace_files'],
+      compactMandate: true,
+    };
+  }
+  if (sizeB > 1.5 && sizeB <= 3.5) {
+    return {
+      tier: 'small',
+      maxMessages: 10,
+      numCtx: 6144,
+      maxReadOpsWithoutWrite: 2,
+      maxNudgeRetriesCap: 2,
+      toolNames: ['read_active_file', 'read_specific_file', 'read_file_slice', 'create_or_edit_file', 'replace_in_file', 'list_workspace_files', 'execute_terminal_command'],
+      compactMandate: true,
+    };
+  }
+  if (sizeB > 0 && sizeB <= 9) {
+    return {
+      tier: 'medium',
+      maxMessages: 16,
+      numCtx: 8192,
+      maxReadOpsWithoutWrite: 3,
+      maxNudgeRetriesCap: 3,
+      toolNames: null,
+      compactMandate: false,
+    };
+  }
+  if (sizeB > 9 && sizeB <= 16) {
+    return {
+      tier: 'large',
+      maxMessages: 24,
+      numCtx: 12288,
+      maxReadOpsWithoutWrite: 3,
+      maxNudgeRetriesCap: 4,
+      toolNames: null,
+      compactMandate: false,
+    };
+  }
+  if (sizeB > 16 && sizeB <= 34) {
+    return {
+      tier: 'large',
+      maxMessages: 32,
+      numCtx: 16384,
+      maxReadOpsWithoutWrite: 3,
+      maxNudgeRetriesCap: 4,
+      toolNames: null,
+      compactMandate: false,
+    };
+  }
+  return {
+    tier: 'xlarge',
+    maxMessages: 48,
+    numCtx: 32768,
+    maxReadOpsWithoutWrite: 4,
+    maxNudgeRetriesCap: 5,
+    toolNames: null,
+    compactMandate: false,
+  };
+}
+const MODEL_LIMITS = getModelCapabilityProfile(MODEL);
 
 const cliArgs = process.argv.slice(2);
 
@@ -307,6 +369,22 @@ function logEvent(event, data = {}) {
 
 // ─── System prompt (keep in sync with callOllama in ManulAiChatProvider.ts) ─
 function buildAgentMandate() {
+  if (MODEL_LIMITS.compactMandate) {
+    return `[IDENTITY]
+You are ManulAI, a local VS Code coding agent.
+Workspace root: ${wsRoot}
+
+[RULES]
+- Execute the next concrete action. No long plan.
+- Prefer exactly ONE tool call per response.
+- Read before edit. Prefer read_file_slice for large files.
+- Use replace_in_file for small edits and create_or_edit_file for new files.
+- Do not narrate tool calls. Do not print JSON as text.
+- If a tool fails, adapt once and continue.
+- Finish with one short summary when the task is done.
+`;
+  }
+
   return `[IDENTITY]
 You are ManulAI, a local VS Code coding agent.
 Workspace root: ${wsRoot}
@@ -441,6 +519,20 @@ If steps remain → continue with the next tool call.
 }
 
 function buildPlannerMandate() {
+  if (MODEL_LIMITS.compactMandate) {
+    return `[IDENTITY]
+You are ManulAI, a local VS Code coding agent in Planner mode.
+Workspace root: ${wsRoot}
+
+[RULES]
+- If the user asks a direct question, answer briefly in text.
+- For edit or file tasks: do exactly ONE small tool call per response.
+- Prefer read_file_slice over large reads.
+- Keep responses short. No multi-step plans. No JSON in text.
+- Finish with a one-line summary when done.
+`;
+  }
+
   return `[IDENTITY]
 You are ManulAI, a local VS Code coding agent in Planner mode.
 Workspace root: ${wsRoot}
@@ -460,7 +552,7 @@ All file paths are relative to the workspace root unless absolute.
 
 // ─── Tool definitions ────────────────────────────────────────────────────────
 function getToolDefinitions() {
-  return [
+  const allTools = [
     {
       type: 'function',
       function: {
@@ -596,6 +688,13 @@ function getToolDefinitions() {
       }
     }
   ];
+
+  if (!MODEL_LIMITS.toolNames) {
+    return allTools;
+  }
+
+  const allowed = new Set(MODEL_LIMITS.toolNames);
+  return allTools.filter(tool => allowed.has(tool.function.name));
 }
 
 // ─── Tool execution ──────────────────────────────────────────────────────────
@@ -2112,7 +2211,7 @@ let args = rawArgs;
     }
 
     // For non-write tasks, nudge after 3+ reads
-    if (!REQUIRES_FILE_WRITE && totalReadOps >= 3 && !hadSuccessfulWrite) {
+    if (!REQUIRES_FILE_WRITE && totalReadOps >= MODEL_LIMITS.maxReadOpsWithoutWrite && !hadSuccessfulWrite) {
       const linesRead = recentReads.length > 0
         ? `lines ${recentReads[0].startLine || 1}–${recentReads[recentReads.length - 1].endLine || '?'}`
         : `${totalReadOps} sections`;
@@ -2186,7 +2285,8 @@ let args = rawArgs;
     seenToolSigs.add(sig);
     return true;
   });
-    const resolvedToolCalls = nativeToolCalls.length > 0 ? nativeToolCalls : textToolCalls;
+    const allowedToolNames = new Set(getToolDefinitions().map(tool => tool.function.name));
+    const resolvedToolCalls = (nativeToolCalls.length > 0 ? nativeToolCalls : textToolCalls).filter(tc => allowedToolNames.has(String(tc.function?.name ?? '').trim()));
     const wasNative = nativeToolCalls.length > 0;
 
     logEvent('ollama_response', {
@@ -2371,7 +2471,7 @@ let args = rawArgs;
       }
 
       // For non-write tasks (summarize, explain, review), nudge the model to stop reading and produce output
-      if (!REQUIRES_FILE_WRITE && totalReadOps >= 3 && !hadSuccessfulWrite) {
+      if (!REQUIRES_FILE_WRITE && totalReadOps >= MODEL_LIMITS.maxReadOpsWithoutWrite && !hadSuccessfulWrite) {
         const linesRead = recentReads.length > 0
           ? `lines ${recentReads[0].startLine || 1}–${recentReads[recentReads.length - 1].endLine || '?'}`
           : `${totalReadOps} sections`;
@@ -2432,7 +2532,7 @@ let args = rawArgs;
         logEvent('session_done', { turn, reason: 'continuation_exhausted', extractionCount });
         break;
       }
-      if (retryCount >= 4) {
+      if (retryCount >= MODEL_LIMITS.maxNudgeRetriesCap) {
         label(R, 'STUCK', `Model returned empty/overflow ${retryCount} times with no tool call — giving up.`);
         logEvent('retry_limit', { turn, retryCount, reason: 'empty_loop' });
         break;
@@ -2653,7 +2753,7 @@ let args = rawArgs;
       break;
     }
 
-    if (retryCount >= 4 || consecutiveIdenticalResponses >= 2) {
+    if (retryCount >= MODEL_LIMITS.maxNudgeRetriesCap || consecutiveIdenticalResponses >= 2) {
       if (consecutiveIdenticalResponses >= 2) {
         label(R, 'IDENTICAL LOOP', `Model produced identical response ${consecutiveIdenticalResponses + 1} times — aborting.`);
         logEvent('retry_limit', { turn, retryCount, reason: 'identical_response_loop', consecutiveIdenticalResponses });

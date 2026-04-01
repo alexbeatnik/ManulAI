@@ -25,6 +25,25 @@ interface FileWriteSummary {
   revertOperationId?: string;
 }
 
+type ModelCapabilityTier = 'micro' | 'small' | 'medium' | 'large' | 'xlarge';
+
+interface ModelCapabilityProfile {
+  tier: ModelCapabilityTier;
+  maxMessages: number;
+  numCtx: number;
+  workspaceTreeMaxDepth: number;
+  workspaceTreeFileCap: number;
+  summaryContextLimit: number;
+  includeWorkspaceInstructions: boolean;
+  includeWorkspaceNotes: boolean;
+  includeRecentChatSummaries: boolean;
+  useCompactMandate: boolean;
+  preferStepwiseExecution: boolean;
+  maxNudgeRetriesCap: number;
+  maxReadOpsWithoutWrite: number;
+  toolNames: string[];
+}
+
 export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = 'manulai.chatView';
 
@@ -308,6 +327,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     }
 
     await this.persistStoredSetting('ollamaModel', normalizedModel);
+    this.workspaceSnapshotCache = null;
     await this.refreshModelCatalog(false);
     if (previousModel !== normalizedModel) {
       this.debugLog('model_changed', { previousModel: previousModel || null, model: normalizedModel });
@@ -857,10 +877,14 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       }
     }
 
+    const capabilityProfile = this.getModelCapabilityProfile();
+
     if (this.agentMode === 'agent') {
       this.messages.push({
         role: 'user',
-        content: 'Before taking any action, output a brief numbered plan (3–8 steps) describing what you will do. Keep it concise. After the plan, immediately start executing step 1 with the appropriate tool call — do NOT wait for confirmation. After each file modification, make sure the project verification/build check passes. Prefer the project\'s own verification command for the detected stack. If the system injects a build_verify tool result with errors, fix those errors before moving to the next step.',
+        content: capabilityProfile.preferStepwiseExecution
+          ? 'Use ONE concrete action at a time. Do NOT output a long plan. If a tool is needed, call exactly ONE tool now, then decide the next action from the tool result. Keep each step small and immediate.'
+          : 'Before taking any action, output a brief numbered plan (3–8 steps) describing what you will do. Keep it concise. After the plan, immediately start executing step 1 with the appropriate tool call — do NOT wait for confirmation. After each file modification, make sure the project verification/build check passes. Prefer the project\'s own verification command for the detected stack. If the system injects a build_verify tool result with errors, fix those errors before moving to the next step.',
         hiddenFromTranscript: true
       });
     } else if (this.agentMode === 'planner') {
@@ -1535,7 +1559,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       }
 
       // For non-write tasks (summarize, explain, review), nudge the model to stop reading and produce output
-      if (!this.currentRequestRequiresWrite && this.totalReadOps >= 3 && !hadSuccessfulWrite) {
+      if (!this.currentRequestRequiresWrite && this.totalReadOps >= this.getModelCapabilityProfile().maxReadOpsWithoutWrite && !hadSuccessfulWrite) {
         const readNudge = `You have already read ${this.totalReadOps} sections of the file(s). You now have enough context. STOP reading additional sections and produce your summary/analysis/answer as a text response NOW. Do NOT call any more tools.`;
         this.debugLog('read_loop_nudge', { totalReadOps: this.totalReadOps });
         messages.push({ role: 'user', content: readNudge, hiddenFromTranscript: true });
@@ -2272,17 +2296,20 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           && hasRecentMeaningfulWrite
           && /(?:update|import|moving more|move more|refactor(?:ing)? methods|use imported types|created and populated)/i.test(finalContent)
         );
-        const maxNudgeRetries = hasRecentReplaceNotFound
-          ? 3
-          : (hasPreReadLargeRefactorNarration || hasFakePreReadCodeDump || hasLargeRefactorShellReadBypass || (isLargeRefactorRequest && !hasRecentReadOfLargeRefactorTarget))
-            ? 4
-          : isAskingUserForExactSlice
-            ? 5
-          : hasFakePostReadAnalysisDump || hasAnnouncedExtractionWithoutWrite || hasReadButNoWriteOnLargeRefactor || hasLazyRefusalOnLargeRefactor || hasModelRefusalResponse || hasPostReadSummaryOnLargeRefactor
-            ? 4
-          : (!hasRecentSuccessfulAction && !hasRecentMeaningfulWrite && hasRecentToolResults)
-            ? 4
-            : 2;
+        const maxNudgeRetries = Math.min(
+          this.getModelCapabilityProfile().maxNudgeRetriesCap,
+          hasRecentReplaceNotFound
+            ? 3
+            : (hasPreReadLargeRefactorNarration || hasFakePreReadCodeDump || hasLargeRefactorShellReadBypass || (isLargeRefactorRequest && !hasRecentReadOfLargeRefactorTarget))
+              ? 4
+              : isAskingUserForExactSlice
+                ? 5
+                : hasFakePostReadAnalysisDump || hasAnnouncedExtractionWithoutWrite || hasReadButNoWriteOnLargeRefactor || hasLazyRefusalOnLargeRefactor || hasModelRefusalResponse || hasPostReadSummaryOnLargeRefactor
+                  ? 4
+                  : (!hasRecentSuccessfulAction && !hasRecentMeaningfulWrite && hasRecentToolResults)
+                    ? 4
+                    : 2
+        );
         const requiresToolContinuation = (
           isPassingToUser
           || isAnnouncedButNotExecuted
@@ -2730,27 +2757,117 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
    * Parses size hints like :7b, :14b, :30b, :70b from the model string.
    * Returns { maxMessages, numCtx } tuned for the model's capacity.
    */
-  private getModelContextLimits(): { maxMessages: number; numCtx: number } {
+  private getModelSizeInBillions(): number {
     const model = this.getSelectedModel().toLowerCase();
-    // Try to extract parameter count from model tag (e.g. qwen3-coder:30b → 30)
     const sizeMatch = model.match(/(\d+\.?\d*)b/);
-    const sizeB = sizeMatch ? parseFloat(sizeMatch[1]) : 0;
+    return sizeMatch ? parseFloat(sizeMatch[1]) : 0;
+  }
+
+  private getModelCapabilityProfile(): ModelCapabilityProfile {
+    const sizeB = this.getModelSizeInBillions();
+
+    if (sizeB > 0 && sizeB <= 1.5) {
+      return {
+        tier: 'micro',
+        maxMessages: 8,
+        numCtx: 4096,
+        workspaceTreeMaxDepth: 2,
+        workspaceTreeFileCap: 60,
+        summaryContextLimit: 2,
+        includeWorkspaceInstructions: false,
+        includeWorkspaceNotes: false,
+        includeRecentChatSummaries: false,
+        useCompactMandate: true,
+        preferStepwiseExecution: true,
+        maxNudgeRetriesCap: 1,
+        maxReadOpsWithoutWrite: 2,
+        toolNames: ['read_specific_file', 'read_file_slice', 'create_or_edit_file', 'replace_in_file', 'list_workspace_files']
+      };
+    }
+
+    if (sizeB > 1.5 && sizeB <= 3.5) {
+      return {
+        tier: 'small',
+        maxMessages: 10,
+        numCtx: 6144,
+        workspaceTreeMaxDepth: 2,
+        workspaceTreeFileCap: 100,
+        summaryContextLimit: 4,
+        includeWorkspaceInstructions: true,
+        includeWorkspaceNotes: false,
+        includeRecentChatSummaries: true,
+        useCompactMandate: true,
+        preferStepwiseExecution: true,
+        maxNudgeRetriesCap: 2,
+        maxReadOpsWithoutWrite: 2,
+        toolNames: ['read_active_file', 'read_specific_file', 'read_file_slice', 'create_or_edit_file', 'replace_in_file', 'list_workspace_files', 'execute_terminal_command']
+      };
+    }
 
     if (sizeB > 0 && sizeB <= 9) {
-      // 7B-class: very limited context, aggressive trim
-      return { maxMessages: 16, numCtx: 8192 };
-    } else if (sizeB > 9 && sizeB <= 16) {
-      // 14B-class
-      return { maxMessages: 24, numCtx: 12288 };
-    } else if (sizeB > 16 && sizeB <= 34) {
-      // 30B-class: moderate
-      return { maxMessages: 32, numCtx: 16384 };
-    } else if (sizeB > 34) {
-      // 70B+ class: generous
-      return { maxMessages: 48, numCtx: 32768 };
+      return {
+        tier: 'medium',
+        maxMessages: 16,
+        numCtx: 8192,
+        workspaceTreeMaxDepth: 3,
+        workspaceTreeFileCap: 160,
+        summaryContextLimit: 6,
+        includeWorkspaceInstructions: true,
+        includeWorkspaceNotes: true,
+        includeRecentChatSummaries: true,
+        useCompactMandate: false,
+        preferStepwiseExecution: false,
+        maxNudgeRetriesCap: 3,
+        maxReadOpsWithoutWrite: 3,
+        toolNames: this.getToolDefinitions().map(tool => tool.function.name)
+      };
     }
-    // Unknown size — conservative default
-    return { maxMessages: 32, numCtx: 16384 };
+
+    if (sizeB > 9 && sizeB <= 34) {
+      return {
+        tier: 'large',
+        maxMessages: sizeB <= 16 ? 24 : 32,
+        numCtx: sizeB <= 16 ? 12288 : 16384,
+        workspaceTreeMaxDepth: 3,
+        workspaceTreeFileCap: 220,
+        summaryContextLimit: 8,
+        includeWorkspaceInstructions: true,
+        includeWorkspaceNotes: true,
+        includeRecentChatSummaries: true,
+        useCompactMandate: false,
+        preferStepwiseExecution: false,
+        maxNudgeRetriesCap: 4,
+        maxReadOpsWithoutWrite: 3,
+        toolNames: this.getToolDefinitions().map(tool => tool.function.name)
+      };
+    }
+
+    return {
+      tier: 'xlarge',
+      maxMessages: 48,
+      numCtx: 32768,
+      workspaceTreeMaxDepth: 4,
+      workspaceTreeFileCap: 260,
+      summaryContextLimit: 10,
+      includeWorkspaceInstructions: true,
+      includeWorkspaceNotes: true,
+      includeRecentChatSummaries: true,
+      useCompactMandate: false,
+      preferStepwiseExecution: false,
+      maxNudgeRetriesCap: 5,
+      maxReadOpsWithoutWrite: 4,
+      toolNames: this.getToolDefinitions().map(tool => tool.function.name)
+    };
+  }
+
+  private getModelContextLimits(): { maxMessages: number; numCtx: number } {
+    const { maxMessages, numCtx } = this.getModelCapabilityProfile();
+    return { maxMessages, numCtx };
+  }
+
+  private getActiveToolDefinitions(): ToolDefinition[] {
+    const allowed = new Set(this.getModelCapabilityProfile().toolNames);
+    return this.getToolDefinitions().filter(tool => allowed.has(tool.function.name));
   }
 
   private isDegenerateOutput(content: string): boolean {
@@ -3169,14 +3286,24 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     const requestMessages: OllamaMessage[] = [];
 
     if (this.isAgentLike) {
-      const workspaceInstructions = await this.getWorkspaceInstructions();
-      const recentChatSummaries = this.buildRecentChatSummaryContext();
+      const capabilityProfile = this.getModelCapabilityProfile();
+      const workspaceInstructions = capabilityProfile.includeWorkspaceInstructions ? await this.getWorkspaceInstructions() : '';
+      const recentChatSummaries = capabilityProfile.includeRecentChatSummaries ? this.buildRecentChatSummaryContext() : '';
 
       const wsRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? '';
 
     if (this.agentMode === 'planner') {
       // Planner mode: condensed system prompt to reduce token overhead for weaker models
-      let plannerMandate = `[IDENTITY]
+      let plannerMandate = capabilityProfile.useCompactMandate ? `[IDENTITY]
+You are ManulAI, a local VS Code coding agent in Planner mode.
+${wsRoot ? `Workspace root: ${wsRoot}\n` : ''}
+[RULES]
+- If the user asks a direct question, answer briefly in text.
+- For edit or file tasks: do exactly ONE small tool call per response.
+- Prefer read_file_slice over large reads.
+- Keep responses short. No multi-step plans. No JSON in text.
+- Finish with a one-line summary when done.
+` : `[IDENTITY]
 You are ManulAI, a local VS Code coding agent in Planner mode.
 ${wsRoot ? `Workspace root: ${wsRoot}\n` : ''}
 [RULES]
@@ -3196,13 +3323,15 @@ ${wsRoot ? `Workspace root: ${wsRoot}\n` : ''}
         plannerMandate += '\n[WORKSPACE STRUCTURE]\n' + workspaceTree;
       }
 
-      const notesResult = await this.readWorkspaceNotes();
-      try {
-        const { content: notesContent } = JSON.parse(notesResult) as { content: string };
-        if (notesContent && !notesContent.startsWith('(no notes') && !notesContent.startsWith('(empty)') && !notesContent.startsWith('(no workspace')) {
-          plannerMandate += '\n[WORKSPACE NOTES]\n' + notesContent;
-        }
-      } catch { /* ignore parse errors */ }
+      if (capabilityProfile.includeWorkspaceNotes) {
+        const notesResult = await this.readWorkspaceNotes();
+        try {
+          const { content: notesContent } = JSON.parse(notesResult) as { content: string };
+          if (notesContent && !notesContent.startsWith('(no notes') && !notesContent.startsWith('(empty)') && !notesContent.startsWith('(no workspace')) {
+            plannerMandate += '\n[WORKSPACE NOTES]\n' + this.compactMemoryText(notesContent, capabilityProfile.tier === 'medium' ? 900 : 1400);
+          }
+        } catch { /* ignore parse errors */ }
+      }
 
       requestMessages.push({
         role: 'system',
@@ -3210,7 +3339,19 @@ ${wsRoot ? `Workspace root: ${wsRoot}\n` : ''}
         hiddenFromTranscript: true
       });
     } else {
-    let agentMandate = `[IDENTITY]
+    let agentMandate = capabilityProfile.useCompactMandate ? `[IDENTITY]
+  You are ManulAI, a local VS Code coding agent.
+  ${wsRoot ? `Workspace root: ${wsRoot}\n` : ''}
+
+  [RULES]
+  - Execute the next concrete action. No long plan.
+  - Prefer exactly ONE tool call per response.
+  - Read before edit. Prefer read_file_slice for large files.
+  - Use replace_in_file for small edits and create_or_edit_file for new files.
+  - Do not narrate tool calls. Do not print JSON as text.
+  - If a tool fails, adapt once and continue.
+  - Finish with one short summary when the task is done.
+  ` : `[IDENTITY]
 You are ManulAI, a local VS Code coding agent.
 ${wsRoot ? `Workspace root: ${wsRoot}\n` : ''}
 All file paths are relative to the workspace root unless absolute.
@@ -3342,11 +3483,11 @@ If steps remain → continue with the next tool call.
 `;
 
       if (workspaceInstructions) {
-        agentMandate += '\n\n<workspace_instructions>\n' + workspaceInstructions + '\n</workspace_instructions>';
+        agentMandate += '\n\n<workspace_instructions>\n' + (capabilityProfile.useCompactMandate ? this.compactMemoryText(workspaceInstructions, 1200) : workspaceInstructions) + '\n</workspace_instructions>';
       }
 
       if (recentChatSummaries) {
-        agentMandate += '\n\n[RECENT CHAT SUMMARIES]\n' + recentChatSummaries + '\n\nUse these summaries as short-term memory of prior dialog outcomes before re-reading files.';
+        agentMandate += '\n\n[RECENT CHAT SUMMARIES]\n' + (capabilityProfile.useCompactMandate ? this.compactMemoryText(recentChatSummaries, 600) : recentChatSummaries) + '\n\nUse these summaries as short-term memory of prior dialog outcomes before re-reading files.';
       }
 
       // Inject the compact workspace tree so the model knows the project structure up front
@@ -3356,13 +3497,15 @@ If steps remain → continue with the next tool call.
       }
 
       // Inject persisted notes from previous sessions if they exist
-      const notesResult = await this.readWorkspaceNotes();
-      try {
-        const { content: notesContent } = JSON.parse(notesResult) as { content: string };
-        if (notesContent && !notesContent.startsWith('(no notes') && !notesContent.startsWith('(empty)') && !notesContent.startsWith('(no workspace')) {
-          agentMandate += '\n\n[WORKSPACE NOTES FROM PREVIOUS SESSIONS]\n' + notesContent + '\n\nUse these notes to avoid re-reading files you already know about. Update them after completing a task.';
-        }
-      } catch { /* ignore parse errors */ }
+      if (capabilityProfile.includeWorkspaceNotes) {
+        const notesResult = await this.readWorkspaceNotes();
+        try {
+          const { content: notesContent } = JSON.parse(notesResult) as { content: string };
+          if (notesContent && !notesContent.startsWith('(no notes') && !notesContent.startsWith('(empty)') && !notesContent.startsWith('(no workspace')) {
+            agentMandate += '\n\n[WORKSPACE NOTES FROM PREVIOUS SESSIONS]\n' + this.compactMemoryText(notesContent, capabilityProfile.tier === 'medium' ? 900 : 1400) + '\n\nUse these notes to avoid re-reading files you already know about. Update them after completing a task.';
+          }
+        } catch { /* ignore parse errors */ }
+      }
 
       requestMessages.push({
         role: 'system',
@@ -3495,7 +3638,7 @@ If the user asks for a change but provides NO code:
     };
 
     if (this.isAgentLike) {
-      body.tools = this.getToolDefinitions();
+      body.tools = this.getActiveToolDefinitions();
     }
 
     const abortController = new AbortController();
@@ -3565,7 +3708,11 @@ If the user asks for a change but provides NO code:
   }
 
   private extractToolCalls(message: OllamaMessage): ToolFunctionCall[] {
-    return extractToolCallsHelper(message, this.getToolDefinitions());
+    const allowedToolNames = new Set(this.getActiveToolDefinitions().map(tool => tool.function.name));
+    return extractToolCallsHelper(message, this.getActiveToolDefinitions()).filter(toolCall => {
+      const name = this.remapWeakModelToolName(toolCall.function?.name ?? '');
+      return allowedToolNames.has(name);
+    });
   }
 
   private stripToolCallsFromContent(content: string): string {
@@ -3573,7 +3720,7 @@ If the user asks for a change but provides NO code:
   }
 
   private parseToolCallsFromContent(content: string): ToolFunctionCall[] {
-    return parseToolCallsFromContentHelper(content, this.getToolDefinitions());
+    return parseToolCallsFromContentHelper(content, this.getActiveToolDefinitions());
   }
 
   /**
@@ -3586,7 +3733,7 @@ If the user asks for a change but provides NO code:
   }
 
   private parseTaggedToolCalls(content: string): ToolFunctionCall[] {
-    const knownToolNames = new Set(this.getToolDefinitions().map(t => t.function.name));
+    const knownToolNames = new Set(this.getActiveToolDefinitions().map(t => t.function.name));
     const calls: ToolFunctionCall[] = [];
     const functionPattern = /<function=([a-zA-Z0-9_]+)>\s*([\s\S]*?)<\/function>/g;
     let match: RegExpExecArray | null;
@@ -3622,19 +3769,19 @@ If the user asks for a change but provides NO code:
    * tool-call JSON as file content.
    */
   private looksLikeToolCallContent(content: string): boolean {
-    return looksLikeToolCallContentHelper(content, this.getToolDefinitions());
+    return looksLikeToolCallContentHelper(content, this.getActiveToolDefinitions());
   }
 
   private looksLikeMalformedToolCallContent(content: string): boolean {
-    return looksLikeMalformedToolCallContentHelper(content, this.getToolDefinitions());
+    return looksLikeMalformedToolCallContentHelper(content, this.getActiveToolDefinitions());
   }
 
   private extractToolCallNameHint(content: string): string | undefined {
-    return extractToolCallNameHintHelper(content, this.getToolDefinitions());
+    return extractToolCallNameHintHelper(content, this.getActiveToolDefinitions());
   }
 
   private containsLeakedToolCallPayload(content: string): boolean {
-    return containsLeakedToolCallPayloadHelper(content, this.getToolDefinitions());
+    return containsLeakedToolCallPayloadHelper(content, this.getActiveToolDefinitions());
   }
 
   /** Extract a balanced JSON object starting at `startIndex` in `text`. */
@@ -4703,13 +4850,15 @@ If the user asks for a change but provides NO code:
     const root = vscode.workspace.workspaceFolders?.[0]?.uri;
     if (!root) { return ''; }
 
+    const capabilityProfile = this.getModelCapabilityProfile();
+
     const IGNORED = new Set([
       'node_modules', '.git', '.hg', '.svn', 'dist', 'out', 'build', '.next', '.nuxt',
       '__pycache__', '.cache', '.turbo', '.parcel-cache', 'coverage', '.nyc_output',
       '.manulai', 'logs', '.venv', 'venv', '.tox'
     ]);
-    const MAX_DEPTH = 3;
-    const FILE_CAP = 200;
+    const MAX_DEPTH = capabilityProfile.workspaceTreeMaxDepth;
+    const FILE_CAP = capabilityProfile.workspaceTreeFileCap;
     let count = 0;
     const lines: string[] = [];
 
@@ -6749,7 +6898,7 @@ If the user asks for a change but provides NO code:
     return `${normalized.slice(0, Math.max(0, maxLength - 3)).trimEnd()}...`;
   }
 
-  private buildRecentChatSummaryContext(limit = 8): string {
+  private buildRecentChatSummaryContext(limit = this.getModelCapabilityProfile().summaryContextLimit): string {
     const collected: string[] = [];
     for (const chat of this.chats) {
       for (const summary of chat.summaryMemory.slice(-2)) {

@@ -14,7 +14,7 @@ This repository contains a VS Code extension named ManulAI.
 - Avoid unrelated refactors when making targeted changes.
 - Preserve the distinction between Chat Mode, Agent Mode, and Planner Mode.
 - In Chat Mode, never claim that files were created, modified, or deleted.
-- Planner Mode uses the same tools as Agent Mode but with a condensed system mandate focused on step-by-step planning and execution.
+- Planner Mode uses the same tools as Agent Mode conceptually but may expose a reduced tool subset for very small local models; its system mandate stays condensed and step-by-step.
 - Planner Mode must still answer direct text questions without requiring tool calls.
 - For small edit requests, prefer surgical edits over whole-file rewrites.
 - Never delete unrelated file content when the user asked for a narrow change.
@@ -59,6 +59,7 @@ This repository contains a VS Code extension named ManulAI.
 - If retry exhaustion is reached and the model still returns pseudo-progress or plan text, surface a deterministic backend failure message instead of leaking raw `Step 1/3`-style output.
 - For large refactor requests, nudge the model toward short module/file plans and iterative execution instead of one-shot whole-file rewrites.
 - Keep context trimming model-aware; derive sliding-window size and `num_ctx` from the model size tag rather than using hardcoded limits.
+- Keep prompt/context simplification model-aware too: ultra-small models should receive shorter mandates, less injected workspace memory, tighter retry budgets, and fewer tools when that improves reliability.
 - Keep `num_ctx` always present in the Ollama request body so the runtime allocates an appropriate KV-cache window.
 - Keep `execute_terminal_command` documented as having no stdin; interactive programs must use `launch_in_terminal` which opens a real VS Code terminal.
 - When `execute_terminal_command` times out because the child process was killed, the error must hint that stdin is unavailable and the program should not be retried.
