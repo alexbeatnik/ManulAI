@@ -56,12 +56,15 @@ This repository contains a VS Code extension named ManulAI.
 - Keep debug logging useful for reproducing issues; log the original user request before local hidden nudges or retries alter the effective agent context.
 - Keep the model selector truthful: when no local model is chosen, the UI and backend state must remain empty rather than showing a fake fallback model.
 - Keep the built-in model picker focused on the currently validated local agent models unless explicit testing proves a new family reliable enough to surface by default.
+- Treat the current validated baseline as `phi4-mini:3.8b`, `llama3.1:8b`, and `qwen3-coder:30b`, based on direct Ollama `/api/chat` checks plus standalone agent-loop testing rather than picker assumptions alone.
 - Keep revert metadata attached to revertable native file-tool transcript entries so the webview can surface `Revert changes` directly on those results.
 - If retry exhaustion is reached and the model still returns pseudo-progress or plan text, surface a deterministic backend failure message instead of leaking raw `Step 1/3`-style output.
 - For large refactor requests, nudge the model toward short module/file plans and iterative execution instead of one-shot whole-file rewrites.
 - Keep context trimming model-aware; derive sliding-window size and `num_ctx` from the model size tag rather than using hardcoded limits.
 - Keep prompt/context simplification model-aware too: ultra-small models should receive shorter mandates, less injected workspace memory, tighter retry budgets, and fewer tools when that improves reliability.
 - Keep preferred stronger local models (`phi4-mini`, `llama3.1`, `qwen3-coder`) on model-specific profiles that bias toward one-step execution and concrete file creation over unnecessary project scans for greenfield tasks.
+- For preferred-model greenfield tasks, reject shallow placeholder scaffolds and do not allow `execute_terminal_command` immediately after the first successful `create_or_edit_file`; require another real file/tool step or a direct completion instead.
+- Do not re-surface weaker `qwen2.5-coder` tiers in the built-in picker without new validation showing stable tool-loop behavior; partially acceptable raw code generation alone is not enough.
 - For ultra-small model tiers, prefer no-plan execution: one immediate bounded action instead of showing or accepting a plan.
 - Raw function-call assistant text such as `tool_name(...)` must not be accepted as a final answer; route it through native-tool recovery or continue nudging until a real tool call happens.
 - If a small or medium local model produces degenerate repetitive output, do not fail immediately on the first hit; strip the bad output and retry once with a stricter one-step recovery nudge.

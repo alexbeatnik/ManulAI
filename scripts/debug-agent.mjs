@@ -217,10 +217,10 @@ function looksLikeGreenfieldCreateTask(text) {
 }
 
 const REQUIRES_FILE_WRITE = looksLikeWriteIntent(userPrompt);
-const SHOULD_BLOCK_IMMEDIATE_DRY_RUN_TERMINAL = DRY_RUN
-  && isPreferredSupportedModel(MODEL)
+const IS_PREFERRED_GREENFIELD_REQUEST = isPreferredSupportedModel(MODEL)
   && looksLikeGreenfieldCreateTask(userPrompt)
   && !IS_SPLIT_TASK;
+const SHOULD_BLOCK_IMMEDIATE_DRY_RUN_TERMINAL = DRY_RUN && IS_PREFERRED_GREENFIELD_REQUEST;
 
 function buildDryRunTerminalBlockResult(command, filePath) {
   const targetPath = filePath ? ` after creating ${filePath}` : '';
@@ -231,6 +231,30 @@ function buildDryRunTerminalBlockResult(command, filePath) {
     skipped: true,
     note: `execute_terminal_command was skipped in DRY_RUN greenfield smoke${targetPath}. Continue with file creation, another file/tool step, or finalization instead of executing the new file.`
   });
+}
+
+function detectInsufficientGreenfieldCreateContent(filepath, content) {
+  if (!IS_PREFERRED_GREENFIELD_REQUEST) return undefined;
+
+  const ext = path.extname(filepath).toLowerCase();
+  const codeExtensions = new Set(['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs', '.py', '.go', '.rs', '.java', '.kt', '.cs', '.php', '.rb', '.swift', '.c', '.cc', '.cpp', '.cxx', '.h', '.hpp', '.hh']);
+  if (!codeExtensions.has(ext)) return undefined;
+
+  const nonEmptyLines = content.replace(/\r\n/g, '\n').split('\n').map(line => line.trim()).filter(Boolean);
+  if (nonEmptyLines.length === 0) {
+    return 'Blocked write: greenfield file content is empty. Write the actual implementation instead of an empty scaffold.';
+  }
+
+  const nonCommentLines = nonEmptyLines.filter(line => !/^(?:\/\/|\/\*|\*|#|<!--)/.test(line));
+  const placeholderPattern = /(?:your\s+\w+\s+here|your game logic here|game logic here|logic here|implementation here|code here|placeholder|stub|todo|tbd|coming soon|implement me|fill (?:me|this) in|to be implemented)/i;
+  const hasPlaceholderLine = nonEmptyLines.some(line => placeholderPattern.test(line));
+  if (!hasPlaceholderLine) return undefined;
+
+  const nonImportLines = nonCommentLines.filter(line => !/^(?:import\s+.+|from\s+\S+\s+import\s+.+|using\s+.+;?|package\s+[\w.]+;?|namespace\s+[\w.]+;?|export\s+\{.*\};?)$/.test(line));
+  const hasImplementationLine = nonImportLines.some(line => /(?:\bdef\b|\bclass\b|\bfunction\b|\bconst\b|\blet\b|\bvar\b|\bif\b|\bfor\b|\bwhile\b|\breturn\b|\bprint\s*\(|\bconsole\.log\s*\(|\bmain\s*\(|=>|[{}();=])/.test(line));
+  if (hasImplementationLine) return undefined;
+
+  return 'Blocked write: greenfield file content is still a placeholder scaffold, not a real implementation. Do not write comments like "Your game logic here". Write the actual working code now.';
 }
 
 function detectLanguageId(filepath) {
@@ -1235,6 +1259,11 @@ async function executeTool(name, args) {
               'Then call replace_in_file on the original file to replace that extracted block with the appropriate module reference or equivalent update.'
           });
         }
+      }
+
+      const insufficientGreenfieldContent = detectInsufficientGreenfieldCreateContent(fp, content);
+      if (insufficientGreenfieldContent) {
+        return JSON.stringify({ error: insufficientGreenfieldContent });
       }
 
       // Import-shell guard: reject files whose only content is import / re-export lines (no actual definitions)

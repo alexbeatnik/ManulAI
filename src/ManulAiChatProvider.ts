@@ -74,6 +74,9 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   private progressStepCounter = 0;
   private totalReadOps = 0;
   private currentRequestRequiresWrite = true;
+  private currentRequestIsPreferredGreenfield = false;
+  private blockImmediateTerminalAfterWrite = false;
+  private lastImmediateWritePath = '';
   private failedCommandCounts = new Map<string, number>();
   private lastNudgedResponseContent = '';
   private consecutiveIdenticalResponses = 0;
@@ -908,9 +911,15 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       });
     }
 
-    if (this.isAgentLike
+    const isPreferredGreenfieldRequest = this.isAgentLike
       && this.isPreferredSupportedModel(this.getSelectedModel())
-      && this.looksLikeGreenfieldCreateTask(text)) {
+      && this.looksLikeGreenfieldCreateTask(text);
+
+    this.currentRequestIsPreferredGreenfield = isPreferredGreenfieldRequest;
+    this.blockImmediateTerminalAfterWrite = false;
+    this.lastImmediateWritePath = '';
+
+    if (isPreferredGreenfieldRequest) {
       const starterFilepath = this.inferDegenerateRecoveryStarterFilepath(text);
       this.messages.push({
         role: 'user',
@@ -1281,6 +1290,101 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     }
 
     return /(?:placeholder|stub|scaffold|skeleton|template|boilerplate|todo|tbd|empty component|blank component)/i.test(latestVisibleUserRequest);
+  }
+
+  private shouldApplyPreferredGreenfieldGuards(): boolean {
+    return this.isAgentLike
+      && this.currentRequestIsPreferredGreenfield
+      && this.isPreferredSupportedModel(this.getSelectedModel());
+  }
+
+  private detectInsufficientGreenfieldCreateContent(filename: string, content: string): string | undefined {
+    if (!this.shouldApplyPreferredGreenfieldGuards() || this.requestExplicitlyAllowsPlaceholderWrites()) {
+      return undefined;
+    }
+
+    const ext = path.extname(filename).toLowerCase();
+    const codeExtensions = new Set(['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs', '.py', '.go', '.rs', '.java', '.kt', '.cs', '.php', '.rb', '.swift', '.c', '.cc', '.cpp', '.cxx', '.h', '.hpp', '.hh']);
+    if (!codeExtensions.has(ext)) {
+      return undefined;
+    }
+
+    const nonEmptyLines = content.replace(/\r\n/g, '\n').split('\n').map(line => line.trim()).filter(Boolean);
+    if (nonEmptyLines.length === 0) {
+      return 'Blocked write: greenfield file content is empty. Write the actual implementation instead of an empty scaffold.';
+    }
+
+    const nonCommentLines = nonEmptyLines.filter(line => !/^(?:\/\/|\/\*|\*|#|<!--)/.test(line));
+    const placeholderPattern = /(?:your\s+\w+\s+here|your game logic here|game logic here|logic here|implementation here|code here|placeholder|stub|todo|tbd|coming soon|implement me|fill (?:me|this) in|to be implemented)/i;
+    const hasPlaceholderLine = nonEmptyLines.some(line => placeholderPattern.test(line));
+    if (!hasPlaceholderLine) {
+      return undefined;
+    }
+
+    const nonImportLines = nonCommentLines.filter(line => !/^(?:import\s+.+|from\s+\S+\s+import\s+.+|using\s+.+;?|package\s+[\w.]+;?|namespace\s+[\w.]+;?|export\s+\{.*\};?)$/.test(line));
+    const hasImplementationLine = nonImportLines.some(line => /(?:\bdef\b|\bclass\b|\bfunction\b|\bconst\b|\blet\b|\bvar\b|\bif\b|\bfor\b|\bwhile\b|\breturn\b|\bprint\s*\(|\bconsole\.log\s*\(|\bmain\s*\(|=>|[{}();=])/.test(line));
+    if (hasImplementationLine) {
+      return undefined;
+    }
+
+    return 'Blocked write: greenfield file content is still a placeholder scaffold, not a real implementation. Do not write comments like "Your game logic here". Write the actual working code now.';
+  }
+
+  private updateImmediateTerminalGuardBeforeTool(toolName: string): void {
+    if (toolName !== 'execute_terminal_command' && toolName !== 'launch_in_terminal' && toolName !== 'create_or_edit_file') {
+      this.blockImmediateTerminalAfterWrite = false;
+      this.lastImmediateWritePath = '';
+    }
+  }
+
+  private updateImmediateTerminalGuardAfterTool(toolName: string, toolResult: string): void {
+    if (toolName !== 'create_or_edit_file' || !this.shouldApplyPreferredGreenfieldGuards()) {
+      return;
+    }
+
+    try {
+      const parsed = JSON.parse(toolResult) as Record<string, unknown>;
+      if (!parsed.error && !isPlaceholderCreateResult(parsed)) {
+        this.blockImmediateTerminalAfterWrite = true;
+        this.lastImmediateWritePath = String(parsed.path ?? '');
+      }
+    } catch {
+      // Ignore malformed tool results here.
+    }
+  }
+
+  private buildImmediatePostCreateTerminalBlockResult(command: string): string {
+    const targetLabel = this.lastImmediateWritePath ? ` after creating ${path.basename(this.lastImmediateWritePath)}` : '';
+    return JSON.stringify({
+      command,
+      exitCode: 1,
+      blocked: true,
+      reason: 'immediate_post_create_greenfield_terminal',
+      error: `Blocked command: do not run execute_terminal_command immediately${targetLabel} in a preferred-model greenfield flow. Continue with the next file/tool step or finish based on the code you already wrote.`
+    });
+  }
+
+  private maybeNudgeAfterBlockedImmediateTerminal(messages: OllamaMessage[], toolName: string, toolResult: string): boolean {
+    if (toolName !== 'execute_terminal_command') {
+      return false;
+    }
+
+    try {
+      const parsed = JSON.parse(toolResult) as Record<string, unknown>;
+      if (parsed.reason !== 'immediate_post_create_greenfield_terminal') {
+        return false;
+      }
+    } catch {
+      return false;
+    }
+
+    this.debugLog('greenfield_terminal_blocked', { path: this.lastImmediateWritePath || null });
+    messages.push({
+      role: 'user',
+      content: 'Do NOT run execute_terminal_command immediately after creating a file for this greenfield task. Continue with the next required file/tool step, or finish based on the code you already wrote.',
+      hiddenFromTranscript: true
+    });
+    return true;
   }
 
   private async tryHandleDirectLicenseAuthorRename(text: string): Promise<FileWriteSummary | undefined> {
@@ -1836,6 +1940,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       for (const toolCall of resolvedToolCalls) {
         this.throwIfRequestStopped();
         const toolName = toolCall.function?.name || 'unknown_tool';
+        this.updateImmediateTerminalGuardBeforeTool(toolName);
 
         // Short-circuit repeated read_workspace_notes calls — notes don't change within a single exchange.
         if (toolName === 'read_workspace_notes') {
@@ -1861,8 +1966,14 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           revertOperationIds: this.extractToolResultRevertOperationIds(toolResult)
         });
 
+        this.updateImmediateTerminalGuardAfterTool(toolName, toolResult);
+
         if (await this.tryAutoRecoverDeterministicReadFailure(messages, toolName, toolResult)) {
           return;
+        }
+
+        if (this.maybeNudgeAfterBlockedImmediateTerminal(messages, toolName, toolResult)) {
+          continue;
         }
 
         // Count read operations for read-loop nudge
@@ -4741,6 +4852,9 @@ If the user asks for a change but provides NO code:
         case 'replace_in_file':
           return await this.replaceInFile(String(args.filepath ?? ''), String(args.old_text ?? ''), String(args.new_text ?? ''));
         case 'execute_terminal_command':
+          if (this.shouldApplyPreferredGreenfieldGuards() && this.blockImmediateTerminalAfterWrite) {
+            return this.buildImmediatePostCreateTerminalBlockResult(String(args.command ?? ''));
+          }
           return await this.executeTerminalCommand(String(args.command ?? ''));
         case 'launch_in_terminal':
           return this.launchInTerminal(String(args.command ?? ''));
@@ -5296,6 +5410,10 @@ If the user asks for a change but provides NO code:
         return JSON.stringify({
           error: 'Blocked write: content is only a placeholder or stub comment, not real file content. Write the actual implementation instead.'
         });
+      }
+      const insufficientGreenfieldContent = this.detectInsufficientGreenfieldCreateContent(targetUri.fsPath, sanitizedContent);
+      if (insufficientGreenfieldContent) {
+        return JSON.stringify({ error: insufficientGreenfieldContent });
       }
       const invalidStructuredContent = detectInvalidStructuredCreateContent(targetUri.fsPath, sanitizedContent);
       if (invalidStructuredContent) {
@@ -6576,6 +6694,7 @@ If the user asks for a change but provides NO code:
 
     this.postProgressStep(this.describeToolExecution(toolCall));
     this.debugLog('tool_exec_start', { tool: toolName, args: toolCall.function?.arguments, synthetic: true });
+    this.updateImmediateTerminalGuardBeforeTool(toolName);
     const toolResult = await this.executeToolCall(toolCall);
     this.debugLog('tool_exec_result', { tool: toolName, result: toolResult.substring(0, 500), synthetic: true });
     messages.push({
@@ -6585,6 +6704,9 @@ If the user asks for a change but provides NO code:
       hiddenFromTranscript: true,
       revertOperationIds: this.extractToolResultRevertOperationIds(toolResult)
     });
+
+    this.updateImmediateTerminalGuardAfterTool(toolName, toolResult);
+    this.maybeNudgeAfterBlockedImmediateTerminal(messages, toolName, toolResult);
 
     const writeToolNames = new Set(['replace_in_file', 'create_or_edit_file', 'write_to_file', 'delete_file']);
     if (writeToolNames.has(toolName)) {
