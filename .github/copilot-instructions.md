@@ -79,6 +79,7 @@ This repository contains a VS Code extension named ManulAI.
 
 - Keep README accurate when behavior or setup changes.
 - Keep `README-dev.md` accurate when architecture, tools, or safety behavior changes.
+- When packaging version changes, update `package.json`, `package-lock.json`, `README.md`, and `README-dev.md` in the same change.
 - Keep wording direct and technical.
 - Keep README tone alpha-stage and avoid marketing fluff.
 - User-facing README should describe ManulAI primarily as a local AI assistant for Ollama inside VS Code.
