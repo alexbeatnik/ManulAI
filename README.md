@@ -75,7 +75,7 @@ ManulAI has three working modes:
 - `Agent Mode` enables local tools and lets Ollama continue the tool loop automatically
 - `Planner Mode` uses the same tools as Agent Mode but with a condensed system mandate focused on step-by-step planning and execution; it can also answer direct text questions without requiring tool calls
 - tiny local models are simplified automatically by model size: smaller context windows, shorter mandates, fewer hidden notes/summaries, and a reduced tool menu for ultra-small models so even `0.5b`-class models have a chance to stay on task
-- the currently preferred agent-capable models also get extra tuning: `phi4-mini`, `llama3.1`, and `qwen3-coder` are biased toward one-step execution and a smaller core tool set so they spend less time on unnecessary scans and more time on concrete file work; for greenfield create tasks they also reject obvious placeholder scaffolds, block overly thin first source files, recover some plain-text code dumps back into real file writes, and avoid jumping into terminal commands before or immediately after the first file create
+- the currently preferred agent-capable models also get extra tuning: `phi4-mini`, `llama3.1`, and `qwen3-coder` are biased toward one-step execution and a smaller core tool set so they spend less time on unnecessary scans and more time on concrete file work; for greenfield create tasks they also reject obvious placeholder scaffolds including trivial dumps like `...`, block overly thin first source files, recover some plain-text code dumps back into real file writes, require syntax verification before arbitrary terminal runs after the first source-file write, and block global package installs from the agent loop
 - in chat-only mode, ManulAI should not claim that files were changed
 - `Auto-Approve` can be turned on to execute tools immediately or off to require confirmation for every tool call
 
@@ -139,7 +139,7 @@ For ultra-small models, a few very simple requests can bypass the full agent loo
 
 `read_file_slice` reads only a bounded 1-based line range from a file and is intended for large files where a full-file read would waste context or push a weaker local model into summary-only behavior.
 
-After successful file edits, ManulAI also tries to run a stack-appropriate verification command automatically when the workspace provides one, instead of assuming every project is TypeScript-only. For standalone greenfield files from a different stack, ManulAI now skips unrelated workspace verification rather than dragging the model into the wrong tool loop.
+After successful file edits, ManulAI also tries to run a stack-appropriate verification command automatically when the workspace provides one, instead of assuming every project is TypeScript-only. For standalone greenfield files from a different stack, ManulAI now skips unrelated workspace verification rather than dragging the model into the wrong tool loop, and preferred-model greenfield flows now keep arbitrary terminal commands blocked until that syntax verification step has completed.
 
 ### Safer Editing Behavior
 

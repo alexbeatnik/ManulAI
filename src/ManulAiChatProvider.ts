@@ -7,7 +7,7 @@ import { AgentModeValue, AttachedFileContext, ChatRole, ChatSession, DEFAULT_STO
 import { deserializeAttachedFileContext as deserializePersistedAttachedFileContext, deserializeChatMessage as deserializePersistedChatMessage, deserializeChatSession as deserializePersistedChatSession, getChatStorageDirUri as getPersistedChatStorageDirUri, getChatStorageUri as getPersistedChatStorageUri, getWorkspaceSettingsDirUri as getPersistedWorkspaceSettingsDirUri, getWorkspaceSettingsUri as getPersistedWorkspaceSettingsUri, normalizePersistedChatSession as normalizeRestoredChatSession, normalizeStoredSettings as normalizePersistedSettings, restorePersistedChats as restorePersistedChatState, serializeChatState as serializePersistedChatState } from './providerPersistenceUtils';
 import { extractCodeBlockFileWrites as extractCodeBlockFileWritesHelper, extractDescribedFileDump as extractDescribedFileDumpHelper, extractDescribedReplacements as extractDescribedReplacementsHelper, extractInlineFileBlocks as extractInlineFileBlocksHelper, extractMarkerFileWrite as extractMarkerFileWriteHelper, extractNewFileCreation as extractNewFileCreationHelper, extractTrustedFullFileContent as extractTrustedFullFileContentHelper, extractUnifiedDiffWrite as extractUnifiedDiffWriteHelper, findAttachedFileForReplacements as findAttachedFileForReplacementsHelper, findMentionedFileForReplacements as findMentionedFileForReplacementsHelper, findMentionedFileInContent as findMentionedFileInContentHelper, isLikelyFileReference as isLikelyFileReferenceHelper, looksLikeChangeSummary as looksLikeChangeSummaryHelper, looksLikeDiffOutput as looksLikeDiffOutputHelper, matchResponseToActiveFile as matchResponseToActiveFileHelper, matchResponseToAttachedFile as matchResponseToAttachedFileHelper, sanitizeGeneratedFileContent as sanitizeGeneratedFileContentHelper, stripDiffPrefixes as stripDiffPrefixesHelper, truncateLargeCodeBlocks as truncateLargeCodeBlocksHelper } from './providerFileFallbackUtils';
 import { extractSymbolNamesFromGeneratedContent, inferRepeatedNarratedBootstrapToolCall, validateGeneratedModuleContent } from './providerRefactorUtils';
-import { buildBuildVerifyFailureNudge, buildPreviewSnippet, detectInvalidStructuredCreateContent, inferBuildVerifyStack, isPlaceholderCreateResult, isPlaceholderReplacementText, isTerminalReadOnlyInspectionCommand, toolResultMatchesAnyTargetPath } from './providerSafetyUtils';
+import { buildBuildVerifyFailureNudge, buildPreviewSnippet, detectInvalidStructuredCreateContent, inferBuildVerifyStack, isGlobalPackageInstallCommand, isPlaceholderCreateResult, isPlaceholderReplacementText, isTerminalReadOnlyInspectionCommand, toolResultMatchesAnyTargetPath } from './providerSafetyUtils';
 import { containsLeakedToolCallPayload as containsLeakedToolCallPayloadHelper, escapeJsonStringValues as escapeJsonStringValuesHelper, extractBalancedJson as extractBalancedJsonHelper, extractToolCallNameHint as extractToolCallNameHintHelper, extractToolCalls as extractToolCallsHelper, looksLikeMalformedToolCallContent as looksLikeMalformedToolCallContentHelper, looksLikeToolCallContent as looksLikeToolCallContentHelper, normalizeToolArguments as normalizeToolArgumentsHelper, parseToolCallsFromContent as parseToolCallsFromContentHelper, remapWeakModelArgumentAliases as remapWeakModelArgumentAliasesHelper, remapWeakModelToolName as remapWeakModelToolNameHelper, repairSingleQuotedJson as repairSingleQuotedJsonHelper, stripToolCallsFromContent as stripToolCallsFromContentHelper } from './providerToolParsingUtils';
 import { formatToolMessageForTranscript as formatTranscriptToolMessage, getActiveFileState as getWebviewActiveFileState, getDisplayPath as getWebviewDisplayPath, renderAttachmentContextMessage as renderWebviewAttachmentContextMessage } from './providerWebviewUtils';
 
@@ -78,6 +78,8 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   private preferredGreenfieldSuccessfulWriteCount = 0;
   private blockImmediateTerminalAfterWrite = false;
   private lastImmediateWritePath = '';
+  private pendingGreenfieldVerificationPath = '';
+  private lastGreenfieldVerifiedPath = '';
   private failedCommandCounts = new Map<string, number>();
   private lastNudgedResponseContent = '';
   private consecutiveIdenticalResponses = 0;
@@ -929,6 +931,8 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     this.preferredGreenfieldSuccessfulWriteCount = 0;
     this.blockImmediateTerminalAfterWrite = false;
     this.lastImmediateWritePath = '';
+    this.pendingGreenfieldVerificationPath = '';
+    this.lastGreenfieldVerifiedPath = '';
 
     if (isPreferredGreenfieldRequest) {
       const starterFilepath = this.inferDegenerateRecoveryStarterFilepath(text);
@@ -1338,6 +1342,25 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     return !!target && this.isSyntaxRelevantFilePath(target);
   }
 
+  private getDeterministicGreenfieldTargetPath(): string | undefined {
+    const target = this.getCurrentPreferredGreenfieldBootstrapTarget();
+    return target && this.isSyntaxRelevantFilePath(target) ? target : undefined;
+  }
+
+  private normalizeComparablePath(filePath: string): string {
+    return path.normalize(filePath).replace(/\\/g, '/').toLowerCase();
+  }
+
+  private toolPathMatchesTarget(toolPathValue: unknown, targetPath: string): boolean {
+    const normalizedToolPath = this.normalizeComparablePath(String(toolPathValue ?? ''));
+    if (!normalizedToolPath) {
+      return false;
+    }
+
+    const normalizedTargetPath = this.normalizeComparablePath(targetPath);
+    return normalizedToolPath === normalizedTargetPath || normalizedToolPath.endsWith(`/${normalizedTargetPath.replace(/^\/+/, '')}`);
+  }
+
   private detectInsufficientGreenfieldCreateContent(filename: string, content: string): string | undefined {
     if (!this.shouldApplyPreferredGreenfieldGuards() || this.requestExplicitlyAllowsPlaceholderWrites()) {
       return undefined;
@@ -1411,6 +1434,8 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         this.preferredGreenfieldSuccessfulWriteCount += 1;
         this.blockImmediateTerminalAfterWrite = true;
         this.lastImmediateWritePath = String(parsed.path ?? '');
+        this.pendingGreenfieldVerificationPath = this.lastImmediateWritePath;
+        this.lastGreenfieldVerifiedPath = '';
       }
     } catch {
       // Ignore malformed tool results here.
@@ -1439,6 +1464,29 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     });
   }
 
+  private buildPendingVerifyTerminalBlockResult(command: string): string {
+    const targetLabel = this.pendingGreenfieldVerificationPath
+      ? ` for ${path.basename(this.pendingGreenfieldVerificationPath)}`
+      : '';
+    return JSON.stringify({
+      command,
+      exitCode: 1,
+      blocked: true,
+      reason: 'greenfield_verify_before_run',
+      error: `Blocked command: do not run arbitrary terminal commands${targetLabel} before syntax verification completes for the latest greenfield file write. Let the automatic verification run first, then continue with fixes if needed.`
+    });
+  }
+
+  private buildGlobalInstallBlockResult(command: string): string {
+    return JSON.stringify({
+      command,
+      exitCode: 1,
+      blocked: true,
+      reason: 'global_install_blocked',
+      error: 'Blocked command: do not install packages globally from the agent loop. Use local project dependencies only when the user explicitly asked for them or they are genuinely required inside the current workspace.'
+    });
+  }
+
   private maybeNudgeAfterBlockedImmediateTerminal(messages: OllamaMessage[], toolName: string, toolResult: string): boolean {
     if (toolName !== 'execute_terminal_command') {
       return false;
@@ -1447,7 +1495,10 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     try {
       const parsed = JSON.parse(toolResult) as Record<string, unknown>;
       const reason = String(parsed.reason ?? '');
-      if (reason !== 'immediate_post_create_greenfield_terminal' && reason !== 'prewrite_greenfield_terminal') {
+      if (reason !== 'immediate_post_create_greenfield_terminal'
+        && reason !== 'prewrite_greenfield_terminal'
+        && reason !== 'greenfield_verify_before_run'
+        && reason !== 'global_install_blocked') {
         return false;
       }
     } catch {
@@ -1460,9 +1511,49 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       role: 'user',
       content: this.preferredGreenfieldSuccessfulWriteCount === 0
         ? `Do NOT use execute_terminal_command yet for this greenfield task. Start by writing ${starterFilepath ? path.basename(starterFilepath) : 'the main source file'} with create_or_edit_file.`
-        : 'Do NOT run execute_terminal_command immediately after creating a file for this greenfield task. Continue with the next required file/tool step, or finish based on the code you already wrote.',
+        : this.pendingGreenfieldVerificationPath
+          ? `Do NOT run execute_terminal_command yet. The latest file write to ${path.basename(this.pendingGreenfieldVerificationPath)} must pass syntax verification first.`
+          : 'Do NOT run execute_terminal_command immediately after creating a file for this greenfield task. Continue with the next required file/tool step, or finish based on the code you already wrote.',
       hiddenFromTranscript: true
     });
+    return true;
+  }
+
+  private async tryAutoRecoverWrongGreenfieldReadTarget(messages: OllamaMessage[], toolName: string, toolResult: string): Promise<boolean> {
+    if (!this.shouldApplyPreferredGreenfieldGuards()
+      || this.preferredGreenfieldSuccessfulWriteCount > 0
+      || (toolName !== 'read_specific_file' && toolName !== 'read_file_slice')) {
+      return false;
+    }
+
+    const targetPath = this.getDeterministicGreenfieldTargetPath();
+    if (!targetPath) {
+      return false;
+    }
+
+    let parsedResult: Record<string, unknown>;
+    try {
+      parsedResult = JSON.parse(toolResult) as Record<string, unknown>;
+    } catch {
+      return false;
+    }
+
+    if (parsedResult.error || this.toolPathMatchesTarget(parsedResult.path, targetPath)) {
+      return false;
+    }
+
+    this.debugLog('greenfield_wrong_read_target_recovery', {
+      failedTool: toolName,
+      attemptedPath: String(parsedResult.path ?? ''),
+      recoveredPath: targetPath
+    });
+
+    messages.push({
+      role: 'user',
+      content: `Wrong file target. For this greenfield task, the primary source file is ${targetPath}. Do not read unrelated files first. Create or update ${targetPath} now unless you truly need a bounded read of that same file.`,
+      hiddenFromTranscript: true
+    });
+    await this.processOllamaResponse(messages, 0);
     return true;
   }
 
@@ -2229,6 +2320,10 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           return;
         }
 
+        if (await this.tryAutoRecoverWrongGreenfieldReadTarget(messages, toolName, toolResult)) {
+          return;
+        }
+
         if (this.maybeNudgeAfterBlockedImmediateTerminal(messages, toolName, toolResult)) {
           continue;
         }
@@ -2312,6 +2407,10 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         const verifyResult = await this.tryRunBuildVerify(messages);
         if (verifyResult !== null) {
           if (verifyResult.ok) {
+            if (this.pendingGreenfieldVerificationPath) {
+              this.lastGreenfieldVerifiedPath = this.pendingGreenfieldVerificationPath;
+              this.pendingGreenfieldVerificationPath = '';
+            }
             this.postProgressStep('Build check: OK');
           } else {
             this.postProgressStep('Build errors detected — sending to model...');
@@ -5113,16 +5212,27 @@ If the user asks for a change but provides NO code:
         case 'replace_in_file':
           return await this.replaceInFile(String(args.filepath ?? ''), String(args.old_text ?? ''), String(args.new_text ?? ''));
         case 'execute_terminal_command':
-          if (this.shouldApplyPreferredGreenfieldGuards()
-            && this.currentRequestLooksLikeRecoverableGreenfieldCode()
-            && this.preferredGreenfieldSuccessfulWriteCount === 0
-            && !isTerminalReadOnlyInspectionCommand(String(args.command ?? ''))) {
-            return this.buildEarlyGreenfieldTerminalBlockResult(String(args.command ?? ''));
+          {
+            const terminalCommand = String(args.command ?? '');
+            if (this.shouldApplyPreferredGreenfieldGuards()
+              && this.currentRequestLooksLikeRecoverableGreenfieldCode()
+              && this.preferredGreenfieldSuccessfulWriteCount === 0
+              && !isTerminalReadOnlyInspectionCommand(terminalCommand)) {
+              return this.buildEarlyGreenfieldTerminalBlockResult(terminalCommand);
+            }
+            if (isGlobalPackageInstallCommand(terminalCommand)) {
+              return this.buildGlobalInstallBlockResult(terminalCommand);
+            }
+            if (this.shouldApplyPreferredGreenfieldGuards() && this.blockImmediateTerminalAfterWrite) {
+              return this.buildImmediatePostCreateTerminalBlockResult(terminalCommand);
+            }
+            if (this.shouldApplyPreferredGreenfieldGuards()
+              && this.pendingGreenfieldVerificationPath
+              && !isTerminalReadOnlyInspectionCommand(terminalCommand)) {
+              return this.buildPendingVerifyTerminalBlockResult(terminalCommand);
+            }
+            return await this.executeTerminalCommand(terminalCommand);
           }
-          if (this.shouldApplyPreferredGreenfieldGuards() && this.blockImmediateTerminalAfterWrite) {
-            return this.buildImmediatePostCreateTerminalBlockResult(String(args.command ?? ''));
-          }
-          return await this.executeTerminalCommand(String(args.command ?? ''));
         case 'launch_in_terminal':
           return this.launchInTerminal(String(args.command ?? ''));
         case 'delete_file':

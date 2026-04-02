@@ -260,6 +260,51 @@ function buildEarlyGreenfieldTerminalBlockResult(command) {
   });
 }
 
+function getDeterministicGreenfieldTargetPath() {
+  if (!IS_CODE_PREFERRED_GREENFIELD_REQUEST || !PREFERRED_GREENFIELD_BOOTSTRAP_FILEPATH) return undefined;
+  return PREFERRED_GREENFIELD_BOOTSTRAP_FILEPATH;
+}
+
+function normalizeComparablePath(value) {
+  return String(value ?? '').replace(/\\/g, '/').replace(/^\.\//, '').toLowerCase();
+}
+
+function toolPathMatchesTarget(toolPathValue, targetPath) {
+  const toolPath = normalizeComparablePath(toolPathValue);
+  const normalizedTarget = normalizeComparablePath(targetPath);
+  if (!toolPath || !normalizedTarget) return false;
+  return toolPath === normalizedTarget
+    || toolPath.endsWith(`/${normalizedTarget}`)
+    || path.basename(toolPath) === path.basename(normalizedTarget);
+}
+
+function buildPendingVerifyTerminalBlockResult(command, pendingPath) {
+  const targetLabel = pendingPath ? ` for ${path.basename(pendingPath)}` : '';
+  return JSON.stringify({
+    command,
+    exitCode: 1,
+    blocked: true,
+    reason: 'greenfield_verify_before_run',
+    error: `Blocked command: do not run arbitrary terminal commands${targetLabel} before syntax verification completes for the latest greenfield file write. Let the automatic verification run first, then continue with fixes if needed.`
+  });
+}
+
+function buildGlobalInstallBlockResult(command) {
+  return JSON.stringify({
+    command,
+    exitCode: 1,
+    blocked: true,
+    reason: 'global_install_blocked',
+    error: 'Blocked command: do not install packages globally from the agent loop. Use local project dependencies only when the user explicitly asked for them or they are genuinely required inside the current workspace.'
+  });
+}
+
+function isGlobalPackageInstallCommand(command) {
+  const normalized = String(command ?? '').trim().toLowerCase().replace(/\s+/g, ' ');
+  if (!normalized) return false;
+  return /(?:^|\b)(?:npm\s+(?:install|i|add)\s+-g\b|pnpm\s+add\s+-g\b|yarn\s+global\s+add\b|bun\s+add\s+-g\b)/.test(normalized);
+}
+
 function detectInsufficientGreenfieldCreateContent(filepath, content) {
   if (!IS_PREFERRED_GREENFIELD_REQUEST) return undefined;
 
@@ -2672,6 +2717,8 @@ async function main() {
   let lastNudgedResponseContent = '';  // track identical responses
   let consecutiveIdenticalResponses = 0;
   let blockImmediateTerminalAfterWrite = false;
+  let pendingGreenfieldVerificationPath = '';
+  let lastGreenfieldVerifiedPath = '';
   preferredGreenfieldSuccessfulWriteCount = 0;
   dryRunFiles.clear(); // reset for this session
 
@@ -2711,12 +2758,32 @@ let args = rawArgs;
         blockImmediateTerminalAfterWrite = false;
       }
 
+      if (toolName === 'execute_terminal_command' && isGlobalPackageInstallCommand(String(args.command ?? ''))) {
+        const blockedResult = buildGlobalInstallBlockResult(String(args.command ?? ''));
+        label(Y, '  BLOCK GLOBAL INSTALL', String(args.command ?? ''));
+        logEvent('tool_exec_blocked', { tool: toolName, args, reason: 'global_install_blocked' });
+        messages.push({ role: 'tool', content: blockedResult, tool_name: toolName });
+        messages.push({ role: 'user', content: 'Do not install packages globally. Use local workspace dependencies only when they are genuinely required for this task.' });
+        continue;
+      }
+
       if (toolName === 'execute_terminal_command' && SHOULD_BLOCK_IMMEDIATE_DRY_RUN_TERMINAL && blockImmediateTerminalAfterWrite) {
         const blockedResult = buildDryRunTerminalBlockResult(String(args.command ?? ''), lastSuccessfulWritePath);
         label(Y, '  SKIP TERMINAL', 'Blocked immediate execute_terminal_command after create_or_edit_file in DRY_RUN greenfield smoke');
         logEvent('tool_exec_blocked', { tool: toolName, args, reason: 'dry_run_greenfield_post_create_guard', path: lastSuccessfulWritePath });
         messages.push({ role: 'tool', content: blockedResult, tool_name: toolName });
         messages.push({ role: 'user', content: 'Do not run terminal commands immediately after creating a file in this DRY_RUN greenfield smoke. Continue with the next file/tool step or finish the task based on the code you already wrote.' });
+        continue;
+      }
+
+      if (toolName === 'execute_terminal_command'
+        && pendingGreenfieldVerificationPath
+        && !isTerminalReadOnlyInspectionCommand(String(args.command ?? ''))) {
+        const blockedResult = buildPendingVerifyTerminalBlockResult(String(args.command ?? ''), pendingGreenfieldVerificationPath);
+        label(Y, '  BLOCK VERIFY-FIRST', path.basename(pendingGreenfieldVerificationPath));
+        logEvent('tool_exec_blocked', { tool: toolName, args, reason: 'greenfield_verify_before_run', path: pendingGreenfieldVerificationPath });
+        messages.push({ role: 'tool', content: blockedResult, tool_name: toolName });
+        messages.push({ role: 'user', content: `Do not run execute_terminal_command yet. The latest file write to ${path.basename(pendingGreenfieldVerificationPath)} must pass syntax verification first.` });
         continue;
       }
 
@@ -2786,6 +2853,15 @@ let args = rawArgs;
             targetAppearsExhausted = false;
           }
         }
+        if ((toolName === 'read_file_slice' || toolName === 'read_specific_file')
+          && preferredGreenfieldSuccessfulWriteCount === 0) {
+          const greenfieldTargetPath = getDeterministicGreenfieldTargetPath();
+          if (greenfieldTargetPath && !toolPathMatchesTarget(parsed.path ?? args.filepath, greenfieldTargetPath)) {
+            label(Y, '  WRONG TARGET', `${String(parsed.path ?? args.filepath ?? '')} -> ${greenfieldTargetPath}`);
+            logEvent('greenfield_wrong_read_target_recovery', { failedTool: toolName, attemptedPath: String(parsed.path ?? args.filepath ?? ''), recoveredPath: greenfieldTargetPath });
+            messages.push({ role: 'user', content: `Wrong file target. For this greenfield task, the primary source file is ${greenfieldTargetPath}. Do not read unrelated files first. Create or update ${greenfieldTargetPath} now unless you truly need a bounded read of that same file.` });
+          }
+        }
         if (toolName === 'read_file_slice' && parsed.content) {
           lastSuccessfulRead = { filepath: String(args.filepath ?? ''), startLine: args.startLine ?? 1, endLine: args.endLine ?? 1, content: parsed.content };
           recentReads.push(lastSuccessfulRead);
@@ -2797,6 +2873,10 @@ let args = rawArgs;
           if (toolName === 'create_or_edit_file' && SHOULD_BLOCK_IMMEDIATE_DRY_RUN_TERMINAL) {
             preferredGreenfieldSuccessfulWriteCount++;
             blockImmediateTerminalAfterWrite = true;
+          }
+          if (toolName === 'create_or_edit_file' && IS_CODE_PREFERRED_GREENFIELD_REQUEST) {
+            pendingGreenfieldVerificationPath = lastSuccessfulWritePath;
+            lastGreenfieldVerifiedPath = '';
           }
           if (IS_SPLIT_TASK && toolName === 'create_or_edit_file') {
             const createdPath = parsed.path ?? '';
@@ -2838,6 +2918,11 @@ let args = rawArgs;
         const verifyResult = await executeTool('execute_terminal_command', { command: `cd ${JSON.stringify(verifyConfig.projectRoot)} && ${verifyConfig.command}` });
         const parsedVerify = JSON.parse(verifyResult);
         const verifyOutput = [String(parsedVerify.stdout ?? ''), String(parsedVerify.stderr ?? '')].filter(Boolean).join('\n').trim();
+        if (Number(parsedVerify.exitCode ?? 1) === 0 && pendingGreenfieldVerificationPath) {
+          lastGreenfieldVerifiedPath = pendingGreenfieldVerificationPath;
+          pendingGreenfieldVerificationPath = '';
+          blockImmediateTerminalAfterWrite = false;
+        }
         messages.push({
           role: 'tool',
           content: JSON.stringify({
@@ -2989,12 +3074,32 @@ let args = rawArgs;
           blockImmediateTerminalAfterWrite = false;
         }
 
+        if (toolName === 'execute_terminal_command' && isGlobalPackageInstallCommand(String(args.command ?? ''))) {
+          const blockedResult = buildGlobalInstallBlockResult(String(args.command ?? ''));
+          label(Y, '  BLOCK GLOBAL INSTALL', String(args.command ?? ''));
+          logEvent('tool_exec_blocked', { tool: toolName, args, reason: 'global_install_blocked' });
+          messages.push({ role: 'tool', content: blockedResult, tool_name: toolName });
+          messages.push({ role: 'user', content: 'Do not install packages globally. Use local workspace dependencies only when they are genuinely required for this task.' });
+          continue;
+        }
+
         if (toolName === 'execute_terminal_command' && SHOULD_BLOCK_IMMEDIATE_DRY_RUN_TERMINAL && blockImmediateTerminalAfterWrite) {
           const blockedResult = buildDryRunTerminalBlockResult(String(args.command ?? ''), lastSuccessfulWritePath);
           label(Y, '  SKIP TERMINAL', 'Blocked immediate execute_terminal_command after create_or_edit_file in DRY_RUN greenfield smoke');
           logEvent('tool_exec_blocked', { tool: toolName, args, reason: 'dry_run_greenfield_post_create_guard', path: lastSuccessfulWritePath });
           messages.push({ role: 'tool', content: blockedResult, tool_name: toolName });
           messages.push({ role: 'user', content: 'Do not run terminal commands immediately after creating a file in this DRY_RUN greenfield smoke. Continue with the next file/tool step or finish the task based on the code you already wrote.' });
+          continue;
+        }
+
+        if (toolName === 'execute_terminal_command'
+          && pendingGreenfieldVerificationPath
+          && !isTerminalReadOnlyInspectionCommand(String(args.command ?? ''))) {
+          const blockedResult = buildPendingVerifyTerminalBlockResult(String(args.command ?? ''), pendingGreenfieldVerificationPath);
+          label(Y, '  BLOCK VERIFY-FIRST', path.basename(pendingGreenfieldVerificationPath));
+          logEvent('tool_exec_blocked', { tool: toolName, args, reason: 'greenfield_verify_before_run', path: pendingGreenfieldVerificationPath });
+          messages.push({ role: 'tool', content: blockedResult, tool_name: toolName });
+          messages.push({ role: 'user', content: `Do not run execute_terminal_command yet. The latest file write to ${path.basename(pendingGreenfieldVerificationPath)} must pass syntax verification first.` });
           continue;
         }
 
@@ -3060,6 +3165,15 @@ let args = rawArgs;
               targetAppearsExhausted = false;
             }
           }
+          if ((toolName === 'read_file_slice' || toolName === 'read_specific_file')
+            && preferredGreenfieldSuccessfulWriteCount === 0) {
+            const greenfieldTargetPath = getDeterministicGreenfieldTargetPath();
+            if (greenfieldTargetPath && !toolPathMatchesTarget(parsed.path ?? args.filepath, greenfieldTargetPath)) {
+              label(Y, '  WRONG TARGET', `${String(parsed.path ?? args.filepath ?? '')} -> ${greenfieldTargetPath}`);
+              logEvent('greenfield_wrong_read_target_recovery', { failedTool: toolName, attemptedPath: String(parsed.path ?? args.filepath ?? ''), recoveredPath: greenfieldTargetPath });
+              messages.push({ role: 'user', content: `Wrong file target. For this greenfield task, the primary source file is ${greenfieldTargetPath}. Do not read unrelated files first. Create or update ${greenfieldTargetPath} now unless you truly need a bounded read of that same file.` });
+            }
+          }
           // Track successful reads for replace_in_file reminder context
           if (toolName === 'read_file_slice' && parsed.content) {
             lastSuccessfulRead = { filepath: String(args.filepath ?? ''), startLine: args.startLine ?? 1, endLine: args.endLine ?? 1, content: parsed.content };
@@ -3072,6 +3186,10 @@ let args = rawArgs;
             if (toolName === 'create_or_edit_file' && SHOULD_BLOCK_IMMEDIATE_DRY_RUN_TERMINAL) {
               preferredGreenfieldSuccessfulWriteCount++;
               blockImmediateTerminalAfterWrite = true;
+            }
+            if (toolName === 'create_or_edit_file' && IS_CODE_PREFERRED_GREENFIELD_REQUEST) {
+              pendingGreenfieldVerificationPath = lastSuccessfulWritePath;
+              lastGreenfieldVerifiedPath = '';
             }
             // After creating a NEW file (not the main refactor target), remind model to replace in original — SPLIT TASKS ONLY
             if (IS_SPLIT_TASK && toolName === 'create_or_edit_file') {
@@ -3134,6 +3252,11 @@ let args = rawArgs;
           const verifyResult = await executeTool('execute_terminal_command', { command: `cd ${JSON.stringify(verifyConfig.projectRoot)} && ${verifyConfig.command}` });
           const parsedVerify = JSON.parse(verifyResult);
           const verifyOutput = [String(parsedVerify.stdout ?? ''), String(parsedVerify.stderr ?? '')].filter(Boolean).join('\n').trim();
+          if (Number(parsedVerify.exitCode ?? 1) === 0 && pendingGreenfieldVerificationPath) {
+            lastGreenfieldVerifiedPath = pendingGreenfieldVerificationPath;
+            pendingGreenfieldVerificationPath = '';
+            blockImmediateTerminalAfterWrite = false;
+          }
           messages.push({
             role: 'tool',
             content: JSON.stringify({
