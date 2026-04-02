@@ -208,6 +208,17 @@ function looksLikeWriteIntent(text) {
   return englishWritePattern.test(normalized) || cyrillicWritePattern.test(normalized);
 }
 
+function isSyntaxRelevantFilePath(filepath) {
+  const ext = path.extname(filepath || '').toLowerCase();
+  return new Set([
+    '.ts', '.tsx', '.mts', '.cts',
+    '.js', '.jsx', '.mjs', '.cjs',
+    '.py', '.go', '.rs', '.java', '.kt', '.cs', '.php', '.rb', '.swift',
+    '.c', '.cc', '.cpp', '.cxx', '.h', '.hpp', '.hh',
+    '.html', '.css', '.scss', '.sass', '.less', '.json', '.jsonc', '.yaml', '.yml', '.sh'
+  ]).has(ext);
+}
+
 function looksLikeGreenfieldCreateTask(text) {
   const normalized = text.trim().toLowerCase();
   if (!normalized || !looksLikeWriteIntent(text)) return false;
@@ -221,6 +232,11 @@ const REQUIRES_FILE_WRITE = looksLikeWriteIntent(userPrompt);
 const IS_PREFERRED_GREENFIELD_REQUEST = isPreferredSupportedModel(MODEL)
   && looksLikeGreenfieldCreateTask(userPrompt)
   && !IS_SPLIT_TASK;
+const PREFERRED_GREENFIELD_BOOTSTRAP_FILEPATH = IS_PREFERRED_GREENFIELD_REQUEST
+  ? inferDegenerateRecoveryStarterFilepath(userPrompt)
+  : undefined;
+const IS_CODE_PREFERRED_GREENFIELD_REQUEST = !!PREFERRED_GREENFIELD_BOOTSTRAP_FILEPATH
+  && isSyntaxRelevantFilePath(PREFERRED_GREENFIELD_BOOTSTRAP_FILEPATH);
 const SHOULD_BLOCK_IMMEDIATE_DRY_RUN_TERMINAL = DRY_RUN && IS_PREFERRED_GREENFIELD_REQUEST;
 
 function buildDryRunTerminalBlockResult(command, filePath) {
@@ -234,12 +250,21 @@ function buildDryRunTerminalBlockResult(command, filePath) {
   });
 }
 
+function buildEarlyGreenfieldTerminalBlockResult(command) {
+  return JSON.stringify({
+    command,
+    exitCode: 1,
+    blocked: true,
+    reason: 'prewrite_greenfield_terminal',
+    error: `Blocked command: do not use execute_terminal_command before the first real file write for this preferred-model greenfield task. Start by writing ${PREFERRED_GREENFIELD_BOOTSTRAP_FILEPATH ? path.basename(PREFERRED_GREENFIELD_BOOTSTRAP_FILEPATH) : 'the main source file'}.`
+  });
+}
+
 function detectInsufficientGreenfieldCreateContent(filepath, content) {
   if (!IS_PREFERRED_GREENFIELD_REQUEST) return undefined;
 
   const ext = path.extname(filepath).toLowerCase();
-  const codeExtensions = new Set(['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs', '.py', '.go', '.rs', '.java', '.kt', '.cs', '.php', '.rb', '.swift', '.c', '.cc', '.cpp', '.cxx', '.h', '.hpp', '.hh']);
-  if (!codeExtensions.has(ext)) return undefined;
+  if (!isSyntaxRelevantFilePath(filepath)) return undefined;
 
   const nonEmptyLines = content.replace(/\r\n/g, '\n').split('\n').map(line => line.trim()).filter(Boolean);
   if (nonEmptyLines.length === 0) {
@@ -250,28 +275,24 @@ function detectInsufficientGreenfieldCreateContent(filepath, content) {
   const placeholderPattern = /(?:your\s+\w+\s+here|your game logic here|game logic here|logic here|implementation here|code here|placeholder|stub|todo|tbd|coming soon|implement me|fill (?:me|this) in|to be implemented)/i;
   const hasPlaceholderLine = nonEmptyLines.some(line => placeholderPattern.test(line));
   const nonImportLines = nonCommentLines.filter(line => !/^(?:import\s+.+|from\s+\S+\s+import\s+.+|using\s+.+;?|package\s+[\w.]+;?|namespace\s+[\w.]+;?|export\s+\{.*\};?)$/.test(line));
-  const looksLikePythonGreenfield = (/(?:\bpython\b|\bpy\b)/i.test(userPrompt)
-    || userPrompt.toLowerCase().includes('пайтон')
-    || userPrompt.toLowerCase().includes('питон')
-    || userPrompt.toLowerCase().includes('піто'))
-    && ext === '.py'
-    && preferredGreenfieldSuccessfulWriteCount === 0;
-  if (looksLikePythonGreenfield) {
-    const strongGameSignals = nonImportLines.filter(line => /(?:\binput\s*\(|\brandom\b|\brandint\b|\bchoice\b|\bwhile\b|\bfor\b|\bif\b|\belif\b|\bscore\b|\broll\b|\bdice\b|\bкост)/i.test(line));
-    const trivialBoilerplatePattern = /^(?:def\s+main\s*\(\s*\)\s*:|if\s+__name__\s*==\s*['"]__main__['"]\s*:|main\s*\(\s*\)\s*|print\s*\(.+\)\s*|time\.sleep\s*\(.+\)\s*|return\b.*|pass\b|import\s+(?:os|time)(?:\s+as\s+\w+)?\s*|from\s+time\s+import\s+.+|from\s+os\s+import\s+.+)$/;
-    const commentOnlyGamePlaceholderPattern = /(?:game logic here|logic here|console game|welcome to our console game|game over|thanks for playing)/i;
+  const targetExt = path.extname(PREFERRED_GREENFIELD_BOOTSTRAP_FILEPATH ?? '').toLowerCase();
+  const isFirstGreenfieldSourceWrite = preferredGreenfieldSuccessfulWriteCount === 0
+    && IS_CODE_PREFERRED_GREENFIELD_REQUEST
+    && (!targetExt || ext === targetExt);
+  if (isFirstGreenfieldSourceWrite) {
+    const implementationSignalPattern = /(?:\bclass\b|\bfunction\b|\bdef\b|\bfunc\b|\bstruct\b|\benum\b|\binterface\b|\btype\b|\bif\b|\bfor\b|\bwhile\b|\bswitch\b|\bmatch\b|\bcase\b|\breturn\b|\btry\b|\bcatch\b|=>|[{}()[\];=])/i;
+    const trivialBoilerplatePattern = /^(?:print\s*\(.+\)\s*|console\.log\s*\(.+\)\s*|puts\s+.+|echo\s+.+|pass\b|return\b.*|main\s*\(\s*\)\s*|def\s+main\s*\(\s*\)\s*:|if\s+__name__\s*==\s*['"]__main__['"]\s*:|function\s+main\s*\(|public\s+static\s+void\s+main\s*\(|int\s+main\s*\(|fn\s+main\s*\(|package\s+[\w.]+;?|using\s+[\w.]+;?|import\s+.+|from\s+\S+\s+import\s+.+)$/i;
+    const significantLines = nonImportLines.filter(line => implementationSignalPattern.test(line));
     const hasOnlyTrivialBoilerplate = nonEmptyLines.every(line => {
       const trimmed = line.trim();
       if (!trimmed) return true;
       if (/^(?:#|\/\/|\/\*|\*)/.test(trimmed)) {
-        return commentOnlyGamePlaceholderPattern.test(trimmed) || placeholderPattern.test(trimmed);
+        return placeholderPattern.test(trimmed);
       }
       return trivialBoilerplatePattern.test(trimmed);
     });
-    const isTooThinPythonStarter = strongGameSignals.length === 0
-      && (hasOnlyTrivialBoilerplate || nonImportLines.length <= 6);
-    if (isTooThinPythonStarter) {
-      return 'Blocked write: the first Python file for this greenfield task is too thin to be a real starting implementation. Do not stop at one print statement or a placeholder comment. Write a minimal but working first version with actual game flow, functions, and input/roll logic.';
+    if (significantLines.length < 3 && (hasOnlyTrivialBoilerplate || nonImportLines.length <= 6)) {
+      return 'Blocked write: the first source file for this greenfield task is too thin to be a real starting implementation. Do not stop at a placeholder, a single print/log line, or a bare wrapper. Write a minimal but working first version with real control flow and implementation logic.';
     }
   }
 
@@ -461,12 +482,6 @@ function pickVerifyCommandForPath(targetPath) {
   const hasJavaProjectMarkers = existsSync(path.join(projectRoot, 'pom.xml')) || existsSync(path.join(projectRoot, 'build.gradle')) || existsSync(path.join(projectRoot, 'build.gradle.kts'));
   const hasDotnetProjectMarkers = existsSync(projectRoot) && readdirSafe(projectRoot).some(name => name.endsWith('.sln') || name.endsWith('.csproj'));
 
-  if (latestExt === '.py' && !hasPythonProjectMarkers) return null;
-  if (latestExt === '.go' && !existsSync(path.join(projectRoot, 'go.mod'))) return null;
-  if (latestExt === '.rs' && !existsSync(path.join(projectRoot, 'Cargo.toml'))) return null;
-  if ((latestExt === '.java' || latestExt === '.kt') && !hasJavaProjectMarkers) return null;
-  if (latestExt === '.cs' && !hasDotnetProjectMarkers) return null;
-
   const packageJsonPath = path.join(projectRoot, 'package.json');
   if (existsSync(packageJsonPath)) {
     try {
@@ -489,6 +504,11 @@ function pickVerifyCommandForPath(targetPath) {
     return { command: existsSync(path.join(projectRoot, 'gradlew')) ? './gradlew -q build -x test 2>&1 | head -30' : 'gradle -q build -x test 2>&1 | head -30', projectRoot, stack: 'java/gradle' };
   }
   if (hasDotnetProjectMarkers) return { command: 'dotnet build -nologo 2>&1 | head -30', projectRoot, stack: '.net' };
+  const quotedTargetPath = JSON.stringify(targetPath);
+  if (latestExt === '.py') return { command: `python -m py_compile ${quotedTargetPath} 2>&1 | head -30`, projectRoot, stack: 'python-file' };
+  if (['.js', '.jsx', '.mjs', '.cjs'].includes(latestExt)) return { command: `node --check ${quotedTargetPath} 2>&1 | head -30`, projectRoot, stack: 'javascript-file' };
+  if (['.ts', '.tsx', '.mts', '.cts'].includes(latestExt)) return { command: `npx tsc --pretty false --noEmit ${quotedTargetPath} 2>&1 | head -30`, projectRoot, stack: 'typescript-file' };
+  if (latestExt === '.go') return { command: `gofmt -d ${quotedTargetPath} 2>&1 | head -30`, projectRoot, stack: 'go-file' };
   return null;
 }
 
@@ -1394,6 +1414,9 @@ async function executeTool(name, args) {
     case 'execute_terminal_command': {
       const cmd = String(args.command ?? '');
       if (!cmd) return JSON.stringify({ error: 'command is required.' });
+      if (IS_CODE_PREFERRED_GREENFIELD_REQUEST && preferredGreenfieldSuccessfulWriteCount === 0 && !isTerminalReadOnlyInspectionCommand(cmd)) {
+        return buildEarlyGreenfieldTerminalBlockResult(cmd);
+      }
       try {
         const { stdout, stderr } = await execAsync(cmd, { cwd: wsRoot, timeout: 30_000, maxBuffer: 1024 * 512 });
         return JSON.stringify({ command: cmd, exitCode: 0, stdout, stderr });
@@ -1599,10 +1622,119 @@ function inferDegenerateRecoveryStarterFilepath(text) {
   const normalized = text.trim().toLowerCase();
   if (!looksLikeWriteIntent(text)) return undefined;
   if (/\bpython\b|\bpy\b/i.test(normalized) || normalized.includes('пайтон') || normalized.includes('питон') || normalized.includes('піто')) return 'main.py';
+  if (/\bgo\b|\bgolang\b/i.test(normalized)) return 'main.go';
+  if (/\brust\b|\brs\b/i.test(normalized)) return 'main.rs';
+  if (/\bjava\b/i.test(normalized)) return 'Main.java';
+  if (/\bkotlin\b|\bkt\b/i.test(normalized)) return 'Main.kt';
+  if (/\bc#\b|\bcsharp\b|\bdotnet\b|\.net\b|\bcs\b/i.test(normalized)) return 'Program.cs';
   if (/\btypescript\b|\btype script\b|\bts\b/i.test(normalized)) return 'main.ts';
   if (/\bjavascript\b|\bnode\b|\bjs\b/i.test(normalized)) return 'main.js';
+  if (/\bphp\b/i.test(normalized)) return 'index.php';
+  if (/\bruby\b|\brb\b/i.test(normalized)) return 'main.rb';
+  if (/\bswift\b/i.test(normalized)) return 'main.swift';
+  if (/\bc\+\+\b|\bcpp\b|\bcxx\b/i.test(normalized)) return 'main.cpp';
+  if (/\bc\b/i.test(normalized)) return 'main.c';
   if (/\bhtml\b|\bweb\s*page\b|\blanding\b/i.test(normalized)) return 'index.html';
+  if (/\bcss\b|\bscss\b|\bsass\b|\bless\b/i.test(normalized)) return 'styles.css';
+  if (/\bjson\b/i.test(normalized)) return 'data.json';
+  if (/\byaml\b|\byml\b/i.test(normalized)) return 'config.yaml';
+  if (/\bshell\b|\bbash\b|\bsh\b|\bscript\b/i.test(normalized)) return 'main.sh';
   return 'main.txt';
+}
+
+function getPreferredGreenfieldCodeDumpSpec(targetFilepath) {
+  const ext = path.extname(targetFilepath || '').toLowerCase();
+  if (ext === '.py') {
+    return {
+      firstCodeLinePattern: /^(?:import\s+\w|from\s+\w+\s+import\s+.+|def\s+\w+\(|class\s+\w+)/,
+      codeSignalPattern: /(?:\bdef\b|\bclass\b|\binput\s*\(|\brandom\b|\bwhile\b|\bfor\b|\bif\b|\belif\b|\breturn\b|\broll\b|\bdice\b)/g,
+      minLength: 120,
+      minSignalCount: 4
+    };
+  }
+  if (['.ts', '.tsx', '.mts', '.cts', '.js', '.jsx', '.mjs', '.cjs'].includes(ext)) {
+    return {
+      firstCodeLinePattern: /^(?:import\s+.+|export\s+.+|const\s+\w+|let\s+\w+|var\s+\w+|function\s+\w+|async\s+function\s+\w+|class\s+\w+|interface\s+\w+|type\s+\w+|enum\s+\w+)/,
+      codeSignalPattern: /(?:\bimport\b|\bexport\b|\bconst\b|\blet\b|\bvar\b|\bfunction\b|\bclass\b|=>|[{}();])/g,
+      minLength: 120,
+      minSignalCount: 4
+    };
+  }
+  if (ext === '.go') {
+    return {
+      firstCodeLinePattern: /^(?:package\s+\w+|import\s*\(|import\s+".+"|func\s+\w+|type\s+\w+)/,
+      codeSignalPattern: /(?:\bpackage\b|\bimport\b|\bfunc\b|\btype\b|\bstruct\b|\bif\b|\bfor\b|:=|[{}()])/g,
+      minLength: 120,
+      minSignalCount: 4
+    };
+  }
+  if (ext === '.rs') {
+    return {
+      firstCodeLinePattern: /^(?:use\s+\w+|fn\s+\w+|struct\s+\w+|enum\s+\w+|impl\s+\w+|mod\s+\w+)/,
+      codeSignalPattern: /(?:\buse\b|\bfn\b|\bstruct\b|\benum\b|\bimpl\b|\blet\b|\bmatch\b|[{}();])/g,
+      minLength: 120,
+      minSignalCount: 4
+    };
+  }
+  if (ext === '.java' || ext === '.kt' || ext === '.cs') {
+    return {
+      firstCodeLinePattern: /^(?:package\s+[\w.]+;?|import\s+[\w.*]+;?|using\s+[\w.]+;?|namespace\s+[\w.]+|public\s+class\s+\w+|class\s+\w+|object\s+\w+)/,
+      codeSignalPattern: /(?:\bpackage\b|\bimport\b|\busing\b|\bnamespace\b|\bclass\b|\bpublic\b|\bprivate\b|\bfun\b|\bstatic\b|[{}();])/g,
+      minLength: 140,
+      minSignalCount: 4
+    };
+  }
+  if (['.php', '.rb', '.swift', '.c', '.cc', '.cpp', '.cxx', '.h', '.hpp', '.hh'].includes(ext)) {
+    return {
+      firstCodeLinePattern: /^(?:<\?php|#include\s+[<"].+[>"]|require\s+['"].+['"]|func\s+\w+|def\s+\w+|class\s+\w+|struct\s+\w+|int\s+main\s*\(|void\s+\w+\s*\()/,
+      codeSignalPattern: /(?:<\?php|#include\b|\brequire\b|\bdef\b|\bclass\b|\bfunc\b|\bstruct\b|\breturn\b|[{}();])/g,
+      minLength: 120,
+      minSignalCount: 4
+    };
+  }
+  if (['.html', '.css', '.scss', '.sass', '.less'].includes(ext)) {
+    return {
+      firstCodeLinePattern: /^(?:<!doctype\s+html>|<html\b|<head\b|<body\b|<main\b|<div\b|<section\b|<style\b|[.#][\w-]+\s*\{)/i,
+      codeSignalPattern: /(?:<html\b|<body\b|<main\b|<div\b|<section\b|<script\b|<style\b|\{[^}]*\}|\bdisplay\s*:|\bcolor\s*:)/gi,
+      minLength: 120,
+      minSignalCount: 3
+    };
+  }
+  if (['.json', '.jsonc', '.yaml', '.yml', '.sh'].includes(ext)) {
+    return {
+      firstCodeLinePattern: /^(?:\{|\[|\w+\s*:|#!\/bin\/(?:bash|sh)|set\s+-[a-z]+|[A-Za-z_][A-Za-z0-9_]*=)/,
+      codeSignalPattern: /(?:\{|\[|\]|\}|:\s|#!\/bin\/(?:bash|sh)|\bif\b|\bfi\b|\bthen\b|\bexport\b|\=)/g,
+      minLength: 80,
+      minSignalCount: 3
+    };
+  }
+  return undefined;
+}
+
+function extractPreferredGreenfieldCodeDump(content) {
+  if (!IS_CODE_PREFERRED_GREENFIELD_REQUEST || preferredGreenfieldSuccessfulWriteCount > 0 || !PREFERRED_GREENFIELD_BOOTSTRAP_FILEPATH) return undefined;
+
+  const spec = getPreferredGreenfieldCodeDumpSpec(PREFERRED_GREENFIELD_BOOTSTRAP_FILEPATH);
+  if (!spec) return undefined;
+
+  const normalized = content.replace(/\r\n/g, '\n').trim();
+  if (!normalized) return undefined;
+
+  const fencedCandidates = Array.from(normalized.matchAll(/```(?:[\w+-]+)?\n([\s\S]*?)```/g), match => match[1].trim()).filter(Boolean);
+  for (const block of [normalized, ...fencedCandidates]) {
+    const lines = block.split('\n');
+    const firstCodeIndex = lines.findIndex(line => spec.firstCodeLinePattern.test(line.trim()));
+    if (firstCodeIndex < 0) continue;
+
+    const candidate = lines.slice(firstCodeIndex).join('\n').trim();
+    if (candidate.length < spec.minLength) continue;
+    const codeSignalCount = (candidate.match(spec.codeSignalPattern) ?? []).length;
+    if (codeSignalCount < spec.minSignalCount) continue;
+    if (detectInsufficientGreenfieldCreateContent(PREFERRED_GREENFIELD_BOOTSTRAP_FILEPATH, candidate)) continue;
+    return { filepath: PREFERRED_GREENFIELD_BOOTSTRAP_FILEPATH, content: candidate };
+  }
+
+  return undefined;
 }
 
 async function tryUltraSmallDeterministicFastPath() {
@@ -2744,6 +2876,21 @@ let args = rawArgs;
     repeatedNarratedCallCount = 0;
   };
 
+  const tryBootstrapPreferredGreenfieldCodeDump = async content => {
+    const candidate = extractPreferredGreenfieldCodeDump(content);
+    if (!candidate) return false;
+
+    label(Y, 'GREENFIELD CODE BOOTSTRAP', `Recovered a plain-text code dump into create_or_edit_file(${candidate.filepath})`);
+    logEvent('preferred_greenfield_code_bootstrap', { turn, model: MODEL, filepath: candidate.filepath, contentPreview: candidate.content.substring(0, 200) });
+    await executeResolvedToolCalls([
+      { function: { name: 'create_or_edit_file', arguments: { filename: candidate.filepath, content: candidate.content } } }
+    ], {
+      assistantContent: content,
+      recoveryLabel: 'GREENFIELD CODE BOOTSTRAP'
+    });
+    return true;
+  };
+
   while (turn < MAX_TURNS) {
     turn++;
     label(C, `TURN ${turn}`, `retry=${retryCount} messages=${messages.length}`);
@@ -3115,6 +3262,10 @@ let args = rawArgs;
     const analysis = analyzeResponse(content, recentMessages);
     label(Y, 'ANALYSIS', JSON.stringify(analysis));
     logEvent('response_analysis', { turn, retryCount, ...analysis });
+
+    if (await tryBootstrapPreferredGreenfieldCodeDump(content)) {
+      continue;
+    }
 
     const bootstrapCandidate = inferBootstrapToolCall(content, {
       analysis,

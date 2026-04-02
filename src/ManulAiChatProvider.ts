@@ -1309,20 +1309,33 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       && this.isPreferredSupportedModel(this.getSelectedModel());
   }
 
-  private currentRequestLooksLikePythonGreenfield(): boolean {
+  private isSyntaxRelevantFilePath(filepath: string): boolean {
+    const ext = path.extname(filepath).toLowerCase();
+    return new Set([
+      '.ts', '.tsx', '.mts', '.cts',
+      '.js', '.jsx', '.mjs', '.cjs',
+      '.py', '.go', '.rs', '.java', '.kt', '.cs', '.php', '.rb', '.swift',
+      '.c', '.cc', '.cpp', '.cxx', '.h', '.hpp', '.hh',
+      '.html', '.css', '.scss', '.sass', '.less', '.json', '.jsonc', '.yaml', '.yml', '.sh'
+    ]).has(ext);
+  }
+
+  private getCurrentPreferredGreenfieldBootstrapTarget(): string | undefined {
     if (!this.shouldApplyPreferredGreenfieldGuards()) {
-      return false;
+      return undefined;
     }
 
-    const latestVisibleUserRequest = this.getLatestVisibleUserRequest(this.messages).toLowerCase();
+    const latestVisibleUserRequest = this.getLatestVisibleUserRequest(this.messages);
     if (!latestVisibleUserRequest) {
-      return false;
+      return undefined;
     }
 
-    return /\bpython\b|\bpy\b/i.test(latestVisibleUserRequest)
-      || latestVisibleUserRequest.includes('пайтон')
-      || latestVisibleUserRequest.includes('питон')
-      || latestVisibleUserRequest.includes('піто');
+    return this.inferDegenerateRecoveryStarterFilepath(latestVisibleUserRequest);
+  }
+
+  private currentRequestLooksLikeRecoverableGreenfieldCode(): boolean {
+    const target = this.getCurrentPreferredGreenfieldBootstrapTarget();
+    return !!target && this.isSyntaxRelevantFilePath(target);
   }
 
   private detectInsufficientGreenfieldCreateContent(filename: string, content: string): string | undefined {
@@ -1331,8 +1344,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     }
 
     const ext = path.extname(filename).toLowerCase();
-    const codeExtensions = new Set(['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs', '.py', '.go', '.rs', '.java', '.kt', '.cs', '.php', '.rb', '.swift', '.c', '.cc', '.cpp', '.cxx', '.h', '.hpp', '.hh']);
-    if (!codeExtensions.has(ext)) {
+    if (!this.isSyntaxRelevantFilePath(filename)) {
       return undefined;
     }
 
@@ -1345,27 +1357,27 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     const placeholderPattern = /(?:your\s+\w+\s+here|your game logic here|game logic here|logic here|implementation here|code here|placeholder|stub|todo|tbd|coming soon|implement me|fill (?:me|this) in|to be implemented)/i;
     const hasPlaceholderLine = nonEmptyLines.some(line => placeholderPattern.test(line));
     const nonImportLines = nonCommentLines.filter(line => !/^(?:import\s+.+|from\s+\S+\s+import\s+.+|using\s+.+;?|package\s+[\w.]+;?|namespace\s+[\w.]+;?|export\s+\{.*\};?)$/.test(line));
-    const isFirstPythonGreenfieldWrite = this.currentRequestLooksLikePythonGreenfield()
-      && ext === '.py'
-      && this.preferredGreenfieldSuccessfulWriteCount === 0;
-    if (isFirstPythonGreenfieldWrite) {
-      const strongGameSignals = nonImportLines.filter(line => /(?:\binput\s*\(|\brandom\b|\brandint\b|\bchoice\b|\bwhile\b|\bfor\b|\bif\b|\belif\b|\bscore\b|\broll\b|\bdice\b|\bкост)/i.test(line));
-      const trivialBoilerplatePattern = /^(?:def\s+main\s*\(\s*\)\s*:|if\s+__name__\s*==\s*['"]__main__['"]\s*:|main\s*\(\s*\)\s*|print\s*\(.+\)\s*|time\.sleep\s*\(.+\)\s*|return\b.*|pass\b|import\s+(?:os|time)(?:\s+as\s+\w+)?\s*|from\s+time\s+import\s+.+|from\s+os\s+import\s+.+)$/;
-      const commentOnlyGamePlaceholderPattern = /(?:game logic here|logic here|console game|welcome to our console game|game over|thanks for playing)/i;
+    const targetFilepath = this.getCurrentPreferredGreenfieldBootstrapTarget();
+    const targetExt = path.extname(targetFilepath ?? '').toLowerCase();
+    const isFirstGreenfieldSourceWrite = this.preferredGreenfieldSuccessfulWriteCount === 0
+      && this.currentRequestLooksLikeRecoverableGreenfieldCode()
+      && (!targetExt || ext === targetExt);
+    if (isFirstGreenfieldSourceWrite) {
+      const implementationSignalPattern = /(?:\bclass\b|\bfunction\b|\bdef\b|\bfunc\b|\bstruct\b|\benum\b|\binterface\b|\btype\b|\bif\b|\bfor\b|\bwhile\b|\bswitch\b|\bmatch\b|\bcase\b|\breturn\b|\btry\b|\bcatch\b|=>|[{}()[\];=])/i;
+      const trivialBoilerplatePattern = /^(?:print\s*\(.+\)\s*|console\.log\s*\(.+\)\s*|puts\s+.+|echo\s+.+|pass\b|return\b.*|main\s*\(\s*\)\s*|def\s+main\s*\(\s*\)\s*:|if\s+__name__\s*==\s*['"]__main__['"]\s*:|function\s+main\s*\(|public\s+static\s+void\s+main\s*\(|int\s+main\s*\(|fn\s+main\s*\(|package\s+[\w.]+;?|using\s+[\w.]+;?|import\s+.+|from\s+\S+\s+import\s+.+)$/i;
+      const significantLines = nonImportLines.filter(line => implementationSignalPattern.test(line));
       const hasOnlyTrivialBoilerplate = nonEmptyLines.every(line => {
         const trimmed = line.trim();
         if (!trimmed) {
           return true;
         }
         if (/^(?:#|\/\/|\/\*|\*)/.test(trimmed)) {
-          return commentOnlyGamePlaceholderPattern.test(trimmed) || placeholderPattern.test(trimmed);
+          return placeholderPattern.test(trimmed);
         }
         return trivialBoilerplatePattern.test(trimmed);
       });
-      const isTooThinPythonStarter = strongGameSignals.length === 0
-        && (hasOnlyTrivialBoilerplate || nonImportLines.length <= 6);
-      if (isTooThinPythonStarter) {
-        return 'Blocked write: the first Python file for this greenfield task is too thin to be a real starting implementation. Do not stop at one print statement or a placeholder comment. Write a minimal but working first version with actual game flow, functions, and input/roll logic.';
+      if (significantLines.length < 3 && (hasOnlyTrivialBoilerplate || nonImportLines.length <= 6)) {
+        return 'Blocked write: the first source file for this greenfield task is too thin to be a real starting implementation. Do not stop at a placeholder, a single print/log line, or a bare wrapper. Write a minimal but working first version with real control flow and implementation logic.';
       }
     }
 
@@ -1416,6 +1428,17 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     });
   }
 
+  private buildEarlyGreenfieldTerminalBlockResult(command: string): string {
+    const starterFilepath = this.getCurrentPreferredGreenfieldBootstrapTarget();
+    return JSON.stringify({
+      command,
+      exitCode: 1,
+      blocked: true,
+      reason: 'prewrite_greenfield_terminal',
+      error: `Blocked command: do not use execute_terminal_command before the first real file write for this preferred-model greenfield task. Start by writing ${starterFilepath ? path.basename(starterFilepath) : 'the main source file'}.`
+    });
+  }
+
   private maybeNudgeAfterBlockedImmediateTerminal(messages: OllamaMessage[], toolName: string, toolResult: string): boolean {
     if (toolName !== 'execute_terminal_command') {
       return false;
@@ -1423,7 +1446,8 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
 
     try {
       const parsed = JSON.parse(toolResult) as Record<string, unknown>;
-      if (parsed.reason !== 'immediate_post_create_greenfield_terminal') {
+      const reason = String(parsed.reason ?? '');
+      if (reason !== 'immediate_post_create_greenfield_terminal' && reason !== 'prewrite_greenfield_terminal') {
         return false;
       }
     } catch {
@@ -1431,12 +1455,151 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     }
 
     this.debugLog('greenfield_terminal_blocked', { path: this.lastImmediateWritePath || null });
+    const starterFilepath = this.getCurrentPreferredGreenfieldBootstrapTarget();
     messages.push({
       role: 'user',
-      content: 'Do NOT run execute_terminal_command immediately after creating a file for this greenfield task. Continue with the next required file/tool step, or finish based on the code you already wrote.',
+      content: this.preferredGreenfieldSuccessfulWriteCount === 0
+        ? `Do NOT use execute_terminal_command yet for this greenfield task. Start by writing ${starterFilepath ? path.basename(starterFilepath) : 'the main source file'} with create_or_edit_file.`
+        : 'Do NOT run execute_terminal_command immediately after creating a file for this greenfield task. Continue with the next required file/tool step, or finish based on the code you already wrote.',
       hiddenFromTranscript: true
     });
     return true;
+  }
+
+  private getPreferredGreenfieldCodeDumpSpec(targetFilepath: string): { firstCodeLinePattern: RegExp; codeSignalPattern: RegExp; minLength: number; minSignalCount: number } | undefined {
+    const ext = path.extname(targetFilepath).toLowerCase();
+    if (ext === '.py') {
+      return {
+        firstCodeLinePattern: /^(?:import\s+\w|from\s+\w+\s+import\s+.+|def\s+\w+\(|class\s+\w+)/,
+        codeSignalPattern: /(?:\bdef\b|\bclass\b|\binput\s*\(|\brandom\b|\bwhile\b|\bfor\b|\bif\b|\belif\b|\breturn\b|\broll\b|\bdice\b)/g,
+        minLength: 120,
+        minSignalCount: 4
+      };
+    }
+    if (['.ts', '.tsx', '.mts', '.cts', '.js', '.jsx', '.mjs', '.cjs'].includes(ext)) {
+      return {
+        firstCodeLinePattern: /^(?:import\s+.+|export\s+.+|const\s+\w+|let\s+\w+|var\s+\w+|function\s+\w+|async\s+function\s+\w+|class\s+\w+|interface\s+\w+|type\s+\w+|enum\s+\w+)/,
+        codeSignalPattern: /(?:\bimport\b|\bexport\b|\bconst\b|\blet\b|\bvar\b|\bfunction\b|\bclass\b|=>|[{}();])/g,
+        minLength: 120,
+        minSignalCount: 4
+      };
+    }
+    if (ext === '.go') {
+      return {
+        firstCodeLinePattern: /^(?:package\s+\w+|import\s*\(|import\s+".+"|func\s+\w+|type\s+\w+)/,
+        codeSignalPattern: /(?:\bpackage\b|\bimport\b|\bfunc\b|\btype\b|\bstruct\b|\bif\b|\bfor\b|:=|[{}()])/g,
+        minLength: 120,
+        minSignalCount: 4
+      };
+    }
+    if (ext === '.rs') {
+      return {
+        firstCodeLinePattern: /^(?:use\s+\w+|fn\s+\w+|struct\s+\w+|enum\s+\w+|impl\s+\w+|mod\s+\w+)/,
+        codeSignalPattern: /(?:\buse\b|\bfn\b|\bstruct\b|\benum\b|\bimpl\b|\blet\b|\bmatch\b|[{}();])/g,
+        minLength: 120,
+        minSignalCount: 4
+      };
+    }
+    if (ext === '.java' || ext === '.kt' || ext === '.cs') {
+      return {
+        firstCodeLinePattern: /^(?:package\s+[\w.]+;?|import\s+[\w.*]+;?|using\s+[\w.]+;?|namespace\s+[\w.]+|public\s+class\s+\w+|class\s+\w+|object\s+\w+)/,
+        codeSignalPattern: /(?:\bpackage\b|\bimport\b|\busing\b|\bnamespace\b|\bclass\b|\bpublic\b|\bprivate\b|\bfun\b|\bstatic\b|[{}();])/g,
+        minLength: 140,
+        minSignalCount: 4
+      };
+    }
+    if (ext === '.php' || ext === '.rb' || ext === '.swift' || ext === '.c' || ext === '.cc' || ext === '.cpp' || ext === '.cxx' || ext === '.h' || ext === '.hpp' || ext === '.hh') {
+      return {
+        firstCodeLinePattern: /^(?:<\?php|#include\s+[<"].+[>"]|require\s+['"].+['"]|func\s+\w+|def\s+\w+|class\s+\w+|struct\s+\w+|int\s+main\s*\(|void\s+\w+\s*\()/,
+        codeSignalPattern: /(?:<\?php|#include\b|\brequire\b|\bdef\b|\bclass\b|\bfunc\b|\bstruct\b|\breturn\b|[{}();])/g,
+        minLength: 120,
+        minSignalCount: 4
+      };
+    }
+    if (ext === '.html' || ext === '.css' || ext === '.scss' || ext === '.sass' || ext === '.less') {
+      return {
+        firstCodeLinePattern: /^(?:<!doctype\s+html>|<html\b|<head\b|<body\b|<main\b|<div\b|<section\b|<style\b|[.#][\w-]+\s*\{)/i,
+        codeSignalPattern: /(?:<html\b|<body\b|<main\b|<div\b|<section\b|<script\b|<style\b|\{[^}]*\}|\bdisplay\s*:|\bcolor\s*:)/gi,
+        minLength: 120,
+        minSignalCount: 3
+      };
+    }
+    if (ext === '.json' || ext === '.jsonc' || ext === '.yaml' || ext === '.yml' || ext === '.sh') {
+      return {
+        firstCodeLinePattern: /^(?:\{|\[|\w+\s*:|#!\/bin\/(?:bash|sh)|set\s+-[a-z]+|[A-Za-z_][A-Za-z0-9_]*=)/,
+        codeSignalPattern: /(?:\{|\[|\]|\}|:\s|#!\/bin\/(?:bash|sh)|\bif\b|\bfi\b|\bthen\b|\bexport\b|\=)/g,
+        minLength: 80,
+        minSignalCount: 3
+      };
+    }
+    return undefined;
+  }
+
+  private extractPreferredGreenfieldCodeDump(content: string): { filepath: string; content: string } | undefined {
+    const targetFilepath = this.getCurrentPreferredGreenfieldBootstrapTarget();
+    if (!targetFilepath || !this.isSyntaxRelevantFilePath(targetFilepath) || this.preferredGreenfieldSuccessfulWriteCount > 0) {
+      return undefined;
+    }
+
+    const spec = this.getPreferredGreenfieldCodeDumpSpec(targetFilepath);
+    if (!spec) {
+      return undefined;
+    }
+
+    const normalized = content.replace(/\r\n/g, '\n').trim();
+    if (!normalized) {
+      return undefined;
+    }
+
+    const fencedCandidates = Array.from(normalized.matchAll(/```(?:[\w+-]+)?\n([\s\S]*?)```/g), match => match[1].trim()).filter(Boolean);
+    for (const block of [normalized, ...fencedCandidates]) {
+      const lines = block.split('\n');
+      const firstCodeIndex = lines.findIndex(line => spec.firstCodeLinePattern.test(line.trim()));
+      if (firstCodeIndex < 0) {
+        continue;
+      }
+
+      const candidate = lines.slice(firstCodeIndex).join('\n').trim();
+      if (candidate.length < spec.minLength) {
+        continue;
+      }
+
+      const codeSignalCount = (candidate.match(spec.codeSignalPattern) ?? []).length;
+      if (codeSignalCount < spec.minSignalCount) {
+        continue;
+      }
+
+      if (this.detectInsufficientGreenfieldCreateContent(targetFilepath, candidate)) {
+        continue;
+      }
+
+      return { filepath: targetFilepath, content: candidate };
+    }
+
+    return undefined;
+  }
+
+  private async tryBootstrapPreferredGreenfieldCodeDump(messages: OllamaMessage[], content: string): Promise<boolean> {
+    const candidate = this.extractPreferredGreenfieldCodeDump(content);
+    if (!candidate) {
+      return false;
+    }
+
+    this.debugLog('preferred_greenfield_code_bootstrap', {
+      model: this.getSelectedModel(),
+      filepath: candidate.filepath,
+      contentPreview: candidate.content.substring(0, 200)
+    });
+
+    return await this.executeSyntheticBootstrapToolCall(messages, content, {
+      function: {
+        name: 'create_or_edit_file',
+        arguments: {
+          filename: candidate.filepath,
+          content: candidate.content
+        }
+      }
+    });
   }
 
   private async tryHandleDirectLicenseAuthorRename(text: string): Promise<FileWriteSummary | undefined> {
@@ -1660,14 +1823,56 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     if (/\bpython\b|\bpy\b/i.test(normalized) || normalized.includes('пайтон') || normalized.includes('питон') || normalized.includes('піто')) {
       return 'main.py';
     }
+    if (/\bgo\b|\bgolang\b/i.test(normalized)) {
+      return 'main.go';
+    }
+    if (/\brust\b|\brs\b/i.test(normalized)) {
+      return 'main.rs';
+    }
+    if (/\bjava\b/i.test(normalized)) {
+      return 'Main.java';
+    }
+    if (/\bkotlin\b|\bkt\b/i.test(normalized)) {
+      return 'Main.kt';
+    }
+    if (/\bc#\b|\bcsharp\b|\bdotnet\b|\.net\b|\bcs\b/i.test(normalized)) {
+      return 'Program.cs';
+    }
     if (/\btypescript\b|\btype script\b|\bts\b/i.test(normalized)) {
       return 'main.ts';
     }
     if (/\bjavascript\b|\bnode\b|\bjs\b/i.test(normalized)) {
       return 'main.js';
     }
+    if (/\bphp\b/i.test(normalized)) {
+      return 'index.php';
+    }
+    if (/\bruby\b|\brb\b/i.test(normalized)) {
+      return 'main.rb';
+    }
+    if (/\bswift\b/i.test(normalized)) {
+      return 'main.swift';
+    }
+    if (/\bc\+\+\b|\bcpp\b|\bcxx\b/i.test(normalized)) {
+      return 'main.cpp';
+    }
+    if (/\bc\b/i.test(normalized)) {
+      return 'main.c';
+    }
     if (/\bhtml\b|\bweb\s*page\b|\blanding\b/i.test(normalized)) {
       return 'index.html';
+    }
+    if (/\bcss\b|\bscss\b|\bsass\b|\bless\b/i.test(normalized)) {
+      return 'styles.css';
+    }
+    if (/\bjson\b/i.test(normalized)) {
+      return 'data.json';
+    }
+    if (/\byaml\b|\byml\b/i.test(normalized)) {
+      return 'config.yaml';
+    }
+    if (/\bshell\b|\bbash\b|\bsh\b|\bscript\b/i.test(normalized)) {
+      return 'main.sh';
     }
 
     return 'main.txt';
@@ -2201,6 +2406,10 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       });
       this.postStatus('Raw tool call leaked into the response — nudging model to execute the tool...');
       await this.processOllamaResponse(messages, retryCount);
+      return;
+    }
+
+    if (await this.tryBootstrapPreferredGreenfieldCodeDump(messages, finalContent)) {
       return;
     }
 
@@ -4904,6 +5113,12 @@ If the user asks for a change but provides NO code:
         case 'replace_in_file':
           return await this.replaceInFile(String(args.filepath ?? ''), String(args.old_text ?? ''), String(args.new_text ?? ''));
         case 'execute_terminal_command':
+          if (this.shouldApplyPreferredGreenfieldGuards()
+            && this.currentRequestLooksLikeRecoverableGreenfieldCode()
+            && this.preferredGreenfieldSuccessfulWriteCount === 0
+            && !isTerminalReadOnlyInspectionCommand(String(args.command ?? ''))) {
+            return this.buildEarlyGreenfieldTerminalBlockResult(String(args.command ?? ''));
+          }
           if (this.shouldApplyPreferredGreenfieldGuards() && this.blockImmediateTerminalAfterWrite) {
             return this.buildImmediatePostCreateTerminalBlockResult(String(args.command ?? ''));
           }
@@ -5077,14 +5292,62 @@ If the user asks for a change but provides NO code:
       && (message.tool_name === 'create_or_edit_file' || message.tool_name === 'replace_in_file' || message.tool_name === 'write_to_file')
     )?.content;
     let latestWriteExt = '';
+    let latestWritePath = '';
     if (latestWriteRaw) {
       try {
         const parsed = JSON.parse(latestWriteRaw) as Record<string, unknown>;
-        latestWriteExt = path.extname(String(parsed.path ?? '')).toLowerCase();
+        latestWritePath = String(parsed.path ?? '');
+        latestWriteExt = path.extname(latestWritePath).toLowerCase();
       } catch {
+        latestWritePath = '';
         latestWriteExt = '';
       }
     }
+
+    const collectSyntaxDiagnostics = async (filepath: string): Promise<vscode.Diagnostic[]> => {
+      try {
+        const targetUri = vscode.Uri.file(filepath);
+        await vscode.workspace.openTextDocument(targetUri);
+        for (let attempt = 0; attempt < 5; attempt += 1) {
+          const diagnostics = vscode.languages.getDiagnostics(targetUri)
+            .filter(diagnostic => diagnostic.severity === vscode.DiagnosticSeverity.Error);
+          if (diagnostics.length > 0 || attempt === 4) {
+            return diagnostics;
+          }
+          await new Promise(resolve => setTimeout(resolve, 150));
+        }
+      } catch {
+        // Ignore diagnostic probing failures and fall back to terminal verification.
+      }
+      return [];
+    };
+
+    const formatDiagnostics = (filepath: string, diagnostics: vscode.Diagnostic[]): string => {
+      const relativePath = vscode.workspace.asRelativePath(filepath, false) || path.basename(filepath);
+      return diagnostics.slice(0, 20).map(diagnostic => {
+        const line = diagnostic.range.start.line + 1;
+        const column = diagnostic.range.start.character + 1;
+        const source = diagnostic.source ? `[${diagnostic.source}] ` : '';
+        return `${relativePath}:${line}:${column} ${source}${diagnostic.message}`.replace(/\s+/g, ' ').trim();
+      }).join('\n');
+    };
+
+    const buildStandaloneSyntaxVerifyCommand = (filepath: string): string | undefined => {
+      const quotedPath = JSON.stringify(filepath);
+      if (latestWriteExt === '.py') {
+        return `python -m py_compile ${quotedPath} 2>&1 | head -30`;
+      }
+      if (['.js', '.jsx', '.mjs', '.cjs'].includes(latestWriteExt)) {
+        return `node --check ${quotedPath} 2>&1 | head -30`;
+      }
+      if (['.ts', '.tsx', '.mts', '.cts'].includes(latestWriteExt)) {
+        return `npx tsc --pretty false --noEmit ${quotedPath} 2>&1 | head -30`;
+      }
+      if (latestWriteExt === '.go') {
+        return `gofmt -d ${quotedPath} 2>&1 | head -30`;
+      }
+      return undefined;
+    };
 
     const pickPackageManager = async (): Promise<'npm' | 'pnpm' | 'yarn' | 'bun'> => {
       if (await exists('pnpm-lock.yaml')) {
@@ -5112,20 +5375,17 @@ If the user asks for a change but provides NO code:
       return dotnetProjects.length > 0;
     };
 
-    if (latestWriteExt === '.py' && !(await hasPythonProjectMarkers())) {
-      return null;
-    }
-    if (latestWriteExt === '.go' && !(await exists('go.mod'))) {
-      return null;
-    }
-    if (latestWriteExt === '.rs' && !(await exists('Cargo.toml'))) {
-      return null;
-    }
-    if ((latestWriteExt === '.java' || latestWriteExt === '.kt') && !(await hasJavaProjectMarkers())) {
-      return null;
-    }
-    if (latestWriteExt === '.cs' && !(await hasDotnetProjectMarkers())) {
-      return null;
+    let syntaxVerificationSummary = '';
+    if (latestWritePath && this.isSyntaxRelevantFilePath(latestWritePath)) {
+      const diagnostics = await collectSyntaxDiagnostics(latestWritePath);
+      const relativePath = vscode.workspace.asRelativePath(latestWritePath, false) || path.basename(latestWritePath);
+      if (diagnostics.length > 0) {
+        return {
+          ok: false,
+          output: `Syntax verification failed for ${relativePath}:\n${formatDiagnostics(latestWritePath, diagnostics)}`
+        };
+      }
+      syntaxVerificationSummary = `Syntax verification passed for ${relativePath}.`;
     }
 
     const scriptCommand = (pm: 'npm' | 'pnpm' | 'yarn' | 'bun', scriptName: string): string => {
@@ -5187,8 +5447,12 @@ If the user asks for a change but provides NO code:
       command = 'dotnet build -nologo 2>&1 | head -30';
     }
 
+    if (!command && latestWritePath && this.isSyntaxRelevantFilePath(latestWritePath)) {
+      command = buildStandaloneSyntaxVerifyCommand(latestWritePath);
+    }
+
     if (!command) {
-      return null;
+      return syntaxVerificationSummary ? { ok: true, output: syntaxVerificationSummary } : null;
     }
 
     try {
@@ -5196,11 +5460,11 @@ If the user asks for a change but provides NO code:
       const parsed = JSON.parse(raw) as Record<string, unknown>;
       const stdout = String(parsed.stdout ?? '').trim();
       const stderr = String(parsed.stderr ?? '').trim();
-      const output = [stdout, stderr].filter(Boolean).join('\n').trim();
+      const output = [syntaxVerificationSummary, stdout, stderr].filter(Boolean).join('\n').trim();
       const exitCode = Number(parsed.exitCode ?? 1);
       return { ok: exitCode === 0, output };
     } catch {
-      return null;
+      return syntaxVerificationSummary ? { ok: true, output: syntaxVerificationSummary } : null;
     }
   }
 
