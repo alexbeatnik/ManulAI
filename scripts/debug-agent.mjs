@@ -528,6 +528,76 @@ function resolveFilepathInfo(fp, options = {}) {
   return { path: resolved, recoveredToTarget: false, originalPath };
 }
 
+function normalizeRequestTargetIntoWorkspace(targetPath) {
+  const normalizedTarget = String(targetPath ?? '').trim().replace(/\\/g, '/');
+  if (!normalizedTarget) return '';
+  if (path.isAbsolute(normalizedTarget)) return path.normalize(normalizedTarget);
+  const trimmedTarget = normalizedTarget
+    .replace(/^\.\//, '')
+    .replace(/^\.[/\\]/, '')
+    .replace(/^[/\\]+/, '');
+  return path.normalize(path.join(wsRoot, trimmedTarget));
+}
+
+function getExplicitWriteRequestTargets() {
+  if (!looksLikeWriteIntent(userPrompt)) return [];
+  const seen = new Set();
+  const targets = [];
+  for (const requestTarget of extractLikelyRequestFileTargets(userPrompt)) {
+    const absoluteTarget = normalizeRequestTargetIntoWorkspace(requestTarget);
+    if (!absoluteTarget) continue;
+    const withinWorkspace = absoluteTarget === wsRoot || absoluteTarget.startsWith(`${wsRoot}${path.sep}`);
+    if (!withinWorkspace) continue;
+    const comparableTarget = path.normalize(absoluteTarget).replace(/\\/g, '/').toLowerCase();
+    if (seen.has(comparableTarget)) continue;
+    seen.add(comparableTarget);
+    targets.push(absoluteTarget);
+  }
+  return targets;
+}
+
+function targetExistsForCreateRecovery(targetPath) {
+  return dryRunFiles.has(targetPath) || existsSync(targetPath);
+}
+
+function recoverRequestScopedCreatePath(requestedPath) {
+  const explicitTargets = getExplicitWriteRequestTargets();
+  if (!requestedPath || explicitTargets.length === 0) return {};
+
+  const requestedAbsolute = resolveFilepath(requestedPath);
+  if (!requestedAbsolute) return {};
+
+  const comparableRequested = path.normalize(requestedAbsolute).replace(/\\/g, '/').toLowerCase();
+  if (explicitTargets.some(target => path.normalize(target).replace(/\\/g, '/').toLowerCase() === comparableRequested)) {
+    return { resolvedPath: requestedAbsolute };
+  }
+
+  const requestedBasename = path.basename(requestedAbsolute).toLowerCase();
+  const basenameMatches = explicitTargets.filter(target => path.basename(target).toLowerCase() === requestedBasename);
+  if (basenameMatches.length === 1) {
+    return { resolvedPath: basenameMatches[0], recoveredFrom: String(requestedPath) };
+  }
+
+  const requestedExtension = path.extname(requestedAbsolute).toLowerCase();
+  if (!requestedExtension) {
+    if (explicitTargets.length === 1) {
+      return { resolvedPath: explicitTargets[0], recoveredFrom: String(requestedPath) };
+    }
+    return {};
+  }
+
+  const sameExtensionTargets = explicitTargets.filter(target => path.extname(target).toLowerCase() === requestedExtension);
+  const missingSameExtensionTargets = sameExtensionTargets.filter(target => !targetExistsForCreateRecovery(target));
+  if (missingSameExtensionTargets.length === 1) {
+    return { resolvedPath: missingSameExtensionTargets[0], recoveredFrom: String(requestedPath) };
+  }
+  if (sameExtensionTargets.length === 1) {
+    return { resolvedPath: sameExtensionTargets[0], recoveredFrom: String(requestedPath) };
+  }
+
+  return {};
+}
+
 function findNearestProjectRoot(startPath) {
   const startDir = path.dirname(startPath);
   const markers = ['package.json', 'tsconfig.json', 'pyproject.toml', 'requirements.txt', 'setup.py', 'Cargo.toml', 'go.mod', 'pom.xml', 'build.gradle', 'build.gradle.kts', 'gradlew'];
@@ -1373,7 +1443,8 @@ async function executeTool(name, args) {
     }
 
     case 'create_or_edit_file': {
-      const fp = resolveFilepath(args.filename ?? args.filepath ?? '');
+      const recoveredCreateTarget = recoverRequestScopedCreatePath(args.filename ?? args.filepath ?? '');
+      const fp = recoveredCreateTarget.resolvedPath ?? resolveFilepath(args.filename ?? args.filepath ?? '');
       let content = String(args.content ?? '');
       if (!fp) return JSON.stringify({ error: 'filename is required.' });
       const withinWorkspace = fp === wsRoot || fp.startsWith(`${wsRoot}${path.sep}`);
@@ -1467,10 +1538,21 @@ async function executeTool(name, args) {
       if (DRY_RUN) {
         label(Y, 'DRY-RUN write', `${fp}\n  ${content.substring(0, 150).replace(/\n/g, '\n  ')}${content.length > 150 ? '\n  ...' : ''}`);
         dryRunFiles.set(fp, content); // cache for reads
-        return JSON.stringify({ path: fp, bytesWritten: content.length, preview: content.substring(0, 80), dryRun: true });
+        return JSON.stringify({
+          path: fp,
+          bytesWritten: content.length,
+          preview: content.substring(0, 80),
+          dryRun: true,
+          ...(recoveredCreateTarget.recoveredFrom ? { note: `Recovered requested path ${recoveredCreateTarget.recoveredFrom} to exact target ${fp}. Use this exact target path for subsequent reads and edits.` } : {})
+        });
       }
       writeFileSync(fp, content, 'utf8');
-      return JSON.stringify({ path: fp, bytesWritten: content.length, preview: content.substring(0, 80) });
+      return JSON.stringify({
+        path: fp,
+        bytesWritten: content.length,
+        preview: content.substring(0, 80),
+        ...(recoveredCreateTarget.recoveredFrom ? { note: `Recovered requested path ${recoveredCreateTarget.recoveredFrom} to exact target ${fp}. Use this exact target path for subsequent reads and edits.` } : {})
+      });
     }
 
     case 'replace_in_file': {
@@ -1708,7 +1790,7 @@ function extractLikelyRequestFileTargets(text) {
   };
 
   let match;
-  const explicitPathPattern = /(?:^|\s)((?:[A-Za-z]:)?[A-Za-z0-9_./\\-]+\.(?:ts|tsx|js|jsx|json|md|css|scss|html|py|yml|yaml|xml|txt|sh|toml|ini))(?:\s|$)/gi;
+  const explicitPathPattern = /(?:^|\s)((?:[A-Za-z]:)?[A-Za-z0-9_./\\-]+\.(?:ts|tsx|js|jsx|json|md|css|scss|html|py|yml|yaml|xml|txt|sh|toml|ini|go))(?:\s|$|[,.;:!?])/gi;
   while ((match = explicitPathPattern.exec(text)) !== null) {
     pushCandidate(match[1]);
   }

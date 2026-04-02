@@ -157,6 +157,7 @@ The extension now pushes stricter file-editing rules into the agent prompt:
 - for ultra-small tiers, do not plan at all; execute one bounded action immediately
 - do not declare success unless all required steps ran and the relevant tool calls succeeded
 - if the user explicitly requested multiple target files, do not declare success until each requested file has a real successful write result
+- if the user explicitly requested concrete file paths, recover shallow or wrong-directory create writes back toward those exact requested targets instead of accepting repo-root aliases like `main.js`
 - do not modify a file before reading it first
 - if unsure, read more files and gather more context instead of guessing
 - for large refactor requests, inspect structure first, then split the work into small module/file steps instead of attempting a one-shot rewrite

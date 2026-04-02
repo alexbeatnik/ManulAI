@@ -1118,7 +1118,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     };
 
     let match: RegExpExecArray | null;
-    const explicitPathPattern = /(?:^|\s)((?:[A-Za-z]:)?[A-Za-z0-9_./\\-]+\.(?:ts|tsx|js|jsx|json|md|css|scss|html|py|yml|yaml|xml|txt|sh|toml|ini))(?:\s|$)/gi;
+    const explicitPathPattern = /(?:^|\s)((?:[A-Za-z]:)?[A-Za-z0-9_./\\-]+\.(?:ts|tsx|js|jsx|json|md|css|scss|html|py|yml|yaml|xml|txt|sh|toml|ini|go))(?:\s|$|[,.;:!?])/gi;
     while ((match = explicitPathPattern.exec(text)) !== null) {
       pushCandidate(match[1]);
     }
@@ -1294,6 +1294,124 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         recoveredFrom: normalizedTarget
       };
     }
+  }
+
+  private normalizeRequestTargetIntoWorkspace(targetPath: string, workspaceRoot: string): string {
+    const normalizedTarget = targetPath.trim().replace(/\\/g, '/');
+    if (path.isAbsolute(normalizedTarget)) {
+      return path.normalize(normalizedTarget);
+    }
+
+    const trimmedTarget = normalizedTarget
+      .replace(/^\.\//, '')
+      .replace(/^\.[/\\]/, '')
+      .replace(/^[/\\]+/, '');
+    return path.normalize(path.join(workspaceRoot, trimmedTarget));
+  }
+
+  private getRequestScopedWriteTargets(): string[] {
+    if (!this.currentRequestRequiresWrite) {
+      return [];
+    }
+
+    const latestVisibleUserRequest = this.getLatestVisibleUserRequest(this.messages);
+    const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    if (!latestVisibleUserRequest || !workspaceRoot) {
+      return [];
+    }
+
+    const seen = new Set<string>();
+    const targets: string[] = [];
+    for (const requestTarget of this.extractLikelyRequestFileTargets(latestVisibleUserRequest)) {
+      const absoluteTarget = this.normalizeRequestTargetIntoWorkspace(requestTarget, workspaceRoot);
+      if (!this.isPathInsideWorkspace(absoluteTarget)) {
+        continue;
+      }
+
+      const normalizedComparable = this.normalizeComparablePath(absoluteTarget);
+      if (seen.has(normalizedComparable)) {
+        continue;
+      }
+
+      seen.add(normalizedComparable);
+      targets.push(absoluteTarget);
+    }
+
+    return targets;
+  }
+
+  private async pathExists(fsPath: string): Promise<boolean> {
+    try {
+      await vscode.workspace.fs.stat(vscode.Uri.file(fsPath));
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  private async recoverRequestScopedCreateTargetPath(targetPath: string): Promise<{ resolvedPath?: string; recoveredFrom?: string }> {
+    const normalizedTarget = targetPath.trim();
+    if (!normalizedTarget) {
+      return {};
+    }
+
+    const requestTargets = this.getRequestScopedWriteTargets();
+    const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    if (requestTargets.length === 0 || !workspaceRoot) {
+      return {};
+    }
+
+    const requestedAbsolute = path.normalize(path.isAbsolute(normalizedTarget)
+      ? normalizedTarget
+      : path.join(workspaceRoot, normalizedTarget));
+    const normalizedRequested = this.normalizeComparablePath(requestedAbsolute);
+    if (requestTargets.some(requestTarget => this.normalizeComparablePath(requestTarget) === normalizedRequested)) {
+      return { resolvedPath: requestedAbsolute };
+    }
+
+    const requestedBasename = path.basename(requestedAbsolute).toLowerCase();
+    const basenameMatches = requestTargets.filter(requestTarget => path.basename(requestTarget).toLowerCase() === requestedBasename);
+    if (basenameMatches.length === 1) {
+      return {
+        resolvedPath: basenameMatches[0],
+        recoveredFrom: normalizedTarget
+      };
+    }
+
+    const requestedExtension = path.extname(requestedAbsolute).toLowerCase();
+    if (!requestedExtension) {
+      if (requestTargets.length === 1) {
+        return {
+          resolvedPath: requestTargets[0],
+          recoveredFrom: normalizedTarget
+        };
+      }
+      return {};
+    }
+
+    const sameExtensionTargets = requestTargets.filter(requestTarget => path.extname(requestTarget).toLowerCase() === requestedExtension);
+    const missingSameExtensionTargets: string[] = [];
+    for (const requestTarget of sameExtensionTargets) {
+      if (!await this.pathExists(requestTarget)) {
+        missingSameExtensionTargets.push(requestTarget);
+      }
+    }
+
+    if (missingSameExtensionTargets.length === 1) {
+      return {
+        resolvedPath: missingSameExtensionTargets[0],
+        recoveredFrom: normalizedTarget
+      };
+    }
+
+    if (sameExtensionTargets.length === 1) {
+      return {
+        resolvedPath: sameExtensionTargets[0],
+        recoveredFrom: normalizedTarget
+      };
+    }
+
+    return {};
   }
 
   private async validateRequestScopedCreatePath(requestedPath: string, resolvedFsPath: string): Promise<string | undefined> {
@@ -5470,6 +5588,11 @@ If the user asks for a change but provides NO code:
     }
 
     if (allowCreate) {
+      const recoveredCreateTarget = await this.recoverRequestScopedCreateTargetPath(normalizedTarget);
+      if (recoveredCreateTarget.resolvedPath) {
+        return vscode.Uri.file(recoveredCreateTarget.resolvedPath);
+      }
+
       const requestScopedCreateUri = await this.resolveRequestScopedCreateUri(normalizedTarget);
       return requestScopedCreateUri ?? directUri;
     }
@@ -6046,6 +6169,7 @@ If the user asks for a change but provides NO code:
     }
 
     try {
+      const recoveredCreateTarget = await this.recoverRequestScopedCreateTargetPath(filename);
       const targetUri = await this.resolveWorkspaceUriForOperation(filename, true);
       const pathGuardError = await this.validateRequestScopedCreatePath(filename, targetUri.fsPath);
       if (pathGuardError) {
@@ -6103,7 +6227,8 @@ If the user asks for a change but provides NO code:
         bytesWritten: Buffer.byteLength(sanitizedContent, 'utf8'),
         preview: oldContent === undefined || !oldContent.trim() ? buildPreviewSnippet(sanitizedContent) : undefined,
         diff,
-        revertOperationId
+        revertOperationId,
+        ...(recoveredCreateTarget.recoveredFrom ? { note: this.buildRecoveredTargetNote(recoveredCreateTarget.recoveredFrom, targetUri.fsPath) } : {})
       });
     } catch (error) {
       return JSON.stringify({
