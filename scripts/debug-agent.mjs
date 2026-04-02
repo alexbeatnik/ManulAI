@@ -219,6 +219,11 @@ function isSyntaxRelevantFilePath(filepath) {
   ]).has(ext);
 }
 
+function isGreenfieldSourceFilePath(filepath) {
+  const ext = path.extname(filepath || '').toLowerCase();
+  return isSyntaxRelevantFilePath(filepath) && !['.json', '.jsonc', '.yaml', '.yml'].includes(ext);
+}
+
 function looksLikeGreenfieldCreateTask(text) {
   const normalized = text.trim().toLowerCase();
   if (!normalized || !looksLikeWriteIntent(text)) return false;
@@ -258,6 +263,17 @@ function buildEarlyGreenfieldTerminalBlockResult(command) {
     reason: 'prewrite_greenfield_terminal',
     error: `Blocked command: do not use execute_terminal_command before the first real file write for this preferred-model greenfield task. Start by writing ${PREFERRED_GREENFIELD_BOOTSTRAP_FILEPATH ? path.basename(PREFERRED_GREENFIELD_BOOTSTRAP_FILEPATH) : 'the main source file'}.`
   });
+}
+
+function isTerminalReadOnlyInspectionCommand(command) {
+  const trimmed = String(command ?? '').trim();
+  const normalized = trimmed.toLowerCase();
+  if (!normalized) return false;
+  if (/[;&|<>`\n\r]|\$\(|\b-exec\b/.test(trimmed)) return false;
+  if (/\bsed\b[^\n]*\s-i\b/.test(normalized)) return false;
+  return /^(?:cat|head|tail|sed|grep|rg|less|more|ls|find)\b/.test(normalized)
+    || /(?:\bcat\b|\bhead\b|\btail\b|\bsed\b|\bgrep\b|\brg\b).*\bmanulaichatprovider\.ts\b/.test(normalized)
+    || /^ls(?:\b|\b.*-)/.test(normalized);
 }
 
 function getDeterministicGreenfieldTargetPath() {
@@ -305,13 +321,36 @@ function isGlobalPackageInstallCommand(command) {
   return /(?:^|\b)(?:npm\s+(?:install|i|add)\s+-g\b|pnpm\s+add\s+-g\b|yarn\s+global\s+add\b|bun\s+add\s+-g\b)/.test(normalized);
 }
 
+async function runTerminalCommandDirect(command) {
+  try {
+    const { stdout, stderr } = await execAsync(command, { cwd: wsRoot, timeout: 30_000, maxBuffer: 1024 * 512 });
+    return JSON.stringify({ command, exitCode: 0, stdout, stderr });
+  } catch (e) {
+    let errorMessage = e.message;
+    if (e.killed) {
+      errorMessage = 'Command timed out after 30 seconds. No stdin available — interactive programs (input(), readline) will always hang.';
+    }
+    return JSON.stringify({ command, exitCode: e.code ?? 1, stdout: e.stdout ?? '', stderr: e.stderr ?? '', error: errorMessage });
+  }
+}
+
 function detectInsufficientGreenfieldCreateContent(filepath, content) {
   if (!IS_PREFERRED_GREENFIELD_REQUEST) return undefined;
 
-  const ext = path.extname(filepath).toLowerCase();
-  if (!isSyntaxRelevantFilePath(filepath)) return undefined;
-
   const nonEmptyLines = content.replace(/\r\n/g, '\n').split('\n').map(line => line.trim()).filter(Boolean);
+  const ext = path.extname(filepath).toLowerCase();
+  if (!isGreenfieldSourceFilePath(filepath)) {
+    const codeLikeLines = nonEmptyLines.filter(line =>
+      !/^(?:\/\/|\/\*|\*|#|<!--)/.test(line)
+      && (/(?:^|\s)(?:export|import|const|let|var|function|class|interface|type|enum|async|def|struct|impl|package|namespace|using|return)\b/.test(line)
+        || /[{}();=]/.test(line))
+    );
+    if (IS_CODE_PREFERRED_GREENFIELD_REQUEST && codeLikeLines.length > 0) {
+      return 'Blocked write: source code for a greenfield task must go into a real source file, not a generic text or data file. Write the implementation to the correct .py, .ts, .js, .go, .rs, .java, .cs, or similar source file path.';
+    }
+    return undefined;
+  }
+
   if (nonEmptyLines.length === 0) {
     return 'Blocked write: greenfield file content is empty. Write the actual implementation instead of an empty scaffold.';
   }
@@ -520,12 +559,41 @@ function scriptCommand(pm, scriptName) {
   return `bun run ${scriptName} 2>&1 | head -30`;
 }
 
+function isProjectVerificationManifestFile(targetPath) {
+  const basename = path.basename(targetPath || '').toLowerCase();
+  return basename === 'package.json'
+    || basename === 'tsconfig.json'
+    || basename === 'pyproject.toml'
+    || basename === 'requirements.txt'
+    || basename === 'setup.py'
+    || basename === 'cargo.toml'
+    || basename === 'go.mod'
+    || basename === 'pom.xml'
+    || basename === 'build.gradle'
+    || basename === 'build.gradle.kts'
+    || basename === 'gradlew'
+    || basename.endsWith('.sln')
+    || basename.endsWith('.csproj');
+}
+
 function pickVerifyCommandForPath(targetPath) {
   const projectRoot = findNearestProjectRoot(targetPath);
   const latestExt = path.extname(targetPath || '').toLowerCase();
   const hasPythonProjectMarkers = existsSync(path.join(projectRoot, 'pyproject.toml')) || existsSync(path.join(projectRoot, 'requirements.txt')) || existsSync(path.join(projectRoot, 'setup.py'));
   const hasJavaProjectMarkers = existsSync(path.join(projectRoot, 'pom.xml')) || existsSync(path.join(projectRoot, 'build.gradle')) || existsSync(path.join(projectRoot, 'build.gradle.kts'));
   const hasDotnetProjectMarkers = existsSync(projectRoot) && readdirSafe(projectRoot).some(name => name.endsWith('.sln') || name.endsWith('.csproj'));
+  const shouldPreferStandaloneSyntaxVerification = IS_PREFERRED_GREENFIELD_REQUEST && isGreenfieldSourceFilePath(targetPath);
+
+  const quotedTargetPath = JSON.stringify(targetPath);
+  if (IS_PREFERRED_GREENFIELD_REQUEST && !isGreenfieldSourceFilePath(targetPath) && !isProjectVerificationManifestFile(targetPath)) {
+    return null;
+  }
+  if (shouldPreferStandaloneSyntaxVerification) {
+    if (latestExt === '.py') return { command: `python -m py_compile ${quotedTargetPath} 2>&1 | head -30`, projectRoot, stack: 'python-file' };
+    if (['.js', '.jsx', '.mjs', '.cjs'].includes(latestExt)) return { command: `node --check ${quotedTargetPath} 2>&1 | head -30`, projectRoot, stack: 'javascript-file' };
+    if (['.ts', '.tsx', '.mts', '.cts'].includes(latestExt)) return { command: `npx tsc --pretty false --noEmit ${quotedTargetPath} 2>&1 | head -30`, projectRoot, stack: 'typescript-file' };
+    if (latestExt === '.go') return { command: `gofmt -d ${quotedTargetPath} 2>&1 | head -30`, projectRoot, stack: 'go-file' };
+  }
 
   const packageJsonPath = path.join(projectRoot, 'package.json');
   if (existsSync(packageJsonPath)) {
@@ -549,7 +617,6 @@ function pickVerifyCommandForPath(targetPath) {
     return { command: existsSync(path.join(projectRoot, 'gradlew')) ? './gradlew -q build -x test 2>&1 | head -30' : 'gradle -q build -x test 2>&1 | head -30', projectRoot, stack: 'java/gradle' };
   }
   if (hasDotnetProjectMarkers) return { command: 'dotnet build -nologo 2>&1 | head -30', projectRoot, stack: '.net' };
-  const quotedTargetPath = JSON.stringify(targetPath);
   if (latestExt === '.py') return { command: `python -m py_compile ${quotedTargetPath} 2>&1 | head -30`, projectRoot, stack: 'python-file' };
   if (['.js', '.jsx', '.mjs', '.cjs'].includes(latestExt)) return { command: `node --check ${quotedTargetPath} 2>&1 | head -30`, projectRoot, stack: 'javascript-file' };
   if (['.ts', '.tsx', '.mts', '.cts'].includes(latestExt)) return { command: `npx tsc --pretty false --noEmit ${quotedTargetPath} 2>&1 | head -30`, projectRoot, stack: 'typescript-file' };
@@ -1250,7 +1317,7 @@ async function executeTool(name, args) {
     }
 
     case 'read_file_slice': {
-      const pathInfo = resolveFilepathInfo(args.filepath, { recoverTarget: true });
+      const pathInfo = resolveFilepathInfo(args.filepath ?? args.filename, { recoverTarget: true });
       const fp = pathInfo.path;
       try {
         // In DRY_RUN mode, serve from cache if file was written in this session
@@ -1271,7 +1338,7 @@ async function executeTool(name, args) {
     }
 
     case 'read_specific_file': {
-      const pathInfo = resolveFilepathInfo(args.filepath, { recoverTarget: true });
+      const pathInfo = resolveFilepathInfo(args.filepath ?? args.filename, { recoverTarget: true });
       const fp = pathInfo.path;
       try {
         // In DRY_RUN mode, serve from cache if file was written in this session
@@ -1457,25 +1524,16 @@ async function executeTool(name, args) {
     }
 
     case 'execute_terminal_command': {
-      const cmd = String(args.command ?? '');
+      const cmd = String(args.command ?? args.cmd ?? '');
       if (!cmd) return JSON.stringify({ error: 'command is required.' });
       if (IS_CODE_PREFERRED_GREENFIELD_REQUEST && preferredGreenfieldSuccessfulWriteCount === 0 && !isTerminalReadOnlyInspectionCommand(cmd)) {
         return buildEarlyGreenfieldTerminalBlockResult(cmd);
       }
-      try {
-        const { stdout, stderr } = await execAsync(cmd, { cwd: wsRoot, timeout: 30_000, maxBuffer: 1024 * 512 });
-        return JSON.stringify({ command: cmd, exitCode: 0, stdout, stderr });
-      } catch (e) {
-        let errorMessage = e.message;
-        if (e.killed) {
-          errorMessage = 'Command timed out after 30 seconds. No stdin available — interactive programs (input(), readline) will always hang.';
-        }
-        return JSON.stringify({ command: cmd, exitCode: e.code ?? 1, stdout: e.stdout ?? '', stderr: e.stderr ?? '', error: errorMessage });
-      }
+      return await runTerminalCommandDirect(cmd);
     }
 
     case 'launch_in_terminal': {
-      const cmd = String(args.command ?? '');
+      const cmd = String(args.command ?? args.cmd ?? '');
       if (!cmd) return JSON.stringify({ error: 'command is required.' });
       console.log(`[LAUNCH_IN_TERMINAL] ${cmd}`);
       return JSON.stringify({ launched: true, command: cmd, note: 'In debug mode, interactive launch is simulated. In VS Code, this opens a real terminal.' });
@@ -2758,9 +2816,9 @@ let args = rawArgs;
         blockImmediateTerminalAfterWrite = false;
       }
 
-      if (toolName === 'execute_terminal_command' && isGlobalPackageInstallCommand(String(args.command ?? ''))) {
-        const blockedResult = buildGlobalInstallBlockResult(String(args.command ?? ''));
-        label(Y, '  BLOCK GLOBAL INSTALL', String(args.command ?? ''));
+      if ((toolName === 'execute_terminal_command' || toolName === 'launch_in_terminal') && isGlobalPackageInstallCommand(String(args.command ?? args.cmd ?? ''))) {
+        const blockedResult = buildGlobalInstallBlockResult(String(args.command ?? args.cmd ?? ''));
+        label(Y, '  BLOCK GLOBAL INSTALL', String(args.command ?? args.cmd ?? ''));
         logEvent('tool_exec_blocked', { tool: toolName, args, reason: 'global_install_blocked' });
         messages.push({ role: 'tool', content: blockedResult, tool_name: toolName });
         messages.push({ role: 'user', content: 'Do not install packages globally. Use local workspace dependencies only when they are genuinely required for this task.' });
@@ -2776,14 +2834,14 @@ let args = rawArgs;
         continue;
       }
 
-      if (toolName === 'execute_terminal_command'
+      if ((toolName === 'execute_terminal_command' || toolName === 'launch_in_terminal')
         && pendingGreenfieldVerificationPath
-        && !isTerminalReadOnlyInspectionCommand(String(args.command ?? ''))) {
-        const blockedResult = buildPendingVerifyTerminalBlockResult(String(args.command ?? ''), pendingGreenfieldVerificationPath);
+        && !isTerminalReadOnlyInspectionCommand(String(args.command ?? args.cmd ?? ''))) {
+        const blockedResult = buildPendingVerifyTerminalBlockResult(String(args.command ?? args.cmd ?? ''), pendingGreenfieldVerificationPath);
         label(Y, '  BLOCK VERIFY-FIRST', path.basename(pendingGreenfieldVerificationPath));
         logEvent('tool_exec_blocked', { tool: toolName, args, reason: 'greenfield_verify_before_run', path: pendingGreenfieldVerificationPath });
         messages.push({ role: 'tool', content: blockedResult, tool_name: toolName });
-        messages.push({ role: 'user', content: `Do not run execute_terminal_command yet. The latest file write to ${path.basename(pendingGreenfieldVerificationPath)} must pass syntax verification first.` });
+        messages.push({ role: 'user', content: `Do not run terminal tools yet. The latest file write to ${path.basename(pendingGreenfieldVerificationPath)} must pass syntax verification first.` });
         continue;
       }
 
@@ -2870,7 +2928,7 @@ let args = rawArgs;
         if (toolName === 'create_or_edit_file' || toolName === 'replace_in_file') {
           hadSuccessfulWrite = true;
           lastSuccessfulWritePath = String(parsed.path ?? args.filename ?? args.filepath ?? lastSuccessfulWritePath ?? '');
-          if (toolName === 'create_or_edit_file' && SHOULD_BLOCK_IMMEDIATE_DRY_RUN_TERMINAL) {
+          if (toolName === 'create_or_edit_file' && IS_CODE_PREFERRED_GREENFIELD_REQUEST) {
             preferredGreenfieldSuccessfulWriteCount++;
             blockImmediateTerminalAfterWrite = true;
           }
@@ -2915,7 +2973,7 @@ let args = rawArgs;
           logEvent('verify_skipped', { reason: 'dry_run_greenfield_post_create_guard', stack: verifyConfig.stack, command: verifyConfig.command, projectRoot: verifyConfig.projectRoot });
         } else {
         label(B, 'VERIFY', `${verifyConfig.stack}: ${verifyConfig.command}`);
-        const verifyResult = await executeTool('execute_terminal_command', { command: `cd ${JSON.stringify(verifyConfig.projectRoot)} && ${verifyConfig.command}` });
+        const verifyResult = await runTerminalCommandDirect(`cd ${JSON.stringify(verifyConfig.projectRoot)} && ${verifyConfig.command}`);
         const parsedVerify = JSON.parse(verifyResult);
         const verifyOutput = [String(parsedVerify.stdout ?? ''), String(parsedVerify.stderr ?? '')].filter(Boolean).join('\n').trim();
         if (Number(parsedVerify.exitCode ?? 1) === 0 && pendingGreenfieldVerificationPath) {
@@ -3074,9 +3132,9 @@ let args = rawArgs;
           blockImmediateTerminalAfterWrite = false;
         }
 
-        if (toolName === 'execute_terminal_command' && isGlobalPackageInstallCommand(String(args.command ?? ''))) {
-          const blockedResult = buildGlobalInstallBlockResult(String(args.command ?? ''));
-          label(Y, '  BLOCK GLOBAL INSTALL', String(args.command ?? ''));
+        if ((toolName === 'execute_terminal_command' || toolName === 'launch_in_terminal') && isGlobalPackageInstallCommand(String(args.command ?? args.cmd ?? ''))) {
+          const blockedResult = buildGlobalInstallBlockResult(String(args.command ?? args.cmd ?? ''));
+          label(Y, '  BLOCK GLOBAL INSTALL', String(args.command ?? args.cmd ?? ''));
           logEvent('tool_exec_blocked', { tool: toolName, args, reason: 'global_install_blocked' });
           messages.push({ role: 'tool', content: blockedResult, tool_name: toolName });
           messages.push({ role: 'user', content: 'Do not install packages globally. Use local workspace dependencies only when they are genuinely required for this task.' });
@@ -3092,14 +3150,14 @@ let args = rawArgs;
           continue;
         }
 
-        if (toolName === 'execute_terminal_command'
+        if ((toolName === 'execute_terminal_command' || toolName === 'launch_in_terminal')
           && pendingGreenfieldVerificationPath
-          && !isTerminalReadOnlyInspectionCommand(String(args.command ?? ''))) {
-          const blockedResult = buildPendingVerifyTerminalBlockResult(String(args.command ?? ''), pendingGreenfieldVerificationPath);
+          && !isTerminalReadOnlyInspectionCommand(String(args.command ?? args.cmd ?? ''))) {
+          const blockedResult = buildPendingVerifyTerminalBlockResult(String(args.command ?? args.cmd ?? ''), pendingGreenfieldVerificationPath);
           label(Y, '  BLOCK VERIFY-FIRST', path.basename(pendingGreenfieldVerificationPath));
           logEvent('tool_exec_blocked', { tool: toolName, args, reason: 'greenfield_verify_before_run', path: pendingGreenfieldVerificationPath });
           messages.push({ role: 'tool', content: blockedResult, tool_name: toolName });
-          messages.push({ role: 'user', content: `Do not run execute_terminal_command yet. The latest file write to ${path.basename(pendingGreenfieldVerificationPath)} must pass syntax verification first.` });
+          messages.push({ role: 'user', content: `Do not run terminal tools yet. The latest file write to ${path.basename(pendingGreenfieldVerificationPath)} must pass syntax verification first.` });
           continue;
         }
 
@@ -3183,7 +3241,7 @@ let args = rawArgs;
           if (toolName === 'create_or_edit_file' || toolName === 'replace_in_file') {
             hadSuccessfulWrite = true;
             lastSuccessfulWritePath = String(parsed.path ?? args.filename ?? args.filepath ?? lastSuccessfulWritePath ?? '');
-            if (toolName === 'create_or_edit_file' && SHOULD_BLOCK_IMMEDIATE_DRY_RUN_TERMINAL) {
+            if (toolName === 'create_or_edit_file' && IS_CODE_PREFERRED_GREENFIELD_REQUEST) {
               preferredGreenfieldSuccessfulWriteCount++;
               blockImmediateTerminalAfterWrite = true;
             }
@@ -3249,7 +3307,7 @@ let args = rawArgs;
             logEvent('verify_skipped', { reason: 'dry_run_greenfield_post_create_guard', stack: verifyConfig.stack, command: verifyConfig.command, projectRoot: verifyConfig.projectRoot });
           } else {
           label(B, 'VERIFY', `${verifyConfig.stack}: ${verifyConfig.command}`);
-          const verifyResult = await executeTool('execute_terminal_command', { command: `cd ${JSON.stringify(verifyConfig.projectRoot)} && ${verifyConfig.command}` });
+          const verifyResult = await runTerminalCommandDirect(`cd ${JSON.stringify(verifyConfig.projectRoot)} && ${verifyConfig.command}`);
           const parsedVerify = JSON.parse(verifyResult);
           const verifyOutput = [String(parsedVerify.stdout ?? ''), String(parsedVerify.stderr ?? '')].filter(Boolean).join('\n').trim();
           if (Number(parsedVerify.exitCode ?? 1) === 0 && pendingGreenfieldVerificationPath) {
@@ -3551,7 +3609,24 @@ let args = rawArgs;
 
     // Force continuation if last tool result was a placeholder/error from create_or_edit_file
     const lastToolMsg = [...messages].reverse().find(m => m.role === 'tool');
-    const lastToolWasError = lastToolMsg && (() => { try { return !!JSON.parse(lastToolMsg.content).error; } catch { return false; } })();
+    const recentToolMessages = [...messages].filter(m => m.role === 'tool').slice(-3);
+    const lastToolWasError = recentToolMessages.some(toolMessage => {
+      try {
+        const parsed = JSON.parse(toolMessage.content);
+        if (parsed.error) return true;
+        return parsed.tool === 'build_verify' && parsed.ok === false;
+      } catch {
+        return false;
+      }
+    }) || (lastToolMsg && (() => {
+      try {
+        const parsed = JSON.parse(lastToolMsg.content);
+        if (parsed.error) return true;
+        return parsed.tool === 'build_verify' && parsed.ok === false;
+      } catch {
+        return false;
+      }
+    })());
     // If model claims done after actual write succeeded AND no pending tool call in text → accept done
     const textCallsInResponse = parseToolCallsFromText(content);
     const hasPendingTextCall = textCallsInResponse.length > 0;

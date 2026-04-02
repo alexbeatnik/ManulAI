@@ -1324,6 +1324,12 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     ]).has(ext);
   }
 
+  private isGreenfieldSourceFilePath(filepath: string): boolean {
+    const ext = path.extname(filepath).toLowerCase();
+    return this.isSyntaxRelevantFilePath(filepath)
+      && !['.json', '.jsonc', '.yaml', '.yml'].includes(ext);
+  }
+
   private getCurrentPreferredGreenfieldBootstrapTarget(): string | undefined {
     if (!this.shouldApplyPreferredGreenfieldGuards()) {
       return undefined;
@@ -1366,12 +1372,20 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       return undefined;
     }
 
+    const nonEmptyLines = content.replace(/\r\n/g, '\n').split('\n').map(line => line.trim()).filter(Boolean);
     const ext = path.extname(filename).toLowerCase();
-    if (!this.isSyntaxRelevantFilePath(filename)) {
+    if (!this.isGreenfieldSourceFilePath(filename)) {
+      const codeLikeLines = nonEmptyLines.filter(line =>
+        !/^(?:\/\/|\/\*|\*|#|<!--)/.test(line)
+        && (/(?:^|\s)(?:export|import|const|let|var|function|class|interface|type|enum|async|def|struct|impl|package|namespace|using|return)\b/.test(line)
+          || /[{}();=]/.test(line))
+      );
+      if (this.currentRequestLooksLikeRecoverableGreenfieldCode() && codeLikeLines.length > 0) {
+        return 'Blocked write: source code for a greenfield task must go into a real source file, not a generic text or data file. Write the implementation to the correct .py, .ts, .js, .go, .rs, .java, .cs, or similar source file path.';
+      }
       return undefined;
     }
 
-    const nonEmptyLines = content.replace(/\r\n/g, '\n').split('\n').map(line => line.trim()).filter(Boolean);
     if (nonEmptyLines.length === 0) {
       return 'Blocked write: greenfield file content is empty. Write the actual implementation instead of an empty scaffold.';
     }
@@ -1488,7 +1502,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   }
 
   private maybeNudgeAfterBlockedImmediateTerminal(messages: OllamaMessage[], toolName: string, toolResult: string): boolean {
-    if (toolName !== 'execute_terminal_command') {
+    if (toolName !== 'execute_terminal_command' && toolName !== 'launch_in_terminal') {
       return false;
     }
 
@@ -1510,10 +1524,10 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     messages.push({
       role: 'user',
       content: this.preferredGreenfieldSuccessfulWriteCount === 0
-        ? `Do NOT use execute_terminal_command yet for this greenfield task. Start by writing ${starterFilepath ? path.basename(starterFilepath) : 'the main source file'} with create_or_edit_file.`
+        ? `Do NOT use terminal tools yet for this greenfield task. Start by writing ${starterFilepath ? path.basename(starterFilepath) : 'the main source file'} with create_or_edit_file.`
         : this.pendingGreenfieldVerificationPath
-          ? `Do NOT run execute_terminal_command yet. The latest file write to ${path.basename(this.pendingGreenfieldVerificationPath)} must pass syntax verification first.`
-          : 'Do NOT run execute_terminal_command immediately after creating a file for this greenfield task. Continue with the next required file/tool step, or finish based on the code you already wrote.',
+          ? `Do NOT run terminal tools yet. The latest file write to ${path.basename(this.pendingGreenfieldVerificationPath)} must pass syntax verification first.`
+          : 'Do NOT run terminal tools immediately after creating a file for this greenfield task. Continue with the next required file/tool step, or finish based on the code you already wrote.',
       hiddenFromTranscript: true
     });
     return true;
@@ -5213,7 +5227,7 @@ If the user asks for a change but provides NO code:
           return await this.replaceInFile(String(args.filepath ?? ''), String(args.old_text ?? ''), String(args.new_text ?? ''));
         case 'execute_terminal_command':
           {
-            const terminalCommand = String(args.command ?? '');
+            const terminalCommand = String(args.command ?? args.cmd ?? '');
             if (this.shouldApplyPreferredGreenfieldGuards()
               && this.currentRequestLooksLikeRecoverableGreenfieldCode()
               && this.preferredGreenfieldSuccessfulWriteCount === 0
@@ -5234,7 +5248,27 @@ If the user asks for a change but provides NO code:
             return await this.executeTerminalCommand(terminalCommand);
           }
         case 'launch_in_terminal':
-          return this.launchInTerminal(String(args.command ?? ''));
+          {
+            const terminalCommand = String(args.command ?? args.cmd ?? '');
+            if (this.shouldApplyPreferredGreenfieldGuards()
+              && this.currentRequestLooksLikeRecoverableGreenfieldCode()
+              && this.preferredGreenfieldSuccessfulWriteCount === 0
+              && !isTerminalReadOnlyInspectionCommand(terminalCommand)) {
+              return this.buildEarlyGreenfieldTerminalBlockResult(terminalCommand);
+            }
+            if (isGlobalPackageInstallCommand(terminalCommand)) {
+              return this.buildGlobalInstallBlockResult(terminalCommand);
+            }
+            if (this.shouldApplyPreferredGreenfieldGuards() && this.blockImmediateTerminalAfterWrite) {
+              return this.buildImmediatePostCreateTerminalBlockResult(terminalCommand);
+            }
+            if (this.shouldApplyPreferredGreenfieldGuards()
+              && this.pendingGreenfieldVerificationPath
+              && !isTerminalReadOnlyInspectionCommand(terminalCommand)) {
+              return this.buildPendingVerifyTerminalBlockResult(terminalCommand);
+            }
+            return this.launchInTerminal(terminalCommand);
+          }
         case 'delete_file':
           return await this.deleteFile(String(args.filepath ?? ''));
         case 'list_workspace_files': {
@@ -5459,6 +5493,29 @@ If the user asks for a change but provides NO code:
       return undefined;
     };
 
+    const isProjectVerificationManifestFile = (filepath: string): boolean => {
+      const basename = path.basename(filepath).toLowerCase();
+      return basename === 'package.json'
+        || basename === 'tsconfig.json'
+        || basename === 'pyproject.toml'
+        || basename === 'requirements.txt'
+        || basename === 'setup.py'
+        || basename === 'cargo.toml'
+        || basename === 'go.mod'
+        || basename === 'pom.xml'
+        || basename === 'build.gradle'
+        || basename === 'build.gradle.kts'
+        || basename === 'gradlew'
+        || basename.endsWith('.sln')
+        || basename.endsWith('.csproj');
+    };
+
+    const shouldPreferStandaloneSyntaxVerification = (): boolean => (
+      this.currentRequestIsPreferredGreenfield
+      && !!latestWritePath
+      && this.isGreenfieldSourceFilePath(latestWritePath)
+    );
+
     const pickPackageManager = async (): Promise<'npm' | 'pnpm' | 'yarn' | 'bun'> => {
       if (await exists('pnpm-lock.yaml')) {
         return 'pnpm';
@@ -5498,6 +5555,13 @@ If the user asks for a change but provides NO code:
       syntaxVerificationSummary = `Syntax verification passed for ${relativePath}.`;
     }
 
+    if (this.currentRequestIsPreferredGreenfield
+      && latestWritePath
+      && !this.isGreenfieldSourceFilePath(latestWritePath)
+      && !isProjectVerificationManifestFile(latestWritePath)) {
+      return syntaxVerificationSummary ? { ok: true, output: syntaxVerificationSummary } : null;
+    }
+
     const scriptCommand = (pm: 'npm' | 'pnpm' | 'yarn' | 'bun', scriptName: string): string => {
       if (pm === 'npm') {
         return `npm run ${scriptName} 2>&1 | head -30`;
@@ -5513,21 +5577,27 @@ If the user asks for a change but provides NO code:
 
     // Detect the best available verification command for the current stack.
     let command: string | undefined;
+    if (shouldPreferStandaloneSyntaxVerification() && latestWritePath) {
+      command = buildStandaloneSyntaxVerifyCommand(latestWritePath);
+    }
+
     try {
-      const pkgBytes = await vscode.workspace.fs.readFile(vscode.Uri.joinPath(workspaceRoot, 'package.json'));
-      const pkg = JSON.parse(Buffer.from(pkgBytes).toString('utf8')) as Record<string, unknown>;
-      const scripts = pkg.scripts as Record<string, string> | undefined;
-      const packageManager = await pickPackageManager();
-      if (scripts?.check) {
-        command = scriptCommand(packageManager, 'check');
-      } else if (scripts?.verify) {
-        command = scriptCommand(packageManager, 'verify');
-      } else if (scripts?.build) {
-        command = scriptCommand(packageManager, 'build');
-      } else if (scripts?.compile) {
-        command = scriptCommand(packageManager, 'compile');
-      } else if (scripts?.test) {
-        command = scriptCommand(packageManager, 'test');
+      if (!command) {
+        const pkgBytes = await vscode.workspace.fs.readFile(vscode.Uri.joinPath(workspaceRoot, 'package.json'));
+        const pkg = JSON.parse(Buffer.from(pkgBytes).toString('utf8')) as Record<string, unknown>;
+        const scripts = pkg.scripts as Record<string, string> | undefined;
+        const packageManager = await pickPackageManager();
+        if (scripts?.check) {
+          command = scriptCommand(packageManager, 'check');
+        } else if (scripts?.verify) {
+          command = scriptCommand(packageManager, 'verify');
+        } else if (scripts?.build) {
+          command = scriptCommand(packageManager, 'build');
+        } else if (scripts?.compile) {
+          command = scriptCommand(packageManager, 'compile');
+        } else if (scripts?.test) {
+          command = scriptCommand(packageManager, 'test');
+        }
       }
     } catch {
       // no package.json or unreadable package.json
