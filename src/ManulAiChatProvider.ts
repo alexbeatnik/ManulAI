@@ -3117,6 +3117,17 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           }
           return !recentExecutedCommands.some(executed => executed.includes(command) || command.includes(executed));
         });
+        const syntheticToolResultJsonContent = (finalContent.match(/```json\s*([\s\S]*?)```/i)?.[1] ?? finalContent).trim();
+        const hasSyntheticToolResponseJson = Boolean(
+          hasRecentToolResults
+          && (
+            /(?:<tool_response>|\[tool_response\])/i.test(finalContent)
+            || (
+              /"(?:tool|tool_name)"\s*:\s*"(?:build_verify|create_or_edit_file|replace_in_file|read_file_slice|read_specific_file|read_active_file|execute_terminal_command|launch_in_terminal|delete_file|list_workspace_files|project_scan|read_workspace_notes)"/i.test(syntheticToolResultJsonContent)
+              && /"(?:ok|result|exitCode|stdout|stderr|path|startLine|endLine|replacements|command|projectRoot|stack)"\s*:/i.test(syntheticToolResultJsonContent)
+            )
+          )
+        );
 
         const announcedNewFilePath = this.extractAnnouncedNewFilePath(finalContent);
         const suggestedNextSlice = this.suggestNextLargeRefactorSlice(recentToolResults, largeRefactorTargets);
@@ -3149,7 +3160,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         const hasFakePostReadAnalysisDump = Boolean(
           hasReadButNoWriteOnLargeRefactor
           && (isLongDump || hasLargeCodeBlocks)
-          && /(?:```json\s*\{\s*"response"|"function_name"\s*:\s*"extract_code_snippet"|<tool_response>|\[tool_response\]|successfully processed the request|this code snippet appears to be|class, named `?(?:ollamaextension|ollamaassistant)`?|"class_name"\s*:\s*"(?:OllamaAssistant|OllamaExtension)"|here(?:'|’)s a breakdown of some key functionalities)/i.test(finalContent)
+          && (hasSyntheticToolResponseJson || /(?:```json\s*\{\s*"response"|"function_name"\s*:\s*"extract_code_snippet"|<tool_response>|\[tool_response\]|successfully processed the request|this code snippet appears to be|class, named `?(?:ollamaextension|ollamaassistant)`?|"class_name"\s*:\s*"(?:OllamaAssistant|OllamaExtension)"|here(?:'|’)s a breakdown of some key functionalities)/i.test(finalContent))
         );
         const hasAnnouncedExtractionWithoutWrite = Boolean(
           hasReadButNoWriteOnLargeRefactor
@@ -3194,7 +3205,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
               ? 4
               : isAskingUserForExactSlice
                 ? 5
-                : hasFakePostReadAnalysisDump || hasAnnouncedExtractionWithoutWrite || hasReadButNoWriteOnLargeRefactor || hasLazyRefusalOnLargeRefactor || hasModelRefusalResponse || hasPostReadSummaryOnLargeRefactor
+                : hasFakePostReadAnalysisDump || hasSyntheticToolResponseJson || hasAnnouncedExtractionWithoutWrite || hasReadButNoWriteOnLargeRefactor || hasLazyRefusalOnLargeRefactor || hasModelRefusalResponse || hasPostReadSummaryOnLargeRefactor
                   ? 4
                   : (!hasRecentSuccessfulAction && !hasRecentMeaningfulWrite && hasRecentToolResults)
                     ? 4
@@ -3212,6 +3223,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           || hasLargeRefactorShellReadBypass
           || hasPreReadLargeRefactorNarration
           || hasFakePreReadCodeDump
+          || hasSyntheticToolResponseJson
           || isAskingUserForExactSlice
           || hasFakePostReadAnalysisDump
           || hasAnnouncedExtractionWithoutWrite
@@ -3343,10 +3355,11 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         }
 
         if (shouldNudge) {
-          this.debugLog('nudge', { retryCount, isConversationalUserMessage, hasRecentToolResults, hasRecentSuccessfulAction, hasRecentMeaningfulWrite, latestCreatedFilePath, hasRecentReadOfLargeRefactorTarget, latestLargeRefactorTargetTotalLines, latestLargeRefactorTargetRemainingLines, canStopAfterTinyLargeRefactor, hasLargeRefactorShellReadBypass, hasPreReadLargeRefactorNarration, hasFakePreReadCodeDump, hasFakePostReadAnalysisDump, hasPostReadSummaryOnLargeRefactor, hasModelRefusalResponse, hasAnnouncedExtractionWithoutWrite, hasLazyRefusalOnLargeRefactor, isAskingUserForExactSlice, suggestedNextSlice, hasReadButNoWriteOnLargeRefactor, hasPostReadToolStall, hasPostCreateRefactorNarration, announcedNewFilePath, hasRecentToolErrors, hasRecentBuildVerifyFailure, hasRecentReplaceNotFound, replaceNotFoundFilepath, replaceNotFoundStartLine, replaceNotFoundEndLine, lastSuccessfulActionIndex, isLongDump, hasLargeCodeBlocks, claimsDone, mentionsChange, isLazyAcknowledgment, hasIncompletePlan: !!hasIncompletePlan, hasExplicitNextSteps, isProgressOnlyResponse, claimedButUnexecutedCommand, isPassingToUser, isAnnouncedButNotExecuted, isPlanOnlyResponse, isLargeRefactorRequest, contentPreview: finalContent.substring(0, 200) });
+          this.debugLog('nudge', { retryCount, isConversationalUserMessage, hasRecentToolResults, hasRecentSuccessfulAction, hasRecentMeaningfulWrite, latestCreatedFilePath, hasRecentReadOfLargeRefactorTarget, latestLargeRefactorTargetTotalLines, latestLargeRefactorTargetRemainingLines, canStopAfterTinyLargeRefactor, hasLargeRefactorShellReadBypass, hasPreReadLargeRefactorNarration, hasFakePreReadCodeDump, hasSyntheticToolResponseJson, hasFakePostReadAnalysisDump, hasPostReadSummaryOnLargeRefactor, hasModelRefusalResponse, hasAnnouncedExtractionWithoutWrite, hasLazyRefusalOnLargeRefactor, isAskingUserForExactSlice, suggestedNextSlice, hasReadButNoWriteOnLargeRefactor, hasPostReadToolStall, hasPostCreateRefactorNarration, announcedNewFilePath, hasRecentToolErrors, hasRecentBuildVerifyFailure, hasRecentReplaceNotFound, replaceNotFoundFilepath, replaceNotFoundStartLine, replaceNotFoundEndLine, lastSuccessfulActionIndex, isLongDump, hasLargeCodeBlocks, claimsDone, mentionsChange, isLazyAcknowledgment, hasIncompletePlan: !!hasIncompletePlan, hasExplicitNextSteps, isProgressOnlyResponse, claimedButUnexecutedCommand, isPassingToUser, isAnnouncedButNotExecuted, isPlanOnlyResponse, isLargeRefactorRequest, contentPreview: finalContent.substring(0, 200) });
           // Show plan/progress text to the user before nudging
           if (!isProgressOnlyResponse
             && !hasFakePreReadCodeDump
+            && !hasSyntheticToolResponseJson
             && !hasPreReadLargeRefactorNarration
             && !isAskingUserForExactSlice
             && !(isLargeRefactorRequest && !hasRecentSuccessfulAction && (isLongDump || hasLargeCodeBlocks))
@@ -3397,6 +3410,10 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
             nudgeMessage = announcedNewFilePath
               ? `This is a large refactor request for ${primaryTarget}. You already read the real file. Do NOT output generic summaries, fake JSON tool responses, invented class descriptions, or code-analysis dumps. Your next response must be tool calls only. First call create_or_edit_file for ${announcedNewFilePath} with one real self-contained type, interface group, or function from the bounded slices you actually read. Then call replace_in_file on ${primaryTarget} to remove the moved block and add any needed import. No prose before the tool calls.`
               : `This is a large refactor request for ${primaryTarget}. You already read the real file. Do NOT output generic summaries, fake JSON tool responses, invented class descriptions, or code-analysis dumps. Your next response must be tool calls only. Either call create_or_edit_file now for one concrete self-contained type, interface group, or function from the slices you already read and then call replace_in_file on ${primaryTarget}, or call read_file_slice for the next suggested bounded slice. No prose before the tool calls.`;
+          } else if (hasSyntheticToolResponseJson) {
+            nudgeMessage = hasRecentMeaningfulWrite && !isLargeRefactorRequest
+              ? 'The real tool result is already recorded. Do NOT echo or invent JSON tool results. If the task is complete, reply with a short plain-text completion summary only. Otherwise make the next real tool call.'
+              : 'The real tool result is already recorded. Do NOT echo or invent JSON tool results. Continue with the next real tool call, or give a short plain-text final answer if the task is already complete.';
           } else if (hasLazyRefusalOnLargeRefactor) {
             const primaryTarget = largeRefactorTargets[0] ?? 'the target file';
             nudgeMessage = suggestedNextSlice?.filepath && suggestedNextSlice.startLine && suggestedNextSlice.endLine
@@ -3575,6 +3592,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
             hasLargeRefactorShellReadBypass,
             hasPreReadLargeRefactorNarration,
             hasFakePreReadCodeDump,
+            hasSyntheticToolResponseJson,
             hasFakePostReadAnalysisDump,
             hasAnnouncedExtractionWithoutWrite,
             hasPostReadSummaryOnLargeRefactor,
@@ -3599,6 +3617,8 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           });
           finalContent = hasFakePostReadAnalysisDump
             ? 'The model read the real file but then produced a fake analysis dump or synthetic tool-response JSON instead of making a concrete file edit. Retry the request or use a stronger tool-calling model for iterative refactors.'
+            : hasSyntheticToolResponseJson
+            ? 'The model repeated synthetic JSON or echoed tool-result content instead of continuing with a real tool call or a normal plain-text completion. Retry the request or use a stronger tool-calling model.'
             : hasAnnouncedExtractionWithoutWrite
             ? `The model announced an extraction${announcedNewFilePath ? ` to ${announcedNewFilePath}` : ''} but never executed the required file tools. It must call create_or_edit_file and replace_in_file instead of narrating the extraction.`
             : hasLazyRefusalOnLargeRefactor

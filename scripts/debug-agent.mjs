@@ -2436,6 +2436,21 @@ async function tryRecoverFromDegenerateOutput(messages, content, retryCount, tur
   return true;
 }
 
+function isSyntheticToolResultText(content) {
+  const trimmed = content.trim();
+  if (!trimmed) return false;
+  if (/(?:<tool_response>|\[tool_response\])/i.test(trimmed)) return true;
+
+  const jsonLikeContent = (trimmed.match(/```json\s*([\s\S]*?)```/i)?.[1] ?? trimmed).trim();
+  if (!/"(?:tool|tool_name)"\s*:\s*"/i.test(jsonLikeContent)) {
+    return false;
+  }
+
+  const hasKnownToolName = /"(?:tool|tool_name)"\s*:\s*"(?:build_verify|create_or_edit_file|replace_in_file|read_file_slice|read_specific_file|read_active_file|execute_terminal_command|launch_in_terminal|delete_file|list_workspace_files|project_scan|read_workspace_notes)"/i.test(jsonLikeContent);
+  const hasToolResultKeys = /"(?:ok|result|exitCode|stdout|stderr|path|startLine|endLine|replacements|command|projectRoot|stack)"\s*:/i.test(jsonLikeContent);
+  return hasKnownToolName && hasToolResultKeys;
+}
+
 // ─── Simple nudge analysis (matches key detectors in processOllamaResponse) ──
 function analyzeResponse(content, recentMessages) {
   const hasToolResults = recentMessages.some(m => m.role === 'tool');
@@ -2443,7 +2458,7 @@ function analyzeResponse(content, recentMessages) {
   const progressLines = content.trim().split('\n').map(l => l.trim()).filter(Boolean);
   const isProgressOnly = content.trim().length < 220 &&
     progressLines.every(l => /^(?:step\s+\d+\s*(?:\/|of)\s*\d+|step\s+\d+\s+completed|execut(?:e|ing)\s+step\s+\d+|reading|i(?:'ll| will)\s+read)/i.test(l));
-  const isHallucinatingToolResponse = /<tool_response>/.test(content);
+  const isHallucinatingToolResponse = /<tool_response>/.test(content) || (hasToolResults && isSyntheticToolResultText(content));
   const isAnnouncedButNotExecuted = /(?:execut(?:e|ing)|proceed(?:ing)?\s+with)\s+(?:with\s+)?step\s+\d+\s*[:/.,!]?/i.test(content) || /step \d+\/\d+:\s*\w/i.test(content);
   const isPassingToUser = /(?:please (?:execute|run|proceed|confirm|provide|read)|would you like me to|shall i (?:proceed|continue)|can you (?:provide|share)|could you (?:provide|share))/i.test(content) && content.length < 800;
   const claimsDone = /(?:step \d+ completed|successfully applied|file (?:created|updated)|has been (?:created|moved|split)|(?<!\w)done\b(?![\s]*[:;{,=(])|(?:all (?:required )?)?tool calls? (?:have )?succeeded|(?:file )?splitting is complete|task(?:s)? (?:is |are )?complete)/i.test(content);  // Mentions a known tool name but parseToolCallsFromText couldn't extract a valid call
@@ -2534,7 +2549,7 @@ function buildReplaceReminder(createdPath, newFileContent, allRecentReads) {
 }
 
 function buildNudge(analysis, lastToolWasError, ctx = {}) {
-  const { pendingReplaceAfterCreate: pReplace, lastSuccessfulRead: lastRead, lastCreatedFileState: lastCreated } = ctx;
+  const { pendingReplaceAfterCreate: pReplace, lastSuccessfulRead: lastRead, lastCreatedFileState: lastCreated, hadSuccessfulWrite } = ctx;
 
   // Context-rich nudge when a new file was created but replace_in_file hasn't succeeded yet
   if (pReplace && lastCreated) {
@@ -2559,6 +2574,9 @@ function buildNudge(analysis, lastToolWasError, ctx = {}) {
     if (extractionContinuationPending) {
       const nextStart = (lastSuccessfulRead?.endLine ?? 120) + 1;
       return `The tool result is already recorded. Do NOT echo tool results. Read the next section — use read_file_slice with lines ${nextStart}–${nextStart + 119} — then extract another block.`;
+    }
+    if (!IS_SPLIT_TASK && hadSuccessfulWrite) {
+      return 'The real tool result is already recorded. Do NOT echo or invent JSON tool results. Reply with a short plain-text completion summary only.';
     }
     return 'The tool result is already recorded. Do NOT echo or repeat tool results in your response. Proceed with the next action.';
   }
