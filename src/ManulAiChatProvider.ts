@@ -3034,6 +3034,8 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         const isLongDump = finalContent.length > 300;
         const hasLargeCodeBlocks = /```[\w]*\n[\s\S]{100,}?```/.test(finalContent);
         const claimsDone = /(?:зробив|замінив|оновив|готово|i've made|i have made|i have updated|i updated|i fixed|i removed|i verified|i confirmed|i corrected|i aligned|successfully applied|successfully saved|has been removed|has been moved|addressed the|fixed the|removed the|updated the|verified the|confirmed the|corrected the|aligned the|summary of the changes|summary:)/i.test(finalContent);
+        const claimsFailure = /(?:failed to|unable to|could(?: not|n't)|did not|was not|were not|not created|not updated|creation failed|update failed|tool call failed|error occurred|encountered (?:an|a) (?:problem|issue|error)|не удалось|не вдалось|не получилось|не вдалося|не смог(?:ла|ли)?|не створ(?:ив|ено)|не онов(?:ив|лено)|не змог(?:ла|ли)?|помилка|ошибка)/i.test(finalContent)
+          && !/(?:no (?:errors?|issues?|problems?)|without errors?|verified successfully|verification passed|build verification passed)/i.test(finalContent);
         const mentionsChange = /(?:змін|зроби|оновл|replac|chang|updat|modif|address|fix(?:ed)?|remov(?:e|ed)|verif(?:y|ied)|confirm(?:ed)?|correct(?:ed)?|align(?:ed)?)/i.test(finalContent);
         const isLazyAcknowledgment = !isConversationalUserMessage
           && (/^(?:understood|sure|ok|okay|got it|i will|let me know|i can help|i'll make sure)\b/i.test(finalContent.trim())
@@ -3224,6 +3226,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           || hasPreReadLargeRefactorNarration
           || hasFakePreReadCodeDump
           || hasSyntheticToolResponseJson
+          || (claimsFailure && (hasRecentToolResults || hasRecentMeaningfulWrite || hasRecentSuccessfulAction))
           || isAskingUserForExactSlice
           || hasFakePostReadAnalysisDump
           || hasAnnouncedExtractionWithoutWrite
@@ -3355,7 +3358,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         }
 
         if (shouldNudge) {
-          this.debugLog('nudge', { retryCount, isConversationalUserMessage, hasRecentToolResults, hasRecentSuccessfulAction, hasRecentMeaningfulWrite, latestCreatedFilePath, hasRecentReadOfLargeRefactorTarget, latestLargeRefactorTargetTotalLines, latestLargeRefactorTargetRemainingLines, canStopAfterTinyLargeRefactor, hasLargeRefactorShellReadBypass, hasPreReadLargeRefactorNarration, hasFakePreReadCodeDump, hasSyntheticToolResponseJson, hasFakePostReadAnalysisDump, hasPostReadSummaryOnLargeRefactor, hasModelRefusalResponse, hasAnnouncedExtractionWithoutWrite, hasLazyRefusalOnLargeRefactor, isAskingUserForExactSlice, suggestedNextSlice, hasReadButNoWriteOnLargeRefactor, hasPostReadToolStall, hasPostCreateRefactorNarration, announcedNewFilePath, hasRecentToolErrors, hasRecentBuildVerifyFailure, hasRecentReplaceNotFound, replaceNotFoundFilepath, replaceNotFoundStartLine, replaceNotFoundEndLine, lastSuccessfulActionIndex, isLongDump, hasLargeCodeBlocks, claimsDone, mentionsChange, isLazyAcknowledgment, hasIncompletePlan: !!hasIncompletePlan, hasExplicitNextSteps, isProgressOnlyResponse, claimedButUnexecutedCommand, isPassingToUser, isAnnouncedButNotExecuted, isPlanOnlyResponse, isLargeRefactorRequest, contentPreview: finalContent.substring(0, 200) });
+          this.debugLog('nudge', { retryCount, isConversationalUserMessage, hasRecentToolResults, hasRecentSuccessfulAction, hasRecentMeaningfulWrite, latestCreatedFilePath, hasRecentReadOfLargeRefactorTarget, latestLargeRefactorTargetTotalLines, latestLargeRefactorTargetRemainingLines, canStopAfterTinyLargeRefactor, hasLargeRefactorShellReadBypass, hasPreReadLargeRefactorNarration, hasFakePreReadCodeDump, hasSyntheticToolResponseJson, hasFakePostReadAnalysisDump, hasPostReadSummaryOnLargeRefactor, hasModelRefusalResponse, hasAnnouncedExtractionWithoutWrite, hasLazyRefusalOnLargeRefactor, isAskingUserForExactSlice, suggestedNextSlice, hasReadButNoWriteOnLargeRefactor, hasPostReadToolStall, hasPostCreateRefactorNarration, announcedNewFilePath, hasRecentToolErrors, hasRecentBuildVerifyFailure, hasRecentReplaceNotFound, replaceNotFoundFilepath, replaceNotFoundStartLine, replaceNotFoundEndLine, lastSuccessfulActionIndex, isLongDump, hasLargeCodeBlocks, claimsDone, claimsFailure, mentionsChange, isLazyAcknowledgment, hasIncompletePlan: !!hasIncompletePlan, hasExplicitNextSteps, isProgressOnlyResponse, claimedButUnexecutedCommand, isPassingToUser, isAnnouncedButNotExecuted, isPlanOnlyResponse, isLargeRefactorRequest, contentPreview: finalContent.substring(0, 200) });
           // Show plan/progress text to the user before nudging
           if (!isProgressOnlyResponse
             && !hasFakePreReadCodeDump
@@ -3414,6 +3417,10 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
             nudgeMessage = hasRecentMeaningfulWrite && !isLargeRefactorRequest
               ? 'The real tool result is already recorded. Do NOT echo or invent JSON tool results. If the task is complete, reply with a short plain-text completion summary only. Otherwise make the next real tool call.'
               : 'The real tool result is already recorded. Do NOT echo or invent JSON tool results. Continue with the next real tool call, or give a short plain-text final answer if the task is already complete.';
+          } else if (claimsFailure && (hasRecentToolResults || hasRecentMeaningfulWrite || hasRecentSuccessfulAction)) {
+            nudgeMessage = hasRecentMeaningfulWrite
+              ? 'The previous real tool result already shows a successful file write. Do NOT claim that the file was not created or updated. Either continue with the next real tool step, or reply with a short plain-text completion summary only.'
+              : 'You claimed that the task or tool call failed. Check the actual recorded tool results and adapt from the real state. If a tool truly failed, retry with corrected parameters. If it succeeded, continue instead of contradicting it.';
           } else if (hasLazyRefusalOnLargeRefactor) {
             const primaryTarget = largeRefactorTargets[0] ?? 'the target file';
             nudgeMessage = suggestedNextSlice?.filepath && suggestedNextSlice.startLine && suggestedNextSlice.endLine
@@ -5530,11 +5537,19 @@ If the user asks for a change but provides NO code:
         || basename.endsWith('.csproj');
     };
 
-    const shouldPreferStandaloneSyntaxVerification = (): boolean => (
-      this.currentRequestIsPreferredGreenfield
-      && !!latestWritePath
-      && this.isGreenfieldSourceFilePath(latestWritePath)
-    );
+    const shouldPreferStandaloneSyntaxVerification = async (): Promise<boolean> => {
+      if (!latestWritePath) {
+        return false;
+      }
+      if (this.currentRequestIsPreferredGreenfield && this.isGreenfieldSourceFilePath(latestWritePath)) {
+        return true;
+      }
+      const latestExt = path.extname(latestWritePath).toLowerCase();
+      if (latestExt === '.go' && !isProjectVerificationManifestFile(latestWritePath)) {
+        return !(await exists('go.mod'));
+      }
+      return false;
+    };
 
     const pickPackageManager = async (): Promise<'npm' | 'pnpm' | 'yarn' | 'bun'> => {
       if (await exists('pnpm-lock.yaml')) {
@@ -5597,7 +5612,7 @@ If the user asks for a change but provides NO code:
 
     // Detect the best available verification command for the current stack.
     let command: string | undefined;
-    if (shouldPreferStandaloneSyntaxVerification() && latestWritePath) {
+    if (await shouldPreferStandaloneSyntaxVerification() && latestWritePath) {
       command = buildStandaloneSyntaxVerifyCommand(latestWritePath);
     }
 

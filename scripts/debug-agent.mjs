@@ -582,7 +582,8 @@ function pickVerifyCommandForPath(targetPath) {
   const hasPythonProjectMarkers = existsSync(path.join(projectRoot, 'pyproject.toml')) || existsSync(path.join(projectRoot, 'requirements.txt')) || existsSync(path.join(projectRoot, 'setup.py'));
   const hasJavaProjectMarkers = existsSync(path.join(projectRoot, 'pom.xml')) || existsSync(path.join(projectRoot, 'build.gradle')) || existsSync(path.join(projectRoot, 'build.gradle.kts'));
   const hasDotnetProjectMarkers = existsSync(projectRoot) && readdirSafe(projectRoot).some(name => name.endsWith('.sln') || name.endsWith('.csproj'));
-  const shouldPreferStandaloneSyntaxVerification = IS_PREFERRED_GREENFIELD_REQUEST && isGreenfieldSourceFilePath(targetPath);
+  const shouldPreferStandaloneSyntaxVerification = (IS_PREFERRED_GREENFIELD_REQUEST && isGreenfieldSourceFilePath(targetPath))
+    || (latestExt === '.go' && !existsSync(path.join(projectRoot, 'go.mod')) && !isProjectVerificationManifestFile(targetPath));
 
   const quotedTargetPath = JSON.stringify(targetPath);
   if (IS_PREFERRED_GREENFIELD_REQUEST && !isGreenfieldSourceFilePath(targetPath) && !isProjectVerificationManifestFile(targetPath)) {
@@ -1325,8 +1326,17 @@ async function executeTool(name, args) {
           ? dryRunFiles.get(fp)
           : readFileSync(fp, 'utf8');
         const lines = rawContent.split('\n');
-        const start = Math.max(1, Number(args.startLine ?? 1));
-        const end   = Math.min(lines.length, Number(args.endLine ?? lines.length));
+        const rawStart = args.startLine === undefined || args.startLine === null || args.startLine === '' ? 1 : Number(args.startLine);
+        const rawEnd = args.endLine === undefined || args.endLine === null || args.endLine === '' ? lines.length : Number(args.endLine);
+        if (!Number.isFinite(rawStart) || !Number.isFinite(rawEnd)) {
+          return JSON.stringify({ error: 'startLine and endLine must be numbers.' });
+        }
+        const start = Math.max(1, Math.floor(rawStart));
+        const requestedEnd = Math.max(1, Math.floor(rawEnd));
+        if (requestedEnd < start) {
+          return JSON.stringify({ error: 'endLine must be greater than or equal to startLine.' });
+        }
+        const end = Math.min(lines.length, requestedEnd);
         return JSON.stringify({
           path: fp, languageId: detectLanguageId(fp),
           startLine: start, endLine: end,
@@ -2462,6 +2472,8 @@ function analyzeResponse(content, recentMessages) {
   const isAnnouncedButNotExecuted = /(?:execut(?:e|ing)|proceed(?:ing)?\s+with)\s+(?:with\s+)?step\s+\d+\s*[:/.,!]?/i.test(content) || /step \d+\/\d+:\s*\w/i.test(content);
   const isPassingToUser = /(?:please (?:execute|run|proceed|confirm|provide|read)|would you like me to|shall i (?:proceed|continue)|can you (?:provide|share)|could you (?:provide|share))/i.test(content) && content.length < 800;
   const claimsDone = /(?:step \d+ completed|successfully applied|file (?:created|updated)|has been (?:created|moved|split)|(?<!\w)done\b(?![\s]*[:;{,=(])|(?:all (?:required )?)?tool calls? (?:have )?succeeded|(?:file )?splitting is complete|task(?:s)? (?:is |are )?complete)/i.test(content);  // Mentions a known tool name but parseToolCallsFromText couldn't extract a valid call
+  const claimsFailure = /(?:failed to|unable to|could(?: not|n't)|did not|was not|were not|not created|not updated|creation failed|update failed|tool call failed|error occurred|encountered (?:an|a) (?:problem|issue|error)|не удалось|не вдалось|не получилось|не вдалося|не смог(?:ла|ли)?|не створ(?:ив|ено)|не онов(?:ив|лено)|не змог(?:ла|ли)?|помилка|ошибка)/i.test(content)
+    && !/(?:no (?:errors?|issues?|problems?)|without errors?|verified successfully|verification passed|build verification passed)/i.test(content);
   const parsedFromContent = parseToolCallsFromText(content);
   const lowerContent = content.toLowerCase();
   const mentionsToolButNotCalled = parsedFromContent.length === 0 && ALL_TOOL_NAMES.some(t => lowerContent.includes(t.toLowerCase()));  // looksLikePlan: numbered list. After tool results, also fire when content ends with an execute instruction.
@@ -2477,10 +2489,10 @@ function analyzeResponse(content, recentMessages) {
   const isPlanOnlyResponse = /^#{1,3}\s+(?:Plan|Steps?|Implementation|Approach)/mi.test(content) &&
     /\d+\.\s+\*\*/.test(content);
 
-  const requiresContinuation = isProgressOnly || isAnnouncedButNotExecuted || isPassingToUser || isHallucinatingToolResponse ||
+  const requiresContinuation = isProgressOnly || isAnnouncedButNotExecuted || isPassingToUser || isHallucinatingToolResponse || claimsFailure ||
     (claimsDone && !hasToolResults) || isLong || mentionsToolButNotCalled || isPlanOnlyResponse;
 
-  return { isLong, isProgressOnly, isAnnouncedButNotExecuted, isPassingToUser, isHallucinatingToolResponse, claimsDone, mentionsToolButNotCalled, looksLikePlan: looksLikePlan || isPlanOnlyResponse, requiresContinuation };
+  return { isLong, isProgressOnly, isAnnouncedButNotExecuted, isPassingToUser, isHallucinatingToolResponse, claimsDone, claimsFailure, mentionsToolButNotCalled, looksLikePlan: looksLikePlan || isPlanOnlyResponse, requiresContinuation };
 }
 
 // Builds the reminder message injected after a new extraction file is created.
@@ -2601,6 +2613,12 @@ function buildNudge(analysis, lastToolWasError, ctx = {}) {
     return IS_SPLIT_TASK
       ? 'Do not ask the user anything. You have all the tools you need. Use read_file_slice to read the source file, copy the actual code, and call create_or_edit_file with that real code.'
       : 'Do not ask the user anything. You have all the tools you need. Call create_or_edit_file to create files, or execute_terminal_command to run setup commands.';
+  }
+  if (analysis.claimsFailure) {
+    if (hadSuccessfulWrite) {
+      return 'The previous real tool result already shows a successful file write. Do NOT claim that the file was not created or updated. Either continue with the next real tool step, or reply with a short plain-text completion summary only.';
+    }
+    return 'You claimed that the task or tool call failed. Check the actual tool results in context, then either retry with corrected parameters or continue from the real successful state. Do not contradict the recorded tool output.';
   }
   if (lastToolWasError) {
     return IS_SPLIT_TASK
@@ -3650,12 +3668,12 @@ let args = rawArgs;
     const hasPendingTextCall = textCallsInResponse.length > 0;
     const writeStillPending = REQUIRES_FILE_WRITE && !hadSuccessfulWrite;
     const isDoneAfterWrite = hadSuccessfulWrite && !analysis.isPassingToUser &&
-      !analysis.isAnnouncedButNotExecuted && !analysis.isHallucinatingToolResponse &&
+      !analysis.isAnnouncedButNotExecuted && !analysis.isHallucinatingToolResponse && !analysis.claimsFailure &&
       !analysis.mentionsToolButNotCalled && !hasPendingTextCall &&
       (analysis.claimsDone || (analysis.isLong && !analysis.looksLikePlan));
     // For non-split tasks: a long, non-plan text response with no tool calls is the final answer
     const isNonSplitFinalAnswer = !IS_SPLIT_TASK && analysis.isLong && !analysis.looksLikePlan &&
-      !analysis.mentionsToolButNotCalled && !hasPendingTextCall && !analysis.isHallucinatingToolResponse &&
+      !analysis.mentionsToolButNotCalled && !hasPendingTextCall && !analysis.isHallucinatingToolResponse && !analysis.claimsFailure &&
       (!REQUIRES_FILE_WRITE || hadSuccessfulWrite);
     if ((!writeStillPending && (!analysis.requiresContinuation || isDoneAfterWrite || isNonSplitFinalAnswer)) && !lastToolWasError) {
       // For split tasks, require 2 cycles normally, but relax for tiny/exhausted targets.
