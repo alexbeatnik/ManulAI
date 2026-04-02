@@ -157,12 +157,12 @@ Safe deterministic known-file reads are now available beyond the ultra-small tie
 
 ## Tested Model Baseline
 
-The current model policy is based on direct `/api/chat` checks against Ollama plus standalone `scripts/debug-agent.mjs` runs on simple greenfield coding tasks, especially single-file creation tasks such as a Python console dice game.
+The current model policy is based on direct `/api/chat` checks against Ollama, standalone `scripts/debug-agent.mjs` runs, and the local regression matrix in `scripts/run-regression-matrix.mjs`. That matrix now covers chat-only explanation and edit-behavior checks, exact read-package cases, Go explanation cases, multi-file create flows, explicit nested-path create flows, and temp-file edit flows in both Agent and Planner modes. So the baseline is no longer derived only from simple greenfield or single-file create prompts.
 
 - `qwen3-coder:30b` is the strongest validated model in this project so far. It is the most reliable at emitting native tool calls, starting with a concrete file write, and staying coherent across multi-step agent execution.
 - `llama3.1:8b` is also viable. Raw coding output is solid and it is much more stable than the weak `qwen2.5-coder` tiers, but it still trails `qwen3-coder:30b` in tool-loop consistency.
 - `phi4-mini:3.8b` is viable for agent use and much better than the weak small models, but it still needs more recovery help around pseudo-tool text and malformed tool-call formatting.
-- `gpt-oss:20b` is not part of the validated picker baseline yet. In local testing it handled chat-only tasks well and benefited from deterministic exact-read recovery, but it still remained unstable in several agent/planner create or edit flows.
+- `gpt-oss:20b` is not part of the validated picker baseline yet. It benefits from deterministic exact-read recovery, transient fetch retry, and explicit create-only completion recovery, but it still remains unstable in several agent/planner create or edit flows. Recent full reruns also exposed intermittent Ollama model-load/resource failures on this machine, so its current results are not stable enough for the default picker.
 - `qwen2.5-coder:7b` is not treated as reliable enough for the built-in picker. It can produce partially acceptable raw coding output in English, but in planner/agent loops it still degrades too often into malformed, repetitive, or incoherent responses.
 - `qwen2.5-coder:1.5b` and `qwen2.5-coder:0.5b` are not considered dependable agent models for this runtime. In current tests they collapse too early, often before the tool loop is even the main problem.
 
