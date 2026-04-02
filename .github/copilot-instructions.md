@@ -14,6 +14,8 @@ This repository contains a VS Code extension named ManulAI.
 - Avoid unrelated refactors when making targeted changes.
 - Preserve the distinction between Chat Mode, Agent Mode, and Planner Mode.
 - In Chat Mode, never claim that files were created, modified, or deleted.
+- In Chat Mode, answer direct code-explanation or review requests in plain text; reserve `Old` / `New` suggestion format for explicit visible-snippet edit requests.
+- In Chat Mode, do not return full file dumps for create-file requests; give brief manual guidance or a minimal one-file starter only when explicitly asked.
 - Planner Mode uses the same tools as Agent Mode conceptually but may expose a reduced tool subset for very small local models; its system mandate stays condensed and step-by-step.
 - Planner Mode must still answer direct text questions without requiring tool calls.
 - For small edit requests, prefer surgical edits over whole-file rewrites.

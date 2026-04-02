@@ -995,6 +995,34 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     return (editVerbPattern.test(normalized) || this.looksLikeWriteIntent(normalized)) && fileTargetPattern.test(normalized);
   }
 
+  private looksLikeChatCreateRequest(text: string): boolean {
+    const normalized = text.trim().toLowerCase();
+    if (!normalized || !this.looksLikeWriteIntent(text)) {
+      return false;
+    }
+
+    if (this.looksLikeLargeRefactorRequest(text)) {
+      return false;
+    }
+
+    const createPattern = /\b(?:create|generate|build|make|write|scaffold)\b|(?:^|[\s"'`([{])(?:створи|создай|згенеруй|сгенерируй|зроби|сделай|напиши|побудуй|собери)(?=$|[\s"'`)\]},.!?:;])/i;
+    if (!createPattern.test(normalized)) {
+      return false;
+    }
+
+    const explicitTargets = this.extractLikelyRequestFileTargets(text);
+    const editPattern = /\b(?:rename|replace|fix|change|update|edit|modify|rewrite)\b|(?:^|[\s"'`([{])(?:поміняй|зміни|измени|поменяй|онови|обнови|заміни|замени|відредагуй|редагуй|перепиши|виправ|исправь)(?=$|[\s"'`)\]},.!?:;])/i;
+    const visibleSnippetPattern = /```|\b(?:function|class|const|let|var|return|import)\b|<[A-Za-z][\w:-]*\b/;
+
+    if (explicitTargets.length > 0) {
+      return true;
+    }
+
+    return !editPattern.test(normalized)
+      && !visibleSnippetPattern.test(text)
+      && /\b(?:app|script|tool|program|page|component|project|files?)\b|(?:^|[\s"'`([{])(?:додаток|скрипт|утиліт|сторінк|компонент|проєкт|проект|файл)(?=$|[\s"'`)\]},.!?:;])/i.test(normalized);
+  }
+
   private looksLikeProjectScanRequest(text: string): boolean {
     const normalized = text.trim().toLowerCase();
     if (!normalized) {
@@ -2537,7 +2565,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
 
     if (!this.isAgentLike) {
       // Chat mode: display the model response as-is, no file-write fallback processing.
-      finalContent = this.truncateLargeCodeBlocks(finalContent);
+      finalContent = this.sanitizeChatOnlyResponse(finalContent, this.getLatestVisibleUserRequest(messages));
       if (!finalContent.trim()) {
         finalContent = 'The model returned an empty response. Try rephrasing your question.';
       }
@@ -4566,7 +4594,7 @@ You are ManulAI in CHAT-ONLY mode.
 - Never claim edits — you cannot change files.
 - Only modify what is visible in the snippet.
 - Never invent missing code or unseen lines.
-- Format strictly as Old → New.
+- Use Old → New ONLY for explicit code-change requests.
 - If unsure, say so — do not guess.
 - Keep changes minimal and precise.
 
@@ -4590,9 +4618,24 @@ You are ManulAI in CHAT-ONLY mode.
 
 ---
 
+[REQUEST ROUTING]
+
+- If the user asks to explain, review, summarize, or identify what visible code does:
+  - Answer in short plain text
+  - You MAY quote short visible snippets
+  - Do NOT use Old/New unless the user also explicitly asks for a change
+- If the user explicitly asks to change, fix, rename, replace, rewrite, or edit visible code:
+  - Respond with Old/New for the exact visible snippet only
+- If the user asks to create files, add features, or make edits without tools:
+  - Never claim execution
+  - Explain the needed manual changes briefly
+  - Include a minimal example only when necessary
+
+---
+
 [CODE MODIFICATION RULES]
 
-If the user provides code:
+If the user explicitly asks to change visible code:
 
 - ONLY modify what is visible
 - NEVER invent missing code
@@ -4641,7 +4684,8 @@ If the user asks for a change but provides NO code:
 
 [OUTPUT RULES]
 
-- No explanations unless necessary
+- For explain/review/question requests: short plain-text answer
+- For explicit edit requests: Old/New only
 - No polite endings
 - No full file dumps
 `,
@@ -5237,6 +5281,30 @@ If the user asks for a change but provides NO code:
 
   private truncateLargeCodeBlocks(content: string): string {
     return truncateLargeCodeBlocksHelper(content);
+  }
+
+  private sanitizeChatOnlyResponse(content: string, latestVisibleUserRequest: string): string {
+    const trimmed = content.trim();
+    if (!trimmed) {
+      return trimmed;
+    }
+
+    const requestTargets = this.extractLikelyRequestFileTargets(latestVisibleUserRequest);
+    const codeBlockWrites = this.extractCodeBlockFileWrites(trimmed);
+    const newFileWrite = this.extractNewFileCreation(trimmed);
+    const hasLargeCodeFence = /```[\w.+-]*\n[\s\S]{180,}?```/.test(trimmed);
+    const looksLikeExplicitSnippetEdit = /(?:^|\n)Old:\s*`[^`]+`\s*(?:\n|\r\n?)New:\s*`[^`]+`/i.test(trimmed);
+
+    if (this.looksLikeChatCreateRequest(latestVisibleUserRequest)
+      && !looksLikeExplicitSnippetEdit
+      && (codeBlockWrites.length > 0 || Boolean(newFileWrite) || hasLargeCodeFence)) {
+      const targetList = requestTargets.length > 0
+        ? ` Suggested targets: ${requestTargets.slice(0, 4).join(', ')}.`
+        : '';
+      return `Chat mode cannot create files or return full file dumps.${targetList} Ask for one specific file if you want a minimal starter snippet, or switch to Agent Mode to write the files automatically.`;
+    }
+
+    return this.truncateLargeCodeBlocks(trimmed);
   }
 
   private extractInlineFileBlocks(content: string): Array<{ fullMatch: string; filepath: string; fileContent: string }> {

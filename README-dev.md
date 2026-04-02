@@ -135,6 +135,8 @@ Chats also persist a compact `summaryMemory` alongside the full transcript in `.
 
 - Agent Mode sends tool definitions to Ollama and continues the loop automatically.
 - Planner Mode sends the same tools as Agent Mode conceptually, but the runtime may reduce the actual tool set for smaller models. Planner Mode also uses a shorter system mandate focused on step-by-step execution; direct text questions are answered without requiring tool calls.
+- Chat Mode uses a dedicated no-tools mandate. Direct code explanation/review requests in chat should be answered in short plain text, while explicit visible-snippet edit requests stay in manual `Old:` / `New:` suggestion format.
+- Chat Mode also suppresses full file dumps for file-creation requests; those requests should degrade to brief manual guidance and push the user toward Agent Mode or a one-file-at-a-time starter snippet.
 - For micro/small tiers, visible and hidden plan behavior is suppressed; the runtime biases toward one immediate bounded action instead of accepting or displaying plans.
 - The runtime now also curates the visible model picker toward the currently reliable agent-capable local models: `phi4-mini:3.8b`, `llama3.1:8b`, and `qwen3-coder:30b`. Smaller glitch-prone coder models are no longer surfaced in the picker by default.
 - Auto-Approve can bypass per-tool confirmations when enabled.

@@ -72,6 +72,8 @@ That is why the built-in picker is intentionally narrowed to the currently valid
 ManulAI has three working modes:
 
 - `Chat Mode` disables tools and responds as plain chat only
+- in `Chat Mode`, direct code-explanation or review questions should be answered in plain text, while explicit visible-snippet edit requests should stay in manual `Old:` / `New:` suggestion format
+- in `Chat Mode`, file-creation requests should stay as brief manual guidance and should not return full file dumps; switch to Agent Mode for actual file creation
 - `Agent Mode` enables local tools and lets Ollama continue the tool loop automatically
 - `Planner Mode` uses the same tools as Agent Mode but with a condensed system mandate focused on step-by-step planning and execution; it can also answer direct text questions without requiring tool calls
 - tiny local models are simplified automatically by model size: smaller context windows, shorter mandates, fewer hidden notes/summaries, and a reduced tool menu for ultra-small models so even `0.5b`-class models have a chance to stay on task
