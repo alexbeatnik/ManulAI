@@ -233,10 +233,24 @@ function looksLikeGreenfieldCreateTask(text) {
   return /(?:\bfrom scratch\b|\bconsole\b|\bcli\b|\bgame\b|\bapp\b|\bscript\b|\btool\b|\bprogram\b|\bservice\b|\bбот\b|\bгра\b|\bгру\b|\bскрипт\b|\bдодаток\b|\bутиліт)/i.test(normalized);
 }
 
+function looksLikeExplicitCreateOnlyTask(text) {
+  const normalized = text.trim().toLowerCase();
+  if (!normalized || !looksLikeWriteIntent(text)) return false;
+  if (/розбий|split|refactor.*module|extract.*module/i.test(normalized)) return false;
+
+  const explicitTargets = extractLikelyRequestFileTargets(text);
+  if (explicitTargets.length === 0) return false;
+
+  const createPattern = /\b(?:create|write|add|generate|make|scaffold)\b|(?:^|[\s"'`([{])(?:створи|создай|згенеруй|сгенерируй|зроби|сделай|напиши|побудуй|собери)(?=$|[\s"'`)\]},.!?:;])/i;
+  const editPattern = /\b(?:rename|replace|fix|change|update|edit|modify|rewrite|refactor|split|move|delete|remove)\b|(?:^|[\s"'`([{])(?:поміняй|зміни|измени|поменяй|онови|обнови|заміни|замени|відредагуй|редагуй|перепиши|виправ|исправь|видали|удали)(?=$|[\s"'`)\]},.!?:;])/i;
+  return createPattern.test(normalized) && !editPattern.test(normalized);
+}
+
 const REQUIRES_FILE_WRITE = looksLikeWriteIntent(userPrompt);
 const IS_PREFERRED_GREENFIELD_REQUEST = isPreferredSupportedModel(MODEL)
   && looksLikeGreenfieldCreateTask(userPrompt)
   && !IS_SPLIT_TASK;
+const IS_EXPLICIT_CREATE_ONLY_TASK = !IS_SPLIT_TASK && looksLikeExplicitCreateOnlyTask(userPrompt);
 const PREFERRED_GREENFIELD_BOOTSTRAP_FILEPATH = IS_PREFERRED_GREENFIELD_REQUEST
   ? inferDegenerateRecoveryStarterFilepath(userPrompt)
   : undefined;
@@ -332,6 +346,34 @@ async function runTerminalCommandDirect(command) {
     }
     return JSON.stringify({ command, exitCode: e.code ?? 1, stdout: e.stdout ?? '', stderr: e.stderr ?? '', error: errorMessage });
   }
+}
+
+function isRetryableOllamaFetchError(error) {
+  const message = error instanceof Error ? error.message : String(error ?? '');
+  return /fetch failed|networkerror|econnreset|econnrefused|socket hang up|timed out|timeout/i.test(message);
+}
+
+async function fetchOllamaChat(body) {
+  let lastError;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      return await fetch(`${OLLAMA_URL}/api/chat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+      });
+    } catch (error) {
+      lastError = error;
+      if (attempt >= 1 || !isRetryableOllamaFetchError(error)) {
+        throw error;
+      }
+      const message = error instanceof Error ? error.message : String(error ?? 'unknown fetch error');
+      label(Y, 'OLLAMA RETRY', `Transient fetch failure: ${message}`);
+      logEvent('ollama_fetch_retry', { attempt: attempt + 1, error: message });
+      await new Promise(resolve => setTimeout(resolve, 700));
+    }
+  }
+  throw lastError ?? new Error('Ollama fetch failed');
 }
 
 function detectInsufficientGreenfieldCreateContent(filepath, content) {
@@ -2954,6 +2996,7 @@ async function main() {
   let blockImmediateTerminalAfterWrite = false;
   let pendingGreenfieldVerificationPath = '';
   let lastGreenfieldVerifiedPath = '';
+  let sessionCompleted = false;
   preferredGreenfieldSuccessfulWriteCount = 0;
   dryRunFiles.clear(); // reset for this session
 
@@ -2972,8 +3015,12 @@ async function main() {
     return explicitRequestedWriteTargets.filter(target => ![...successfulWritePaths].some(writePath => toolPathMatchesTarget(writePath, target)));
   };
 
+  const hasSatisfiedExplicitWriteRequest = () => explicitRequestedWriteTargets.length > 0 && getMissingExplicitRequestedWriteTargets().length === 0;
+
   const executeResolvedToolCalls = async (toolCalls, options = {}) => {
     const { assistantContent = '', toolCallsPayload = undefined, recoveryLabel = 'BOOTSTRAP TOOL CALL' } = options;
+    let hadToolErrorThisRound = false;
+    let buildVerifyFailedThisRound = false;
 
     extractionContinuationPending = false;
     label(Y, recoveryLabel, `Executing ${toolCalls.length} recovered tool call(s)`);
@@ -3043,6 +3090,7 @@ let args = rawArgs;
       const parsed = JSON.parse(result);
 
       if (parsed.error) {
+        hadToolErrorThisRound = true;
         label(R, `  ✗ ${toolName}`, parsed.error);
         if (toolName === 'read_file_slice' || toolName === 'read_specific_file') {
           const recoveryTarget = getDeterministicReadRecoveryTargetFromPrompt(userPrompt);
@@ -3161,6 +3209,7 @@ let args = rawArgs;
         const verifyResult = await runTerminalCommandDirect(`cd ${JSON.stringify(verifyConfig.projectRoot)} && ${verifyConfig.command}`);
         const parsedVerify = JSON.parse(verifyResult);
         const verifyOutput = [String(parsedVerify.stdout ?? ''), String(parsedVerify.stderr ?? '')].filter(Boolean).join('\n').trim();
+        buildVerifyFailedThisRound = Number(parsedVerify.exitCode ?? 1) !== 0;
         if (Number(parsedVerify.exitCode ?? 1) === 0 && pendingGreenfieldVerificationPath) {
           lastGreenfieldVerifiedPath = pendingGreenfieldVerificationPath;
           pendingGreenfieldVerificationPath = '';
@@ -3187,6 +3236,18 @@ let args = rawArgs;
     for (const { _type, ...msg } of postToolMessages) {
       if (_type === 'reminder' && !pendingReplaceAfterCreate) continue;
       messages.push(msg);
+    }
+
+    if (IS_EXPLICIT_CREATE_ONLY_TASK
+      && hadSuccessfulWrite
+      && !hadToolErrorThisRound
+      && !buildVerifyFailedThisRound
+      && !pendingReplaceAfterCreate
+      && hasSatisfiedExplicitWriteRequest()) {
+      sessionCompleted = true;
+      label(G, 'DONE', 'All explicitly requested files were written and verified — task complete.');
+      logEvent('session_done', { turn, reason: 'explicit_create_auto_completion', targets: explicitRequestedWriteTargets });
+      return;
     }
 
     // For non-write tasks, nudge after 3+ reads
@@ -3220,6 +3281,9 @@ let args = rawArgs;
   };
 
   while (turn < MAX_TURNS) {
+    if (sessionCompleted) {
+      break;
+    }
     turn++;
     label(C, `TURN ${turn}`, `retry=${retryCount} messages=${messages.length}`);
 
@@ -3249,11 +3313,7 @@ let args = rawArgs;
 
     let responseData;
     try {
-      const resp = await fetch(`${OLLAMA_URL}/api/chat`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body)
-      });
+      const resp = await fetchOllamaChat(body);
       if (!resp.ok) {
         const txt = await resp.text();
         let recoveredFromParseError = false;
@@ -3322,6 +3382,8 @@ let args = rawArgs;
       const postToolMessages = [];
       const INSPECTION_ONLY_TOOLS = new Set(['read_file_slice', 'read_specific_file', 'list_workspace_files', 'project_scan', 'read_workspace_notes']);
       const toolNamesInBatch = [];
+      let hadToolErrorThisRound = false;
+      let buildVerifyFailedThisRound = false;
 
       for (const tc of resolvedToolCalls) {
         const toolName = tc.function?.name ?? 'unknown';
@@ -3390,6 +3452,7 @@ let args = rawArgs;
         const parsed = JSON.parse(result);
 
         if (parsed.error) {
+          hadToolErrorThisRound = true;
           label(R, `  ✗ ${toolName}`, parsed.error);
           // After create_or_edit_file fails (e.g. overwrite guard), allow re-reads so model can get fresh context
           if (toolName === 'create_or_edit_file') {
@@ -3517,6 +3580,7 @@ let args = rawArgs;
           const verifyResult = await runTerminalCommandDirect(`cd ${JSON.stringify(verifyConfig.projectRoot)} && ${verifyConfig.command}`);
           const parsedVerify = JSON.parse(verifyResult);
           const verifyOutput = [String(parsedVerify.stdout ?? ''), String(parsedVerify.stderr ?? '')].filter(Boolean).join('\n').trim();
+          buildVerifyFailedThisRound = Number(parsedVerify.exitCode ?? 1) !== 0;
           if (Number(parsedVerify.exitCode ?? 1) === 0 && pendingGreenfieldVerificationPath) {
             lastGreenfieldVerifiedPath = pendingGreenfieldVerificationPath;
             pendingGreenfieldVerificationPath = '';
@@ -3545,6 +3609,17 @@ let args = rawArgs;
         // Skip the reminder if the same batch already handled replace_in_file (pendingReplaceAfterCreate=false)
         if (_type === 'reminder' && !pendingReplaceAfterCreate) continue;
         messages.push(msg);
+      }
+
+      if (IS_EXPLICIT_CREATE_ONLY_TASK
+        && hadSuccessfulWrite
+        && !hadToolErrorThisRound
+        && !buildVerifyFailedThisRound
+        && !pendingReplaceAfterCreate
+        && hasSatisfiedExplicitWriteRequest()) {
+        label(G, 'DONE', 'All explicitly requested files were written and verified — task complete.');
+        logEvent('session_done', { turn, reason: 'explicit_create_auto_completion', targets: explicitRequestedWriteTargets });
+        sessionCompleted = true;
       }
 
       // For non-write tasks (summarize, explain, review), nudge the model to stop reading and produce output

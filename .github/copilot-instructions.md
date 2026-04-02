@@ -60,6 +60,7 @@ This repository contains a VS Code extension named ManulAI.
 - Keep the built-in model picker focused on the currently validated local agent models unless explicit testing proves a new family reliable enough to surface by default.
 - Treat the current validated baseline as `phi4-mini:3.8b`, `llama3.1:8b`, and `qwen3-coder:30b`, based on direct Ollama `/api/chat` checks plus standalone agent-loop testing rather than picker assumptions alone.
 - `gpt-oss:20b` may be tested manually, but do not add it to the built-in picker baseline until its agent/planner create and edit loops stop failing on malformed or truncated tool-call behavior.
+- Keep the one-shot transient Ollama fetch retry and explicit create-only early-completion behavior in sync between `scripts/debug-agent.mjs` and `src/ManulAiChatProvider.ts`; if a requested explicit create-only target set was already written successfully, do not force an extra model turn just for a completion sentence.
 - Keep revert metadata attached to revertable native file-tool transcript entries so the webview can surface `Revert changes` directly on those results.
 - If retry exhaustion is reached and the model still returns pseudo-progress or plan text, surface a deterministic backend failure message instead of leaking raw `Step 1/3`-style output.
 - For explicit multi-file write requests, do not accept final completion text until the recorded successful file-tool writes cover every requested target file.

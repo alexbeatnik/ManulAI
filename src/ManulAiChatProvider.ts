@@ -75,6 +75,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   private totalReadOps = 0;
   private currentRequestRequiresWrite = true;
   private currentRequestIsPreferredGreenfield = false;
+  private currentRequestIsExplicitCreateOnly = false;
   private preferredGreenfieldSuccessfulWriteCount = 0;
   private blockImmediateTerminalAfterWrite = false;
   private lastImmediateWritePath = '';
@@ -928,6 +929,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       && this.looksLikeGreenfieldCreateTask(text);
 
     this.currentRequestIsPreferredGreenfield = isPreferredGreenfieldRequest;
+    this.currentRequestIsExplicitCreateOnly = this.isAgentLike && this.looksLikeExplicitCreateOnlyTask(text);
     this.preferredGreenfieldSuccessfulWriteCount = 0;
     this.blockImmediateTerminalAfterWrite = false;
     this.lastImmediateWritePath = '';
@@ -981,6 +983,26 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
 
     return /(?:\bfrom scratch\b|\bconsole\b|\bcli\b|\bgame\b|\bapp\b|\bscript\b|\btool\b|\bprogram\b|\bservice\b|\bбот\b|\bгра\b|\bгру\b|\bскрипт\b|\bдодаток\b|\bутиліт)/i.test(normalized)
       || !this.looksLikeFileMutationRequest(text);
+  }
+
+  private looksLikeExplicitCreateOnlyTask(text: string): boolean {
+    const normalized = text.trim().toLowerCase();
+    if (!normalized || !this.looksLikeWriteIntent(text)) {
+      return false;
+    }
+
+    if (this.looksLikeLargeRefactorRequest(text)) {
+      return false;
+    }
+
+    const explicitTargets = this.extractLikelyRequestFileTargets(text);
+    if (explicitTargets.length === 0) {
+      return false;
+    }
+
+    const createPattern = /\b(?:create|write|add|generate|make|scaffold)\b|(?:^|[\s"'`([{])(?:створи|создай|згенеруй|сгенерируй|зроби|сделай|напиши|побудуй|собери)(?=$|[\s"'`)\]},.!?:;])/i;
+    const editPattern = /\b(?:rename|replace|fix|change|update|edit|modify|rewrite|refactor|split|move|delete|remove)\b|(?:^|[\s"'`([{])(?:поміняй|зміни|измени|поменяй|онови|обнови|заміни|замени|відредагуй|редагуй|перепиши|виправ|исправь|видали|удали)(?=$|[\s"'`)\]},.!?:;])/i;
+    return createPattern.test(normalized) && !editPattern.test(normalized);
   }
 
   private looksLikeFileMutationRequest(text: string): boolean {
@@ -1553,6 +1575,53 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     }
 
     return requestTargets.filter(target => !successfulWritePaths.some(writePath => this.toolPathMatchesTarget(writePath, target)));
+  }
+
+  private shouldAutoCompleteExplicitCreateOnlyRequest(messages: OllamaMessage[]): boolean {
+    if (!this.currentRequestRequiresWrite || !this.currentRequestIsExplicitCreateOnly || this.pendingGreenfieldVerificationPath) {
+      return false;
+    }
+
+    const latestVisibleUserRequest = this.getLatestVisibleUserRequest(messages);
+    const explicitTargets = this.extractLikelyRequestFileTargets(latestVisibleUserRequest);
+    if (explicitTargets.length === 0) {
+      return false;
+    }
+
+    const lastVisibleUserIdx = this.getLastVisibleUserMessageIndex(messages);
+    const recentMessages = lastVisibleUserIdx >= 0 ? messages.slice(lastVisibleUserIdx) : messages;
+    const recentToolResults = recentMessages
+      .filter((message): message is OllamaMessage & { role: 'tool' } => message.role === 'tool')
+      .map((message, index) => {
+        try {
+          return { message, parsed: JSON.parse(message.content) as Record<string, unknown>, index };
+        } catch {
+          return { message, parsed: {} as Record<string, unknown>, index };
+        }
+      });
+
+    const recentSuccessfulWritePaths = this.getRecentSuccessfulWritePaths(recentToolResults);
+    if (this.getMissingExplicitRequestedWriteTargets(explicitTargets, recentSuccessfulWritePaths).length > 0) {
+      return false;
+    }
+
+    if (recentToolResults.some(({ parsed }) => Boolean(parsed.error))) {
+      return false;
+    }
+
+    if (this.getLatestBuildVerifyFailure(recentToolResults)) {
+      return false;
+    }
+
+    return recentToolResults.some(({ message, parsed }) => {
+      if (parsed.error) {
+        return false;
+      }
+      if (message.tool_name === 'replace_in_file') {
+        return true;
+      }
+      return message.tool_name === 'create_or_edit_file' && !isPlaceholderCreateResult(parsed);
+    });
   }
 
   private detectInsufficientGreenfieldCreateContent(filename: string, content: string): string | undefined {
@@ -2629,6 +2698,18 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
             });
           }
         }
+      }
+
+      if (this.shouldAutoCompleteExplicitCreateOnlyRequest(messages)) {
+        const latestVisibleUserRequest = this.getLatestVisibleUserRequest(messages);
+        this.debugLog('explicit_create_auto_completion', {
+          targets: this.extractLikelyRequestFileTargets(latestVisibleUserRequest)
+        });
+        messages.push({
+          role: 'assistant',
+          content: 'Completed the explicitly requested file creation.'
+        });
+        return;
       }
 
       // For non-write tasks (summarize, explain, review), nudge the model to stop reading and produce output
@@ -4464,6 +4545,43 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     });
   }
 
+  private isRetryableOllamaFetchError(error: unknown): boolean {
+    if (this.isAbortError(error)) {
+      return false;
+    }
+
+    const message = error instanceof Error ? error.message : String(error ?? '');
+    return /fetch failed|networkerror|econnreset|econnrefused|socket hang up|timed out|timeout/i.test(message);
+  }
+
+  private async fetchOllamaChatResponse(baseUrl: string, body: Record<string, unknown>, abortController: AbortController): Promise<Response> {
+    let lastError: unknown;
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        return await fetch(`${baseUrl}/api/chat`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify(body),
+          signal: abortController.signal
+        });
+      } catch (error) {
+        lastError = error;
+        if (attempt >= 1 || !this.isRetryableOllamaFetchError(error)) {
+          throw error;
+        }
+
+        const message = error instanceof Error ? error.message : String(error ?? 'unknown fetch error');
+        this.debugLog('ollama_fetch_retry', { attempt: attempt + 1, error: message, model: this.getSelectedModel() });
+        this.postStatus('Ollama request failed transiently — retrying once...');
+        await new Promise(resolve => setTimeout(resolve, 700));
+      }
+    }
+
+    throw lastError instanceof Error ? lastError : new Error('Ollama fetch failed');
+  }
+
   private async callOllama(messages: OllamaMessage[]): Promise<OllamaResponse> {
     const baseUrl = this.getOllamaBaseUrl();
     const model = this.getSelectedModel();
@@ -4849,14 +4967,7 @@ If the user asks for a change but provides NO code:
     const abortController = new AbortController();
     this.currentRequestAbortController = abortController;
 
-    const response = await fetch(`${baseUrl}/api/chat`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify(body),
-      signal: abortController.signal
-    });
+    const response = await this.fetchOllamaChatResponse(baseUrl, body as Record<string, unknown>, abortController);
 
     if (!response.ok) {
       const errorText = await response.text();
@@ -4866,12 +4977,7 @@ If the user asks for a change but provides NO code:
         this.postStatus('Model does not support tools — retrying as plain chat...');
         const retryController = new AbortController();
         this.currentRequestAbortController = retryController;
-        const retryResponse = await fetch(`${baseUrl}/api/chat`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(body),
-          signal: retryController.signal
-        });
+        const retryResponse = await this.fetchOllamaChatResponse(baseUrl, body as Record<string, unknown>, retryController);
         if (!retryResponse.ok) {
           const retryError = await retryResponse.text();
           throw new Error(`Ollama HTTP ${retryResponse.status}: ${retryError}`);
