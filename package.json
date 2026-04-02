@@ -2,7 +2,7 @@
   "name": "manulai-local-agent",
   "displayName": "ManulAI Local Agent",
   "description": "ManulAI is a local AI coding assistant for Visual Studio Code powered entirely by your own Ollama runtime.",
-  "version": "0.0.6",
+  "version": "0.0.7",
   "publisher": "manul-engine",
   "icon": "icon.png",
   "license": "Apache-2.0",
@@ -61,6 +61,12 @@
         "title": "Attach Folder to ManulAI Chat",
         "category": "ManulAI",
         "icon": "$(file-directory)"
+      },
+      {
+        "command": "manulai.devSendPrompt",
+        "title": "ManulAI: Send Prompt (Dev/Test)",
+        "category": "ManulAI",
+        "icon": "$(beaker)"
       }
     ],
     "menus": {
@@ -165,7 +171,10 @@
     "@types/vscode": "^1.110.0",
     "@typescript-eslint/eslint-plugin": "^8.27.0",
     "@typescript-eslint/parser": "^8.27.0",
+    "axios": "^1.14.0",
     "eslint": "^9.22.0",
+    "express": "^4.22.1",
+    "jest": "^30.3.0",
     "typescript": "^5.8.2"
   }
 }

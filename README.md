@@ -46,15 +46,39 @@ ManulAI is designed for developers who already want Ollama as the model runtime 
 - supports native Ollama tool-calling flow with `tool` role responses
 - no hard request timeout inside the extension; long-running local responses can finish naturally
 - model selection is exposed inside the extension UI and settings
+- the built-in model picker is intentionally curated toward the currently reliable local agent models: `phi4-mini:3.8b`, `llama3.1:8b`, and `qwen3-coder:30b`
 - if no local model is selected, the UI stays empty instead of showing a fake fallback model
+
+### Tested Local Models
+
+These results come from direct Ollama `/api/chat` checks, standalone ManulAI debug-harness runs, and the local regression matrix across Chat, Agent, and Planner tasks. The suite now covers more than simple greenfield creation: it includes plain-text explain cases, visible-snippet edit behavior, missing-code edit behavior, exact `package.json` reads, Go explanation tasks, multi-file create flows, explicit nested-path create flows, and temp-file edit checks. This is still not a universal benchmark for every prompt, but it is the current practical baseline for agent use inside ManulAI.
+
+- `qwen3-coder:30b` is the strongest tested model so far. It produces the most reliable native tool calls, usually starts greenfield tasks by creating the first concrete file immediately, and is the least likely to fall into repetitive or malformed output.
+- `llama3.1:8b` is usable and generally coherent. Raw coding output is solid, and it behaves much better than the weaker `qwen2.5-coder` tiers, but it is still not as consistent as `qwen3-coder:30b` for multi-step agent loops.
+- `phi4-mini:3.8b` is also usable and much better than the weak small models, especially for short direct coding tasks. Its main weakness is tool-call formatting: it can still leak pseudo-tool text or need recovery more often than `qwen3-coder:30b`.
+- `gpt-oss:20b` is still manual-test-only. It now benefits from deterministic recovery for exact `package.json` and `README.md` read requests, a one-shot transient Ollama fetch retry, and auto-completion after successful explicit create-only writes, but it is not yet reliable enough for the curated picker. In current testing it still falls over too often in Agent and Planner create/edit loops, and recent full reruns also exposed intermittent Ollama model-load/resource failures on this machine.
+- `qwen2.5-coder:7b` is not reliable enough for the built-in picker. It can produce partially reasonable raw English coding output, but in planner or agent loops it still tends to degrade into broken, repetitive, or malformed responses too often.
+- `qwen2.5-coder:1.5b` is not currently viable for dependable agent behavior here. In testing it collapsed into low-quality repetitive output even on simple generation tasks.
+- `qwen2.5-coder:0.5b` is not currently viable for real agent use. It regularly fails even before the tool loop matters, so the product no longer treats this class as a reliable default model.
+
+In practical terms, the difference is mostly this:
+
+- stronger models can follow the tool loop, choose a sane first action, and keep moving without getting trapped in scans, malformed tool syntax, or repetitive garbage
+- weaker models may still answer something, but they are much more likely to narrate instead of acting, emit broken tool-call text, repeat themselves, or fail after the first write step
+
+That is why the built-in picker is intentionally narrowed to the currently validated families instead of exposing every local Ollama model as if all of them were equally agent-capable.
 
 ### Agent Mode And Chat Mode
 
 ManulAI has three working modes:
 
 - `Chat Mode` disables tools and responds as plain chat only
+- in `Chat Mode`, direct code-explanation or review questions should be answered in plain text, while explicit visible-snippet edit requests should stay in manual `Old:` / `New:` suggestion format
+- in `Chat Mode`, file-creation requests should stay as brief manual guidance and should not return full file dumps; switch to Agent Mode for actual file creation
 - `Agent Mode` enables local tools and lets Ollama continue the tool loop automatically
 - `Planner Mode` uses the same tools as Agent Mode but with a condensed system mandate focused on step-by-step planning and execution; it can also answer direct text questions without requiring tool calls
+- tiny local models are simplified automatically by model size: smaller context windows, shorter mandates, fewer hidden notes/summaries, and a reduced tool menu for ultra-small models so even `0.5b`-class models have a chance to stay on task
+- the currently preferred agent-capable models also get extra tuning: `phi4-mini`, `llama3.1`, and `qwen3-coder` are biased toward one-step execution and a smaller core tool set so they spend less time on unnecessary scans and more time on concrete file work; for greenfield create tasks they also reject obvious placeholder scaffolds including trivial dumps like `...`, block overly thin first source files, recover some plain-text code dumps back into real file writes, require syntax verification before arbitrary terminal runs after the first source-file write, and block global package installs from the agent loop
 - in chat-only mode, ManulAI should not claim that files were changed
 - `Auto-Approve` can be turned on to execute tools immediately or off to require confirmation for every tool call
 
@@ -102,6 +126,10 @@ Agent Mode currently exposes these tools to Ollama:
 
 These cover the main local coding tasks: reading files, targeted edits, full rewrites when necessary, file creation, file deletion, listing workspace directories, running local shell commands, and launching interactive programs.
 
+For very small models, ManulAI automatically narrows this tool surface. Ultra-small models get a compact read/edit/list tool subset instead of the full menu, and small models get shorter prompts plus tighter retry/read limits to reduce planning loops and context overload.
+
+For any model tier, a few exact known-file read requests can bypass the normal agent loop entirely when the target is unambiguous. Today that includes reading `package.json` name/version and reading the `README.md` title. Ultra-small models additionally keep deterministic fast paths for exact-line replacement in one known file and single explicit-file creation, so a `0.5b`-class model does not need to survive the full tool-planning cycle for those narrow cases.
+
 `execute_terminal_command` runs a shell command and captures stdout/stderr. It has no stdin support, so interactive programs (games, REPLs, scripts using `input()` or `readline`) will hang and time out. When a timeout occurs because the process was killed, the error message explicitly hints that stdin is unavailable.
 
 `launch_in_terminal` opens a visible VS Code integrated terminal and runs the given command there. The user can interact with the program directly (type input, respond to prompts). The tool returns immediately — the model does not see the terminal output.
@@ -114,7 +142,7 @@ These cover the main local coding tasks: reading files, targeted edits, full rew
 
 `read_file_slice` reads only a bounded 1-based line range from a file and is intended for large files where a full-file read would waste context or push a weaker local model into summary-only behavior.
 
-After successful file edits, ManulAI also tries to run a stack-appropriate verification command automatically when the workspace provides one, instead of assuming every project is TypeScript-only.
+After successful file edits, ManulAI also tries to run a stack-appropriate verification command automatically when the workspace provides one, instead of assuming every project is TypeScript-only. For standalone greenfield files from a different stack, ManulAI now skips unrelated workspace verification rather than dragging the model into the wrong tool loop, and preferred-model greenfield flows now keep arbitrary terminal commands blocked until that syntax verification step has completed.
 
 ### Safer Editing Behavior
 
@@ -127,12 +155,18 @@ The extension now pushes stricter file-editing rules into the agent prompt:
 - do not claim a file changed unless a real tool changed it
 - do not treat a failed replacement or failed terminal command as a completed fix
 - do not stop on partial plans like `Step 1/3` when more reading or fixing is still required
+- for ultra-small tiers, do not plan at all; execute one bounded action immediately
 - do not declare success unless all required steps ran and the relevant tool calls succeeded
+- if the user explicitly requested multiple target files, do not declare success until each requested file has a real successful write result
+- if the user explicitly requested concrete file paths, recover shallow or wrong-directory create writes back toward those exact requested targets instead of accepting repo-root aliases like `main.js`
+- if Ollama returns a malformed tool-call parse error but the raw payload still contains a recoverable tool call, recover that tool intent instead of immediately failing the whole loop
 - do not modify a file before reading it first
 - if unsure, read more files and gather more context instead of guessing
 - for large refactor requests, inspect structure first, then split the work into small module/file steps instead of attempting a one-shot rewrite
 - prefer `read_file_slice` over whole-file reads when a large file only needs bounded inspection
 - do not leak raw or malformed tool-call JSON into fallback file writes; those responses are retried as tool calls instead of being treated as file content
+- raw function-call text like `list_workspace_files()` or `create_or_edit_file(...)` is treated as a broken tool call and pushed back into recovery instead of being accepted as a final answer
+- if a small or medium local model falls into repetitive garbage output, ManulAI retries once with a much stricter one-step recovery nudge instead of failing immediately
 - do not treat shell command blocks as file content during fallback file-write extraction
 - reject suspicious pseudo-filenames such as numeric dotted names or names with trailing dots before writing files
 
@@ -159,6 +193,7 @@ The extension contributes these VS Code commands:
 - `Attach to ManulAI Chat`
 - `Attach Active File to ManulAI Chat`
 - `Attach Explorer Selection to ManulAI Chat`
+- `ManulAI: Send Prompt (Dev/Test)`
 
 ---
 
@@ -216,6 +251,7 @@ Default values:
 
 ## What's New
 
+- **0.0.7:** Agent and Planner behavior is now model-aware. Smaller Ollama models run with shorter mandates, tighter retry budgets, bounded-read bias, and a reduced tool set so weak local models are less likely to stall or ramble. The runtime also recovers more aggressively from malformed tool output: raw leaked tool-call text can be re-parsed, exact `package.json` name/version and `README.md` title requests can be answered deterministically, and explicit create-path requests are handled more reliably instead of drifting to the wrong file. Preferred local models are now curated around the currently validated baseline `phi4-mini:3.8b`, `llama3.1:8b`, and `qwen3-coder:30b`, with stronger greenfield-create nudges and tighter guardrails against placeholder scaffolds. The standalone debug harness was kept in sync with the extension runtime for the same recovery and model-profile behavior. Packaging version updated to `0.0.7`.
 - **0.0.6:** Workspace notes are now per-chat: each chat stores its own notes under `.manulai/notes/<chatId>.md` instead of a shared `.manulai/notes.md`. Notes are automatically deleted when the chat is deleted. The nudge system now detects conversational user messages (greetings, short non-actionable text) and skips action-forcing nudges so the model responds naturally instead of executing stale tasks from earlier context. Packaging version updated to `0.0.6`.
 - **0.0.5:** Added Planner Mode as the third working mode alongside Chat and Agent — uses the same tools as Agent Mode but with a condensed step-by-step mandate; it can also answer direct text questions without requiring tool calls. Added `launch_in_terminal` tool for running interactive programs (games, REPLs, scripts needing user input) in a visible VS Code terminal instead of the non-interactive `execute_terminal_command`. Terminal command execution now detects timeout-killed processes and reports that stdin is unavailable, preventing futile retries of interactive programs. Context trimming is now model-aware: the sliding-window size and `num_ctx` sent to Ollama are derived from the model size tag (e.g. `:7b`, `:30b`) instead of using hardcoded limits. Large-refactor recovery is stricter for weaker local models. If the model keeps narrating the same `read_file_slice`, `create_or_edit_file`, or `replace_in_file` step instead of executing it, ManulAI can now auto-bootstrap the real tool call on the repeated response and continue the agent loop. Generated extraction output for Go and Rust is also screened harder before writes so obviously invalid cross-language blocks are rejected instead of being saved. Tool-call stripping in the response pipeline was tightened so only `json`, `tool_call`, and `tool` code blocks are removed instead of all fenced code blocks. Internally, the provider-side large-refactor/bootstrap helpers were split into a dedicated module to keep the production provider maintainable. Packaging version updated to `0.0.5`.
 - **0.0.4:** Removed the separate Activity Bar launcher badge so ManulAI stays focused on the Secondary Sidebar chat view. The header and chat controls were compacted further, with chat creation and deletion moved next to the chat selector. Empty-model handling is now truthful instead of showing a fake fallback model, and revertable native file-tool transcript entries expose `Revert changes` again. Large files can now be read with bounded line slices through `read_file_slice`, and large refactor requests are nudged toward step-by-step module/file plans instead of whole-file summaries. Agent Mode now also exposes `project_scan`, `read_workspace_notes`, and `write_workspace_notes`, persists compact project notes in `.manulai/notes.md`, and stores short chat-summary memory so future requests can recover prior context with less re-reading. Packaging version updated to `0.0.4`. *(Note: `project_scan`, workspace notes, and chat-summary memory were first introduced in 0.0.4 and remain available in later versions.)*

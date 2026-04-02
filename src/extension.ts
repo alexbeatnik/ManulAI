@@ -132,7 +132,7 @@ export function activate(context: vscode.ExtensionContext): void {
       }));
 
       if (availableModels.length === 0) {
-        void vscode.window.showWarningMessage('No Ollama models were found. Check the local Ollama server and try again.');
+        void vscode.window.showWarningMessage('No supported Ollama models were found. ManulAI is currently tuned for phi4-mini, llama3.1, and qwen3-coder local models.');
         return;
       }
 
@@ -147,6 +147,32 @@ export function activate(context: vscode.ExtensionContext): void {
 
       await provider.setSelectedModel(selected.label);
       await openChat();
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('manulai.devSendPrompt', async (promptArg?: unknown, optionsArg?: unknown) => {
+      let prompt = typeof promptArg === 'string' ? promptArg.trim() : '';
+      const options = typeof optionsArg === 'object' && optionsArg !== null
+        ? optionsArg as { autoApprove?: boolean }
+        : undefined;
+
+      if (!prompt) {
+        const entered = await vscode.window.showInputBox({
+          title: 'ManulAI Dev/Test Prompt',
+          prompt: 'Send a prompt directly into the installed ManulAI provider flow',
+          placeHolder: 'Enter a prompt to run through the extension',
+          ignoreFocusOut: true
+        });
+        prompt = entered?.trim() ?? '';
+      }
+
+      if (!prompt) {
+        return;
+      }
+
+      await openChat();
+      await provider.submitPromptForTesting(prompt, options?.autoApprove);
     })
   );
 

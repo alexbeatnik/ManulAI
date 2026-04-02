@@ -66,6 +66,15 @@ export function isTerminalReadOnlyInspectionCommand(command: string): boolean {
     || /^ls(?:\b|\b.*-)/.test(normalized);
 }
 
+export function isGlobalPackageInstallCommand(command: string): boolean {
+  const normalized = command.trim().toLowerCase().replace(/\s+/g, ' ');
+  if (!normalized) {
+    return false;
+  }
+
+  return /(?:^|\b)(?:npm\s+(?:install|i|add)\s+-g\b|pnpm\s+add\s+-g\b|yarn\s+global\s+add\b|bun\s+add\s+-g\b)/.test(normalized);
+}
+
 export function buildPreviewSnippet(content: string): string {
   const normalized = content.replace(/\r\n/g, '\n').trimEnd();
   if (!normalized.trim()) {
@@ -207,13 +216,24 @@ export function detectDelimiterImbalance(content: string): string | undefined {
 export function isPlaceholderCreateResult(parsed: Record<string, unknown>): boolean {
   const preview = typeof parsed.preview === 'string' ? parsed.preview : '';
   const bytesWritten = Number(parsed.bytesWritten ?? 0);
+  const normalizedPreview = preview.replace(/\r\n/g, '\n').trim();
   const normalizedLines = preview
     .replace(/\r\n/g, '\n')
     .split('\n')
     .map(line => line.trim())
     .filter(Boolean);
 
+  const placeholderLinePattern = /^(?:\/\/|#|\/\*|\*|<!--)?\s*(?:\.{3}|…+|code will be inserted here|todo|tbd|placeholder|stub|coming soon|implement me|fill (?:me|this) in|your\s+\w+\s+here|logic here|implementation here|code here)\s*(?:-->|\*\/)?$/i;
+
+  if (normalizedPreview && placeholderLinePattern.test(normalizedPreview)) {
+    return true;
+  }
+
   if (normalizedLines.length === 0) {
+    return true;
+  }
+
+  if (normalizedLines.every(line => placeholderLinePattern.test(line))) {
     return true;
   }
 
@@ -236,7 +256,7 @@ export function isPlaceholderReplacementText(content: string): boolean {
     .filter(Boolean);
 
   return normalizedLines.length > 0 && normalizedLines.every(line =>
-    /^(?:\/\/|#|\/\*|\*|<!--)?\s*(?:code will be inserted here|todo|tbd|placeholder|stub|coming soon|implement me|fill me in)/i.test(line));
+    /^(?:\/\/|#|\/\*|\*|<!--)?\s*(?:\.{3}|…+|code will be inserted here|todo|tbd|placeholder|stub|coming soon|implement me|fill (?:me|this) in|your\s+\w+\s+here|logic here|implementation here|code here)/i.test(line));
 }
 
 export function toolResultMatchesAnyTargetPath(toolPathValue: unknown, targets: string[]): boolean {

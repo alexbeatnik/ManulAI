@@ -32,17 +32,132 @@ const MODEL       = process.env.MANUL_MODEL ?? 'qwen2.5-coder:7b';
 const DRY_RUN     = process.env.DRY_RUN === 'true';
 const MAX_TURNS   = parseInt(process.env.MAX_TURNS ?? '30', 10);
 
-// Model-based context limits: parse size hint from model tag (e.g. :7b, :30b)
-function getModelContextLimits(model) {
+function getModelSizeInBillions(model) {
   const m = model.toLowerCase().match(/(\d+\.?\d*)b/);
-  const sizeB = m ? parseFloat(m[1]) : 0;
-  if (sizeB > 0 && sizeB <= 9)  return { maxMessages: 16, numCtx: 8192 };
-  if (sizeB > 9 && sizeB <= 16) return { maxMessages: 24, numCtx: 12288 };
-  if (sizeB > 16 && sizeB <= 34) return { maxMessages: 32, numCtx: 16384 };
-  if (sizeB > 34) return { maxMessages: 48, numCtx: 32768 };
-  return { maxMessages: 32, numCtx: 16384 };
+  return m ? parseFloat(m[1]) : 0;
 }
-const MODEL_LIMITS = getModelContextLimits(MODEL);
+
+function isPreferredSupportedModel(model) {
+  const normalized = model.trim().toLowerCase();
+  return /^phi4-mini(?:[:]|$)/.test(normalized)
+    || /^llama3\.1(?:[:]|$)/.test(normalized)
+    || /^qwen3-coder(?:[:]|$)/.test(normalized);
+}
+
+function getModelCapabilityProfile(model) {
+  const normalizedModel = model.trim().toLowerCase();
+  const sizeB = getModelSizeInBillions(model);
+  const preferredToolNames = ['read_active_file', 'read_specific_file', 'read_file_slice', 'create_or_edit_file', 'replace_in_file', 'execute_terminal_command', 'launch_in_terminal', 'delete_file', 'list_workspace_files'];
+
+  if (/^phi4-mini(?:[:]|$)/.test(normalizedModel)) {
+    return {
+      tier: 'medium',
+      maxMessages: 14,
+      numCtx: 10240,
+      maxReadOpsWithoutWrite: 2,
+      maxNudgeRetriesCap: 4,
+      toolNames: preferredToolNames,
+      compactMandate: true,
+      preferStepwiseExecution: true,
+    };
+  }
+  if (/^llama3\.1(?:[:]|$)/.test(normalizedModel)) {
+    return {
+      tier: 'medium',
+      maxMessages: 20,
+      numCtx: 12288,
+      maxReadOpsWithoutWrite: 2,
+      maxNudgeRetriesCap: 4,
+      toolNames: preferredToolNames,
+      compactMandate: false,
+      preferStepwiseExecution: true,
+    };
+  }
+  if (/^qwen3-coder(?:[:]|$)/.test(normalizedModel)) {
+    return {
+      tier: 'large',
+      maxMessages: 28,
+      numCtx: 16384,
+      maxReadOpsWithoutWrite: 2,
+      maxNudgeRetriesCap: 5,
+      toolNames: preferredToolNames,
+      compactMandate: false,
+      preferStepwiseExecution: true,
+    };
+  }
+
+  if (sizeB > 0 && sizeB <= 1.5) {
+    return {
+      tier: 'micro',
+      maxMessages: 8,
+      numCtx: 4096,
+      maxReadOpsWithoutWrite: 2,
+      maxNudgeRetriesCap: 1,
+      toolNames: ['read_specific_file', 'read_file_slice', 'create_or_edit_file', 'replace_in_file', 'list_workspace_files'],
+      compactMandate: true,
+      preferStepwiseExecution: true,
+    };
+  }
+  if (sizeB > 1.5 && sizeB <= 3.5) {
+    return {
+      tier: 'small',
+      maxMessages: 10,
+      numCtx: 6144,
+      maxReadOpsWithoutWrite: 2,
+      maxNudgeRetriesCap: 2,
+      toolNames: ['read_active_file', 'read_specific_file', 'read_file_slice', 'create_or_edit_file', 'replace_in_file', 'list_workspace_files', 'execute_terminal_command'],
+      compactMandate: true,
+      preferStepwiseExecution: true,
+    };
+  }
+  if (sizeB > 0 && sizeB <= 9) {
+    return {
+      tier: 'medium',
+      maxMessages: 16,
+      numCtx: 8192,
+      maxReadOpsWithoutWrite: 3,
+      maxNudgeRetriesCap: 3,
+      toolNames: null,
+      compactMandate: false,
+      preferStepwiseExecution: false,
+    };
+  }
+  if (sizeB > 9 && sizeB <= 16) {
+    return {
+      tier: 'large',
+      maxMessages: 24,
+      numCtx: 12288,
+      maxReadOpsWithoutWrite: 3,
+      maxNudgeRetriesCap: 4,
+      toolNames: null,
+      compactMandate: false,
+      preferStepwiseExecution: false,
+    };
+  }
+  if (sizeB > 16 && sizeB <= 34) {
+    return {
+      tier: 'large',
+      maxMessages: 32,
+      numCtx: 16384,
+      maxReadOpsWithoutWrite: 3,
+      maxNudgeRetriesCap: 4,
+      toolNames: null,
+      compactMandate: false,
+      preferStepwiseExecution: false,
+    };
+  }
+  return {
+    tier: 'xlarge',
+    maxMessages: 48,
+    numCtx: 32768,
+    maxReadOpsWithoutWrite: 4,
+    maxNudgeRetriesCap: 5,
+    toolNames: null,
+    compactMandate: false,
+    preferStepwiseExecution: false,
+  };
+}
+const MODEL_LIMITS = getModelCapabilityProfile(MODEL);
 
 const cliArgs = process.argv.slice(2);
 
@@ -74,6 +189,7 @@ const LOG_FILE    = process.env.LOG_FILE ?? path.join(logDir, `debug-${sessionId
 
 // In-session cache for DRY_RUN "written" files (module-level so executeTool can access it)
 const dryRunFiles = new Map();
+let preferredGreenfieldSuccessfulWriteCount = 0;
 
 const userPrompt = cliArgs[0];
 if (!userPrompt) {
@@ -83,7 +199,236 @@ if (!userPrompt) {
 
 // Detect whether this run is a file-splitting task — only then enforce extractionCount gate
 const IS_SPLIT_TASK = /розбий|split|refactor.*module|extract.*module/i.test(userPrompt);
-const REQUIRES_FILE_WRITE = /\b(?:create|write|edit|modify|update|add|append|change|rename|delete|remove|refactor|split|move)\b/i.test(userPrompt);
+
+function looksLikeWriteIntent(text) {
+  const normalized = text.trim().toLowerCase();
+  if (!normalized) return false;
+  const englishWritePattern = /\b(?:create|write|edit|modify|update|add|append|change|rename|delete|remove|refactor|split|move|build|make|generate)\b/i;
+  const cyrillicWritePattern = /(?:^|[\s"'`([{])(?:поміняй|зміни|измени|поменяй|онови|обнови|заміни|замени|відредагуй|редагуй|перепиши|додай|добавь|видали|удали|створи|создай|зроби|сделай|напиши|виправ|исправь|згенеруй|сгенерируй|побудуй|собери)(?=$|[\s"'`)\]},.!?:;])/i;
+  return englishWritePattern.test(normalized) || cyrillicWritePattern.test(normalized);
+}
+
+function isSyntaxRelevantFilePath(filepath) {
+  const ext = path.extname(filepath || '').toLowerCase();
+  return new Set([
+    '.ts', '.tsx', '.mts', '.cts',
+    '.js', '.jsx', '.mjs', '.cjs',
+    '.py', '.go', '.rs', '.java', '.kt', '.cs', '.php', '.rb', '.swift',
+    '.c', '.cc', '.cpp', '.cxx', '.h', '.hpp', '.hh',
+    '.html', '.css', '.scss', '.sass', '.less', '.json', '.jsonc', '.yaml', '.yml', '.sh'
+  ]).has(ext);
+}
+
+function isGreenfieldSourceFilePath(filepath) {
+  const ext = path.extname(filepath || '').toLowerCase();
+  return isSyntaxRelevantFilePath(filepath) && !['.json', '.jsonc', '.yaml', '.yml'].includes(ext);
+}
+
+function looksLikeGreenfieldCreateTask(text) {
+  const normalized = text.trim().toLowerCase();
+  if (!normalized || !looksLikeWriteIntent(text)) return false;
+  if (/\b(?:scan|inspect|analy[sz]e|read)\s+(?:the\s+)?(?:project|workspace|repo|repository|codebase)\b/i.test(normalized)) return false;
+  if (/розбий|split|refactor.*module|extract.*module/i.test(normalized)) return false;
+  if (extractLikelyRequestFileTargets(text).length > 0) return false;
+  return /(?:\bfrom scratch\b|\bconsole\b|\bcli\b|\bgame\b|\bapp\b|\bscript\b|\btool\b|\bprogram\b|\bservice\b|\bбот\b|\bгра\b|\bгру\b|\bскрипт\b|\bдодаток\b|\bутиліт)/i.test(normalized);
+}
+
+function looksLikeExplicitCreateOnlyTask(text) {
+  const normalized = text.trim().toLowerCase();
+  if (!normalized || !looksLikeWriteIntent(text)) return false;
+  if (/розбий|split|refactor.*module|extract.*module/i.test(normalized)) return false;
+
+  const explicitTargets = extractLikelyRequestFileTargets(text);
+  if (explicitTargets.length === 0) return false;
+
+  const createPattern = /\b(?:create|write|add|generate|make|scaffold)\b|(?:^|[\s"'`([{])(?:створи|создай|згенеруй|сгенерируй|зроби|сделай|напиши|побудуй|собери)(?=$|[\s"'`)\]},.!?:;])/i;
+  const editPattern = /\b(?:rename|replace|fix|change|update|edit|modify|rewrite|refactor|split|move|delete|remove)\b|(?:^|[\s"'`([{])(?:поміняй|зміни|измени|поменяй|онови|обнови|заміни|замени|відредагуй|редагуй|перепиши|виправ|исправь|видали|удали)(?=$|[\s"'`)\]},.!?:;])/i;
+  return createPattern.test(normalized) && !editPattern.test(normalized);
+}
+
+const REQUIRES_FILE_WRITE = looksLikeWriteIntent(userPrompt);
+const IS_PREFERRED_GREENFIELD_REQUEST = isPreferredSupportedModel(MODEL)
+  && looksLikeGreenfieldCreateTask(userPrompt)
+  && !IS_SPLIT_TASK;
+const IS_EXPLICIT_CREATE_ONLY_TASK = !IS_SPLIT_TASK && looksLikeExplicitCreateOnlyTask(userPrompt);
+const PREFERRED_GREENFIELD_BOOTSTRAP_FILEPATH = IS_PREFERRED_GREENFIELD_REQUEST
+  ? inferDegenerateRecoveryStarterFilepath(userPrompt)
+  : undefined;
+const IS_CODE_PREFERRED_GREENFIELD_REQUEST = !!PREFERRED_GREENFIELD_BOOTSTRAP_FILEPATH
+  && isSyntaxRelevantFilePath(PREFERRED_GREENFIELD_BOOTSTRAP_FILEPATH);
+const SHOULD_BLOCK_IMMEDIATE_DRY_RUN_TERMINAL = DRY_RUN && IS_PREFERRED_GREENFIELD_REQUEST;
+
+function buildDryRunTerminalBlockResult(command, filePath) {
+  const targetPath = filePath ? ` after creating ${filePath}` : '';
+  return JSON.stringify({
+    command,
+    exitCode: 0,
+    blocked: true,
+    skipped: true,
+    note: `execute_terminal_command was skipped in DRY_RUN greenfield smoke${targetPath}. Continue with file creation, another file/tool step, or finalization instead of executing the new file.`
+  });
+}
+
+function buildEarlyGreenfieldTerminalBlockResult(command) {
+  return JSON.stringify({
+    command,
+    exitCode: 1,
+    blocked: true,
+    reason: 'prewrite_greenfield_terminal',
+    error: `Blocked command: do not use execute_terminal_command before the first real file write for this preferred-model greenfield task. Start by writing ${PREFERRED_GREENFIELD_BOOTSTRAP_FILEPATH ? path.basename(PREFERRED_GREENFIELD_BOOTSTRAP_FILEPATH) : 'the main source file'}.`
+  });
+}
+
+function isTerminalReadOnlyInspectionCommand(command) {
+  const trimmed = String(command ?? '').trim();
+  const normalized = trimmed.toLowerCase();
+  if (!normalized) return false;
+  if (/[;&|<>`\n\r]|\$\(|\b-exec\b/.test(trimmed)) return false;
+  if (/\bsed\b[^\n]*\s-i\b/.test(normalized)) return false;
+  return /^(?:cat|head|tail|sed|grep|rg|less|more|ls|find)\b/.test(normalized)
+    || /(?:\bcat\b|\bhead\b|\btail\b|\bsed\b|\bgrep\b|\brg\b).*\bmanulaichatprovider\.ts\b/.test(normalized)
+    || /^ls(?:\b|\b.*-)/.test(normalized);
+}
+
+function getDeterministicGreenfieldTargetPath() {
+  if (!IS_CODE_PREFERRED_GREENFIELD_REQUEST || !PREFERRED_GREENFIELD_BOOTSTRAP_FILEPATH) return undefined;
+  return PREFERRED_GREENFIELD_BOOTSTRAP_FILEPATH;
+}
+
+function normalizeComparablePath(value) {
+  return String(value ?? '').replace(/\\/g, '/').replace(/^\.\//, '').toLowerCase();
+}
+
+function toolPathMatchesTarget(toolPathValue, targetPath) {
+  const toolPath = normalizeComparablePath(toolPathValue);
+  const normalizedTarget = normalizeComparablePath(targetPath);
+  if (!toolPath || !normalizedTarget) return false;
+  return toolPath === normalizedTarget
+    || toolPath.endsWith(`/${normalizedTarget}`)
+    || path.basename(toolPath) === path.basename(normalizedTarget);
+}
+
+function buildPendingVerifyTerminalBlockResult(command, pendingPath) {
+  const targetLabel = pendingPath ? ` for ${path.basename(pendingPath)}` : '';
+  return JSON.stringify({
+    command,
+    exitCode: 1,
+    blocked: true,
+    reason: 'greenfield_verify_before_run',
+    error: `Blocked command: do not run arbitrary terminal commands${targetLabel} before syntax verification completes for the latest greenfield file write. Let the automatic verification run first, then continue with fixes if needed.`
+  });
+}
+
+function buildGlobalInstallBlockResult(command) {
+  return JSON.stringify({
+    command,
+    exitCode: 1,
+    blocked: true,
+    reason: 'global_install_blocked',
+    error: 'Blocked command: do not install packages globally from the agent loop. Use local project dependencies only when the user explicitly asked for them or they are genuinely required inside the current workspace.'
+  });
+}
+
+function isGlobalPackageInstallCommand(command) {
+  const normalized = String(command ?? '').trim().toLowerCase().replace(/\s+/g, ' ');
+  if (!normalized) return false;
+  return /(?:^|\b)(?:npm\s+(?:install|i|add)\s+-g\b|pnpm\s+add\s+-g\b|yarn\s+global\s+add\b|bun\s+add\s+-g\b)/.test(normalized);
+}
+
+async function runTerminalCommandDirect(command) {
+  try {
+    const { stdout, stderr } = await execAsync(command, { cwd: wsRoot, timeout: 30_000, maxBuffer: 1024 * 512 });
+    return JSON.stringify({ command, exitCode: 0, stdout, stderr });
+  } catch (e) {
+    let errorMessage = e.message;
+    if (e.killed) {
+      errorMessage = 'Command timed out after 30 seconds. No stdin available — interactive programs (input(), readline) will always hang.';
+    }
+    return JSON.stringify({ command, exitCode: e.code ?? 1, stdout: e.stdout ?? '', stderr: e.stderr ?? '', error: errorMessage });
+  }
+}
+
+function isRetryableOllamaFetchError(error) {
+  const message = error instanceof Error ? error.message : String(error ?? '');
+  return /fetch failed|networkerror|econnreset|econnrefused|socket hang up|timed out|timeout/i.test(message);
+}
+
+async function fetchOllamaChat(body) {
+  let lastError;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      return await fetch(`${OLLAMA_URL}/api/chat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+      });
+    } catch (error) {
+      lastError = error;
+      if (attempt >= 1 || !isRetryableOllamaFetchError(error)) {
+        throw error;
+      }
+      const message = error instanceof Error ? error.message : String(error ?? 'unknown fetch error');
+      label(Y, 'OLLAMA RETRY', `Transient fetch failure: ${message}`);
+      logEvent('ollama_fetch_retry', { attempt: attempt + 1, error: message });
+      await new Promise(resolve => setTimeout(resolve, 700));
+    }
+  }
+  throw lastError ?? new Error('Ollama fetch failed');
+}
+
+function detectInsufficientGreenfieldCreateContent(filepath, content) {
+  if (!IS_PREFERRED_GREENFIELD_REQUEST) return undefined;
+
+  const nonEmptyLines = content.replace(/\r\n/g, '\n').split('\n').map(line => line.trim()).filter(Boolean);
+  const ext = path.extname(filepath).toLowerCase();
+  if (!isGreenfieldSourceFilePath(filepath)) {
+    const codeLikeLines = nonEmptyLines.filter(line =>
+      !/^(?:\/\/|\/\*|\*|#|<!--)/.test(line)
+      && (/(?:^|\s)(?:export|import|const|let|var|function|class|interface|type|enum|async|def|struct|impl|package|namespace|using|return)\b/.test(line)
+        || /[{}();=]/.test(line))
+    );
+    if (IS_CODE_PREFERRED_GREENFIELD_REQUEST && codeLikeLines.length > 0) {
+      return 'Blocked write: source code for a greenfield task must go into a real source file, not a generic text or data file. Write the implementation to the correct .py, .ts, .js, .go, .rs, .java, .cs, or similar source file path.';
+    }
+    return undefined;
+  }
+
+  if (nonEmptyLines.length === 0) {
+    return 'Blocked write: greenfield file content is empty. Write the actual implementation instead of an empty scaffold.';
+  }
+
+  const nonCommentLines = nonEmptyLines.filter(line => !/^(?:\/\/|\/\*|\*|#|<!--)/.test(line));
+  const placeholderPattern = /(?:your\s+\w+\s+here|your game logic here|game logic here|logic here|implementation here|code here|placeholder|stub|todo|tbd|coming soon|implement me|fill (?:me|this) in|to be implemented)/i;
+  const hasPlaceholderLine = nonEmptyLines.some(line => placeholderPattern.test(line));
+  const nonImportLines = nonCommentLines.filter(line => !/^(?:import\s+.+|from\s+\S+\s+import\s+.+|using\s+.+;?|package\s+[\w.]+;?|namespace\s+[\w.]+;?|export\s+\{.*\};?)$/.test(line));
+  const targetExt = path.extname(PREFERRED_GREENFIELD_BOOTSTRAP_FILEPATH ?? '').toLowerCase();
+  const isFirstGreenfieldSourceWrite = preferredGreenfieldSuccessfulWriteCount === 0
+    && IS_CODE_PREFERRED_GREENFIELD_REQUEST
+    && (!targetExt || ext === targetExt);
+  if (isFirstGreenfieldSourceWrite) {
+    const implementationSignalPattern = /(?:\bclass\b|\bfunction\b|\bdef\b|\bfunc\b|\bstruct\b|\benum\b|\binterface\b|\btype\b|\bif\b|\bfor\b|\bwhile\b|\bswitch\b|\bmatch\b|\bcase\b|\breturn\b|\btry\b|\bcatch\b|=>|[{}()[\];=])/i;
+    const trivialBoilerplatePattern = /^(?:print\s*\(.+\)\s*|console\.log\s*\(.+\)\s*|puts\s+.+|echo\s+.+|pass\b|return\b.*|main\s*\(\s*\)\s*|def\s+main\s*\(\s*\)\s*:|if\s+__name__\s*==\s*['"]__main__['"]\s*:|function\s+main\s*\(|public\s+static\s+void\s+main\s*\(|int\s+main\s*\(|fn\s+main\s*\(|package\s+[\w.]+;?|using\s+[\w.]+;?|import\s+.+|from\s+\S+\s+import\s+.+)$/i;
+    const significantLines = nonImportLines.filter(line => implementationSignalPattern.test(line));
+    const hasOnlyTrivialBoilerplate = nonEmptyLines.every(line => {
+      const trimmed = line.trim();
+      if (!trimmed) return true;
+      if (/^(?:#|\/\/|\/\*|\*)/.test(trimmed)) {
+        return placeholderPattern.test(trimmed);
+      }
+      return trivialBoilerplatePattern.test(trimmed);
+    });
+    if (significantLines.length < 3 && (hasOnlyTrivialBoilerplate || nonImportLines.length <= 6)) {
+      return 'Blocked write: the first source file for this greenfield task is too thin to be a real starting implementation. Do not stop at a placeholder, a single print/log line, or a bare wrapper. Write a minimal but working first version with real control flow and implementation logic.';
+    }
+  }
+
+  if (!hasPlaceholderLine) return undefined;
+
+  const hasImplementationLine = nonImportLines.some(line => /(?:\bdef\b|\bclass\b|\bfunction\b|\bconst\b|\blet\b|\bvar\b|\bif\b|\bfor\b|\bwhile\b|\breturn\b|\bprint\s*\(|\bconsole\.log\s*\(|\bmain\s*\(|=>|[{}();=])/.test(line));
+  if (hasImplementationLine) return undefined;
+
+  return 'Blocked write: greenfield file content is still a placeholder scaffold, not a real implementation. Do not write comments like "Your game logic here". Write the actual working code now.';
+}
 
 function detectLanguageId(filepath) {
   const ext = path.extname(filepath).toLowerCase();
@@ -225,6 +570,76 @@ function resolveFilepathInfo(fp, options = {}) {
   return { path: resolved, recoveredToTarget: false, originalPath };
 }
 
+function normalizeRequestTargetIntoWorkspace(targetPath) {
+  const normalizedTarget = String(targetPath ?? '').trim().replace(/\\/g, '/');
+  if (!normalizedTarget) return '';
+  if (path.isAbsolute(normalizedTarget)) return path.normalize(normalizedTarget);
+  const trimmedTarget = normalizedTarget
+    .replace(/^\.\//, '')
+    .replace(/^\.[/\\]/, '')
+    .replace(/^[/\\]+/, '');
+  return path.normalize(path.join(wsRoot, trimmedTarget));
+}
+
+function getExplicitWriteRequestTargets() {
+  if (!looksLikeWriteIntent(userPrompt)) return [];
+  const seen = new Set();
+  const targets = [];
+  for (const requestTarget of extractLikelyRequestFileTargets(userPrompt)) {
+    const absoluteTarget = normalizeRequestTargetIntoWorkspace(requestTarget);
+    if (!absoluteTarget) continue;
+    const withinWorkspace = absoluteTarget === wsRoot || absoluteTarget.startsWith(`${wsRoot}${path.sep}`);
+    if (!withinWorkspace) continue;
+    const comparableTarget = path.normalize(absoluteTarget).replace(/\\/g, '/').toLowerCase();
+    if (seen.has(comparableTarget)) continue;
+    seen.add(comparableTarget);
+    targets.push(absoluteTarget);
+  }
+  return targets;
+}
+
+function targetExistsForCreateRecovery(targetPath) {
+  return dryRunFiles.has(targetPath) || existsSync(targetPath);
+}
+
+function recoverRequestScopedCreatePath(requestedPath) {
+  const explicitTargets = getExplicitWriteRequestTargets();
+  if (!requestedPath || explicitTargets.length === 0) return {};
+
+  const requestedAbsolute = resolveFilepath(requestedPath);
+  if (!requestedAbsolute) return {};
+
+  const comparableRequested = path.normalize(requestedAbsolute).replace(/\\/g, '/').toLowerCase();
+  if (explicitTargets.some(target => path.normalize(target).replace(/\\/g, '/').toLowerCase() === comparableRequested)) {
+    return { resolvedPath: requestedAbsolute };
+  }
+
+  const requestedBasename = path.basename(requestedAbsolute).toLowerCase();
+  const basenameMatches = explicitTargets.filter(target => path.basename(target).toLowerCase() === requestedBasename);
+  if (basenameMatches.length === 1) {
+    return { resolvedPath: basenameMatches[0], recoveredFrom: String(requestedPath) };
+  }
+
+  const requestedExtension = path.extname(requestedAbsolute).toLowerCase();
+  if (!requestedExtension) {
+    if (explicitTargets.length === 1) {
+      return { resolvedPath: explicitTargets[0], recoveredFrom: String(requestedPath) };
+    }
+    return {};
+  }
+
+  const sameExtensionTargets = explicitTargets.filter(target => path.extname(target).toLowerCase() === requestedExtension);
+  const missingSameExtensionTargets = sameExtensionTargets.filter(target => !targetExistsForCreateRecovery(target));
+  if (missingSameExtensionTargets.length === 1) {
+    return { resolvedPath: missingSameExtensionTargets[0], recoveredFrom: String(requestedPath) };
+  }
+  if (sameExtensionTargets.length === 1) {
+    return { resolvedPath: sameExtensionTargets[0], recoveredFrom: String(requestedPath) };
+  }
+
+  return {};
+}
+
 function findNearestProjectRoot(startPath) {
   const startDir = path.dirname(startPath);
   const markers = ['package.json', 'tsconfig.json', 'pyproject.toml', 'requirements.txt', 'setup.py', 'Cargo.toml', 'go.mod', 'pom.xml', 'build.gradle', 'build.gradle.kts', 'gradlew'];
@@ -256,8 +671,43 @@ function scriptCommand(pm, scriptName) {
   return `bun run ${scriptName} 2>&1 | head -30`;
 }
 
+function isProjectVerificationManifestFile(targetPath) {
+  const basename = path.basename(targetPath || '').toLowerCase();
+  return basename === 'package.json'
+    || basename === 'tsconfig.json'
+    || basename === 'pyproject.toml'
+    || basename === 'requirements.txt'
+    || basename === 'setup.py'
+    || basename === 'cargo.toml'
+    || basename === 'go.mod'
+    || basename === 'pom.xml'
+    || basename === 'build.gradle'
+    || basename === 'build.gradle.kts'
+    || basename === 'gradlew'
+    || basename.endsWith('.sln')
+    || basename.endsWith('.csproj');
+}
+
 function pickVerifyCommandForPath(targetPath) {
   const projectRoot = findNearestProjectRoot(targetPath);
+  const latestExt = path.extname(targetPath || '').toLowerCase();
+  const hasPythonProjectMarkers = existsSync(path.join(projectRoot, 'pyproject.toml')) || existsSync(path.join(projectRoot, 'requirements.txt')) || existsSync(path.join(projectRoot, 'setup.py'));
+  const hasJavaProjectMarkers = existsSync(path.join(projectRoot, 'pom.xml')) || existsSync(path.join(projectRoot, 'build.gradle')) || existsSync(path.join(projectRoot, 'build.gradle.kts'));
+  const hasDotnetProjectMarkers = existsSync(projectRoot) && readdirSafe(projectRoot).some(name => name.endsWith('.sln') || name.endsWith('.csproj'));
+  const shouldPreferStandaloneSyntaxVerification = (IS_PREFERRED_GREENFIELD_REQUEST && isGreenfieldSourceFilePath(targetPath))
+    || (latestExt === '.go' && !existsSync(path.join(projectRoot, 'go.mod')) && !isProjectVerificationManifestFile(targetPath));
+
+  const quotedTargetPath = JSON.stringify(targetPath);
+  if (IS_PREFERRED_GREENFIELD_REQUEST && !isGreenfieldSourceFilePath(targetPath) && !isProjectVerificationManifestFile(targetPath)) {
+    return null;
+  }
+  if (shouldPreferStandaloneSyntaxVerification) {
+    if (latestExt === '.py') return { command: `python -m py_compile ${quotedTargetPath} 2>&1 | head -30`, projectRoot, stack: 'python-file' };
+    if (['.js', '.jsx', '.mjs', '.cjs'].includes(latestExt)) return { command: `node --check ${quotedTargetPath} 2>&1 | head -30`, projectRoot, stack: 'javascript-file' };
+    if (['.ts', '.tsx', '.mts', '.cts'].includes(latestExt)) return { command: `npx tsc --pretty false --noEmit ${quotedTargetPath} 2>&1 | head -30`, projectRoot, stack: 'typescript-file' };
+    if (latestExt === '.go') return { command: `gofmt -d ${quotedTargetPath} 2>&1 | head -30`, projectRoot, stack: 'go-file' };
+  }
+
   const packageJsonPath = path.join(projectRoot, 'package.json');
   if (existsSync(packageJsonPath)) {
     try {
@@ -274,13 +724,16 @@ function pickVerifyCommandForPath(targetPath) {
   if (existsSync(path.join(projectRoot, 'tsconfig.json'))) return { command: 'npx tsc --noEmit 2>&1 | head -30', projectRoot, stack: 'typescript' };
   if (existsSync(path.join(projectRoot, 'Cargo.toml'))) return { command: 'cargo check --quiet 2>&1 | head -30', projectRoot, stack: 'rust' };
   if (existsSync(path.join(projectRoot, 'go.mod'))) return { command: 'go test ./... 2>&1 | head -30', projectRoot, stack: 'go' };
-  if (existsSync(path.join(projectRoot, 'pyproject.toml')) || existsSync(path.join(projectRoot, 'requirements.txt')) || existsSync(path.join(projectRoot, 'setup.py'))) return { command: 'python -m compileall -q . 2>&1 | head -30', projectRoot, stack: 'python' };
+  if (hasPythonProjectMarkers) return { command: 'python -m compileall -q . 2>&1 | head -30', projectRoot, stack: 'python' };
   if (existsSync(path.join(projectRoot, 'pom.xml'))) return { command: 'mvn -q -DskipTests compile 2>&1 | head -30', projectRoot, stack: 'java' };
   if (existsSync(path.join(projectRoot, 'build.gradle')) || existsSync(path.join(projectRoot, 'build.gradle.kts'))) {
     return { command: existsSync(path.join(projectRoot, 'gradlew')) ? './gradlew -q build -x test 2>&1 | head -30' : 'gradle -q build -x test 2>&1 | head -30', projectRoot, stack: 'java/gradle' };
   }
-  const hasDotnet = existsSync(projectRoot) && readdirSafe(projectRoot).some(name => name.endsWith('.sln') || name.endsWith('.csproj'));
-  if (hasDotnet) return { command: 'dotnet build -nologo 2>&1 | head -30', projectRoot, stack: '.net' };
+  if (hasDotnetProjectMarkers) return { command: 'dotnet build -nologo 2>&1 | head -30', projectRoot, stack: '.net' };
+  if (latestExt === '.py') return { command: `python -m py_compile ${quotedTargetPath} 2>&1 | head -30`, projectRoot, stack: 'python-file' };
+  if (['.js', '.jsx', '.mjs', '.cjs'].includes(latestExt)) return { command: `node --check ${quotedTargetPath} 2>&1 | head -30`, projectRoot, stack: 'javascript-file' };
+  if (['.ts', '.tsx', '.mts', '.cts'].includes(latestExt)) return { command: `npx tsc --pretty false --noEmit ${quotedTargetPath} 2>&1 | head -30`, projectRoot, stack: 'typescript-file' };
+  if (latestExt === '.go') return { command: `gofmt -d ${quotedTargetPath} 2>&1 | head -30`, projectRoot, stack: 'go-file' };
   return null;
 }
 
@@ -307,6 +760,22 @@ function logEvent(event, data = {}) {
 
 // ─── System prompt (keep in sync with callOllama in ManulAiChatProvider.ts) ─
 function buildAgentMandate() {
+  if (MODEL_LIMITS.compactMandate) {
+    return `[IDENTITY]
+You are ManulAI, a local VS Code coding agent.
+Workspace root: ${wsRoot}
+
+[RULES]
+- Execute the next concrete action. No long plan.
+- Prefer exactly ONE tool call per response.
+- Read before edit. Prefer read_file_slice for large files.
+- Use replace_in_file for small edits and create_or_edit_file for new files.
+- Do not narrate tool calls. Do not print JSON as text.
+- If a tool fails, adapt once and continue.
+- Finish with one short summary when the task is done.
+`;
+  }
+
   return `[IDENTITY]
 You are ManulAI, a local VS Code coding agent.
 Workspace root: ${wsRoot}
@@ -441,6 +910,20 @@ If steps remain → continue with the next tool call.
 }
 
 function buildPlannerMandate() {
+  if (MODEL_LIMITS.compactMandate) {
+    return `[IDENTITY]
+You are ManulAI, a local VS Code coding agent in Planner mode.
+Workspace root: ${wsRoot}
+
+[RULES]
+- If the user asks a direct question, answer briefly in text.
+- For edit or file tasks: do exactly ONE small tool call per response.
+- Prefer read_file_slice over large reads.
+- Keep responses short. No multi-step plans. No JSON in text.
+- Finish with a one-line summary when done.
+`;
+  }
+
   return `[IDENTITY]
 You are ManulAI, a local VS Code coding agent in Planner mode.
 Workspace root: ${wsRoot}
@@ -460,7 +943,7 @@ All file paths are relative to the workspace root unless absolute.
 
 // ─── Tool definitions ────────────────────────────────────────────────────────
 function getToolDefinitions() {
-  return [
+  const allTools = [
     {
       type: 'function',
       function: {
@@ -596,6 +1079,13 @@ function getToolDefinitions() {
       }
     }
   ];
+
+  if (!MODEL_LIMITS.toolNames) {
+    return allTools;
+  }
+
+  const allowed = new Set(MODEL_LIMITS.toolNames);
+  return allTools.filter(tool => allowed.has(tool.function.name));
 }
 
 // ─── Tool execution ──────────────────────────────────────────────────────────
@@ -940,7 +1430,7 @@ async function executeTool(name, args) {
     }
 
     case 'read_file_slice': {
-      const pathInfo = resolveFilepathInfo(args.filepath, { recoverTarget: true });
+      const pathInfo = resolveFilepathInfo(args.filepath ?? args.filename, { recoverTarget: true });
       const fp = pathInfo.path;
       try {
         // In DRY_RUN mode, serve from cache if file was written in this session
@@ -948,8 +1438,17 @@ async function executeTool(name, args) {
           ? dryRunFiles.get(fp)
           : readFileSync(fp, 'utf8');
         const lines = rawContent.split('\n');
-        const start = Math.max(1, Number(args.startLine ?? 1));
-        const end   = Math.min(lines.length, Number(args.endLine ?? lines.length));
+        const rawStart = args.startLine === undefined || args.startLine === null || args.startLine === '' ? 1 : Number(args.startLine);
+        const rawEnd = args.endLine === undefined || args.endLine === null || args.endLine === '' ? lines.length : Number(args.endLine);
+        if (!Number.isFinite(rawStart) || !Number.isFinite(rawEnd)) {
+          return JSON.stringify({ error: 'startLine and endLine must be numbers.' });
+        }
+        const start = Math.max(1, Math.floor(rawStart));
+        const requestedEnd = Math.max(1, Math.floor(rawEnd));
+        if (requestedEnd < start) {
+          return JSON.stringify({ error: 'endLine must be greater than or equal to startLine.' });
+        }
+        const end = Math.min(lines.length, requestedEnd);
         return JSON.stringify({
           path: fp, languageId: detectLanguageId(fp),
           startLine: start, endLine: end,
@@ -961,7 +1460,7 @@ async function executeTool(name, args) {
     }
 
     case 'read_specific_file': {
-      const pathInfo = resolveFilepathInfo(args.filepath, { recoverTarget: true });
+      const pathInfo = resolveFilepathInfo(args.filepath ?? args.filename, { recoverTarget: true });
       const fp = pathInfo.path;
       try {
         // In DRY_RUN mode, serve from cache if file was written in this session
@@ -986,7 +1485,8 @@ async function executeTool(name, args) {
     }
 
     case 'create_or_edit_file': {
-      const fp = resolveFilepath(args.filename ?? args.filepath ?? '');
+      const recoveredCreateTarget = recoverRequestScopedCreatePath(args.filename ?? args.filepath ?? '');
+      const fp = recoveredCreateTarget.resolvedPath ?? resolveFilepath(args.filename ?? args.filepath ?? '');
       let content = String(args.content ?? '');
       if (!fp) return JSON.stringify({ error: 'filename is required.' });
       const withinWorkspace = fp === wsRoot || fp.startsWith(`${wsRoot}${path.sep}`);
@@ -1042,6 +1542,11 @@ async function executeTool(name, args) {
         }
       }
 
+      const insufficientGreenfieldContent = detectInsufficientGreenfieldCreateContent(fp, content);
+      if (insufficientGreenfieldContent) {
+        return JSON.stringify({ error: insufficientGreenfieldContent });
+      }
+
       // Import-shell guard: reject files whose only content is import / re-export lines (no actual definitions)
       const nonCommentCodeLines = nonEmptyLines.filter(l => !/^(?:\/\/|\/\*|\*|#)/.test(l));
       const allAreImports = nonCommentCodeLines.length > 0 &&
@@ -1075,10 +1580,21 @@ async function executeTool(name, args) {
       if (DRY_RUN) {
         label(Y, 'DRY-RUN write', `${fp}\n  ${content.substring(0, 150).replace(/\n/g, '\n  ')}${content.length > 150 ? '\n  ...' : ''}`);
         dryRunFiles.set(fp, content); // cache for reads
-        return JSON.stringify({ path: fp, bytesWritten: content.length, preview: content.substring(0, 80), dryRun: true });
+        return JSON.stringify({
+          path: fp,
+          bytesWritten: content.length,
+          preview: content.substring(0, 80),
+          dryRun: true,
+          ...(recoveredCreateTarget.recoveredFrom ? { note: `Recovered requested path ${recoveredCreateTarget.recoveredFrom} to exact target ${fp}. Use this exact target path for subsequent reads and edits.` } : {})
+        });
       }
       writeFileSync(fp, content, 'utf8');
-      return JSON.stringify({ path: fp, bytesWritten: content.length, preview: content.substring(0, 80) });
+      return JSON.stringify({
+        path: fp,
+        bytesWritten: content.length,
+        preview: content.substring(0, 80),
+        ...(recoveredCreateTarget.recoveredFrom ? { note: `Recovered requested path ${recoveredCreateTarget.recoveredFrom} to exact target ${fp}. Use this exact target path for subsequent reads and edits.` } : {})
+      });
     }
 
     case 'replace_in_file': {
@@ -1142,22 +1658,16 @@ async function executeTool(name, args) {
     }
 
     case 'execute_terminal_command': {
-      const cmd = String(args.command ?? '');
+      const cmd = String(args.command ?? args.cmd ?? '');
       if (!cmd) return JSON.stringify({ error: 'command is required.' });
-      try {
-        const { stdout, stderr } = await execAsync(cmd, { cwd: wsRoot, timeout: 30_000, maxBuffer: 1024 * 512 });
-        return JSON.stringify({ command: cmd, exitCode: 0, stdout, stderr });
-      } catch (e) {
-        let errorMessage = e.message;
-        if (e.killed) {
-          errorMessage = 'Command timed out after 30 seconds. No stdin available — interactive programs (input(), readline) will always hang.';
-        }
-        return JSON.stringify({ command: cmd, exitCode: e.code ?? 1, stdout: e.stdout ?? '', stderr: e.stderr ?? '', error: errorMessage });
+      if (IS_CODE_PREFERRED_GREENFIELD_REQUEST && preferredGreenfieldSuccessfulWriteCount === 0 && !isTerminalReadOnlyInspectionCommand(cmd)) {
+        return buildEarlyGreenfieldTerminalBlockResult(cmd);
       }
+      return await runTerminalCommandDirect(cmd);
     }
 
     case 'launch_in_terminal': {
-      const cmd = String(args.command ?? '');
+      const cmd = String(args.command ?? args.cmd ?? '');
       if (!cmd) return JSON.stringify({ error: 'command is required.' });
       console.log(`[LAUNCH_IN_TERMINAL] ${cmd}`);
       return JSON.stringify({ launched: true, command: cmd, note: 'In debug mode, interactive launch is simulated. In VS Code, this opens a real terminal.' });
@@ -1290,6 +1800,316 @@ function remapArgs(args) {
   return out;
 }
 
+function extractDeterministicSingleFileCreateRequest(text) {
+  const match = text.match(/\b(?:create|write|add)\s+((?:[A-Za-z]:)?[A-Za-z0-9_./\\-]+\.(?:ts|tsx|js|jsx|json|md|css|html|py|yml|yaml|txt|sh))\b/i);
+  if (!match || !match[1]) return undefined;
+  const filepath = match[1].replace(/\\/g, '/');
+  const codeBlockMatch = text.match(/```[\w+-]*\n([\s\S]*?)```/);
+  let content = codeBlockMatch?.[1]?.trim() ?? '';
+  if (!content) {
+    content = text.slice(match.index + match[0].length)
+      .replace(/^\s*(?:with\s+(?:content|code)\s*:|containing\s+|that\s+contains\s+)/i, '')
+      .replace(/^\s*exporting\s+/i, 'export ')
+      .replace(/\bdo\s+not\s+modify\s+any\s+other\s+file\b[.!]?/i, '')
+      .trim()
+      .replace(/[\s.]+$/, '')
+      .trim();
+  }
+  if (!content) return undefined;
+  if (!/(?:\bexport\b|\bfunction\b|=>|\bclass\b|\binterface\b|\bconst\b|\blet\b|\breturn\b|[{};])/m.test(content)) return undefined;
+  return { filepath, content: content.endsWith('\n') ? content : `${content}\n` };
+}
+
+function extractLikelyRequestFileTargets(text) {
+  const candidates = [];
+  const pushCandidate = value => {
+    const trimmed = String(value ?? '').trim().replace(/^[`"']+|[`"'.,;:!?]+$/g, '');
+    if (!trimmed) return;
+    const normalized = trimmed.replace(/\\/g, '/');
+    if (!candidates.some(candidate => candidate.toLowerCase() === normalized.toLowerCase())) {
+      candidates.push(normalized);
+    }
+  };
+
+  let match;
+  const explicitPathPattern = /(?:^|\s)((?:[A-Za-z]:)?[A-Za-z0-9_./\\-]+\.(?:ts|tsx|js|jsx|json|md|css|scss|html|py|yml|yaml|xml|txt|sh|toml|ini|go))(?:\s|$|[,.;:!?])/gi;
+  while ((match = explicitPathPattern.exec(text)) !== null) {
+    pushCandidate(match[1]);
+  }
+
+  const bareNamePattern = /\b(package\.json|tsconfig\.json|README(?:\.md)?|LICENSE(?:\.txt|\.md)?|CHANGELOG(?:\.md)?|Dockerfile|Makefile|\.env(?:\.[A-Za-z0-9_-]+)?)\b/gi;
+  while ((match = bareNamePattern.exec(text)) !== null) {
+    pushCandidate(match[1]);
+  }
+
+  const normalized = text.toLowerCase();
+  if (/(?:\breadme\b|рідмі|ридми)/i.test(normalized)) {
+    pushCandidate('README.md');
+    pushCandidate('README');
+  }
+  if (/(?:\blicense\b|ліцензі|лиценз)/i.test(normalized)) {
+    pushCandidate('LICENSE');
+  }
+  if (/(?:package\s*json|package\.json)/i.test(normalized)) {
+    pushCandidate('package.json');
+  }
+  if (/(?:tsconfig|tsconfig\.json)/i.test(normalized)) {
+    pushCandidate('tsconfig.json');
+  }
+  if (/(?:changelog|історі[яї]\s+змін|список\s+змін|список\s+изменений)/i.test(normalized)) {
+    pushCandidate('CHANGELOG.md');
+  }
+  if (/\bdockerfile\b/i.test(normalized)) {
+    pushCandidate('Dockerfile');
+  }
+  if (/\bmakefile\b/i.test(normalized)) {
+    pushCandidate('Makefile');
+  }
+
+  return candidates;
+}
+
+function resolveDeterministicKnownFilePath(candidates = []) {
+  for (const candidate of candidates) {
+    const resolved = resolveFilepath(candidate);
+    if (resolved && existsSync(resolved)) return resolved;
+  }
+  for (const candidate of ['README.md', 'README', 'LICENSE', 'package.json', 'tsconfig.json']) {
+    const resolved = resolveFilepath(candidate);
+    if (resolved && existsSync(resolved)) return resolved;
+  }
+  return undefined;
+}
+
+function getDeterministicReadRecoveryTargetFromPrompt(text) {
+  const normalized = text.trim().toLowerCase();
+  if (normalized.includes('package.json') && /\bname\b/i.test(text) && /\bversion\b/i.test(text) && /(?:\bread\b|\bshow\b|\banswer\b|\bпокажи\b|\bпрочитай\b|\bскажи\b)/i.test(text)) {
+    return { filepath: 'package.json', reason: 'package.json name/version request' };
+  }
+  if (/(?:\breadme\b|readme\.md)/i.test(normalized) && /(?:\btitle\b|\bheading\b|\bheadline\b|\bзаголовок\b|\bтайтл\b)/i.test(text) && /(?:\bread\b|\bshow\b|\bwhat\b|\banswer\b|\bпокажи\b|\bпрочитай\b|\bскажи\b)/i.test(text)) {
+    return { filepath: 'README.md', reason: 'README title request' };
+  }
+  return undefined;
+}
+
+function inferDegenerateRecoveryStarterFilepath(text) {
+  const explicitTargets = extractLikelyRequestFileTargets(text);
+  if (explicitTargets.length > 0) return explicitTargets[0];
+
+  const normalized = text.trim().toLowerCase();
+  if (!looksLikeWriteIntent(text)) return undefined;
+  if (/\bpython\b|\bpy\b/i.test(normalized) || normalized.includes('пайтон') || normalized.includes('питон') || normalized.includes('піто')) return 'main.py';
+  if (/\bgo\b|\bgolang\b/i.test(normalized)) return 'main.go';
+  if (/\brust\b|\brs\b/i.test(normalized)) return 'main.rs';
+  if (/\bjava\b/i.test(normalized)) return 'Main.java';
+  if (/\bkotlin\b|\bkt\b/i.test(normalized)) return 'Main.kt';
+  if (/\bc#\b|\bcsharp\b|\bdotnet\b|\.net\b|\bcs\b/i.test(normalized)) return 'Program.cs';
+  if (/\btypescript\b|\btype script\b|\bts\b/i.test(normalized)) return 'main.ts';
+  if (/\bjavascript\b|\bnode\b|\bjs\b/i.test(normalized)) return 'main.js';
+  if (/\bphp\b/i.test(normalized)) return 'index.php';
+  if (/\bruby\b|\brb\b/i.test(normalized)) return 'main.rb';
+  if (/\bswift\b/i.test(normalized)) return 'main.swift';
+  if (/\bc\+\+\b|\bcpp\b|\bcxx\b/i.test(normalized)) return 'main.cpp';
+  if (/\bc\b/i.test(normalized)) return 'main.c';
+  if (/\bhtml\b|\bweb\s*page\b|\blanding\b/i.test(normalized)) return 'index.html';
+  if (/\bcss\b|\bscss\b|\bsass\b|\bless\b/i.test(normalized)) return 'styles.css';
+  if (/\bjson\b/i.test(normalized)) return 'data.json';
+  if (/\byaml\b|\byml\b/i.test(normalized)) return 'config.yaml';
+  if (/\bshell\b|\bbash\b|\bsh\b|\bscript\b/i.test(normalized)) return 'main.sh';
+  return 'main.txt';
+}
+
+function extractRawToolPayloadFromOllamaError(errorText) {
+  const match = String(errorText ?? '').match(/error parsing tool call:\s*raw='([\s\S]*?)',\s*err=/i);
+  return match?.[1]?.trim() || undefined;
+}
+
+function getPreferredGreenfieldCodeDumpSpec(targetFilepath) {
+  const ext = path.extname(targetFilepath || '').toLowerCase();
+  if (ext === '.py') {
+    return {
+      firstCodeLinePattern: /^(?:import\s+\w|from\s+\w+\s+import\s+.+|def\s+\w+\(|class\s+\w+)/,
+      codeSignalPattern: /(?:\bdef\b|\bclass\b|\binput\s*\(|\brandom\b|\bwhile\b|\bfor\b|\bif\b|\belif\b|\breturn\b|\broll\b|\bdice\b)/g,
+      minLength: 120,
+      minSignalCount: 4
+    };
+  }
+  if (['.ts', '.tsx', '.mts', '.cts', '.js', '.jsx', '.mjs', '.cjs'].includes(ext)) {
+    return {
+      firstCodeLinePattern: /^(?:import\s+.+|export\s+.+|const\s+\w+|let\s+\w+|var\s+\w+|function\s+\w+|async\s+function\s+\w+|class\s+\w+|interface\s+\w+|type\s+\w+|enum\s+\w+)/,
+      codeSignalPattern: /(?:\bimport\b|\bexport\b|\bconst\b|\blet\b|\bvar\b|\bfunction\b|\bclass\b|=>|[{}();])/g,
+      minLength: 120,
+      minSignalCount: 4
+    };
+  }
+  if (ext === '.go') {
+    return {
+      firstCodeLinePattern: /^(?:package\s+\w+|import\s*\(|import\s+".+"|func\s+\w+|type\s+\w+)/,
+      codeSignalPattern: /(?:\bpackage\b|\bimport\b|\bfunc\b|\btype\b|\bstruct\b|\bif\b|\bfor\b|:=|[{}()])/g,
+      minLength: 120,
+      minSignalCount: 4
+    };
+  }
+  if (ext === '.rs') {
+    return {
+      firstCodeLinePattern: /^(?:use\s+\w+|fn\s+\w+|struct\s+\w+|enum\s+\w+|impl\s+\w+|mod\s+\w+)/,
+      codeSignalPattern: /(?:\buse\b|\bfn\b|\bstruct\b|\benum\b|\bimpl\b|\blet\b|\bmatch\b|[{}();])/g,
+      minLength: 120,
+      minSignalCount: 4
+    };
+  }
+  if (ext === '.java' || ext === '.kt' || ext === '.cs') {
+    return {
+      firstCodeLinePattern: /^(?:package\s+[\w.]+;?|import\s+[\w.*]+;?|using\s+[\w.]+;?|namespace\s+[\w.]+|public\s+class\s+\w+|class\s+\w+|object\s+\w+)/,
+      codeSignalPattern: /(?:\bpackage\b|\bimport\b|\busing\b|\bnamespace\b|\bclass\b|\bpublic\b|\bprivate\b|\bfun\b|\bstatic\b|[{}();])/g,
+      minLength: 140,
+      minSignalCount: 4
+    };
+  }
+  if (['.php', '.rb', '.swift', '.c', '.cc', '.cpp', '.cxx', '.h', '.hpp', '.hh'].includes(ext)) {
+    return {
+      firstCodeLinePattern: /^(?:<\?php|#include\s+[<"].+[>"]|require\s+['"].+['"]|func\s+\w+|def\s+\w+|class\s+\w+|struct\s+\w+|int\s+main\s*\(|void\s+\w+\s*\()/,
+      codeSignalPattern: /(?:<\?php|#include\b|\brequire\b|\bdef\b|\bclass\b|\bfunc\b|\bstruct\b|\breturn\b|[{}();])/g,
+      minLength: 120,
+      minSignalCount: 4
+    };
+  }
+  if (['.html', '.css', '.scss', '.sass', '.less'].includes(ext)) {
+    return {
+      firstCodeLinePattern: /^(?:<!doctype\s+html>|<html\b|<head\b|<body\b|<main\b|<div\b|<section\b|<style\b|[.#][\w-]+\s*\{)/i,
+      codeSignalPattern: /(?:<html\b|<body\b|<main\b|<div\b|<section\b|<script\b|<style\b|\{[^}]*\}|\bdisplay\s*:|\bcolor\s*:)/gi,
+      minLength: 120,
+      minSignalCount: 3
+    };
+  }
+  if (['.json', '.jsonc', '.yaml', '.yml', '.sh'].includes(ext)) {
+    return {
+      firstCodeLinePattern: /^(?:\{|\[|\w+\s*:|#!\/bin\/(?:bash|sh)|set\s+-[a-z]+|[A-Za-z_][A-Za-z0-9_]*=)/,
+      codeSignalPattern: /(?:\{|\[|\]|\}|:\s|#!\/bin\/(?:bash|sh)|\bif\b|\bfi\b|\bthen\b|\bexport\b|\=)/g,
+      minLength: 80,
+      minSignalCount: 3
+    };
+  }
+  return undefined;
+}
+
+function extractPreferredGreenfieldCodeDump(content) {
+  if (!IS_CODE_PREFERRED_GREENFIELD_REQUEST || preferredGreenfieldSuccessfulWriteCount > 0 || !PREFERRED_GREENFIELD_BOOTSTRAP_FILEPATH) return undefined;
+
+  const spec = getPreferredGreenfieldCodeDumpSpec(PREFERRED_GREENFIELD_BOOTSTRAP_FILEPATH);
+  if (!spec) return undefined;
+
+  const normalized = content.replace(/\r\n/g, '\n').trim();
+  if (!normalized) return undefined;
+
+  const fencedCandidates = Array.from(normalized.matchAll(/```(?:[\w+-]+)?\n([\s\S]*?)```/g), match => match[1].trim()).filter(Boolean);
+  for (const block of [normalized, ...fencedCandidates]) {
+    const lines = block.split('\n');
+    const firstCodeIndex = lines.findIndex(line => spec.firstCodeLinePattern.test(line.trim()));
+    if (firstCodeIndex < 0) continue;
+
+    const candidate = lines.slice(firstCodeIndex).join('\n').trim();
+    if (candidate.length < spec.minLength) continue;
+    const codeSignalCount = (candidate.match(spec.codeSignalPattern) ?? []).length;
+    if (codeSignalCount < spec.minSignalCount) continue;
+    if (detectInsufficientGreenfieldCreateContent(PREFERRED_GREENFIELD_BOOTSTRAP_FILEPATH, candidate)) continue;
+    return { filepath: PREFERRED_GREENFIELD_BOOTSTRAP_FILEPATH, content: candidate };
+  }
+
+  return undefined;
+}
+
+async function tryUltraSmallDeterministicFastPath() {
+  if (/package\.json/i.test(userPrompt) && /\bname\b/i.test(userPrompt) && /\bversion\b/i.test(userPrompt) && /(?:\bread\b|\bshow\b|\banswer\b)/i.test(userPrompt)) {
+    try {
+      const packageJson = JSON.parse(readFileSync(path.join(wsRoot, 'package.json'), 'utf8'));
+      const summary = [String(packageJson.name ?? '').trim(), String(packageJson.version ?? '').trim()].filter(Boolean).join(' ').trim();
+      label(G, 'FAST-PATH', `package.json -> ${summary || '(missing name/version)'}`);
+      logEvent('session_done', { reason: 'deterministic_fast_path_package_json', summary });
+      return true;
+    } catch (error) {
+      label(R, 'FAST-PATH ERROR', error instanceof Error ? error.message : String(error));
+      logEvent('fast_path_error', { reason: 'package_json', error: error instanceof Error ? error.message : String(error) });
+      return true;
+    }
+  }
+
+  if (/(?:\breadme\b|readme\.md)/i.test(userPrompt) && /(?:\btitle\b|\bheading\b|\bheadline\b|\bзаголовок\b|\bтайтл\b)/i.test(userPrompt) && /(?:\bread\b|\bshow\b|\bwhat\b|\banswer\b|\bпокажи\b|\bпрочитай\b|\bскажи\b)/i.test(userPrompt)) {
+    try {
+      const readmeText = readFileSync(path.join(wsRoot, 'README.md'), 'utf8');
+      const title = readmeText.match(/^#\s+(.+)$/m)?.[1]?.trim() || 'README.md has no H1 title.';
+      label(G, 'FAST-PATH', `README title -> ${title}`);
+      logEvent('session_done', { reason: 'deterministic_fast_path_readme_title', title });
+      return true;
+    } catch (error) {
+      label(R, 'FAST-PATH ERROR', error instanceof Error ? error.message : String(error));
+      logEvent('fast_path_error', { reason: 'readme_title', error: error instanceof Error ? error.message : String(error) });
+      return true;
+    }
+  }
+
+  if (MODEL_LIMITS.tier !== 'micro') return false;
+
+  const exactLineReplaceMatch = userPrompt.match(/replace\s+(?:the\s+)?exact\s+line\s+["'`](.+?)["'`]\s+with\s+["'`](.+?)["'`](?:\s+in\s+(\S+))?/i);
+  if (exactLineReplaceMatch) {
+    const oldLine = String(exactLineReplaceMatch[1] ?? '').trim();
+    const newLine = String(exactLineReplaceMatch[2] ?? '').trim();
+    const explicitFile = String(exactLineReplaceMatch[3] ?? '').trim();
+    const targetPath = resolveDeterministicKnownFilePath(explicitFile ? [explicitFile] : extractLikelyRequestFileTargets(userPrompt));
+
+    if (!targetPath) {
+      label(R, 'FAST-PATH ERROR', 'Unable to resolve target file for exact-line replace');
+      logEvent('fast_path_error', { reason: 'exact_line_replace', error: 'resolve_target_failed' });
+      return true;
+    }
+
+    try {
+      const current = readFileSync(targetPath, 'utf8');
+      const oldLinePattern = new RegExp(`^${escapeRegex(oldLine)}$`, 'm');
+      if (!oldLinePattern.test(current)) {
+        label(R, 'FAST-PATH ERROR', `Exact line not found in ${path.basename(targetPath)}`);
+        logEvent('fast_path_error', { reason: 'exact_line_replace', error: 'line_not_found', filepath: targetPath });
+        return true;
+      }
+
+      const result = await executeTool('replace_in_file', {
+        filepath: targetPath,
+        old_text: oldLine,
+        new_text: newLine
+      });
+      const parsed = JSON.parse(result);
+      if (parsed.error) {
+        label(R, 'FAST-PATH ERROR', parsed.error);
+        logEvent('fast_path_error', { reason: 'exact_line_replace', error: parsed.error, filepath: targetPath });
+      } else {
+        label(G, 'FAST-PATH', `Replaced exact line in ${path.basename(targetPath)}`);
+        logEvent('session_done', { reason: 'ultra_small_fast_path_exact_line_replace', filepath: targetPath });
+      }
+      return true;
+    } catch (error) {
+      label(R, 'FAST-PATH ERROR', error instanceof Error ? error.message : String(error));
+      logEvent('fast_path_error', { reason: 'exact_line_replace', error: error instanceof Error ? error.message : String(error), filepath: targetPath });
+      return true;
+    }
+  }
+
+  const createRequest = extractDeterministicSingleFileCreateRequest(userPrompt);
+  if (createRequest) {
+    const result = await executeTool('create_or_edit_file', { filename: createRequest.filepath, content: createRequest.content });
+    const parsed = JSON.parse(result);
+    if (parsed.error) {
+      label(R, 'FAST-PATH ERROR', parsed.error);
+      logEvent('fast_path_error', { reason: 'single_file_create', error: parsed.error, filepath: createRequest.filepath });
+    } else {
+      label(G, 'FAST-PATH', `Created ${createRequest.filepath}`);
+      logEvent('session_done', { reason: 'ultra_small_fast_path_single_file_create', filepath: createRequest.filepath });
+    }
+    return true;
+  }
+
+  return false;
+}
+
 // All names (canonical + aliases) that we should try to detect in text
 const ALL_TOOL_NAMES = [...KNOWN_TOOLS, ...Object.keys(TOOL_ALIASES)];
 
@@ -1334,8 +2154,141 @@ function relaxedJsonParse(str) {
   }
 }
 
+function escapeRegex(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function parseQuotedString(value) {
+  if (value.length < 2) return undefined;
+  const quote = value[0];
+  if (!['"', '\'', '`'].includes(quote) || value[value.length - 1] !== quote) return undefined;
+  if (quote === '"') {
+    try { return JSON.parse(value); } catch { return undefined; }
+  }
+  return value.slice(1, -1)
+    .replace(/\\n/g, '\n')
+    .replace(/\\r/g, '\r')
+    .replace(/\\t/g, '\t')
+    .replace(/\\\\/g, '\\')
+    .replace(new RegExp(`\\\\${escapeRegex(quote)}`, 'g'), quote);
+}
+
+function splitTopLevelArguments(value) {
+  const parts = [];
+  let current = '';
+  let parenDepth = 0;
+  let braceDepth = 0;
+  let bracketDepth = 0;
+  let quote = null;
+  let escaped = false;
+
+  for (let index = 0; index < value.length; index++) {
+    const char = value[index];
+    if (quote) {
+      current += char;
+      if (escaped) escaped = false;
+      else if (char === '\\') escaped = true;
+      else if (char === quote) quote = null;
+      continue;
+    }
+    if (char === '"' || char === '\'' || char === '`') {
+      quote = char;
+      current += char;
+      continue;
+    }
+    if (char === '(') parenDepth++;
+    else if (char === ')') parenDepth = Math.max(0, parenDepth - 1);
+    else if (char === '{') braceDepth++;
+    else if (char === '}') braceDepth = Math.max(0, braceDepth - 1);
+    else if (char === '[') bracketDepth++;
+    else if (char === ']') bracketDepth = Math.max(0, bracketDepth - 1);
+
+    if (char === ',' && parenDepth === 0 && braceDepth === 0 && bracketDepth === 0) {
+      const trimmed = current.trim();
+      if (trimmed) parts.push(trimmed);
+      current = '';
+      continue;
+    }
+    current += char;
+  }
+
+  const tail = current.trim();
+  if (tail) parts.push(tail);
+  return parts;
+}
+
+function extractBalancedParentheses(value, startIndex) {
+  if (value[startIndex] !== '(') return undefined;
+  let depth = 0;
+  let quote = null;
+  let escaped = false;
+  for (let index = startIndex; index < value.length; index++) {
+    const char = value[index];
+    if (quote) {
+      if (escaped) escaped = false;
+      else if (char === '\\') escaped = true;
+      else if (char === quote) quote = null;
+      continue;
+    }
+    if (char === '"' || char === '\'' || char === '`') {
+      quote = char;
+      continue;
+    }
+    if (char === '(') depth++;
+    else if (char === ')') {
+      depth--;
+      if (depth === 0) return value.slice(startIndex, index + 1);
+    }
+  }
+  return undefined;
+}
+
+function parseParenthesizedArgValue(token) {
+  const trimmed = token.trim();
+  const quoted = parseQuotedString(trimmed);
+  if (quoted !== undefined) return quoted;
+  if (/^-?\d+$/.test(trimmed)) return parseInt(trimmed, 10);
+  if (/^-?\d+\.\d+$/.test(trimmed)) return parseFloat(trimmed);
+  if (/^(?:true|false)$/i.test(trimmed)) return trimmed.toLowerCase() === 'true';
+  if (/^null$/i.test(trimmed)) return null;
+  return trimmed;
+}
+
+function inferParenthesizedArgs(toolName, argsBody) {
+  if (!argsBody) {
+    if (['list_workspace_files', 'project_scan', 'read_workspace_notes', 'read_active_file'].includes(toolName)) return {};
+    return undefined;
+  }
+  if (argsBody.startsWith('{') && argsBody.endsWith('}')) {
+    const parsed = relaxedJsonParse(argsBody);
+    if (parsed) return remapArgs(parsed);
+  }
+  const values = splitTopLevelArguments(argsBody).map(parseParenthesizedArgValue);
+  if (toolName === 'execute_terminal_command' || toolName === 'launch_in_terminal') return typeof values[0] === 'string' ? { command: values[0] } : undefined;
+  if (toolName === 'read_specific_file') return typeof values[0] === 'string' ? { filepath: values[0] } : undefined;
+  if (toolName === 'list_workspace_files') return values.length === 0 ? {} : (typeof values[0] === 'string' ? { directory: values[0] } : undefined);
+  if (toolName === 'delete_file') return typeof values[0] === 'string' ? { filepath: values[0] } : undefined;
+  if (toolName === 'read_file_slice') return typeof values[0] === 'string' && typeof values[1] === 'number' && typeof values[2] === 'number' ? { filepath: values[0], startLine: values[1], endLine: values[2] } : undefined;
+  if (toolName === 'create_or_edit_file' || toolName === 'write_to_file') return typeof values[0] === 'string' && typeof values[1] === 'string' ? { filename: values[0], filepath: values[0], content: values[1] } : undefined;
+  if (toolName === 'replace_in_file') return typeof values[0] === 'string' && typeof values[1] === 'string' && typeof values[2] === 'string' ? { filepath: values[0], old_text: values[1], new_text: values[2] } : undefined;
+  if (toolName === 'write_workspace_notes') return typeof values[0] === 'string' && typeof values[1] === 'string' ? { content: values[0], mode: values[1] } : undefined;
+  return undefined;
+}
+
 function parseToolCallsFromText(content) {
   const results = [];
+
+  for (const toolName of ALL_TOOL_NAMES) {
+    const callRe = new RegExp(`\\b${escapeRegex(toolName)}\\s*\\(`, 'gi');
+    let callMatch;
+    while ((callMatch = callRe.exec(content)) !== null) {
+      const argsSource = extractBalancedParentheses(content, callMatch.index + callMatch[0].length - 1);
+      if (!argsSource) continue;
+      const mappedName = remapToolName(toolName);
+      const args = inferParenthesizedArgs(mappedName, argsSource.slice(1, -1).trim());
+      if (args) results.push({ function: { name: mappedName, arguments: args } });
+    }
+  }
 
   // Match {"name": "tool_name", "arguments": {...}} — use balanced-brace finder for nested objects
   // Handles both compact {"name":"x"} and indented/pretty-printed JSON from the model
@@ -1373,11 +2326,23 @@ function parseToolCallsFromText(content) {
   }
 
   // Match fenced code blocks — extract full content and try to parse as JSON
-  const fencedPattern = /```(?:json|tool_call)?\s*\n([\s\S]*?)\n```/g;
+  const fencedPattern = /```([a-zA-Z_][\w-]*)?\s*\n([\s\S]*?)\n```/g;
   let match;
   while ((match = fencedPattern.exec(content)) !== null) {
+    const infoString = String(match[1] ?? '').trim();
+    const inner = String(match[2] ?? '').trim();
+    if (infoString) {
+      const mappedName = remapToolName(infoString);
+      if (ALL_TOOL_NAMES.includes(infoString) || KNOWN_TOOLS.includes(mappedName)) {
+        const args = relaxedJsonParse(inner);
+        if (args) {
+          results.push({ function: { name: mappedName, arguments: remapArgs(args) } });
+          continue;
+        }
+      }
+    }
     try {
-      const obj = relaxedJsonParse(match[1].trim());
+      const obj = relaxedJsonParse(inner);
       if (obj?.name && obj?.arguments !== undefined) {
         results.push({ function: { name: remapToolName(obj.name), arguments: remapArgs(typeof obj.arguments === 'string' ? relaxedJsonParse(obj.arguments) ?? {} : obj.arguments) } });
       }
@@ -1638,6 +2603,45 @@ function isDegenerateOutput(content) {
   return false;
 }
 
+async function tryRecoverFromDegenerateOutput(messages, content, retryCount, turn) {
+  if (!IS_AGENT_LIKE) return false;
+  if (MODEL_LIMITS.tier === 'large' || MODEL_LIMITS.tier === 'xlarge') return false;
+
+  const degenerateNudgeCount = messages.filter(
+    message => message.role === 'user'
+      && typeof message.content === 'string'
+      && message.content.includes('Your last response was incoherent or repetitive')
+  ).length;
+  if (degenerateNudgeCount >= 1) return false;
+
+  const starterFilepath = inferDegenerateRecoveryStarterFilepath(userPrompt);
+  const writeRecovery = REQUIRES_FILE_WRITE;
+  const nudge = writeRecovery
+    ? `Your last response was incoherent or repetitive. Reset completely. Do NOT explain, summarize, or plan. Call exactly ONE tool now.${starterFilepath ? ` For this greenfield create task, start by calling create_or_edit_file for ${starterFilepath} with the complete working implementation.` : ' For a create request, your next response should usually be create_or_edit_file with a concrete file path and the full implementation.'} Do not output prose before the tool call.`
+    : 'Your last response was incoherent or repetitive. Reset completely. Do NOT explain or plan. Either answer briefly in plain text now, or call exactly ONE read tool if you truly need file context first.';
+
+  label(Y, 'DEGENERATE RETRY', nudge.substring(0, 220));
+  logEvent('degenerate_output_retry', { turn, retryCount, tier: MODEL_LIMITS.tier, starterFilepath: starterFilepath ?? null, requiresWrite: writeRecovery });
+  messages.push({ role: 'assistant', content, hiddenFromTranscript: true });
+  messages.push({ role: 'user', content: nudge });
+  return true;
+}
+
+function isSyntheticToolResultText(content) {
+  const trimmed = content.trim();
+  if (!trimmed) return false;
+  if (/(?:<tool_response>|\[tool_response\])/i.test(trimmed)) return true;
+
+  const jsonLikeContent = (trimmed.match(/```json\s*([\s\S]*?)```/i)?.[1] ?? trimmed).trim();
+  if (!/"(?:tool|tool_name)"\s*:\s*"/i.test(jsonLikeContent)) {
+    return false;
+  }
+
+  const hasKnownToolName = /"(?:tool|tool_name)"\s*:\s*"(?:build_verify|create_or_edit_file|replace_in_file|read_file_slice|read_specific_file|read_active_file|execute_terminal_command|launch_in_terminal|delete_file|list_workspace_files|project_scan|read_workspace_notes)"/i.test(jsonLikeContent);
+  const hasToolResultKeys = /"(?:ok|result|exitCode|stdout|stderr|path|startLine|endLine|replacements|command|projectRoot|stack)"\s*:/i.test(jsonLikeContent);
+  return hasKnownToolName && hasToolResultKeys;
+}
+
 // ─── Simple nudge analysis (matches key detectors in processOllamaResponse) ──
 function analyzeResponse(content, recentMessages) {
   const hasToolResults = recentMessages.some(m => m.role === 'tool');
@@ -1645,12 +2649,15 @@ function analyzeResponse(content, recentMessages) {
   const progressLines = content.trim().split('\n').map(l => l.trim()).filter(Boolean);
   const isProgressOnly = content.trim().length < 220 &&
     progressLines.every(l => /^(?:step\s+\d+\s*(?:\/|of)\s*\d+|step\s+\d+\s+completed|execut(?:e|ing)\s+step\s+\d+|reading|i(?:'ll| will)\s+read)/i.test(l));
-  const isHallucinatingToolResponse = /<tool_response>/.test(content);
+  const isHallucinatingToolResponse = /<tool_response>/.test(content) || (hasToolResults && isSyntheticToolResultText(content));
   const isAnnouncedButNotExecuted = /(?:execut(?:e|ing)|proceed(?:ing)?\s+with)\s+(?:with\s+)?step\s+\d+\s*[:/.,!]?/i.test(content) || /step \d+\/\d+:\s*\w/i.test(content);
   const isPassingToUser = /(?:please (?:execute|run|proceed|confirm|provide|read)|would you like me to|shall i (?:proceed|continue)|can you (?:provide|share)|could you (?:provide|share))/i.test(content) && content.length < 800;
   const claimsDone = /(?:step \d+ completed|successfully applied|file (?:created|updated)|has been (?:created|moved|split)|(?<!\w)done\b(?![\s]*[:;{,=(])|(?:all (?:required )?)?tool calls? (?:have )?succeeded|(?:file )?splitting is complete|task(?:s)? (?:is |are )?complete)/i.test(content);  // Mentions a known tool name but parseToolCallsFromText couldn't extract a valid call
+  const claimsFailure = /(?:failed to|unable to|could(?: not|n't)|did not|was not|were not|not created|not updated|creation failed|update failed|tool call failed|error occurred|encountered (?:an|a) (?:problem|issue|error)|не удалось|не вдалось|не получилось|не вдалося|не смог(?:ла|ли)?|не створ(?:ив|ено)|не онов(?:ив|лено)|не змог(?:ла|ли)?|помилка|ошибка)/i.test(content)
+    && !/(?:no (?:errors?|issues?|problems?)|without errors?|verified successfully|verification passed|build verification passed)/i.test(content);
   const parsedFromContent = parseToolCallsFromText(content);
-  const mentionsToolButNotCalled = parsedFromContent.length === 0 && ALL_TOOL_NAMES.some(t => content.includes(t));  // looksLikePlan: numbered list. After tool results, also fire when content ends with an execute instruction.
+  const lowerContent = content.toLowerCase();
+  const mentionsToolButNotCalled = parsedFromContent.length === 0 && ALL_TOOL_NAMES.some(t => lowerContent.includes(t.toLowerCase()));  // looksLikePlan: numbered list. After tool results, also fire when content ends with an execute instruction.
   const endsWithExecute = /execut(?:e|ing)\s+step\s+\d+/i.test(content);
   const looksLikePlan = (
     !hasToolResults || endsWithExecute
@@ -1663,10 +2670,10 @@ function analyzeResponse(content, recentMessages) {
   const isPlanOnlyResponse = /^#{1,3}\s+(?:Plan|Steps?|Implementation|Approach)/mi.test(content) &&
     /\d+\.\s+\*\*/.test(content);
 
-  const requiresContinuation = isProgressOnly || isAnnouncedButNotExecuted || isPassingToUser || isHallucinatingToolResponse ||
+  const requiresContinuation = isProgressOnly || isAnnouncedButNotExecuted || isPassingToUser || isHallucinatingToolResponse || claimsFailure ||
     (claimsDone && !hasToolResults) || isLong || mentionsToolButNotCalled || isPlanOnlyResponse;
 
-  return { isLong, isProgressOnly, isAnnouncedButNotExecuted, isPassingToUser, isHallucinatingToolResponse, claimsDone, mentionsToolButNotCalled, looksLikePlan: looksLikePlan || isPlanOnlyResponse, requiresContinuation };
+  return { isLong, isProgressOnly, isAnnouncedButNotExecuted, isPassingToUser, isHallucinatingToolResponse, claimsDone, claimsFailure, mentionsToolButNotCalled, looksLikePlan: looksLikePlan || isPlanOnlyResponse, requiresContinuation };
 }
 
 // Builds the reminder message injected after a new extraction file is created.
@@ -1735,7 +2742,7 @@ function buildReplaceReminder(createdPath, newFileContent, allRecentReads) {
 }
 
 function buildNudge(analysis, lastToolWasError, ctx = {}) {
-  const { pendingReplaceAfterCreate: pReplace, lastSuccessfulRead: lastRead, lastCreatedFileState: lastCreated } = ctx;
+  const { pendingReplaceAfterCreate: pReplace, lastSuccessfulRead: lastRead, lastCreatedFileState: lastCreated, hadSuccessfulWrite } = ctx;
 
   // Context-rich nudge when a new file was created but replace_in_file hasn't succeeded yet
   if (pReplace && lastCreated) {
@@ -1761,6 +2768,9 @@ function buildNudge(analysis, lastToolWasError, ctx = {}) {
       const nextStart = (lastSuccessfulRead?.endLine ?? 120) + 1;
       return `The tool result is already recorded. Do NOT echo tool results. Read the next section — use read_file_slice with lines ${nextStart}–${nextStart + 119} — then extract another block.`;
     }
+    if (!IS_SPLIT_TASK && hadSuccessfulWrite) {
+      return 'The real tool result is already recorded. Do NOT echo or invent JSON tool results. Reply with a short plain-text completion summary only.';
+    }
     return 'The tool result is already recorded. Do NOT echo or repeat tool results in your response. Proceed with the next action.';
   }
   if (analysis.isAnnouncedButNotExecuted) {
@@ -1784,6 +2794,12 @@ function buildNudge(analysis, lastToolWasError, ctx = {}) {
     return IS_SPLIT_TASK
       ? 'Do not ask the user anything. You have all the tools you need. Use read_file_slice to read the source file, copy the actual code, and call create_or_edit_file with that real code.'
       : 'Do not ask the user anything. You have all the tools you need. Call create_or_edit_file to create files, or execute_terminal_command to run setup commands.';
+  }
+  if (analysis.claimsFailure) {
+    if (hadSuccessfulWrite) {
+      return 'The previous real tool result already shows a successful file write. Do NOT claim that the file was not created or updated. Either continue with the next real tool step, or reply with a short plain-text completion summary only.';
+    }
+    return 'You claimed that the task or tool call failed. Check the actual tool results in context, then either retry with corrected parameters or continue from the real successful state. Do not contradict the recorded tool output.';
   }
   if (lastToolWasError) {
     return IS_SPLIT_TASK
@@ -1916,6 +2932,11 @@ async function main() {
   label(B, 'PROMPT', userPrompt);
   logEvent('session_start', { model: MODEL, dryRun: DRY_RUN, prompt: userPrompt });
 
+  if (await tryUltraSmallDeterministicFastPath()) {
+    label(B, 'SUMMARY', `Fast path completed | Log: ${LOG_FILE}`);
+    return;
+  }
+
   const messages = [
     {
       role: 'user',
@@ -1942,14 +2963,25 @@ async function main() {
     { role: 'user', content: userPrompt }
   ];
 
+  if (isPreferredSupportedModel(MODEL) && looksLikeGreenfieldCreateTask(userPrompt)) {
+    const starterFilepath = inferDegenerateRecoveryStarterFilepath(userPrompt);
+    messages.splice(messages.length - 1, 0, {
+      role: 'user',
+      content: `This is a greenfield creation task. Do NOT call project_scan, list_workspace_files, read_workspace_notes, or write_workspace_notes unless the user explicitly asked about the existing project structure.${starterFilepath ? ` Start by creating one concrete file immediately, preferably ${starterFilepath}, with the complete first working implementation.` : ' Start by creating one concrete file immediately with the first working implementation.'} After that, continue with only the next required file or verification step.`
+    });
+  }
+
   let turn = 0;
   let retryCount = 0;
   let hadSuccessfulWrite = false; // tracks if any create_or_edit_file / replace_in_file succeeded
+  let lastSuccessfulWritePath = null;
   let pendingReplaceAfterCreate = false; // set after new-file create; cleared after successful replace_in_file
   let lastSuccessfulRead = null;   // { filepath, startLine, endLine, content } — last successful read_file_slice result
   let lastCreatedFileState = null; // { filePath, content, exportNames } — last successfully created extraction file
   let extractionCount = 0;         // how many complete extract-and-replace cycles succeeded
   let extractionContinuationPending = false; // true after replace_in_file success; cleared when model starts next tool call
+  const successfulWritePaths = new Set();
+  const explicitRequestedWriteTargets = REQUIRES_FILE_WRITE ? extractLikelyRequestFileTargets(userPrompt) : [];
   let targetTotalLinesObserved = 0;
   let targetAppearsExhausted = false;
   let repeatedNarratedCallSignature = null;
@@ -1961,6 +2993,11 @@ async function main() {
   const failedCommandCounts = new Map(); // command signature -> failure count
   let lastNudgedResponseContent = '';  // track identical responses
   let consecutiveIdenticalResponses = 0;
+  let blockImmediateTerminalAfterWrite = false;
+  let pendingGreenfieldVerificationPath = '';
+  let lastGreenfieldVerifiedPath = '';
+  let sessionCompleted = false;
+  preferredGreenfieldSuccessfulWriteCount = 0;
   dryRunFiles.clear(); // reset for this session
 
   const hasMetExtractionGoal = () => {
@@ -1973,8 +3010,17 @@ async function main() {
     return targetTotalLinesObserved <= 40 || remainingUnreadLines <= 8;
   };
 
+  const getMissingExplicitRequestedWriteTargets = () => {
+    if (explicitRequestedWriteTargets.length <= 1) return [];
+    return explicitRequestedWriteTargets.filter(target => ![...successfulWritePaths].some(writePath => toolPathMatchesTarget(writePath, target)));
+  };
+
+  const hasSatisfiedExplicitWriteRequest = () => explicitRequestedWriteTargets.length > 0 && getMissingExplicitRequestedWriteTargets().length === 0;
+
   const executeResolvedToolCalls = async (toolCalls, options = {}) => {
     const { assistantContent = '', toolCallsPayload = undefined, recoveryLabel = 'BOOTSTRAP TOOL CALL' } = options;
+    let hadToolErrorThisRound = false;
+    let buildVerifyFailedThisRound = false;
 
     extractionContinuationPending = false;
     label(Y, recoveryLabel, `Executing ${toolCalls.length} recovered tool call(s)`);
@@ -1995,6 +3041,39 @@ let args = rawArgs;
       label(B, `  → ${toolName}`, JSON.stringify(args).substring(0, 150));
       logEvent('tool_exec_start', { tool: toolName, args });
 
+      if (toolName !== 'execute_terminal_command' && toolName !== 'launch_in_terminal' && toolName !== 'create_or_edit_file') {
+        blockImmediateTerminalAfterWrite = false;
+      }
+
+      if ((toolName === 'execute_terminal_command' || toolName === 'launch_in_terminal') && isGlobalPackageInstallCommand(String(args.command ?? args.cmd ?? ''))) {
+        const blockedResult = buildGlobalInstallBlockResult(String(args.command ?? args.cmd ?? ''));
+        label(Y, '  BLOCK GLOBAL INSTALL', String(args.command ?? args.cmd ?? ''));
+        logEvent('tool_exec_blocked', { tool: toolName, args, reason: 'global_install_blocked' });
+        messages.push({ role: 'tool', content: blockedResult, tool_name: toolName });
+        messages.push({ role: 'user', content: 'Do not install packages globally. Use local workspace dependencies only when they are genuinely required for this task.' });
+        continue;
+      }
+
+      if (toolName === 'execute_terminal_command' && SHOULD_BLOCK_IMMEDIATE_DRY_RUN_TERMINAL && blockImmediateTerminalAfterWrite) {
+        const blockedResult = buildDryRunTerminalBlockResult(String(args.command ?? ''), lastSuccessfulWritePath);
+        label(Y, '  SKIP TERMINAL', 'Blocked immediate execute_terminal_command after create_or_edit_file in DRY_RUN greenfield smoke');
+        logEvent('tool_exec_blocked', { tool: toolName, args, reason: 'dry_run_greenfield_post_create_guard', path: lastSuccessfulWritePath });
+        messages.push({ role: 'tool', content: blockedResult, tool_name: toolName });
+        messages.push({ role: 'user', content: 'Do not run terminal commands immediately after creating a file in this DRY_RUN greenfield smoke. Continue with the next file/tool step or finish the task based on the code you already wrote.' });
+        continue;
+      }
+
+      if ((toolName === 'execute_terminal_command' || toolName === 'launch_in_terminal')
+        && pendingGreenfieldVerificationPath
+        && !isTerminalReadOnlyInspectionCommand(String(args.command ?? args.cmd ?? ''))) {
+        const blockedResult = buildPendingVerifyTerminalBlockResult(String(args.command ?? args.cmd ?? ''), pendingGreenfieldVerificationPath);
+        label(Y, '  BLOCK VERIFY-FIRST', path.basename(pendingGreenfieldVerificationPath));
+        logEvent('tool_exec_blocked', { tool: toolName, args, reason: 'greenfield_verify_before_run', path: pendingGreenfieldVerificationPath });
+        messages.push({ role: 'tool', content: blockedResult, tool_name: toolName });
+        messages.push({ role: 'user', content: `Do not run terminal tools yet. The latest file write to ${path.basename(pendingGreenfieldVerificationPath)} must pass syntax verification first.` });
+        continue;
+      }
+
       if (toolName === 'read_file_slice' || toolName === 'read_specific_file') {
         const readSig = toolName + '|' + JSON.stringify(args);
         const readCount = seenReadSigs.get(readSig) ?? 0;
@@ -2011,7 +3090,23 @@ let args = rawArgs;
       const parsed = JSON.parse(result);
 
       if (parsed.error) {
+        hadToolErrorThisRound = true;
         label(R, `  ✗ ${toolName}`, parsed.error);
+        if (toolName === 'read_file_slice' || toolName === 'read_specific_file') {
+          const recoveryTarget = getDeterministicReadRecoveryTargetFromPrompt(userPrompt);
+          const attemptedPath = String(parsed.path ?? parsed.filepath ?? args.filepath ?? '').trim();
+          if (recoveryTarget && (!attemptedPath || path.basename(attemptedPath).toLowerCase() !== path.basename(recoveryTarget.filepath).toLowerCase())) {
+            const recoveredResult = await executeTool('read_specific_file', { filepath: recoveryTarget.filepath });
+            const recoveredParsed = JSON.parse(recoveredResult);
+            if (!recoveredParsed.error) {
+              label(Y, '  RECOVERY', `Deterministic retry -> ${recoveryTarget.filepath}`);
+              logEvent('deterministic_read_recovery', { failedTool: toolName, failedPath: attemptedPath || null, recoveredPath: recoveryTarget.filepath, reason: recoveryTarget.reason });
+              messages.push({ role: 'tool', content: recoveredResult, tool_name: 'read_specific_file' });
+              messages.push({ role: 'user', content: `The previous read used the wrong target. Continue from ${recoveryTarget.filepath}, which was read for you. ${recoveryTarget.reason}` });
+              continue;
+            }
+          }
+        }
         if (toolName === 'create_or_edit_file') {
           seenReadSigs.clear();
         }
@@ -2046,6 +3141,15 @@ let args = rawArgs;
             targetAppearsExhausted = false;
           }
         }
+        if ((toolName === 'read_file_slice' || toolName === 'read_specific_file')
+          && preferredGreenfieldSuccessfulWriteCount === 0) {
+          const greenfieldTargetPath = getDeterministicGreenfieldTargetPath();
+          if (greenfieldTargetPath && !toolPathMatchesTarget(parsed.path ?? args.filepath, greenfieldTargetPath)) {
+            label(Y, '  WRONG TARGET', `${String(parsed.path ?? args.filepath ?? '')} -> ${greenfieldTargetPath}`);
+            logEvent('greenfield_wrong_read_target_recovery', { failedTool: toolName, attemptedPath: String(parsed.path ?? args.filepath ?? ''), recoveredPath: greenfieldTargetPath });
+            messages.push({ role: 'user', content: `Wrong file target. For this greenfield task, the primary source file is ${greenfieldTargetPath}. Do not read unrelated files first. Create or update ${greenfieldTargetPath} now unless you truly need a bounded read of that same file.` });
+          }
+        }
         if (toolName === 'read_file_slice' && parsed.content) {
           lastSuccessfulRead = { filepath: String(args.filepath ?? ''), startLine: args.startLine ?? 1, endLine: args.endLine ?? 1, content: parsed.content };
           recentReads.push(lastSuccessfulRead);
@@ -2053,6 +3157,18 @@ let args = rawArgs;
         }
         if (toolName === 'create_or_edit_file' || toolName === 'replace_in_file') {
           hadSuccessfulWrite = true;
+          lastSuccessfulWritePath = String(parsed.path ?? args.filename ?? args.filepath ?? lastSuccessfulWritePath ?? '');
+          if (lastSuccessfulWritePath) {
+            successfulWritePaths.add(lastSuccessfulWritePath);
+          }
+          if (toolName === 'create_or_edit_file' && IS_CODE_PREFERRED_GREENFIELD_REQUEST) {
+            preferredGreenfieldSuccessfulWriteCount++;
+            blockImmediateTerminalAfterWrite = true;
+          }
+          if (toolName === 'create_or_edit_file' && IS_CODE_PREFERRED_GREENFIELD_REQUEST) {
+            pendingGreenfieldVerificationPath = lastSuccessfulWritePath;
+            lastGreenfieldVerifiedPath = '';
+          }
           if (IS_SPLIT_TASK && toolName === 'create_or_edit_file') {
             const createdPath = parsed.path ?? '';
             const isOriginal = createdPath.includes(TARGET_BASENAME);
@@ -2082,13 +3198,23 @@ let args = rawArgs;
     }
 
     if (hadSuccessfulWrite) {
-      const verifyTargetPath = lastCreatedFileState?.filePath || resolveFilepath(TARGET_FILE);
+      const verifyTargetPath = lastSuccessfulWritePath || lastCreatedFileState?.filePath || resolveFilepath(TARGET_FILE);
       const verifyConfig = pickVerifyCommandForPath(verifyTargetPath);
       if (verifyConfig) {
+        if (SHOULD_BLOCK_IMMEDIATE_DRY_RUN_TERMINAL && blockImmediateTerminalAfterWrite) {
+          label(Y, 'VERIFY SKIP', 'Skipped immediate auto-verify after create_or_edit_file in DRY_RUN greenfield smoke');
+          logEvent('verify_skipped', { reason: 'dry_run_greenfield_post_create_guard', stack: verifyConfig.stack, command: verifyConfig.command, projectRoot: verifyConfig.projectRoot });
+        } else {
         label(B, 'VERIFY', `${verifyConfig.stack}: ${verifyConfig.command}`);
-        const verifyResult = await executeTool('execute_terminal_command', { command: `cd ${JSON.stringify(verifyConfig.projectRoot)} && ${verifyConfig.command}` });
+        const verifyResult = await runTerminalCommandDirect(`cd ${JSON.stringify(verifyConfig.projectRoot)} && ${verifyConfig.command}`);
         const parsedVerify = JSON.parse(verifyResult);
         const verifyOutput = [String(parsedVerify.stdout ?? ''), String(parsedVerify.stderr ?? '')].filter(Boolean).join('\n').trim();
+        buildVerifyFailedThisRound = Number(parsedVerify.exitCode ?? 1) !== 0;
+        if (Number(parsedVerify.exitCode ?? 1) === 0 && pendingGreenfieldVerificationPath) {
+          lastGreenfieldVerifiedPath = pendingGreenfieldVerificationPath;
+          pendingGreenfieldVerificationPath = '';
+          blockImmediateTerminalAfterWrite = false;
+        }
         messages.push({
           role: 'tool',
           content: JSON.stringify({
@@ -2103,6 +3229,7 @@ let args = rawArgs;
           }),
           tool_name: 'build_verify'
         });
+        }
       }
     }
 
@@ -2111,8 +3238,20 @@ let args = rawArgs;
       messages.push(msg);
     }
 
+    if (IS_EXPLICIT_CREATE_ONLY_TASK
+      && hadSuccessfulWrite
+      && !hadToolErrorThisRound
+      && !buildVerifyFailedThisRound
+      && !pendingReplaceAfterCreate
+      && hasSatisfiedExplicitWriteRequest()) {
+      sessionCompleted = true;
+      label(G, 'DONE', 'All explicitly requested files were written and verified — task complete.');
+      logEvent('session_done', { turn, reason: 'explicit_create_auto_completion', targets: explicitRequestedWriteTargets });
+      return;
+    }
+
     // For non-write tasks, nudge after 3+ reads
-    if (!REQUIRES_FILE_WRITE && totalReadOps >= 3 && !hadSuccessfulWrite) {
+    if (!REQUIRES_FILE_WRITE && totalReadOps >= MODEL_LIMITS.maxReadOpsWithoutWrite && !hadSuccessfulWrite) {
       const linesRead = recentReads.length > 0
         ? `lines ${recentReads[0].startLine || 1}–${recentReads[recentReads.length - 1].endLine || '?'}`
         : `${totalReadOps} sections`;
@@ -2126,7 +3265,25 @@ let args = rawArgs;
     repeatedNarratedCallCount = 0;
   };
 
+  const tryBootstrapPreferredGreenfieldCodeDump = async content => {
+    const candidate = extractPreferredGreenfieldCodeDump(content);
+    if (!candidate) return false;
+
+    label(Y, 'GREENFIELD CODE BOOTSTRAP', `Recovered a plain-text code dump into create_or_edit_file(${candidate.filepath})`);
+    logEvent('preferred_greenfield_code_bootstrap', { turn, model: MODEL, filepath: candidate.filepath, contentPreview: candidate.content.substring(0, 200) });
+    await executeResolvedToolCalls([
+      { function: { name: 'create_or_edit_file', arguments: { filename: candidate.filepath, content: candidate.content } } }
+    ], {
+      assistantContent: content,
+      recoveryLabel: 'GREENFIELD CODE BOOTSTRAP'
+    });
+    return true;
+  };
+
   while (turn < MAX_TURNS) {
+    if (sessionCompleted) {
+      break;
+    }
     turn++;
     label(C, `TURN ${turn}`, `retry=${retryCount} messages=${messages.length}`);
 
@@ -2156,16 +3313,31 @@ let args = rawArgs;
 
     let responseData;
     try {
-      const resp = await fetch(`${OLLAMA_URL}/api/chat`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body)
-      });
+      const resp = await fetchOllamaChat(body);
       if (!resp.ok) {
         const txt = await resp.text();
-        throw new Error(`HTTP ${resp.status}: ${txt}`);
+        let recoveredFromParseError = false;
+        if (resp.status === 500) {
+          const rawToolPayload = extractRawToolPayloadFromOllamaError(txt);
+          if (rawToolPayload) {
+            const recoveredToolCalls = parseToolCallsFromText(rawToolPayload);
+            if (recoveredToolCalls.length > 0) {
+              label(Y, 'OLLAMA RECOVERY', `Recovered ${recoveredToolCalls.length} tool call(s) from HTTP 500 parse error`);
+              logEvent('ollama_parse_error_tool_recovery', {
+                recoveredToolCalls: recoveredToolCalls.map(toolCall => toolCall.function?.name ?? 'unknown')
+              });
+              responseData = { message: { content: rawToolPayload } };
+              recoveredFromParseError = true;
+            }
+          }
+        }
+        if (!recoveredFromParseError) {
+          throw new Error(`HTTP ${resp.status}: ${txt}`);
+        }
       }
-      responseData = await resp.json();
+      if (!responseData) {
+        responseData = await resp.json();
+      }
     } catch (e) {
       label(R, 'OLLAMA ERROR', e.message);
       logEvent('ollama_error', { error: e.message });
@@ -2186,7 +3358,8 @@ let args = rawArgs;
     seenToolSigs.add(sig);
     return true;
   });
-    const resolvedToolCalls = nativeToolCalls.length > 0 ? nativeToolCalls : textToolCalls;
+    const allowedToolNames = new Set(getToolDefinitions().map(tool => tool.function.name));
+    const resolvedToolCalls = (nativeToolCalls.length > 0 ? nativeToolCalls : textToolCalls).filter(tc => allowedToolNames.has(String(tc.function?.name ?? '').trim()));
     const wasNative = nativeToolCalls.length > 0;
 
     logEvent('ollama_response', {
@@ -2209,6 +3382,8 @@ let args = rawArgs;
       const postToolMessages = [];
       const INSPECTION_ONLY_TOOLS = new Set(['read_file_slice', 'read_specific_file', 'list_workspace_files', 'project_scan', 'read_workspace_notes']);
       const toolNamesInBatch = [];
+      let hadToolErrorThisRound = false;
+      let buildVerifyFailedThisRound = false;
 
       for (const tc of resolvedToolCalls) {
         const toolName = tc.function?.name ?? 'unknown';
@@ -2218,6 +3393,39 @@ let args = rawArgs;
         label(B, `  → ${toolName}`, JSON.stringify(args).substring(0, 150));
         logEvent('tool_exec_start', { tool: toolName, args });
         toolNamesInBatch.push(toolName);
+
+        if (toolName !== 'execute_terminal_command' && toolName !== 'launch_in_terminal' && toolName !== 'create_or_edit_file') {
+          blockImmediateTerminalAfterWrite = false;
+        }
+
+        if ((toolName === 'execute_terminal_command' || toolName === 'launch_in_terminal') && isGlobalPackageInstallCommand(String(args.command ?? args.cmd ?? ''))) {
+          const blockedResult = buildGlobalInstallBlockResult(String(args.command ?? args.cmd ?? ''));
+          label(Y, '  BLOCK GLOBAL INSTALL', String(args.command ?? args.cmd ?? ''));
+          logEvent('tool_exec_blocked', { tool: toolName, args, reason: 'global_install_blocked' });
+          messages.push({ role: 'tool', content: blockedResult, tool_name: toolName });
+          messages.push({ role: 'user', content: 'Do not install packages globally. Use local workspace dependencies only when they are genuinely required for this task.' });
+          continue;
+        }
+
+        if (toolName === 'execute_terminal_command' && SHOULD_BLOCK_IMMEDIATE_DRY_RUN_TERMINAL && blockImmediateTerminalAfterWrite) {
+          const blockedResult = buildDryRunTerminalBlockResult(String(args.command ?? ''), lastSuccessfulWritePath);
+          label(Y, '  SKIP TERMINAL', 'Blocked immediate execute_terminal_command after create_or_edit_file in DRY_RUN greenfield smoke');
+          logEvent('tool_exec_blocked', { tool: toolName, args, reason: 'dry_run_greenfield_post_create_guard', path: lastSuccessfulWritePath });
+          messages.push({ role: 'tool', content: blockedResult, tool_name: toolName });
+          messages.push({ role: 'user', content: 'Do not run terminal commands immediately after creating a file in this DRY_RUN greenfield smoke. Continue with the next file/tool step or finish the task based on the code you already wrote.' });
+          continue;
+        }
+
+        if ((toolName === 'execute_terminal_command' || toolName === 'launch_in_terminal')
+          && pendingGreenfieldVerificationPath
+          && !isTerminalReadOnlyInspectionCommand(String(args.command ?? args.cmd ?? ''))) {
+          const blockedResult = buildPendingVerifyTerminalBlockResult(String(args.command ?? args.cmd ?? ''), pendingGreenfieldVerificationPath);
+          label(Y, '  BLOCK VERIFY-FIRST', path.basename(pendingGreenfieldVerificationPath));
+          logEvent('tool_exec_blocked', { tool: toolName, args, reason: 'greenfield_verify_before_run', path: pendingGreenfieldVerificationPath });
+          messages.push({ role: 'tool', content: blockedResult, tool_name: toolName });
+          messages.push({ role: 'user', content: `Do not run terminal tools yet. The latest file write to ${path.basename(pendingGreenfieldVerificationPath)} must pass syntax verification first.` });
+          continue;
+        }
 
         // Cross-turn dedup: skip repeated reads of the same file section (allow each section to be read at most twice)
         if (toolName === 'read_file_slice' || toolName === 'read_specific_file') {
@@ -2244,6 +3452,7 @@ let args = rawArgs;
         const parsed = JSON.parse(result);
 
         if (parsed.error) {
+          hadToolErrorThisRound = true;
           label(R, `  ✗ ${toolName}`, parsed.error);
           // After create_or_edit_file fails (e.g. overwrite guard), allow re-reads so model can get fresh context
           if (toolName === 'create_or_edit_file') {
@@ -2281,6 +3490,15 @@ let args = rawArgs;
               targetAppearsExhausted = false;
             }
           }
+          if ((toolName === 'read_file_slice' || toolName === 'read_specific_file')
+            && preferredGreenfieldSuccessfulWriteCount === 0) {
+            const greenfieldTargetPath = getDeterministicGreenfieldTargetPath();
+            if (greenfieldTargetPath && !toolPathMatchesTarget(parsed.path ?? args.filepath, greenfieldTargetPath)) {
+              label(Y, '  WRONG TARGET', `${String(parsed.path ?? args.filepath ?? '')} -> ${greenfieldTargetPath}`);
+              logEvent('greenfield_wrong_read_target_recovery', { failedTool: toolName, attemptedPath: String(parsed.path ?? args.filepath ?? ''), recoveredPath: greenfieldTargetPath });
+              messages.push({ role: 'user', content: `Wrong file target. For this greenfield task, the primary source file is ${greenfieldTargetPath}. Do not read unrelated files first. Create or update ${greenfieldTargetPath} now unless you truly need a bounded read of that same file.` });
+            }
+          }
           // Track successful reads for replace_in_file reminder context
           if (toolName === 'read_file_slice' && parsed.content) {
             lastSuccessfulRead = { filepath: String(args.filepath ?? ''), startLine: args.startLine ?? 1, endLine: args.endLine ?? 1, content: parsed.content };
@@ -2289,6 +3507,18 @@ let args = rawArgs;
           }
           if (toolName === 'create_or_edit_file' || toolName === 'replace_in_file') {
             hadSuccessfulWrite = true;
+            lastSuccessfulWritePath = String(parsed.path ?? args.filename ?? args.filepath ?? lastSuccessfulWritePath ?? '');
+            if (lastSuccessfulWritePath) {
+              successfulWritePaths.add(lastSuccessfulWritePath);
+            }
+            if (toolName === 'create_or_edit_file' && IS_CODE_PREFERRED_GREENFIELD_REQUEST) {
+              preferredGreenfieldSuccessfulWriteCount++;
+              blockImmediateTerminalAfterWrite = true;
+            }
+            if (toolName === 'create_or_edit_file' && IS_CODE_PREFERRED_GREENFIELD_REQUEST) {
+              pendingGreenfieldVerificationPath = lastSuccessfulWritePath;
+              lastGreenfieldVerifiedPath = '';
+            }
             // After creating a NEW file (not the main refactor target), remind model to replace in original — SPLIT TASKS ONLY
             if (IS_SPLIT_TASK && toolName === 'create_or_edit_file') {
               const createdPath = parsed.path ?? '';
@@ -2339,13 +3569,23 @@ let args = rawArgs;
       }
 
       if (hadSuccessfulWrite) {
-        const verifyTargetPath = lastCreatedFileState?.filePath || resolveFilepath(TARGET_FILE);
+        const verifyTargetPath = lastSuccessfulWritePath || lastCreatedFileState?.filePath || resolveFilepath(TARGET_FILE);
         const verifyConfig = pickVerifyCommandForPath(verifyTargetPath);
         if (verifyConfig) {
+          if (SHOULD_BLOCK_IMMEDIATE_DRY_RUN_TERMINAL && blockImmediateTerminalAfterWrite) {
+            label(Y, 'VERIFY SKIP', 'Skipped immediate auto-verify after create_or_edit_file in DRY_RUN greenfield smoke');
+            logEvent('verify_skipped', { reason: 'dry_run_greenfield_post_create_guard', stack: verifyConfig.stack, command: verifyConfig.command, projectRoot: verifyConfig.projectRoot });
+          } else {
           label(B, 'VERIFY', `${verifyConfig.stack}: ${verifyConfig.command}`);
-          const verifyResult = await executeTool('execute_terminal_command', { command: `cd ${JSON.stringify(verifyConfig.projectRoot)} && ${verifyConfig.command}` });
+          const verifyResult = await runTerminalCommandDirect(`cd ${JSON.stringify(verifyConfig.projectRoot)} && ${verifyConfig.command}`);
           const parsedVerify = JSON.parse(verifyResult);
           const verifyOutput = [String(parsedVerify.stdout ?? ''), String(parsedVerify.stderr ?? '')].filter(Boolean).join('\n').trim();
+          buildVerifyFailedThisRound = Number(parsedVerify.exitCode ?? 1) !== 0;
+          if (Number(parsedVerify.exitCode ?? 1) === 0 && pendingGreenfieldVerificationPath) {
+            lastGreenfieldVerifiedPath = pendingGreenfieldVerificationPath;
+            pendingGreenfieldVerificationPath = '';
+            blockImmediateTerminalAfterWrite = false;
+          }
           messages.push({
             role: 'tool',
             content: JSON.stringify({
@@ -2360,6 +3600,7 @@ let args = rawArgs;
             }),
             tool_name: 'build_verify'
           });
+          }
         }
       }
 
@@ -2370,8 +3611,19 @@ let args = rawArgs;
         messages.push(msg);
       }
 
+      if (IS_EXPLICIT_CREATE_ONLY_TASK
+        && hadSuccessfulWrite
+        && !hadToolErrorThisRound
+        && !buildVerifyFailedThisRound
+        && !pendingReplaceAfterCreate
+        && hasSatisfiedExplicitWriteRequest()) {
+        label(G, 'DONE', 'All explicitly requested files were written and verified — task complete.');
+        logEvent('session_done', { turn, reason: 'explicit_create_auto_completion', targets: explicitRequestedWriteTargets });
+        sessionCompleted = true;
+      }
+
       // For non-write tasks (summarize, explain, review), nudge the model to stop reading and produce output
-      if (!REQUIRES_FILE_WRITE && totalReadOps >= 3 && !hadSuccessfulWrite) {
+      if (!REQUIRES_FILE_WRITE && totalReadOps >= MODEL_LIMITS.maxReadOpsWithoutWrite && !hadSuccessfulWrite) {
         const linesRead = recentReads.length > 0
           ? `lines ${recentReads[0].startLine || 1}–${recentReads[recentReads.length - 1].endLine || '?'}`
           : `${totalReadOps} sections`;
@@ -2399,7 +3651,7 @@ let args = rawArgs;
 
     // Detect degenerate/repetitive output (e.g., "node node node" loops from overwhelmed models)
     if (isDegenerateOutput(content)) {
-      label(R, 'DEGENERATE OUTPUT', `Model produced incoherent repetitive output (${content.length} chars) — aborting.`);
+      label(R, 'DEGENERATE OUTPUT', `Model produced incoherent repetitive output (${content.length} chars).`);
       logEvent('degenerate_output', { turn, retryCount, contentLength: content.length, contentPreview: content.substring(0, 200) });
       // Trim any recently pushed degenerate hidden messages to keep history clean
       for (let i = messages.length - 1; i >= 0; i--) {
@@ -2408,6 +3660,10 @@ let args = rawArgs;
           messages.splice(i, 1);
         }
       }
+      if (await tryRecoverFromDegenerateOutput(messages, content, retryCount, turn)) {
+        retryCount++;
+        continue;
+      }
       break;
     }
 
@@ -2415,31 +3671,41 @@ let args = rawArgs;
     if (content.trim().length === 0 || isTokenOverflow || isEchoOfUserMsg) {
       if (isTokenOverflow) label(Y, 'TOKEN OVERFLOW', 'Model returned a raw im_start token — treating as empty');
       if (isEchoOfUserMsg) label(Y, 'ECHO DETECTED', 'Model echoed a user message — treating as empty');
+      const missingExplicitRequestedWriteTargets = getMissingExplicitRequestedWriteTargets();
+      const hasMissingExplicitWrites = missingExplicitRequestedWriteTargets.length > 0;
+      const hasSatisfiedExplicitWriteRequest = explicitRequestedWriteTargets.length > 0 && !hasMissingExplicitWrites;
       // For greenfield: empty after write = done only if nudged at least once
-      if (!IS_SPLIT_TASK && hadSuccessfulWrite && retryCount >= 1) {
+      if (!IS_SPLIT_TASK && hadSuccessfulWrite && retryCount >= 1 && !hasMissingExplicitWrites) {
         label(G, 'DONE', 'Empty response after successful file write(s) — task complete.');
         logEvent('session_done', { turn, reason: 'empty_after_greenfield_write' });
         break;
       }
-      if (hadSuccessfulWrite && !pendingReplaceAfterCreate && !extractionContinuationPending && hasMetExtractionGoal()) {
+      if (hadSuccessfulWrite && !pendingReplaceAfterCreate && !extractionContinuationPending && hasMetExtractionGoal() && !hasMissingExplicitWrites) {
         label(G, 'DONE', `Empty response after ${extractionCount} extraction cycles — task complete.`);
         logEvent('session_done', { turn, reason: 'empty_after_write', extractionCount });
         break;
       }
       // If model got a continuation nudge but returned empty repeatedly, accept done if we did at least 2 cycles
-      if (extractionContinuationPending && retryCount >= 2 && hasMetExtractionGoal()) {
+      if (extractionContinuationPending && retryCount >= 2 && hasMetExtractionGoal() && !hasMissingExplicitWrites) {
         label(G, 'DONE', `${extractionCount} module(s) extracted — model could not continue further.`);
         logEvent('session_done', { turn, reason: 'continuation_exhausted', extractionCount });
         break;
       }
-      if (retryCount >= 4) {
+      if (hasSatisfiedExplicitWriteRequest && hadSuccessfulWrite && retryCount >= 1) {
+        label(G, 'DONE', 'All explicitly requested files were written and the model went empty afterward — task complete.');
+        logEvent('session_done', { turn, reason: 'empty_after_explicit_write_completion' });
+        break;
+      }
+      if (retryCount >= MODEL_LIMITS.maxNudgeRetriesCap) {
         label(R, 'STUCK', `Model returned empty/overflow ${retryCount} times with no tool call — giving up.`);
         logEvent('retry_limit', { turn, retryCount, reason: 'empty_loop' });
         break;
       }
       // Context-aware empty nudge
       let emptyNudge;
-      if (pendingReplaceAfterCreate && lastCreatedFileState && lastSuccessfulRead && lastSuccessfulRead.content) {
+      if (hasMissingExplicitWrites) {
+        emptyNudge = `You have not actually written all explicitly requested files yet. Missing successful writes for: ${missingExplicitRequestedWriteTargets.join(', ')}. Call create_or_edit_file or replace_in_file for the missing file now. Do NOT claim completion until every requested file has a real successful tool result.`;
+      } else if (pendingReplaceAfterCreate && lastCreatedFileState && lastSuccessfulRead && lastSuccessfulRead.content) {
         emptyNudge = buildNudge({ isAnnouncedButNotExecuted: true, requiresContinuation: true }, false, { pendingReplaceAfterCreate, lastSuccessfulRead, lastCreatedFileState });
       } else if (extractionContinuationPending) {
         const nextStart = (lastSuccessfulRead?.endLine ?? 120) + 1;
@@ -2449,6 +3715,8 @@ let args = rawArgs;
         emptyNudge = `You already read lines ${lastSuccessfulRead.startLine}–${lastSuccessfulRead.endLine} of ${path.basename(lastSuccessfulRead.filepath ?? '')}. ` +
           `Do NOT re-read those lines. Use that content to create a NEW sibling file (e.g. ${SUGGESTED_TYPES_FILE} or ${SUGGESTED_INTERFACES_FILE}) with the extracted real code — use create_or_edit_file. ` +
           `Do NOT attempt to overwrite ${TARGET_FILE}.`;
+      } else if (hasSatisfiedExplicitWriteRequest && hadSuccessfulWrite) {
+        emptyNudge = 'All explicitly requested files already have successful write results. If the task is complete, reply with one short completion summary only. Do NOT call create_or_edit_file again unless a requested target is still missing.';
       } else {
         emptyNudge = IS_SPLIT_TASK
           ? `Your response was empty. Call read_file_slice on ${TARGET_FILE} to read a section, then call create_or_edit_file to create a new module file with the extracted code.`
@@ -2469,6 +3737,10 @@ let args = rawArgs;
     const analysis = analyzeResponse(content, recentMessages);
     label(Y, 'ANALYSIS', JSON.stringify(analysis));
     logEvent('response_analysis', { turn, retryCount, ...analysis });
+
+    if (await tryBootstrapPreferredGreenfieldCodeDump(content)) {
+      continue;
+    }
 
     const bootstrapCandidate = inferBootstrapToolCall(content, {
       analysis,
@@ -2507,6 +3779,14 @@ let args = rawArgs;
 
     // Show plan to console then nudge
     if (analysis.looksLikePlan) {
+      if (MODEL_LIMITS.compactMandate) {
+        const nudge = 'Do NOT output a plan. Call exactly one tool now.';
+        label(Y, 'NUDGE (no-plan)', nudge);
+        messages.push({ role: 'assistant', content });
+        messages.push({ role: 'user', content: nudge });
+        retryCount = 0;
+        continue;
+      }
       label(G, 'PLAN', content);
       messages.push({ role: 'assistant', content });
       const nudge = 'Plan noted. Now execute step 1 immediately with the appropriate tool call. Do not describe what you will do — call the tool.';
@@ -2623,20 +3903,47 @@ let args = rawArgs;
 
     // Force continuation if last tool result was a placeholder/error from create_or_edit_file
     const lastToolMsg = [...messages].reverse().find(m => m.role === 'tool');
-    const lastToolWasError = lastToolMsg && (() => { try { return !!JSON.parse(lastToolMsg.content).error; } catch { return false; } })();
+    const recentToolMessages = [...messages].filter(m => m.role === 'tool').slice(-3);
+    const lastToolWasError = recentToolMessages.some(toolMessage => {
+      try {
+        const parsed = JSON.parse(toolMessage.content);
+        if (parsed.error) return true;
+        return parsed.tool === 'build_verify' && parsed.ok === false;
+      } catch {
+        return false;
+      }
+    }) || (lastToolMsg && (() => {
+      try {
+        const parsed = JSON.parse(lastToolMsg.content);
+        if (parsed.error) return true;
+        return parsed.tool === 'build_verify' && parsed.ok === false;
+      } catch {
+        return false;
+      }
+    })());
     // If model claims done after actual write succeeded AND no pending tool call in text → accept done
     const textCallsInResponse = parseToolCallsFromText(content);
     const hasPendingTextCall = textCallsInResponse.length > 0;
     const writeStillPending = REQUIRES_FILE_WRITE && !hadSuccessfulWrite;
+    const missingExplicitRequestedWriteTargets = getMissingExplicitRequestedWriteTargets();
+    const hasMissingExplicitWrites = missingExplicitRequestedWriteTargets.length > 0;
     const isDoneAfterWrite = hadSuccessfulWrite && !analysis.isPassingToUser &&
-      !analysis.isAnnouncedButNotExecuted && !analysis.isHallucinatingToolResponse &&
+      !analysis.isAnnouncedButNotExecuted && !analysis.isHallucinatingToolResponse && !analysis.claimsFailure &&
       !analysis.mentionsToolButNotCalled && !hasPendingTextCall &&
       (analysis.claimsDone || (analysis.isLong && !analysis.looksLikePlan));
     // For non-split tasks: a long, non-plan text response with no tool calls is the final answer
     const isNonSplitFinalAnswer = !IS_SPLIT_TASK && analysis.isLong && !analysis.looksLikePlan &&
-      !analysis.mentionsToolButNotCalled && !hasPendingTextCall && !analysis.isHallucinatingToolResponse &&
+      !analysis.mentionsToolButNotCalled && !hasPendingTextCall && !analysis.isHallucinatingToolResponse && !analysis.claimsFailure &&
       (!REQUIRES_FILE_WRITE || hadSuccessfulWrite);
     if ((!writeStillPending && (!analysis.requiresContinuation || isDoneAfterWrite || isNonSplitFinalAnswer)) && !lastToolWasError) {
+      if (hasMissingExplicitWrites) {
+        const missingWriteNudge = `You have not actually written all explicitly requested files yet. Missing successful writes for: ${missingExplicitRequestedWriteTargets.join(', ')}. Call create_or_edit_file or replace_in_file for the missing file now. Do NOT claim completion until every requested target has been written.`;
+        label(Y, 'NUDGE (missing explicit writes)', missingWriteNudge);
+        messages.push({ role: 'assistant', content });
+        messages.push({ role: 'user', content: missingWriteNudge });
+        retryCount++;
+        continue;
+      }
       // For split tasks, require 2 cycles normally, but relax for tiny/exhausted targets.
       if (IS_SPLIT_TASK && !hasMetExtractionGoal()) {
         const nextStart = (lastSuccessfulRead?.endLine ?? 120) + 1;
@@ -2653,7 +3960,12 @@ let args = rawArgs;
       break;
     }
 
-    if (retryCount >= 4 || consecutiveIdenticalResponses >= 2) {
+    if (retryCount >= MODEL_LIMITS.maxNudgeRetriesCap || consecutiveIdenticalResponses >= 2) {
+      if (hasMissingExplicitWrites) {
+        label(R, 'MISSING WRITES', `Model stopped before writing all explicitly requested files: ${missingExplicitRequestedWriteTargets.join(', ')}`);
+        logEvent('retry_limit', { turn, retryCount, reason: 'missing_explicit_requested_writes', missingTargets: missingExplicitRequestedWriteTargets });
+        break;
+      }
       if (consecutiveIdenticalResponses >= 2) {
         label(R, 'IDENTICAL LOOP', `Model produced identical response ${consecutiveIdenticalResponses + 1} times — aborting.`);
         logEvent('retry_limit', { turn, retryCount, reason: 'identical_response_loop', consecutiveIdenticalResponses });
@@ -2690,6 +4002,7 @@ let args = rawArgs;
           const parsedW = JSON.parse(writeResult);
           if (!parsedW.error) {
             hadSuccessfulWrite = true;
+            successfulWritePaths.add(fp);
             label(G, '  ✓ LAST-DITCH WRITE', `${path.basename(fp)} (${block.content.length} chars)`);
             messages.push({ role: 'tool', content: writeResult, tool_name: 'create_or_edit_file' });
           } else {
@@ -2707,7 +4020,9 @@ let args = rawArgs;
       break;
     }
 
-    const nudge = buildNudge(analysis, lastToolWasError, { pendingReplaceAfterCreate, lastSuccessfulRead, lastCreatedFileState, extractionContinuationPending, extractionCount, hadSuccessfulWrite });
+    const nudge = hasMissingExplicitWrites
+      ? `You have not actually written all explicitly requested files yet. Missing successful writes for: ${missingExplicitRequestedWriteTargets.join(', ')}. Call create_or_edit_file or replace_in_file for the missing file now. Do NOT claim completion until every requested target has been written.`
+      : buildNudge(analysis, lastToolWasError, { pendingReplaceAfterCreate, lastSuccessfulRead, lastCreatedFileState, extractionContinuationPending, extractionCount, hadSuccessfulWrite });
     const narratedBootstrapWarning = bootstrapCandidate && repeatedNarratedCallCount === 1
       ? `\nIf you describe the same tool call in plain text again instead of executing it, the harness will bootstrap ${bootstrapCandidate.toolCall.function?.name} automatically.`
       : '';
