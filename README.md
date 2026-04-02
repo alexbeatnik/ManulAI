@@ -154,6 +154,7 @@ The extension now pushes stricter file-editing rules into the agent prompt:
 - do not stop on partial plans like `Step 1/3` when more reading or fixing is still required
 - for ultra-small tiers, do not plan at all; execute one bounded action immediately
 - do not declare success unless all required steps ran and the relevant tool calls succeeded
+- if the user explicitly requested multiple target files, do not declare success until each requested file has a real successful write result
 - do not modify a file before reading it first
 - if unsure, read more files and gather more context instead of guessing
 - for large refactor requests, inspect structure first, then split the work into small module/file steps instead of attempting a one-shot rewrite

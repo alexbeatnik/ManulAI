@@ -1697,12 +1697,52 @@ function extractDeterministicSingleFileCreateRequest(text) {
 }
 
 function extractLikelyRequestFileTargets(text) {
-  const candidates = new Set();
-  for (const match of text.matchAll(/\bin\s+([A-Za-z0-9_./\\-]+\.[A-Za-z0-9]+)\b/gi)) {
-    const value = String(match[1] ?? '').trim();
-    if (value) candidates.add(value.replace(/\\/g, '/'));
+  const candidates = [];
+  const pushCandidate = value => {
+    const trimmed = String(value ?? '').trim().replace(/^[`"']+|[`"'.,;:!?]+$/g, '');
+    if (!trimmed) return;
+    const normalized = trimmed.replace(/\\/g, '/');
+    if (!candidates.some(candidate => candidate.toLowerCase() === normalized.toLowerCase())) {
+      candidates.push(normalized);
+    }
+  };
+
+  let match;
+  const explicitPathPattern = /(?:^|\s)((?:[A-Za-z]:)?[A-Za-z0-9_./\\-]+\.(?:ts|tsx|js|jsx|json|md|css|scss|html|py|yml|yaml|xml|txt|sh|toml|ini))(?:\s|$)/gi;
+  while ((match = explicitPathPattern.exec(text)) !== null) {
+    pushCandidate(match[1]);
   }
-  return [...candidates];
+
+  const bareNamePattern = /\b(package\.json|tsconfig\.json|README(?:\.md)?|LICENSE(?:\.txt|\.md)?|CHANGELOG(?:\.md)?|Dockerfile|Makefile|\.env(?:\.[A-Za-z0-9_-]+)?)\b/gi;
+  while ((match = bareNamePattern.exec(text)) !== null) {
+    pushCandidate(match[1]);
+  }
+
+  const normalized = text.toLowerCase();
+  if (/(?:\breadme\b|рідмі|ридми)/i.test(normalized)) {
+    pushCandidate('README.md');
+    pushCandidate('README');
+  }
+  if (/(?:\blicense\b|ліцензі|лиценз)/i.test(normalized)) {
+    pushCandidate('LICENSE');
+  }
+  if (/(?:package\s*json|package\.json)/i.test(normalized)) {
+    pushCandidate('package.json');
+  }
+  if (/(?:tsconfig|tsconfig\.json)/i.test(normalized)) {
+    pushCandidate('tsconfig.json');
+  }
+  if (/(?:changelog|історі[яї]\s+змін|список\s+змін|список\s+изменений)/i.test(normalized)) {
+    pushCandidate('CHANGELOG.md');
+  }
+  if (/\bdockerfile\b/i.test(normalized)) {
+    pushCandidate('Dockerfile');
+  }
+  if (/\bmakefile\b/i.test(normalized)) {
+    pushCandidate('Makefile');
+  }
+
+  return candidates;
 }
 
 function resolveDeterministicKnownFilePath(candidates = []) {
@@ -2799,6 +2839,8 @@ async function main() {
   let lastCreatedFileState = null; // { filePath, content, exportNames } — last successfully created extraction file
   let extractionCount = 0;         // how many complete extract-and-replace cycles succeeded
   let extractionContinuationPending = false; // true after replace_in_file success; cleared when model starts next tool call
+  const successfulWritePaths = new Set();
+  const explicitRequestedWriteTargets = REQUIRES_FILE_WRITE ? extractLikelyRequestFileTargets(userPrompt) : [];
   let targetTotalLinesObserved = 0;
   let targetAppearsExhausted = false;
   let repeatedNarratedCallSignature = null;
@@ -2824,6 +2866,11 @@ async function main() {
     const lastReadEnd = lastSuccessfulRead?.endLine ?? 0;
     const remainingUnreadLines = Math.max(0, targetTotalLinesObserved - lastReadEnd);
     return targetTotalLinesObserved <= 40 || remainingUnreadLines <= 8;
+  };
+
+  const getMissingExplicitRequestedWriteTargets = () => {
+    if (explicitRequestedWriteTargets.length <= 1) return [];
+    return explicitRequestedWriteTargets.filter(target => ![...successfulWritePaths].some(writePath => toolPathMatchesTarget(writePath, target)));
   };
 
   const executeResolvedToolCalls = async (toolCalls, options = {}) => {
@@ -2964,6 +3011,9 @@ let args = rawArgs;
         if (toolName === 'create_or_edit_file' || toolName === 'replace_in_file') {
           hadSuccessfulWrite = true;
           lastSuccessfulWritePath = String(parsed.path ?? args.filename ?? args.filepath ?? lastSuccessfulWritePath ?? '');
+          if (lastSuccessfulWritePath) {
+            successfulWritePaths.add(lastSuccessfulWritePath);
+          }
           if (toolName === 'create_or_edit_file' && IS_CODE_PREFERRED_GREENFIELD_REQUEST) {
             preferredGreenfieldSuccessfulWriteCount++;
             blockImmediateTerminalAfterWrite = true;
@@ -3277,6 +3327,9 @@ let args = rawArgs;
           if (toolName === 'create_or_edit_file' || toolName === 'replace_in_file') {
             hadSuccessfulWrite = true;
             lastSuccessfulWritePath = String(parsed.path ?? args.filename ?? args.filepath ?? lastSuccessfulWritePath ?? '');
+            if (lastSuccessfulWritePath) {
+              successfulWritePaths.add(lastSuccessfulWritePath);
+            }
             if (toolName === 'create_or_edit_file' && IS_CODE_PREFERRED_GREENFIELD_REQUEST) {
               preferredGreenfieldSuccessfulWriteCount++;
               blockImmediateTerminalAfterWrite = true;
@@ -3425,19 +3478,21 @@ let args = rawArgs;
     if (content.trim().length === 0 || isTokenOverflow || isEchoOfUserMsg) {
       if (isTokenOverflow) label(Y, 'TOKEN OVERFLOW', 'Model returned a raw im_start token — treating as empty');
       if (isEchoOfUserMsg) label(Y, 'ECHO DETECTED', 'Model echoed a user message — treating as empty');
+      const missingExplicitRequestedWriteTargets = getMissingExplicitRequestedWriteTargets();
+      const hasMissingExplicitWrites = missingExplicitRequestedWriteTargets.length > 0;
       // For greenfield: empty after write = done only if nudged at least once
-      if (!IS_SPLIT_TASK && hadSuccessfulWrite && retryCount >= 1) {
+      if (!IS_SPLIT_TASK && hadSuccessfulWrite && retryCount >= 1 && !hasMissingExplicitWrites) {
         label(G, 'DONE', 'Empty response after successful file write(s) — task complete.');
         logEvent('session_done', { turn, reason: 'empty_after_greenfield_write' });
         break;
       }
-      if (hadSuccessfulWrite && !pendingReplaceAfterCreate && !extractionContinuationPending && hasMetExtractionGoal()) {
+      if (hadSuccessfulWrite && !pendingReplaceAfterCreate && !extractionContinuationPending && hasMetExtractionGoal() && !hasMissingExplicitWrites) {
         label(G, 'DONE', `Empty response after ${extractionCount} extraction cycles — task complete.`);
         logEvent('session_done', { turn, reason: 'empty_after_write', extractionCount });
         break;
       }
       // If model got a continuation nudge but returned empty repeatedly, accept done if we did at least 2 cycles
-      if (extractionContinuationPending && retryCount >= 2 && hasMetExtractionGoal()) {
+      if (extractionContinuationPending && retryCount >= 2 && hasMetExtractionGoal() && !hasMissingExplicitWrites) {
         label(G, 'DONE', `${extractionCount} module(s) extracted — model could not continue further.`);
         logEvent('session_done', { turn, reason: 'continuation_exhausted', extractionCount });
         break;
@@ -3449,7 +3504,9 @@ let args = rawArgs;
       }
       // Context-aware empty nudge
       let emptyNudge;
-      if (pendingReplaceAfterCreate && lastCreatedFileState && lastSuccessfulRead && lastSuccessfulRead.content) {
+      if (hasMissingExplicitWrites) {
+        emptyNudge = `You have not actually written all explicitly requested files yet. Missing successful writes for: ${missingExplicitRequestedWriteTargets.join(', ')}. Call create_or_edit_file or replace_in_file for the missing file now. Do NOT claim completion until every requested file has a real successful tool result.`;
+      } else if (pendingReplaceAfterCreate && lastCreatedFileState && lastSuccessfulRead && lastSuccessfulRead.content) {
         emptyNudge = buildNudge({ isAnnouncedButNotExecuted: true, requiresContinuation: true }, false, { pendingReplaceAfterCreate, lastSuccessfulRead, lastCreatedFileState });
       } else if (extractionContinuationPending) {
         const nextStart = (lastSuccessfulRead?.endLine ?? 120) + 1;
@@ -3667,6 +3724,8 @@ let args = rawArgs;
     const textCallsInResponse = parseToolCallsFromText(content);
     const hasPendingTextCall = textCallsInResponse.length > 0;
     const writeStillPending = REQUIRES_FILE_WRITE && !hadSuccessfulWrite;
+    const missingExplicitRequestedWriteTargets = getMissingExplicitRequestedWriteTargets();
+    const hasMissingExplicitWrites = missingExplicitRequestedWriteTargets.length > 0;
     const isDoneAfterWrite = hadSuccessfulWrite && !analysis.isPassingToUser &&
       !analysis.isAnnouncedButNotExecuted && !analysis.isHallucinatingToolResponse && !analysis.claimsFailure &&
       !analysis.mentionsToolButNotCalled && !hasPendingTextCall &&
@@ -3676,6 +3735,14 @@ let args = rawArgs;
       !analysis.mentionsToolButNotCalled && !hasPendingTextCall && !analysis.isHallucinatingToolResponse && !analysis.claimsFailure &&
       (!REQUIRES_FILE_WRITE || hadSuccessfulWrite);
     if ((!writeStillPending && (!analysis.requiresContinuation || isDoneAfterWrite || isNonSplitFinalAnswer)) && !lastToolWasError) {
+      if (hasMissingExplicitWrites) {
+        const missingWriteNudge = `You have not actually written all explicitly requested files yet. Missing successful writes for: ${missingExplicitRequestedWriteTargets.join(', ')}. Call create_or_edit_file or replace_in_file for the missing file now. Do NOT claim completion until every requested target has been written.`;
+        label(Y, 'NUDGE (missing explicit writes)', missingWriteNudge);
+        messages.push({ role: 'assistant', content });
+        messages.push({ role: 'user', content: missingWriteNudge });
+        retryCount++;
+        continue;
+      }
       // For split tasks, require 2 cycles normally, but relax for tiny/exhausted targets.
       if (IS_SPLIT_TASK && !hasMetExtractionGoal()) {
         const nextStart = (lastSuccessfulRead?.endLine ?? 120) + 1;
@@ -3693,6 +3760,11 @@ let args = rawArgs;
     }
 
     if (retryCount >= MODEL_LIMITS.maxNudgeRetriesCap || consecutiveIdenticalResponses >= 2) {
+      if (hasMissingExplicitWrites) {
+        label(R, 'MISSING WRITES', `Model stopped before writing all explicitly requested files: ${missingExplicitRequestedWriteTargets.join(', ')}`);
+        logEvent('retry_limit', { turn, retryCount, reason: 'missing_explicit_requested_writes', missingTargets: missingExplicitRequestedWriteTargets });
+        break;
+      }
       if (consecutiveIdenticalResponses >= 2) {
         label(R, 'IDENTICAL LOOP', `Model produced identical response ${consecutiveIdenticalResponses + 1} times — aborting.`);
         logEvent('retry_limit', { turn, retryCount, reason: 'identical_response_loop', consecutiveIdenticalResponses });
@@ -3729,6 +3801,7 @@ let args = rawArgs;
           const parsedW = JSON.parse(writeResult);
           if (!parsedW.error) {
             hadSuccessfulWrite = true;
+            successfulWritePaths.add(fp);
             label(G, '  ✓ LAST-DITCH WRITE', `${path.basename(fp)} (${block.content.length} chars)`);
             messages.push({ role: 'tool', content: writeResult, tool_name: 'create_or_edit_file' });
           } else {
@@ -3746,7 +3819,9 @@ let args = rawArgs;
       break;
     }
 
-    const nudge = buildNudge(analysis, lastToolWasError, { pendingReplaceAfterCreate, lastSuccessfulRead, lastCreatedFileState, extractionContinuationPending, extractionCount, hadSuccessfulWrite });
+    const nudge = hasMissingExplicitWrites
+      ? `You have not actually written all explicitly requested files yet. Missing successful writes for: ${missingExplicitRequestedWriteTargets.join(', ')}. Call create_or_edit_file or replace_in_file for the missing file now. Do NOT claim completion until every requested target has been written.`
+      : buildNudge(analysis, lastToolWasError, { pendingReplaceAfterCreate, lastSuccessfulRead, lastCreatedFileState, extractionContinuationPending, extractionCount, hadSuccessfulWrite });
     const narratedBootstrapWarning = bootstrapCandidate && repeatedNarratedCallCount === 1
       ? `\nIf you describe the same tool call in plain text again instead of executing it, the harness will bootstrap ${bootstrapCandidate.toolCall.function?.name} automatically.`
       : '';

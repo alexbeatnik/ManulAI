@@ -1367,6 +1367,48 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     return normalizedToolPath === normalizedTargetPath || normalizedToolPath.endsWith(`/${normalizedTargetPath.replace(/^\/+/, '')}`);
   }
 
+  private getRecentSuccessfulWritePaths(
+    recentToolResults: Array<{ message: OllamaMessage & { role: 'tool' }; parsed: Record<string, unknown>; index: number }>
+  ): string[] {
+    const seen = new Set<string>();
+    const paths: string[] = [];
+
+    for (const { message, parsed } of recentToolResults) {
+      if (parsed.error) {
+        continue;
+      }
+
+      if (message.tool_name === 'create_or_edit_file' && isPlaceholderCreateResult(parsed)) {
+        continue;
+      }
+
+      if (message.tool_name !== 'create_or_edit_file'
+        && message.tool_name !== 'replace_in_file'
+        && message.tool_name !== 'write_to_file') {
+        continue;
+      }
+
+      const toolPath = typeof parsed.path === 'string' ? parsed.path : '';
+      const normalizedPath = this.normalizeComparablePath(toolPath);
+      if (!normalizedPath || seen.has(normalizedPath)) {
+        continue;
+      }
+
+      seen.add(normalizedPath);
+      paths.push(toolPath);
+    }
+
+    return paths;
+  }
+
+  private getMissingExplicitRequestedWriteTargets(requestTargets: string[], successfulWritePaths: string[]): string[] {
+    if (requestTargets.length <= 1) {
+      return [];
+    }
+
+    return requestTargets.filter(target => !successfulWritePaths.some(writePath => this.toolPathMatchesTarget(writePath, target)));
+  }
+
   private detectInsufficientGreenfieldCreateContent(filename: string, content: string): string | undefined {
     if (!this.shouldApplyPreferredGreenfieldGuards() || this.requestExplicitlyAllowsPlaceholderWrites()) {
       return undefined;
@@ -2969,6 +3011,10 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         const latestBuildVerifyFailure = this.getLatestBuildVerifyFailure(recentToolResults);
         const hasRecentBuildVerifyFailure = Boolean(latestBuildVerifyFailure);
         const latestVisibleUserRequest = this.getLatestVisibleUserRequest(messages);
+        const explicitRequestedWriteTargets = this.currentRequestRequiresWrite ? this.extractLikelyRequestFileTargets(latestVisibleUserRequest) : [];
+        const recentSuccessfulWritePaths = this.getRecentSuccessfulWritePaths(recentToolResults);
+        const missingExplicitRequestedWriteTargets = this.getMissingExplicitRequestedWriteTargets(explicitRequestedWriteTargets, recentSuccessfulWritePaths);
+        const hasMissingExplicitRequestedWrites = missingExplicitRequestedWriteTargets.length > 0;
         const largeRefactorTargets = this.extractLikelyRequestFileTargets(latestVisibleUserRequest);
         const hasRecentReadOfLargeRefactorTarget = largeRefactorTargets.length > 0 && recentToolResults.some(({ message, parsed }) => {
           if (parsed.error) {
@@ -3235,6 +3281,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
           || hasLazyRefusalOnLargeRefactor
           || (hasPostCreateRefactorNarration && !canStopAfterTinyLargeRefactor)
           || (hasRecentBuildVerifyFailure && (claimsDone || mentionsChange || isLazyAcknowledgment || hasIncompletePlan || hasExplicitNextSteps || isProgressOnlyResponse || isPassingToUser))
+          || hasMissingExplicitRequestedWrites
           || (isLargeRefactorRequest && hasRecentToolResults && (!hasRecentSuccessfulAction || !hasRecentReadOfLargeRefactorTarget || !hasRecentMeaningfulWrite))
           || (hasRecentReplaceNotFound && (mentionsChange || claimsDone || isLazyAcknowledgment || hasIncompletePlan || hasExplicitNextSteps || isPassingToUser || isProgressOnlyResponse))
           || (hasRecentToolErrors && (claimsDone || mentionsChange || isLazyAcknowledgment || hasIncompletePlan || hasExplicitNextSteps || isProgressOnlyResponse))
@@ -3358,7 +3405,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         }
 
         if (shouldNudge) {
-          this.debugLog('nudge', { retryCount, isConversationalUserMessage, hasRecentToolResults, hasRecentSuccessfulAction, hasRecentMeaningfulWrite, latestCreatedFilePath, hasRecentReadOfLargeRefactorTarget, latestLargeRefactorTargetTotalLines, latestLargeRefactorTargetRemainingLines, canStopAfterTinyLargeRefactor, hasLargeRefactorShellReadBypass, hasPreReadLargeRefactorNarration, hasFakePreReadCodeDump, hasSyntheticToolResponseJson, hasFakePostReadAnalysisDump, hasPostReadSummaryOnLargeRefactor, hasModelRefusalResponse, hasAnnouncedExtractionWithoutWrite, hasLazyRefusalOnLargeRefactor, isAskingUserForExactSlice, suggestedNextSlice, hasReadButNoWriteOnLargeRefactor, hasPostReadToolStall, hasPostCreateRefactorNarration, announcedNewFilePath, hasRecentToolErrors, hasRecentBuildVerifyFailure, hasRecentReplaceNotFound, replaceNotFoundFilepath, replaceNotFoundStartLine, replaceNotFoundEndLine, lastSuccessfulActionIndex, isLongDump, hasLargeCodeBlocks, claimsDone, claimsFailure, mentionsChange, isLazyAcknowledgment, hasIncompletePlan: !!hasIncompletePlan, hasExplicitNextSteps, isProgressOnlyResponse, claimedButUnexecutedCommand, isPassingToUser, isAnnouncedButNotExecuted, isPlanOnlyResponse, isLargeRefactorRequest, contentPreview: finalContent.substring(0, 200) });
+          this.debugLog('nudge', { retryCount, isConversationalUserMessage, hasRecentToolResults, hasRecentSuccessfulAction, hasRecentMeaningfulWrite, latestCreatedFilePath, hasRecentReadOfLargeRefactorTarget, latestLargeRefactorTargetTotalLines, latestLargeRefactorTargetRemainingLines, canStopAfterTinyLargeRefactor, hasLargeRefactorShellReadBypass, hasPreReadLargeRefactorNarration, hasFakePreReadCodeDump, hasSyntheticToolResponseJson, hasFakePostReadAnalysisDump, hasPostReadSummaryOnLargeRefactor, hasModelRefusalResponse, hasAnnouncedExtractionWithoutWrite, hasLazyRefusalOnLargeRefactor, isAskingUserForExactSlice, suggestedNextSlice, hasReadButNoWriteOnLargeRefactor, hasPostReadToolStall, hasPostCreateRefactorNarration, announcedNewFilePath, hasRecentToolErrors, hasRecentBuildVerifyFailure, hasRecentReplaceNotFound, replaceNotFoundFilepath, replaceNotFoundStartLine, replaceNotFoundEndLine, hasMissingExplicitRequestedWrites, missingExplicitRequestedWriteTargets, lastSuccessfulActionIndex, isLongDump, hasLargeCodeBlocks, claimsDone, claimsFailure, mentionsChange, isLazyAcknowledgment, hasIncompletePlan: !!hasIncompletePlan, hasExplicitNextSteps, isProgressOnlyResponse, claimedButUnexecutedCommand, isPassingToUser, isAnnouncedButNotExecuted, isPlanOnlyResponse, isLargeRefactorRequest, contentPreview: finalContent.substring(0, 200) });
           // Show plan/progress text to the user before nudging
           if (!isProgressOnlyResponse
             && !hasFakePreReadCodeDump
@@ -3472,6 +3519,8 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
             }
           } else if (hasExplicitNextSteps) {
             nudgeMessage = 'You listed next steps but stopped before executing them. Continue now. Do not stop after the first step or the first issue — keep using tools until the scan is complete.';
+          } else if (hasMissingExplicitRequestedWrites) {
+            nudgeMessage = `You have not actually written all explicitly requested files yet. Missing successful writes for: ${missingExplicitRequestedWriteTargets.join(', ')}. Call create_or_edit_file or replace_in_file for the missing file now. Do NOT claim completion until every requested target has a real successful file-tool result.`;
           } else if (hasRecentReplaceNotFound) {
             nudgeMessage = replaceNeverPresentInTarget
               ? (replaceNotFoundFilepath && replaceNotFoundStartLine && replaceNotFoundEndLine
@@ -3612,6 +3661,8 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
             hasPostCreateRefactorNarration,
             hasRecentToolErrors,
             hasRecentReplaceNotFound,
+            hasMissingExplicitRequestedWrites,
+            missingExplicitRequestedWriteTargets,
             replaceNotFoundFilepath,
             isLargeRefactorRequest,
             claimedButUnexecutedCommand,
@@ -3644,6 +3695,8 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
             ? 'The model read a bounded section of the target file but still failed to perform a concrete extraction or edit step. It kept summarizing instead of calling tools. Retry the request or use a stronger tool-calling model for iterative refactors.'
             : isLargeRefactorRequest
             ? 'The model inspected the code but did not carry out the large refactor step-by-step. Retry the request or use a stronger tool-calling model. For large files, prefer bounded reads and iterative extraction instead of whole-file summaries.'
+            : hasMissingExplicitRequestedWrites
+            ? `The model claimed or implied completion before writing all explicitly requested files. Missing successful writes for: ${missingExplicitRequestedWriteTargets.join(', ')}.`
             : hasRecentReplaceNotFound
             ? `The model stopped after a failed replace_in_file attempt and did not recover.${replaceNotFoundFilepath ? ` The last blocked file was ${replaceNotFoundFilepath}.` : ''} It must re-read the exact current file content before trying the edit again.`
             : hasRecentToolErrors

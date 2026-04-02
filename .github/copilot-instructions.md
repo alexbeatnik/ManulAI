@@ -59,6 +59,7 @@ This repository contains a VS Code extension named ManulAI.
 - Treat the current validated baseline as `phi4-mini:3.8b`, `llama3.1:8b`, and `qwen3-coder:30b`, based on direct Ollama `/api/chat` checks plus standalone agent-loop testing rather than picker assumptions alone.
 - Keep revert metadata attached to revertable native file-tool transcript entries so the webview can surface `Revert changes` directly on those results.
 - If retry exhaustion is reached and the model still returns pseudo-progress or plan text, surface a deterministic backend failure message instead of leaking raw `Step 1/3`-style output.
+- For explicit multi-file write requests, do not accept final completion text until the recorded successful file-tool writes cover every requested target file.
 - For large refactor requests, nudge the model toward short module/file plans and iterative execution instead of one-shot whole-file rewrites.
 - Keep context trimming model-aware; derive sliding-window size and `num_ctx` from the model size tag rather than using hardcoded limits.
 - Keep prompt/context simplification model-aware too: ultra-small models should receive shorter mandates, less injected workspace memory, tighter retry budgets, and fewer tools when that improves reliability.
