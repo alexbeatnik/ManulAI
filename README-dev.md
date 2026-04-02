@@ -131,6 +131,8 @@ For ultra-small local models, the runtime automatically filters this tool list d
 
 Chats also persist a compact `summaryMemory` alongside the full transcript in `.manulai/chats.json`; those summaries are injected back into the agent mandate as short dialog memory so the model can reuse prior outcomes without replaying the entire conversation.
 
+Safe deterministic known-file reads are now available beyond the ultra-small tier for a couple of exact read requests. When the user asks only for `package.json` name/version or the `README.md` title, the runtime can answer directly instead of forcing a weaker or quirky model through a full tool-planning loop just to rediscover an obvious target.
+
 ## Response Pipeline Notes
 
 - Agent Mode sends tool definitions to Ollama and continues the loop automatically.
@@ -139,10 +141,12 @@ Chats also persist a compact `summaryMemory` alongside the full transcript in `.
 - Chat Mode also suppresses full file dumps for file-creation requests; those requests should degrade to brief manual guidance and push the user toward Agent Mode or a one-file-at-a-time starter snippet.
 - For micro/small tiers, visible and hidden plan behavior is suppressed; the runtime biases toward one immediate bounded action instead of accepting or displaying plans.
 - The runtime now also curates the visible model picker toward the currently reliable agent-capable local models: `phi4-mini:3.8b`, `llama3.1:8b`, and `qwen3-coder:30b`. Smaller glitch-prone coder models are no longer surfaced in the picker by default.
+- `gpt-oss:20b` has now been exercised on the local regression stack as well. Its chat behavior is solid and its exact package/README read cases are now recoverable, but its agent/planner create and edit loops still produce too many malformed or truncated tool-call failures to justify surfacing it in the built-in picker yet.
 - Auto-Approve can bypass per-tool confirmations when enabled.
 - Chat Mode bypasses tool fallback write layers and returns plain text only.
 - Agent Mode still includes fallback write extraction layers for weaker models that fail to emit native tool calls reliably.
 - Raw function-call text such as `list_workspace_files()` or `create_or_edit_file('file.ts', '...')` is parsed as a broken tool call and routed into recovery instead of being accepted as final prose.
+- Ollama `HTTP 500` parse failures are now also recoverable in a narrower case: if the backend error includes a raw tool-call payload and that payload can be parsed locally, the runtime feeds that recovered tool intent back into the normal tool loop instead of failing immediately.
 - After successful file writes, the provider attempts an automatic `build_verify` step using the best available project command for the detected stack, such as package scripts, `tsc --noEmit`, `cargo check`, `go test ./...`, `python -m compileall`, `mvn compile`, `gradle build`, or `dotnet build`.
 - Automatic build verification now skips unrelated cross-stack standalone files, so creating a single Python file inside a TypeScript workspace does not force the model into a TypeScript verify loop.
 - Ollama requests are not hard-timed out by the extension; users can stop them explicitly.
@@ -158,6 +162,7 @@ The current model policy is based on direct `/api/chat` checks against Ollama pl
 - `qwen3-coder:30b` is the strongest validated model in this project so far. It is the most reliable at emitting native tool calls, starting with a concrete file write, and staying coherent across multi-step agent execution.
 - `llama3.1:8b` is also viable. Raw coding output is solid and it is much more stable than the weak `qwen2.5-coder` tiers, but it still trails `qwen3-coder:30b` in tool-loop consistency.
 - `phi4-mini:3.8b` is viable for agent use and much better than the weak small models, but it still needs more recovery help around pseudo-tool text and malformed tool-call formatting.
+- `gpt-oss:20b` is not part of the validated picker baseline yet. In local testing it handled chat-only tasks well and benefited from deterministic exact-read recovery, but it still remained unstable in several agent/planner create or edit flows.
 - `qwen2.5-coder:7b` is not treated as reliable enough for the built-in picker. It can produce partially acceptable raw coding output in English, but in planner/agent loops it still degrades too often into malformed, repetitive, or incoherent responses.
 - `qwen2.5-coder:1.5b` and `qwen2.5-coder:0.5b` are not considered dependable agent models for this runtime. In current tests they collapse too early, often before the tool loop is even the main problem.
 
@@ -198,7 +203,7 @@ The practical difference between the working and non-working groups is not just 
 - If retry exhaustion is reached and the model still returns pseudo-progress or plan text, the backend should surface a deterministic failure message instead of leaking raw `Step 1/3`-style output into the final answer.
 - Large refactor requests should receive hidden guidance to inspect structure first, form a short module/file split plan, and then execute one concrete step at a time instead of attempting a whole-file rewrite.
 - When a file is large, bounded reads through `read_file_slice` are preferred over re-reading the entire file.
-- Ultra-small tiers also have deterministic local fast paths for a few narrow requests, currently including package.json name/version reads, README title reads, exact-line replacement in one known file, and single explicit-file create requests, so a `0.5b`-class model does not need to survive the full loop for those cases.
+- Exact package.json name/version reads and README title reads now have deterministic local fast paths across model tiers when the target is obvious. Ultra-small tiers additionally keep deterministic local fast paths for exact-line replacement in one known file and single explicit-file create requests, so a `0.5b`-class model does not need to survive the full loop for those narrow cases.
 - Degenerate repetitive garbage output from micro/small/medium tiers no longer fails immediately on the first hit; the runtime now strips the bad output and retries once with a much stricter one-step recovery nudge, optionally suggesting a starter file path such as `main.ts` or `main.py` for simple greenfield create tasks.
 - Preferred stronger models (`phi4-mini`, `llama3.1`, `qwen3-coder`) also run with model-specific profiles that bias toward one-step execution, trim away project-scan and notes tools by default, push greenfield create requests to start from the first concrete file instead of inspecting the workspace, reject shallow placeholder scaffolds including trivial `...` dumps, reject overly thin first source files for simple greenfield starts, recover some plain-text code dumps into synthetic `create_or_edit_file` calls, block `execute_terminal_command` both before the first real source-file write and immediately after the first concrete file write, keep arbitrary terminal commands blocked until the latest greenfield write passes syntax verification, and reject global package installs from the agent loop.
 - The system mandate explicitly treats unread files as unknown state: file edits require a prior read, project-structure assumptions require listing, and completion claims require successful tool confirmation.

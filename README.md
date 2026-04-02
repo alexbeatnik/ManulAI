@@ -56,6 +56,7 @@ These results come from direct Ollama `/api/chat` checks plus the standalone Man
 - `qwen3-coder:30b` is the strongest tested model so far. It produces the most reliable native tool calls, usually starts greenfield tasks by creating the first concrete file immediately, and is the least likely to fall into repetitive or malformed output.
 - `llama3.1:8b` is usable and generally coherent. Raw coding output is solid, and it behaves much better than the weaker `qwen2.5-coder` tiers, but it is still not as consistent as `qwen3-coder:30b` for multi-step agent loops.
 - `phi4-mini:3.8b` is also usable and much better than the weak small models, especially for short direct coding tasks. Its main weakness is tool-call formatting: it can still leak pseudo-tool text or need recovery more often than `qwen3-coder:30b`.
+- `gpt-oss:20b` looks promising in Chat Mode and now benefits from deterministic recovery for exact `package.json` and `README.md` read requests, but it is not yet reliable enough for the curated picker. In current testing it still falls over too often in Agent and Planner create/edit loops, especially around malformed or truncated tool-call output.
 - `qwen2.5-coder:7b` is not reliable enough for the built-in picker. It can produce partially reasonable raw English coding output, but in planner or agent loops it still tends to degrade into broken, repetitive, or malformed responses too often.
 - `qwen2.5-coder:1.5b` is not currently viable for dependable agent behavior here. In testing it collapsed into low-quality repetitive output even on simple generation tasks.
 - `qwen2.5-coder:0.5b` is not currently viable for real agent use. It regularly fails even before the tool loop matters, so the product no longer treats this class as a reliable default model.
@@ -127,7 +128,7 @@ These cover the main local coding tasks: reading files, targeted edits, full rew
 
 For very small models, ManulAI automatically narrows this tool surface. Ultra-small models get a compact read/edit/list tool subset instead of the full menu, and small models get shorter prompts plus tighter retry/read limits to reduce planning loops and context overload.
 
-For ultra-small models, a few very simple requests can bypass the full agent loop entirely. Narrow cases like reading `package.json` name/version, reading the `README.md` title, replacing one exact line in a known file, or creating one explicit file with inline code can be handled deterministically instead of asking a `0.5b`-class model to survive a full tool-planning cycle.
+For any model tier, a few exact known-file read requests can bypass the normal agent loop entirely when the target is unambiguous. Today that includes reading `package.json` name/version and reading the `README.md` title. Ultra-small models additionally keep deterministic fast paths for exact-line replacement in one known file and single explicit-file creation, so a `0.5b`-class model does not need to survive the full tool-planning cycle for those narrow cases.
 
 `execute_terminal_command` runs a shell command and captures stdout/stderr. It has no stdin support, so interactive programs (games, REPLs, scripts using `input()` or `readline`) will hang and time out. When a timeout occurs because the process was killed, the error message explicitly hints that stdin is unavailable.
 
@@ -158,6 +159,7 @@ The extension now pushes stricter file-editing rules into the agent prompt:
 - do not declare success unless all required steps ran and the relevant tool calls succeeded
 - if the user explicitly requested multiple target files, do not declare success until each requested file has a real successful write result
 - if the user explicitly requested concrete file paths, recover shallow or wrong-directory create writes back toward those exact requested targets instead of accepting repo-root aliases like `main.js`
+- if Ollama returns a malformed tool-call parse error but the raw payload still contains a recoverable tool call, recover that tool intent instead of immediately failing the whole loop
 - do not modify a file before reading it first
 - if unsure, read more files and gather more context instead of guessing
 - for large refactor requests, inspect structure first, then split the work into small module/file steps instead of attempting a one-shot rewrite

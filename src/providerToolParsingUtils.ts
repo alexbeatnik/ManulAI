@@ -95,6 +95,12 @@ export function stripToolCallsFromContent(content: string): string {
   return stripped.trim();
 }
 
+export function extractRawToolCallPayloadFromOllamaError(errorText: string): string | undefined {
+  const match = errorText.match(/error parsing tool call:\s*raw='([\s\S]*?)',\s*err=/i);
+  const payload = match?.[1]?.trim();
+  return payload ? payload : undefined;
+}
+
 export function parseToolCallsFromContent(content: string, toolDefinitions: ToolDefinition[]): ToolFunctionCall[] {
   const trimmed = content.trim();
   if (!trimmed) {
@@ -125,12 +131,28 @@ export function parseToolCallsFromContent(content: string, toolDefinitions: Tool
 
   const knownToolNames = new Set(toolDefinitions.map(t => t.function.name));
   const candidates: string[] = [];
-  const codeBlockPattern = /```(?:json|tool_call|tool)?\s*\n?([\s\S]*?)```/g;
+  const codeBlockPattern = /```([a-zA-Z_][\w-]*)?\s*\n([\s\S]*?)```/g;
   const tagPattern = /<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/g;
 
   let match: RegExpExecArray | null;
   while ((match = codeBlockPattern.exec(trimmed)) !== null) {
-    const inner = match[1].trim();
+    const infoString = String(match[1] ?? '').trim();
+    const inner = String(match[2] ?? '').trim();
+    if (infoString) {
+      const mappedToolName = remapWeakModelToolName(infoString);
+      if (knownToolNames.has(mappedToolName)) {
+        const args = relaxedJsonParse(inner);
+        if (args && typeof args === 'object' && !Array.isArray(args)) {
+          return [{
+            type: 'function',
+            function: {
+              name: mappedToolName,
+              arguments: remapWeakModelArgumentAliases(args as Record<string, unknown>)
+            }
+          }];
+        }
+      }
+    }
     if (inner.startsWith('{') || inner.startsWith('[')) {
       candidates.push(inner);
     }
@@ -688,6 +710,18 @@ export function containsLeakedToolCallPayload(content: string, toolDefinitions: 
   let match: RegExpExecArray | null;
   while ((match = codeBlockPattern.exec(trimmed)) !== null) {
     if (looksLikeToolCallContent(match[1] ?? '', toolDefinitions)) {
+      return true;
+    }
+  }
+
+  const namedToolBlockPattern = /```([a-zA-Z_][\w-]*)\s*\n([\s\S]*?)```/g;
+  while ((match = namedToolBlockPattern.exec(trimmed)) !== null) {
+    const mappedToolName = remapWeakModelToolName(match[1] ?? '');
+    if (!toolDefinitions.some(tool => tool.function.name === mappedToolName)) {
+      continue;
+    }
+    const args = relaxedJsonParse((match[2] ?? '').trim());
+    if (args && typeof args === 'object' && !Array.isArray(args)) {
       return true;
     }
   }

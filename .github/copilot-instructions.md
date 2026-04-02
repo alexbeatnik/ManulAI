@@ -59,6 +59,7 @@ This repository contains a VS Code extension named ManulAI.
 - Keep the model selector truthful: when no local model is chosen, the UI and backend state must remain empty rather than showing a fake fallback model.
 - Keep the built-in model picker focused on the currently validated local agent models unless explicit testing proves a new family reliable enough to surface by default.
 - Treat the current validated baseline as `phi4-mini:3.8b`, `llama3.1:8b`, and `qwen3-coder:30b`, based on direct Ollama `/api/chat` checks plus standalone agent-loop testing rather than picker assumptions alone.
+- `gpt-oss:20b` may be tested manually, but do not add it to the built-in picker baseline until its agent/planner create and edit loops stop failing on malformed or truncated tool-call behavior.
 - Keep revert metadata attached to revertable native file-tool transcript entries so the webview can surface `Revert changes` directly on those results.
 - If retry exhaustion is reached and the model still returns pseudo-progress or plan text, surface a deterministic backend failure message instead of leaking raw `Step 1/3`-style output.
 - For explicit multi-file write requests, do not accept final completion text until the recorded successful file-tool writes cover every requested target file.
@@ -67,6 +68,7 @@ This repository contains a VS Code extension named ManulAI.
 - Keep context trimming model-aware; derive sliding-window size and `num_ctx` from the model size tag rather than using hardcoded limits.
 - Keep prompt/context simplification model-aware too: ultra-small models should receive shorter mandates, less injected workspace memory, tighter retry budgets, and fewer tools when that improves reliability.
 - Keep preferred stronger local models (`phi4-mini`, `llama3.1`, `qwen3-coder`) on model-specific profiles that bias toward one-step execution and concrete file creation over unnecessary project scans for greenfield tasks.
+- Keep exact `package.json` name/version reads and `README.md` title reads eligible for deterministic direct handling across model tiers when the target file is obvious.
 - For preferred-model greenfield tasks, reject shallow placeholder scaffolds including trivial `...` dumps, reject overly thin first source files, recover valid plain-text code dumps into real file writes when that is safer than another retry loop, do not allow `execute_terminal_command` before the first real source-file write or immediately after the first successful `create_or_edit_file`, keep arbitrary terminal commands blocked until the latest greenfield write passes syntax verification, and reject global package installs from the agent loop; require another real file/tool step or a direct completion instead.
 - Do not re-surface weaker `qwen2.5-coder` tiers in the built-in picker without new validation showing stable tool-loop behavior; partially acceptable raw code generation alone is not enough.
 - For ultra-small model tiers, prefer no-plan execution: one immediate bounded action instead of showing or accepting a plan.

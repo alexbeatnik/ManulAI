@@ -8,7 +8,7 @@ import { deserializeAttachedFileContext as deserializePersistedAttachedFileConte
 import { extractCodeBlockFileWrites as extractCodeBlockFileWritesHelper, extractDescribedFileDump as extractDescribedFileDumpHelper, extractDescribedReplacements as extractDescribedReplacementsHelper, extractInlineFileBlocks as extractInlineFileBlocksHelper, extractMarkerFileWrite as extractMarkerFileWriteHelper, extractNewFileCreation as extractNewFileCreationHelper, extractTrustedFullFileContent as extractTrustedFullFileContentHelper, extractUnifiedDiffWrite as extractUnifiedDiffWriteHelper, findAttachedFileForReplacements as findAttachedFileForReplacementsHelper, findMentionedFileForReplacements as findMentionedFileForReplacementsHelper, findMentionedFileInContent as findMentionedFileInContentHelper, isLikelyFileReference as isLikelyFileReferenceHelper, looksLikeChangeSummary as looksLikeChangeSummaryHelper, looksLikeDiffOutput as looksLikeDiffOutputHelper, matchResponseToActiveFile as matchResponseToActiveFileHelper, matchResponseToAttachedFile as matchResponseToAttachedFileHelper, sanitizeGeneratedFileContent as sanitizeGeneratedFileContentHelper, stripDiffPrefixes as stripDiffPrefixesHelper, truncateLargeCodeBlocks as truncateLargeCodeBlocksHelper } from './providerFileFallbackUtils';
 import { extractSymbolNamesFromGeneratedContent, inferRepeatedNarratedBootstrapToolCall, validateGeneratedModuleContent } from './providerRefactorUtils';
 import { buildBuildVerifyFailureNudge, buildPreviewSnippet, detectInvalidStructuredCreateContent, inferBuildVerifyStack, isGlobalPackageInstallCommand, isPlaceholderCreateResult, isPlaceholderReplacementText, isTerminalReadOnlyInspectionCommand, toolResultMatchesAnyTargetPath } from './providerSafetyUtils';
-import { containsLeakedToolCallPayload as containsLeakedToolCallPayloadHelper, escapeJsonStringValues as escapeJsonStringValuesHelper, extractBalancedJson as extractBalancedJsonHelper, extractToolCallNameHint as extractToolCallNameHintHelper, extractToolCalls as extractToolCallsHelper, looksLikeMalformedToolCallContent as looksLikeMalformedToolCallContentHelper, looksLikeToolCallContent as looksLikeToolCallContentHelper, normalizeToolArguments as normalizeToolArgumentsHelper, parseToolCallsFromContent as parseToolCallsFromContentHelper, remapWeakModelArgumentAliases as remapWeakModelArgumentAliasesHelper, remapWeakModelToolName as remapWeakModelToolNameHelper, repairSingleQuotedJson as repairSingleQuotedJsonHelper, stripToolCallsFromContent as stripToolCallsFromContentHelper } from './providerToolParsingUtils';
+import { containsLeakedToolCallPayload as containsLeakedToolCallPayloadHelper, escapeJsonStringValues as escapeJsonStringValuesHelper, extractBalancedJson as extractBalancedJsonHelper, extractRawToolCallPayloadFromOllamaError as extractRawToolCallPayloadFromOllamaErrorHelper, extractToolCallNameHint as extractToolCallNameHintHelper, extractToolCalls as extractToolCallsHelper, looksLikeMalformedToolCallContent as looksLikeMalformedToolCallContentHelper, looksLikeToolCallContent as looksLikeToolCallContentHelper, normalizeToolArguments as normalizeToolArgumentsHelper, parseToolCallsFromContent as parseToolCallsFromContentHelper, remapWeakModelArgumentAliases as remapWeakModelArgumentAliasesHelper, remapWeakModelToolName as remapWeakModelToolNameHelper, repairSingleQuotedJson as repairSingleQuotedJsonHelper, stripToolCallsFromContent as stripToolCallsFromContentHelper } from './providerToolParsingUtils';
 import { formatToolMessageForTranscript as formatTranscriptToolMessage, getActiveFileState as getWebviewActiveFileState, getDisplayPath as getWebviewDisplayPath, renderAttachmentContextMessage as renderWebviewAttachmentContextMessage } from './providerWebviewUtils';
 
 interface RevertSnapshot {
@@ -1991,13 +1991,17 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   }
 
   private async tryHandleUltraSmallDeterministicTask(text: string): Promise<FileWriteSummary | undefined> {
+    const deterministicReadSummary = await this.tryHandleUltraSmallPackageJsonRead(text)
+      || await this.tryHandleUltraSmallReadmeTitleRead(text);
+    if (deterministicReadSummary) {
+      return deterministicReadSummary;
+    }
+
     if (this.getModelCapabilityProfile().tier !== 'micro') {
       return undefined;
     }
 
-    return await this.tryHandleUltraSmallPackageJsonRead(text)
-      || await this.tryHandleUltraSmallReadmeTitleRead(text)
-      || await this.tryHandleUltraSmallExactLineReplace(text)
+    return await this.tryHandleUltraSmallExactLineReplace(text)
       || await this.tryHandleUltraSmallSingleFileCreate(text);
   }
 
@@ -4874,6 +4878,27 @@ If the user asks for a change but provides NO code:
         }
         return (await retryResponse.json()) as OllamaResponse;
       }
+
+      if (response.status === 500 && body.tools) {
+        const rawToolPayload = this.extractRawToolCallPayloadFromOllamaError(errorText);
+        if (rawToolPayload) {
+          const recoveredToolCalls = this.parseToolCallsFromContent(rawToolPayload);
+          if (recoveredToolCalls.length > 0) {
+            this.debugLog('ollama_parse_error_tool_recovery', {
+              status: response.status,
+              recoveredToolCalls: recoveredToolCalls.map(toolCall => toolCall.function.name)
+            });
+            return {
+              done: false,
+              message: {
+                role: 'assistant',
+                content: rawToolPayload
+              }
+            };
+          }
+        }
+      }
+
       throw new Error(`Ollama HTTP ${response.status}: ${errorText}`);
     }
 
@@ -4918,6 +4943,10 @@ If the user asks for a change but provides NO code:
 
   private stripToolCallsFromContent(content: string): string {
     return stripToolCallsFromContentHelper(content);
+  }
+
+  private extractRawToolCallPayloadFromOllamaError(errorText: string): string | undefined {
+    return extractRawToolCallPayloadFromOllamaErrorHelper(errorText);
   }
 
   private parseToolCallsFromContent(content: string): ToolFunctionCall[] {

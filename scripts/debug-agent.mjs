@@ -1877,6 +1877,11 @@ function inferDegenerateRecoveryStarterFilepath(text) {
   return 'main.txt';
 }
 
+function extractRawToolPayloadFromOllamaError(errorText) {
+  const match = String(errorText ?? '').match(/error parsing tool call:\s*raw='([\s\S]*?)',\s*err=/i);
+  return match?.[1]?.trim() || undefined;
+}
+
 function getPreferredGreenfieldCodeDumpSpec(targetFilepath) {
   const ext = path.extname(targetFilepath || '').toLowerCase();
   if (ext === '.py') {
@@ -1973,14 +1978,12 @@ function extractPreferredGreenfieldCodeDump(content) {
 }
 
 async function tryUltraSmallDeterministicFastPath() {
-  if (MODEL_LIMITS.tier !== 'micro') return false;
-
   if (/package\.json/i.test(userPrompt) && /\bname\b/i.test(userPrompt) && /\bversion\b/i.test(userPrompt) && /(?:\bread\b|\bshow\b|\banswer\b)/i.test(userPrompt)) {
     try {
       const packageJson = JSON.parse(readFileSync(path.join(wsRoot, 'package.json'), 'utf8'));
       const summary = [String(packageJson.name ?? '').trim(), String(packageJson.version ?? '').trim()].filter(Boolean).join(' ').trim();
       label(G, 'FAST-PATH', `package.json -> ${summary || '(missing name/version)'}`);
-      logEvent('session_done', { reason: 'ultra_small_fast_path_package_json', summary });
+      logEvent('session_done', { reason: 'deterministic_fast_path_package_json', summary });
       return true;
     } catch (error) {
       label(R, 'FAST-PATH ERROR', error instanceof Error ? error.message : String(error));
@@ -1994,7 +1997,7 @@ async function tryUltraSmallDeterministicFastPath() {
       const readmeText = readFileSync(path.join(wsRoot, 'README.md'), 'utf8');
       const title = readmeText.match(/^#\s+(.+)$/m)?.[1]?.trim() || 'README.md has no H1 title.';
       label(G, 'FAST-PATH', `README title -> ${title}`);
-      logEvent('session_done', { reason: 'ultra_small_fast_path_readme_title', title });
+      logEvent('session_done', { reason: 'deterministic_fast_path_readme_title', title });
       return true;
     } catch (error) {
       label(R, 'FAST-PATH ERROR', error instanceof Error ? error.message : String(error));
@@ -2002,6 +2005,8 @@ async function tryUltraSmallDeterministicFastPath() {
       return true;
     }
   }
+
+  if (MODEL_LIMITS.tier !== 'micro') return false;
 
   const exactLineReplaceMatch = userPrompt.match(/replace\s+(?:the\s+)?exact\s+line\s+["'`](.+?)["'`]\s+with\s+["'`](.+?)["'`](?:\s+in\s+(\S+))?/i);
   if (exactLineReplaceMatch) {
@@ -2279,11 +2284,23 @@ function parseToolCallsFromText(content) {
   }
 
   // Match fenced code blocks — extract full content and try to parse as JSON
-  const fencedPattern = /```(?:json|tool_call)?\s*\n([\s\S]*?)\n```/g;
+  const fencedPattern = /```([a-zA-Z_][\w-]*)?\s*\n([\s\S]*?)\n```/g;
   let match;
   while ((match = fencedPattern.exec(content)) !== null) {
+    const infoString = String(match[1] ?? '').trim();
+    const inner = String(match[2] ?? '').trim();
+    if (infoString) {
+      const mappedName = remapToolName(infoString);
+      if (ALL_TOOL_NAMES.includes(infoString) || KNOWN_TOOLS.includes(mappedName)) {
+        const args = relaxedJsonParse(inner);
+        if (args) {
+          results.push({ function: { name: mappedName, arguments: remapArgs(args) } });
+          continue;
+        }
+      }
+    }
     try {
-      const obj = relaxedJsonParse(match[1].trim());
+      const obj = relaxedJsonParse(inner);
       if (obj?.name && obj?.arguments !== undefined) {
         results.push({ function: { name: remapToolName(obj.name), arguments: remapArgs(typeof obj.arguments === 'string' ? relaxedJsonParse(obj.arguments) ?? {} : obj.arguments) } });
       }
@@ -3239,9 +3256,28 @@ let args = rawArgs;
       });
       if (!resp.ok) {
         const txt = await resp.text();
-        throw new Error(`HTTP ${resp.status}: ${txt}`);
+        let recoveredFromParseError = false;
+        if (resp.status === 500) {
+          const rawToolPayload = extractRawToolPayloadFromOllamaError(txt);
+          if (rawToolPayload) {
+            const recoveredToolCalls = parseToolCallsFromText(rawToolPayload);
+            if (recoveredToolCalls.length > 0) {
+              label(Y, 'OLLAMA RECOVERY', `Recovered ${recoveredToolCalls.length} tool call(s) from HTTP 500 parse error`);
+              logEvent('ollama_parse_error_tool_recovery', {
+                recoveredToolCalls: recoveredToolCalls.map(toolCall => toolCall.function?.name ?? 'unknown')
+              });
+              responseData = { message: { content: rawToolPayload } };
+              recoveredFromParseError = true;
+            }
+          }
+        }
+        if (!recoveredFromParseError) {
+          throw new Error(`HTTP ${resp.status}: ${txt}`);
+        }
       }
-      responseData = await resp.json();
+      if (!responseData) {
+        responseData = await resp.json();
+      }
     } catch (e) {
       label(R, 'OLLAMA ERROR', e.message);
       logEvent('ollama_error', { error: e.message });
@@ -3562,6 +3598,7 @@ let args = rawArgs;
       if (isEchoOfUserMsg) label(Y, 'ECHO DETECTED', 'Model echoed a user message — treating as empty');
       const missingExplicitRequestedWriteTargets = getMissingExplicitRequestedWriteTargets();
       const hasMissingExplicitWrites = missingExplicitRequestedWriteTargets.length > 0;
+      const hasSatisfiedExplicitWriteRequest = explicitRequestedWriteTargets.length > 0 && !hasMissingExplicitWrites;
       // For greenfield: empty after write = done only if nudged at least once
       if (!IS_SPLIT_TASK && hadSuccessfulWrite && retryCount >= 1 && !hasMissingExplicitWrites) {
         label(G, 'DONE', 'Empty response after successful file write(s) — task complete.');
@@ -3577,6 +3614,11 @@ let args = rawArgs;
       if (extractionContinuationPending && retryCount >= 2 && hasMetExtractionGoal() && !hasMissingExplicitWrites) {
         label(G, 'DONE', `${extractionCount} module(s) extracted — model could not continue further.`);
         logEvent('session_done', { turn, reason: 'continuation_exhausted', extractionCount });
+        break;
+      }
+      if (hasSatisfiedExplicitWriteRequest && hadSuccessfulWrite && retryCount >= 1) {
+        label(G, 'DONE', 'All explicitly requested files were written and the model went empty afterward — task complete.');
+        logEvent('session_done', { turn, reason: 'empty_after_explicit_write_completion' });
         break;
       }
       if (retryCount >= MODEL_LIMITS.maxNudgeRetriesCap) {
@@ -3598,6 +3640,8 @@ let args = rawArgs;
         emptyNudge = `You already read lines ${lastSuccessfulRead.startLine}–${lastSuccessfulRead.endLine} of ${path.basename(lastSuccessfulRead.filepath ?? '')}. ` +
           `Do NOT re-read those lines. Use that content to create a NEW sibling file (e.g. ${SUGGESTED_TYPES_FILE} or ${SUGGESTED_INTERFACES_FILE}) with the extracted real code — use create_or_edit_file. ` +
           `Do NOT attempt to overwrite ${TARGET_FILE}.`;
+      } else if (hasSatisfiedExplicitWriteRequest && hadSuccessfulWrite) {
+        emptyNudge = 'All explicitly requested files already have successful write results. If the task is complete, reply with one short completion summary only. Do NOT call create_or_edit_file again unless a requested target is still missing.';
       } else {
         emptyNudge = IS_SPLIT_TASK
           ? `Your response was empty. Call read_file_slice on ${TARGET_FILE} to read a section, then call create_or_edit_file to create a new module file with the extracted code.`
