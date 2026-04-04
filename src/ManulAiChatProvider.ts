@@ -4193,6 +4193,9 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   private isDegenerateOutput(content: string): boolean {
     const trimmed = content.trim();
     if (trimmed.length < 80) { return false; }
+    // Bracket soup: high density of [ ] brackets typical of phi4-mini token soup
+    const bracketCount = (trimmed.match(/[\[\]]/g) ?? []).length;
+    if (bracketCount / trimmed.length > 0.08) { return true; }
     // Strip markdown formatting and punctuation, then tokenize
     const cleaned = trimmed.replace(/[*_~`#>|\-—=\[\](){}]/g, ' ');
     const words = cleaned.split(/\s+/).map(w => w.toLowerCase().replace(/[^a-z0-9]/g, '')).filter(w => w.length > 0);
@@ -5777,6 +5780,15 @@ If the user asks for a change but provides NO code:
     }
 
     if (path.isAbsolute(normalizedTarget)) {
+      // Correct case-insensitive workspace root mismatch (e.g. model writes /Documents/manulai/ vs /Documents/ManulAI/)
+      const wsRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+      if (wsRoot) {
+        const normLower = normalizedTarget.toLowerCase();
+        const rootLower = wsRoot.toLowerCase();
+        if (normLower.startsWith(rootLower) && !normalizedTarget.startsWith(wsRoot)) {
+          return vscode.Uri.file(wsRoot + normalizedTarget.slice(wsRoot.length));
+        }
+      }
       return vscode.Uri.file(normalizedTarget);
     }
 
@@ -5991,7 +6003,8 @@ If the user asks for a change but provides NO code:
       }
       const latestExt = path.extname(latestWritePath).toLowerCase();
       if (latestExt === '.go' && !isProjectVerificationManifestFile(latestWritePath)) {
-        return !(await exists('go.mod'));
+        // Always use standalone gofmt for .go files — avoid falling through to package.json npm scripts
+        return true;
       }
       return false;
     };
