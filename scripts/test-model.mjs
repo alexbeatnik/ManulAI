@@ -7,6 +7,16 @@ const SYSTEM_PROMPT = `You are ManulAI, a local VS Code coding agent.
 You execute tasks using tools. Never describe what you intend to do instead of doing it.
 Call the appropriate tool immediately. No preamble.`;
 
+const SYSTEM_PROMPT_TEXT_TOOLS = `You are ManulAI, a local VS Code coding agent.
+You execute tasks by calling tools. Output tool calls as JSON objects using this format:
+{"tool": "tool_name", "args": {"param": "value"}}
+Available tools:
+- create_or_edit_file(filename, content) - Create or edit a file
+- read_specific_file(filepath) - Read file contents
+- list_workspace_files(directory) - List files in directory
+- execute_terminal_command(command) - Run a shell command
+Never describe what you will do. Call the tool immediately using JSON format.`;
+
 const FULL_TOOLS = [
   { type: 'function', function: { name: 'list_workspace_files', description: 'List files and folders in a directory.', parameters: { type: 'object', properties: { directory: { type: 'string', description: 'Directory path relative to workspace root' } }, required: ['directory'] } } },
   { type: 'function', function: { name: 'project_scan', description: 'Get a recursive tree of the entire workspace.', parameters: { type: 'object', properties: {}, required: [] } } },
@@ -24,11 +34,15 @@ const ONE_TOOL = [FULL_TOOLS[6]]; // create_or_edit_file only
 const body = {
   model,
   stream: false,
+  num_ctx: 8192,
   messages: []
 };
 
 if (mode === 'agent') {
   body.messages.push({ role: 'system', content: SYSTEM_PROMPT });
+}
+if (mode === 'agent-text') {
+  body.messages.push({ role: 'system', content: SYSTEM_PROMPT_TEXT_TOOLS });
 }
 body.messages.push({ role: 'user', content: prompt });
 
@@ -36,7 +50,18 @@ if (mode === 'tools') body.tools = ONE_TOOL;
 if (mode === 'tools9') body.tools = FULL_TOOLS;
 if (mode === 'agent') body.tools = FULL_TOOLS;
 
-console.log(`Model: ${model} | Mode: ${mode} | Prompt: ${prompt.substring(0, 80)}`);
+// thinking models (gemma4, deepseek-r1, etc.) need think:false for tool calling
+const thinkingFamilies = /^gemma4(?:[:]|$)|^deepseek-r1(?:[:]|$)/i;
+if (thinkingFamilies.test(model) && body.tools) {
+  body.think = false;
+}
+
+const thinkParam = process.env.THINK; // override via env: THINK=true or THINK=false
+if (thinkParam !== undefined) {
+  body.think = thinkParam === 'true';
+}
+
+console.log(`Model: ${model} | Mode: ${mode} | Think: ${body.think ?? 'default'} | Prompt: ${prompt.substring(0, 60)}`);
 const t0 = Date.now();
 
 const res = await fetch('http://localhost:11434/api/chat', {
@@ -46,7 +71,9 @@ const res = await fetch('http://localhost:11434/api/chat', {
 const d = await res.json();
 const dur = ((Date.now() - t0) / 1000).toFixed(1);
 
-console.log(`Time: ${dur}s | Content: ${d.message?.content?.length ?? 0} chars | Tool calls: ${d.message?.tool_calls?.length ?? 0}`);
+const thinking = d.message?.thinking;
+console.log(`Time: ${dur}s | Content: ${d.message?.content?.length ?? 0} chars | Tool calls: ${d.message?.tool_calls?.length ?? 0} | Thinking: ${thinking ? thinking.length + ' chars' : 'none'}`);
+console.log('RAW message:', JSON.stringify(d.message, null, 2).substring(0, 800));
 if (d.message?.content) {
   console.log('---');
   console.log(d.message.content.substring(0, 600));
@@ -56,4 +83,7 @@ if (d.message?.tool_calls?.length) {
   for (const tc of d.message.tool_calls) {
     console.log(JSON.stringify(tc, null, 2));
   }
+}
+if (d.error) {
+  console.log('--- ERROR ---', d.error);
 }

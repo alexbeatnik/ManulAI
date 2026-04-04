@@ -18,7 +18,7 @@ const packageJson = JSON.parse(readFileSync(path.join(ROOT, 'package.json'), 'ut
 const EXPECTED_EXTENSION_NAME = String(packageJson.name ?? '').trim();
 const EXPECTED_EXTENSION_VERSION = String(packageJson.version ?? '').trim();
 
-const BASELINE_MODELS = ['phi4-mini:3.8b', 'llama3.1:8b', 'qwen3-coder:30b'];
+const BASELINE_MODELS = ['phi4-mini:3.8b', 'llama3.1:8b', 'qwen3-coder:30b', 'gemma4:latest', 'gemma4:31b'];
 const REQUESTED_MODELS = (process.env.REGRESSION_MODELS ?? '')
   .split(',')
   .map(value => value.trim())

@@ -281,6 +281,28 @@ export function parseToolCallsFromContent(content: string, toolDefinitions: Tool
     }
   }
 
+  // Match {"tool": "tool_name", "args": {...}} — text-tool format used by gemma4 and similar models
+  // that receive tool descriptions in the system prompt rather than native Ollama tools.
+  if (trimmed.includes('"tool"') || trimmed.includes('"tool_name"')) {
+    const toolKeyRe = /\{[\s]*"(?:tool|tool_name)"/g;
+    let tkm: RegExpExecArray | null;
+    while ((tkm = toolKeyRe.exec(trimmed)) !== null) {
+      const jsonStr = extractBalancedJson(trimmed, tkm.index);
+      if (jsonStr) {
+        const obj = relaxedJsonParse(jsonStr) as Record<string, unknown> | null | undefined;
+        const toolName = typeof obj?.tool === 'string' ? obj.tool
+          : typeof obj?.tool_name === 'string' ? obj.tool_name : undefined;
+        const args = (obj?.args ?? obj?.arguments ?? obj?.parameters) as Record<string, unknown> | undefined;
+        if (toolName && args !== undefined && typeof args === 'object') {
+          const mappedName = remapWeakModelToolName(toolName);
+          if (knownToolNames.has(mappedName)) {
+            return [{ type: 'function', function: { name: mappedName, arguments: remapWeakModelArgumentAliases(args) } }];
+          }
+        }
+      }
+    }
+  }
+
   return [];
 }
 
@@ -868,12 +890,16 @@ function normalizeSingleParsedToolCall(rawValue: unknown): ToolFunctionCall | un
   }
 
   const record = rawValue as Record<string, unknown>;
+  // Support {"tool": "name", "args": {...}} format emitted by gemma4 and similar text-tool models
   const directName = typeof record.name === 'string' ? record.name.trim()
     : typeof record.function_name === 'string' ? record.function_name.trim()
     : typeof record.function === 'string' ? record.function.trim()
+    : typeof record.tool === 'string' ? record.tool.trim()
+    : typeof record.tool_name === 'string' ? record.tool_name.trim()
     : '';
   const normalizedToolName = remapWeakModelToolName(typeof record.function === 'string' ? record.function.trim() : directName);
-  const directArguments = inferImplicitToolArguments(normalizedToolName, record.arguments ?? record.parameters, record);
+  // Also look at record.args as fallback for record.arguments
+  const directArguments = inferImplicitToolArguments(normalizedToolName, record.arguments ?? record.parameters ?? record.args, record);
   const functionRecord = toObjectRecord(record.function);
   const normalizedArguments = normalizeParsedToolArguments(functionRecord?.arguments ?? directArguments);
 

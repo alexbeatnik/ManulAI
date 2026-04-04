@@ -126,22 +126,45 @@ export function activate(context: vscode.ExtensionContext): void {
       await provider.refreshModelCatalog(true);
 
       const currentModel = provider.getSelectedModel();
-      const availableModels = provider.getAvailableModels().map(model => ({
-        label: model,
-        description: model === currentModel ? 'Current model' : undefined
-      }));
+      const availableModelNames = provider.getAvailableModels();
+      const validatedModels = availableModelNames.filter(model => provider.isValidatedModel(model));
+      const otherModels = availableModelNames.filter(model => !provider.isValidatedModel(model));
+      const availableModels: vscode.QuickPickItem[] = [];
+
+      if (validatedModels.length > 0) {
+        availableModels.push({
+          label: 'Validated Baseline',
+          kind: vscode.QuickPickItemKind.Separator
+        });
+        availableModels.push(...validatedModels.map(model => ({
+          label: model,
+          description: model === currentModel ? 'Current model' : 'Recommended'
+        })));
+      }
+
+      if (otherModels.length > 0) {
+        availableModels.push({
+          label: 'Other Installed Models',
+          kind: vscode.QuickPickItemKind.Separator
+        });
+        availableModels.push(...otherModels.map(model => ({
+          label: model,
+          description: model === currentModel ? 'Current model' : 'Installed locally',
+          detail: 'Available for manual testing, but not part of the validated default baseline yet.'
+        })));
+      }
 
       if (availableModels.length === 0) {
-        void vscode.window.showWarningMessage('No supported Ollama models were found. ManulAI is currently tuned for phi4-mini, llama3.1, and qwen3-coder local models.');
+        void vscode.window.showWarningMessage('No Ollama models were found. Make sure `ollama list` shows installed local models and that `/api/tags` is reachable.');
         return;
       }
 
       const selected = await vscode.window.showQuickPick(availableModels, {
         title: 'Select Ollama model for ManulAI',
-        placeHolder: 'Choose a local Ollama model'
+        placeHolder: 'Choose a local Ollama model. Validated models are shown first.'
       });
 
-      if (!selected) {
+      if (!selected || selected.kind === vscode.QuickPickItemKind.Separator) {
         return;
       }
 

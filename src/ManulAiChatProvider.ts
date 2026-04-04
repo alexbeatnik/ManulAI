@@ -42,6 +42,8 @@ interface ModelCapabilityProfile {
   maxNudgeRetriesCap: number;
   maxReadOpsWithoutWrite: number;
   toolNames: string[];
+  /** When true, do not send native Ollama tools array; inject text tool descriptions into mandate instead. */
+  useTextTools?: boolean;
 }
 
 export class ManulAiChatProvider implements vscode.WebviewViewProvider {
@@ -299,11 +301,24 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     const normalized = model.trim().toLowerCase();
     return /^phi4-mini(?:[:]|$)/.test(normalized)
       || /^llama3\.1(?:[:]|$)/.test(normalized)
-      || /^qwen3-coder(?:[:]|$)/.test(normalized);
+      || /^qwen3-coder(?:[:]|$)/.test(normalized)
+      || /^gemma4(?:[:]|$)/.test(normalized);
   }
 
   private filterPreferredSupportedModels(models: string[]): string[] {
     return models.filter(model => this.isPreferredSupportedModel(model));
+  }
+
+  private sortDiscoveredModels(models: string[]): string[] {
+    const uniqueModels = Array.from(new Set(models.map(model => model.trim()).filter(Boolean)));
+    return uniqueModels.sort((left, right) => {
+      const leftPreferred = this.isPreferredSupportedModel(left);
+      const rightPreferred = this.isPreferredSupportedModel(right);
+      if (leftPreferred !== rightPreferred) {
+        return leftPreferred ? -1 : 1;
+      }
+      return left.localeCompare(right);
+    });
   }
 
   public async refreshModelCatalog(postStatusOnError = false): Promise<void> {
@@ -322,18 +337,21 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       const names = (payload.models ?? [])
         .map(model => String(model.name ?? '').trim())
         .filter(Boolean)
-        .filter(model => this.isPreferredSupportedModel(model))
         .sort((left, right) => left.localeCompare(right));
 
-      this.availableModels = Array.from(new Set(this.filterPreferredSupportedModels(names)));
+      const preferredNames = this.filterPreferredSupportedModels(names);
+
+      this.availableModels = this.sortDiscoveredModels(names);
       this.ollamaReachable = true;
 
       // Auto-select the only available model when none is currently chosen
-      if (!currentModel && names.length === 1) {
+      if (!currentModel && preferredNames.length === 1) {
+        await this.setSelectedModel(preferredNames[0]);
+      } else if (!currentModel && names.length === 1) {
         await this.setSelectedModel(names[0]);
       }
     } catch (error) {
-      this.availableModels = Array.from(new Set(this.filterPreferredSupportedModels(this.availableModels)));
+      this.availableModels = this.sortDiscoveredModels(this.availableModels);
       this.ollamaReachable = false;
 
       if (postStatusOnError) {
@@ -366,6 +384,10 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
 
   public getAvailableModels(): string[] {
     return [...this.availableModels];
+  }
+
+  public isValidatedModel(model: string): boolean {
+    return this.isPreferredSupportedModel(model);
   }
 
   public async handleConfigurationChange(): Promise<void> {
@@ -3961,7 +3983,10 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   private getModelSizeInBillions(): number {
     const model = this.getSelectedModel().toLowerCase();
     const sizeMatch = model.match(/(\d+\.?\d*)b/);
-    return sizeMatch ? parseFloat(sizeMatch[1]) : 0;
+    if (sizeMatch) return parseFloat(sizeMatch[1]);
+    // Family-specific fallback for models whose default tag has no size suffix
+    if (/^gemma4(?:[:]|$)/i.test(model) && /:(latest|instruct|it)$/i.test(model)) return 8;
+    return 0;
   }
 
   private getModelCapabilityProfile(): ModelCapabilityProfile {
@@ -4033,6 +4058,28 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         maxNudgeRetriesCap: 5,
         maxReadOpsWithoutWrite: 2,
         toolNames: preferredToolNames
+      };
+    }
+
+    // gemma4: native tool calling broken in Ollama — uses text-tool fallback mode instead
+    if (/^gemma4(?:[:]|$)/.test(selectedModel)) {
+      const isLarge = sizeB > 10; // gemma4:31b
+      return {
+        tier: isLarge ? 'large' : 'medium',
+        maxMessages: isLarge ? 28 : 20,
+        numCtx: isLarge ? 16384 : 12288,
+        workspaceTreeMaxDepth: 3,
+        workspaceTreeFileCap: isLarge ? 180 : 150,
+        summaryContextLimit: isLarge ? 6 : 5,
+        includeWorkspaceInstructions: true,
+        includeWorkspaceNotes: false,
+        includeRecentChatSummaries: true,
+        useCompactMandate: false,
+        preferStepwiseExecution: true,
+        maxNudgeRetriesCap: isLarge ? 4 : 3,
+        maxReadOpsWithoutWrite: 2,
+        toolNames: preferredToolNames,
+        useTextTools: true // do not send native tools array; inject text tool format into mandate
       };
     }
 
@@ -4630,6 +4677,10 @@ ${wsRoot ? `Workspace root: ${wsRoot}\n` : ''}
         plannerMandate += '\n[WORKSPACE STRUCTURE]\n' + workspaceTree;
       }
 
+      if (capabilityProfile.useTextTools) {
+        plannerMandate += `\n\n---\n\n[TOOL FORMAT]\n\nOutput tool calls as a single JSON object on its own line:\n{"tool": "tool_name", "args": {"param": "value"}}\n\nAvailable tools:\n- create_or_edit_file(filename, content) — Create or overwrite a file\n- replace_in_file(filepath, old_text, new_text) — Replace text in existing file\n- read_specific_file(filepath) — Read full file contents\n- read_file_slice(filepath, startLine, endLine) — Read a line range from a file\n- list_workspace_files(directory) — List files/folders in a directory\n- execute_terminal_command(command) — Run a shell command (no stdin)\n- launch_in_terminal(command) — Open integrated terminal for interactive commands\n- delete_file(filepath) — Delete a file\n- read_active_file() — Read the currently open file\n- project_scan() — Get a recursive tree of the entire workspace\n\nOutput ONE tool call JSON per response. No prose before the JSON.`;
+      }
+
       if (capabilityProfile.includeWorkspaceNotes) {
         const notesResult = await this.readWorkspaceNotes();
         try {
@@ -4751,8 +4802,7 @@ When splitting a file into smaller modules:
 
 [TOOL USAGE RULES]
 
-- ALWAYS use native tool calls
-- NEVER output raw JSON as a tool call substitute
+- ALWAYS use native tool calls${capabilityProfile.useTextTools ? '' : '\n- NEVER output raw JSON as a tool call substitute'}
 - NEVER write "Executing step N:" in text — call the tool instead
 - If fix is known → call the tool immediately
 
@@ -4791,6 +4841,10 @@ If steps remain → continue with the next tool call.
 
       if (workspaceInstructions) {
         agentMandate += '\n\n<workspace_instructions>\n' + (capabilityProfile.useCompactMandate ? this.compactMemoryText(workspaceInstructions, 1200) : workspaceInstructions) + '\n</workspace_instructions>';
+      }
+
+      if (capabilityProfile.useTextTools) {
+        agentMandate += `\n\n---\n\n[TOOL FORMAT]\n\nOutput tool calls as a single JSON object on its own line:\n{"tool": "tool_name", "args": {"param": "value"}}\n\nAvailable tools:\n- create_or_edit_file(filename, content) — Create or overwrite a file\n- replace_in_file(filepath, old_text, new_text) — Replace text in existing file\n- read_specific_file(filepath) — Read full file contents\n- read_file_slice(filepath, startLine, endLine) — Read a line range from a file\n- list_workspace_files(directory) — List files/folders in a directory\n- execute_terminal_command(command) — Run a shell command (no stdin)\n- launch_in_terminal(command) — Open integrated terminal for interactive commands\n- delete_file(filepath) — Delete a file\n- read_active_file() — Read the currently open file\n- project_scan() — Get a recursive tree of the entire workspace\n\nOutput ONE tool call JSON per response. No prose before the JSON.`;
       }
 
       if (recentChatSummaries) {
@@ -4937,31 +4991,40 @@ If the user asks for a change but provides NO code:
       requestMessages.push({ role: 'system', content: systemPrompt, hiddenFromTranscript: true });
     }
 
+    const useTextTools = this.getModelCapabilityProfile().useTextTools === true;
+
     requestMessages.push(...messages.filter(m => !m.localOnly).map(m => {
       // Sanitize any degenerate assistant content that leaked into history (prevents context poisoning)
       if (m.role === 'assistant' && typeof m.content === 'string' && this.isDegenerateOutput(m.content)) {
         return { ...m, content: '[incoherent output removed]' };
       }
+      // For useTextTools models (e.g. gemma4), convert tool-role messages to user-role so they're understood
+      if (m.role === 'tool' && useTextTools) {
+        return { role: 'user' as const, content: `Tool result (${(m as OllamaMessage & { tool_name?: string }).tool_name ?? 'tool'}): ${m.content}`, hiddenFromTranscript: m.hiddenFromTranscript };
+      }
       return { ...m };
     }));
 
     const { numCtx } = this.getModelContextLimits();
-
     const body: {
       model: string;
       stream: false;
       messages: OllamaMessage[];
       tools?: ToolDefinition[];
-      options?: { num_ctx: number };
+      options?: { num_ctx: number; think?: boolean };
     } = {
       model,
       stream: false,
       messages: requestMessages,
-      options: { num_ctx: numCtx }
+      options: { num_ctx: numCtx, ...(useTextTools ? { think: false } : {}) }
     };
 
     if (this.isAgentLike) {
-      body.tools = this.getActiveToolDefinitions();
+      // useTextTools models (e.g. gemma4) do not support native Ollama tool calling;
+      // tool descriptions are injected into the system mandate as text instead.
+      if (!useTextTools) {
+        body.tools = this.getActiveToolDefinitions();
+      }
     }
 
     const abortController = new AbortController();

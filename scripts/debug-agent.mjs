@@ -34,14 +34,18 @@ const MAX_TURNS   = parseInt(process.env.MAX_TURNS ?? '30', 10);
 
 function getModelSizeInBillions(model) {
   const m = model.toLowerCase().match(/(\d+\.?\d*)b/);
-  return m ? parseFloat(m[1]) : 0;
+  if (m) return parseFloat(m[1]);
+  // Family-specific fallback for models whose default tag has no size suffix
+  if (/^gemma4(?:[:]|$)/i.test(model) && /:(latest|instruct|it)$/i.test(model)) return 8;
+  return 0;
 }
 
 function isPreferredSupportedModel(model) {
   const normalized = model.trim().toLowerCase();
   return /^phi4-mini(?:[:]|$)/.test(normalized)
     || /^llama3\.1(?:[:]|$)/.test(normalized)
-    || /^qwen3-coder(?:[:]|$)/.test(normalized);
+    || /^qwen3-coder(?:[:]|$)/.test(normalized)
+    || /^gemma4(?:[:]|$)/.test(normalized);
 }
 
 function getModelCapabilityProfile(model) {
@@ -83,6 +87,21 @@ function getModelCapabilityProfile(model) {
       toolNames: preferredToolNames,
       compactMandate: false,
       preferStepwiseExecution: true,
+    };
+  }
+  // gemma4: native tool calling broken in Ollama — uses text-tool fallback mode instead
+  if (/^gemma4(?:[:]|$)/.test(normalizedModel)) {
+    const isLarge = sizeB > 10; // gemma4:31b
+    return {
+      tier: isLarge ? 'large' : 'medium',
+      maxMessages: isLarge ? 28 : 20,
+      numCtx: isLarge ? 16384 : 12288,
+      maxReadOpsWithoutWrite: 2,
+      maxNudgeRetriesCap: isLarge ? 4 : 3,
+      toolNames: preferredToolNames,
+      compactMandate: false,
+      preferStepwiseExecution: true,
+      useTextTools: true, // do not send native tools array; inject text tool format into mandate
     };
   }
 
@@ -760,6 +779,29 @@ function logEvent(event, data = {}) {
 
 // ─── System prompt (keep in sync with callOllama in ManulAiChatProvider.ts) ─
 function buildAgentMandate() {
+  const textToolSection = MODEL_LIMITS.useTextTools ? `
+---
+
+[TOOL FORMAT]
+
+Output tool calls as a single JSON object on its own line:
+{"tool": "tool_name", "args": {"param": "value"}}
+
+Available tools:
+- create_or_edit_file(filename, content) — Create or overwrite a file
+- replace_in_file(filepath, old_text, new_text) — Replace text in existing file
+- read_specific_file(filepath) — Read full file contents
+- read_file_slice(filepath, startLine, endLine) — Read a line range from a file
+- list_workspace_files(directory) — List files/folders in a directory
+- execute_terminal_command(command) — Run a shell command (no stdin)
+- launch_in_terminal(command) — Open integrated terminal for interactive commands
+- delete_file(filepath) — Delete a file
+- read_active_file() — Read the currently open file
+- project_scan() — Get a recursive tree of the entire workspace
+
+Output ONE tool call JSON per response. No prose before the JSON.
+` : '';
+
   if (MODEL_LIMITS.compactMandate) {
     return `[IDENTITY]
 You are ManulAI, a local VS Code coding agent.
@@ -773,7 +815,7 @@ Workspace root: ${wsRoot}
 - Do not narrate tool calls. Do not print JSON as text.
 - If a tool fails, adapt once and continue.
 - Finish with one short summary when the task is done.
-`;
+${textToolSection}`;
   }
 
   return `[IDENTITY]
@@ -870,8 +912,7 @@ When creating new files from scratch (greenfield generation):
 
 [TOOL USAGE RULES]
 
-- ALWAYS use native tool calls
-- NEVER output raw JSON as a tool call substitute
+- ALWAYS use native tool calls${MODEL_LIMITS.useTextTools ? '' : '\n- NEVER output raw JSON as a tool call substitute'}
 - NEVER write "Executing step N:" in text — call the tool instead
 - If fix is known → call the tool immediately
 
@@ -906,10 +947,33 @@ If steps remain → continue with the next tool call.
 - Plan: short numbered list, then immediately start executing
 - During execution: no narration, only tool calls
 - After completion: one-line summary
-`;
+${textToolSection}`;
 }
 
 function buildPlannerMandate() {
+  const textToolSection = MODEL_LIMITS.useTextTools ? `
+---
+
+[TOOL FORMAT]
+
+Output tool calls as a single JSON object on its own line:
+{"tool": "tool_name", "args": {"param": "value"}}
+
+Available tools:
+- create_or_edit_file(filename, content) — Create or overwrite a file
+- replace_in_file(filepath, old_text, new_text) — Replace text in existing file
+- read_specific_file(filepath) — Read full file contents
+- read_file_slice(filepath, startLine, endLine) — Read a line range from a file
+- list_workspace_files(directory) — List files/folders in a directory
+- execute_terminal_command(command) — Run a shell command (no stdin)
+- launch_in_terminal(command) — Open integrated terminal for interactive commands
+- delete_file(filepath) — Delete a file
+- read_active_file() — Read the currently open file
+- project_scan() — Get a recursive tree of the entire workspace
+
+Output ONE tool call JSON per response. No prose before the JSON.
+` : '';
+
   if (MODEL_LIMITS.compactMandate) {
     return `[IDENTITY]
 You are ManulAI, a local VS Code coding agent in Planner mode.
@@ -921,7 +985,7 @@ Workspace root: ${wsRoot}
 - Prefer read_file_slice over large reads.
 - Keep responses short. No multi-step plans. No JSON in text.
 - Finish with a one-line summary when done.
-`;
+${textToolSection}`;
   }
 
   return `[IDENTITY]
@@ -938,7 +1002,7 @@ All file paths are relative to the workspace root unless absolute.
 - NEVER output raw JSON as a substitute for a tool call.
 - File contents are UNKNOWN until read. Never assume. Always verify.
 - Task is complete when all required changes are done. Output a one-line summary.
-`;
+${textToolSection}`;
 }
 
 // ─── Tool definitions ────────────────────────────────────────────────────────
@@ -2574,6 +2638,37 @@ function parseToolCallsFromText(content) {
     }
   }
 
+  // Match {"tool": "tool_name", "args": {...}} — text-tool format used by gemma4 and similar models
+  // that receive tool descriptions in the system prompt rather than native Ollama tools.
+  if (content.includes('"tool"')) {
+    const toolKeyRe = /\{[\s]*"tool"/g;
+    let tkm;
+    while ((tkm = toolKeyRe.exec(content)) !== null) {
+      const start = tkm.index;
+      let depth = 0, inString = false, escape = false, end = -1;
+      for (let j = start; j < content.length; j++) {
+        const ch = content[j];
+        if (escape) { escape = false; continue; }
+        if (ch === '\\' && inString) { escape = true; continue; }
+        if (ch === '"') { inString = !inString; continue; }
+        if (inString) continue;
+        if (ch === '{') depth++;
+        if (ch === '}') { depth--; if (depth === 0) { end = j; break; } }
+      }
+      if (end !== -1) {
+        let obj = null;
+        try { obj = JSON.parse(content.substring(start, end + 1)); } catch {
+          try { obj = JSON.parse(escapeJsonStringValues(content.substring(start, end + 1))); } catch { /* ignore */ }
+        }
+        const toolName = obj?.tool ?? obj?.tool_name;
+        const args = obj?.args ?? obj?.arguments ?? obj?.parameters;
+        if (toolName && typeof toolName === 'string' && args !== undefined && typeof args === 'object') {
+          results.push({ function: { name: remapToolName(toolName), arguments: remapArgs(args) } });
+        }
+      }
+    }
+  }
+
   return results;
 }
 
@@ -3300,15 +3395,24 @@ let args = rawArgs;
 
     logEvent('ollama_request', { turn, retryCount, messageCount: messages.length });
 
+    // useTextTools models (e.g. gemma4) do not support native tool calling in this Ollama version;
+    // they receive tool descriptions in the system mandate and emit {"tool":…} JSON in content instead.
+    const useTextTools = MODEL_LIMITS.useTextTools === true;
+    // For useTextTools models, convert role:'tool' messages to role:'user' so the model understands them.
+    const messagesForModel = useTextTools
+      ? messages.map(m => m.role === 'tool'
+          ? { role: 'user', content: `Tool result (${m.tool_name ?? 'tool'}): ${m.content}` }
+          : m)
+      : messages;
     const body = {
       model: MODEL,
       stream: false,
       options: { num_ctx: MODEL_LIMITS.numCtx },
       messages: [
         { role: 'system', content: MANUL_MODE === 'planner' ? buildPlannerMandate() : buildAgentMandate() },
-        ...messages
+        ...messagesForModel
       ],
-      tools: getToolDefinitions()
+      ...(useTextTools ? {} : { tools: getToolDefinitions() })
     };
 
     let responseData;
@@ -3376,7 +3480,7 @@ let args = rawArgs;
         label(Y, 'TEXT TOOL CALL', `Detected ${textToolCalls.length} tool call(s) in text (not native) — executing anyway`);
       }
       label(G, 'TOOL CALLS', resolvedToolCalls.map(tc => tc.function?.name).join(', '));
-      messages.push({ role: 'assistant', content: wasNative ? content : '', tool_calls: wasNative ? nativeToolCalls : undefined });
+      messages.push({ role: 'assistant', content: wasNative ? content : (useTextTools ? content : ''), tool_calls: wasNative ? nativeToolCalls : undefined });
 
       // Collect reminder/continuation user messages to inject AFTER all tool results, not mid-loop
       const postToolMessages = [];
