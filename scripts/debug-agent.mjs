@@ -2720,6 +2720,25 @@ function isDegenerateOutput(content) {
   if (words.length >= 50 && freq.size / words.length < 0.05) {
     return true;
   }
+  // Identifier soup: random proper names / bracket tokens, no coherent code structure
+  // (phi4-mini style: "Mark Bob Kevin teacher X[] [ sequential ...")
+  const rawWords = trimmed.split(/\s+/);
+  if (rawWords.length >= 40) {
+    const upperOrBracket = rawWords.filter(w => /^[A-Z][a-z]+$/.test(w) || /^[\[\](){}<>]+$/.test(w));
+    const hasCodeLikeContent = /(?:function|const|let|var|return|import|export|package|func |class |interface |def |\bif\b|\bfor\b|\bwhile\b)/.test(trimmed);
+    if (!hasCodeLikeContent && upperOrBracket.length / rawWords.length > 0.35) {
+      return true;
+    }
+  }
+  // High bracket density with many tokens: token soup regardless of capitalization pattern
+  // (phi4-mini emits long strings with lots of [ ] brackets scattered throughout)
+  if (trimmed.length > 500 && rawWords.length >= 40) {
+    const bracketChars = (trimmed.match(/[\[\]{}]/g) ?? []).length;
+    const hasCodeFences = trimmed.includes('```');
+    if (!hasCodeFences && bracketChars / trimmed.length > 0.08) {
+      return true;
+    }
+  }
   return false;
 }
 

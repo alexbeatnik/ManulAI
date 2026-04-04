@@ -458,21 +458,21 @@ const TASKS = [
       };
     },
     evaluate: ({ stdout, exitCode, prepared }) => {
+      const updatedContent = readText(prepared.targetFile);
+      const hasFuncDecl = /func\s+fibonacci\s*\(/.test(updatedContent);
+      const hasCall = /fibonacci\s*\(\s*7\s*\)/.test(updatedContent);
+      const goSyntax = hasFuncDecl && hasCall ? validateGoFileSyntax(prepared.targetFile) : null;
+      // Check file content first — even if RETRY LIMIT hit, partial writes should be evaluated
+      if (hasFuncDecl && hasCall && goSyntax?.ok) {
+        return { status: 'pass', note: 'Agent temp-go edit added fibonacci and updated main().' };
+      }
       if (hasHardHarnessFailure(stdout, exitCode)) {
         return { status: 'fail', note: 'Agent temp-go edit run hit a hard harness failure.' };
       }
-      const updatedContent = readText(prepared.targetFile);
-      if (!/func\s+fibonacci\s*\(/.test(updatedContent)) {
-        return { status: 'fail', note: 'Agent temp-go edit did not add fibonacci().' };
-      }
-      if (!/fibonacci\s*\(\s*7\s*\)/.test(updatedContent)) {
-        return { status: 'fail', note: 'Agent temp-go edit did not wire fibonacci(7) into main().' };
-      }
-      const goSyntax = validateGoFileSyntax(prepared.targetFile);
-      if (!goSyntax.ok) {
-        return { status: 'fail', note: `Agent temp-go edit wrote invalid Go syntax.${goSyntax.stderr ? ` ${goSyntax.stderr}` : ''}`.trim() };
-      }
-      return { status: 'pass', note: 'Agent temp-go edit added fibonacci and updated main().' };
+      if (!hasFuncDecl) return { status: 'fail', note: 'Agent temp-go edit did not add fibonacci().' };
+      if (!hasCall) return { status: 'fail', note: 'Agent temp-go edit did not wire fibonacci(7) into main().' };
+      if (!goSyntax?.ok) return { status: 'fail', note: `Agent temp-go edit wrote invalid Go syntax.${goSyntax?.stderr ? ` ${goSyntax.stderr}` : ''}`.trim() };
+      return { status: 'fail', note: 'Agent temp-go edit produced unexpected failure.' };
     }
   },
   {
@@ -581,21 +581,20 @@ const TASKS = [
       };
     },
     evaluate: ({ stdout, exitCode, prepared }) => {
+      const updatedContent = readText(prepared.targetFile);
+      const hasFuncDecl = /func\s+fibonacci\s*\(/.test(updatedContent);
+      const hasCall = /fibonacci\s*\(\s*7\s*\)/.test(updatedContent);
+      const goSyntax = hasFuncDecl && hasCall ? validateGoFileSyntax(prepared.targetFile) : null;
+      if (hasFuncDecl && hasCall && goSyntax?.ok) {
+        return { status: 'pass', note: 'Planner temp-go edit added fibonacci and updated main().' };
+      }
       if (hasHardHarnessFailure(stdout, exitCode)) {
         return { status: 'fail', note: 'Planner temp-go edit run hit a hard harness failure.' };
       }
-      const updatedContent = readText(prepared.targetFile);
-      if (!/func\s+fibonacci\s*\(/.test(updatedContent)) {
-        return { status: 'fail', note: 'Planner temp-go edit did not add fibonacci().' };
-      }
-      if (!/fibonacci\s*\(\s*7\s*\)/.test(updatedContent)) {
-        return { status: 'fail', note: 'Planner temp-go edit did not wire fibonacci(7) into main().' };
-      }
-      const goSyntax = validateGoFileSyntax(prepared.targetFile);
-      if (!goSyntax.ok) {
-        return { status: 'fail', note: `Planner temp-go edit wrote invalid Go syntax.${goSyntax.stderr ? ` ${goSyntax.stderr}` : ''}`.trim() };
-      }
-      return { status: 'pass', note: 'Planner temp-go edit added fibonacci and updated main().' };
+      if (!hasFuncDecl) return { status: 'fail', note: 'Planner temp-go edit did not add fibonacci().' };
+      if (!hasCall) return { status: 'fail', note: 'Planner temp-go edit did not wire fibonacci(7) into main().' };
+      if (!goSyntax?.ok) return { status: 'fail', note: `Planner temp-go edit wrote invalid Go syntax.${goSyntax?.stderr ? ` ${goSyntax.stderr}` : ''}`.trim() };
+      return { status: 'fail', note: 'Planner temp-go edit produced unexpected failure.' };
     }
   }
 ];
