@@ -8369,29 +8369,41 @@ If the user asks for a change but provides NO code:
   }
 
   private computeEditDistance(left: string, right: string): number {
-    const rows = left.length + 1;
-    const cols = right.length + 1;
-    const matrix = Array.from({ length: rows }, () => Array<number>(cols).fill(0));
+    if (left === right) return 0;
+    
+    // Short-circuit: we only accept matches with score <= 2.
+    if (Math.abs(left.length - right.length) > 2) return Infinity;
 
-    for (let row = 0; row < rows; row += 1) {
-      matrix[row][0] = row;
-    }
-    for (let col = 0; col < cols; col += 1) {
-      matrix[0][col] = col;
-    }
+    if (left.length === 0) return right.length;
+    if (right.length === 0) return left.length;
 
-    for (let row = 1; row < rows; row += 1) {
-      for (let col = 1; col < cols; col += 1) {
-        const cost = left[row - 1] === right[col - 1] ? 0 : 1;
-        matrix[row][col] = Math.min(
-          matrix[row - 1][col] + 1,
-          matrix[row][col - 1] + 1,
-          matrix[row - 1][col - 1] + cost
+    let prevRow = Array.from({ length: right.length + 1 }, (_, i) => i);
+    let currRow = Array<number>(right.length + 1).fill(0);
+
+    for (let i = 0; i < left.length; i += 1) {
+      currRow[0] = i + 1;
+      let minInRow = currRow[0]; // Track min edit distance for early bailout
+
+      for (let j = 0; j < right.length; j += 1) {
+        const cost = left[i] === right[j] ? 0 : 1;
+        currRow[j + 1] = Math.min(
+          currRow[j] + 1,        // insertion
+          prevRow[j + 1] + 1,    // deletion
+          prevRow[j] + cost      // substitution
         );
+        minInRow = Math.min(minInRow, currRow[j + 1]);
       }
+
+      // Early bailout if the minimum possible distance in this row is already > 2
+      if (minInRow > 2) return Infinity;
+
+      // Swap rows for the next iteration to minimize memory allocations
+      const temp = prevRow;
+      prevRow = currRow;
+      currRow = temp;
     }
 
-    return matrix[rows - 1][cols - 1];
+    return prevRow[right.length];
   }
 
   private extractAnnouncedNewFilePath(content: string): string | undefined {
