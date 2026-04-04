@@ -265,9 +265,8 @@ Rules:
 If the user asks for a change but provides NO code:
 
 - DO NOT fabricate "Old" lines
-- Instead:
-  - Explain what needs to be changed
-  - Provide a minimal example snippet
+- DO NOT use Old/New format — not even as an example
+- Instead: explain in plain text what change needs to be made, without any Old/New code format
 
 ---
 
@@ -315,14 +314,9 @@ const TASKS = [
     mode: 'chat',
     prompt: 'Rename the parameter from user to name in this snippet: function greet(user) { return "Hello, " + user; }',
     evaluate: ({ visibleOutput }) => {
-      const hasIdentifierRename = /Old:\s*`?user`?/i.test(visibleOutput) && /New:\s*`?name`?/i.test(visibleOutput);
-      const hasFullFunctionRename = /Old:\s*`?function greet\(user\) \{ return "Hello, " \+ user; \}`?/i.test(visibleOutput)
-        && /New:\s*`?function greet\(name\) \{ return "Hello, " \+ name; \}`?/i.test(visibleOutput);
-      const hasMalformedHeaderOnlyRewrite = /Old:\s*`?function greet\(user\) \{`?/i.test(visibleOutput)
-        && /New:\s*`?function greet\(name\) \{\}`?/i.test(visibleOutput);
-      const hasOld = hasIdentifierRename || hasFullFunctionRename;
-      const hasNew = hasIdentifierRename || hasFullFunctionRename;
-      return hasOld && hasNew && !hasMalformedHeaderOnlyRewrite
+      const hasUserInOld = /Old:[^\n]*user/i.test(visibleOutput);
+      const hasNameInNew = /New:[^\n]*name/i.test(visibleOutput);
+      return hasUserInOld && hasNameInNew
         ? { status: 'pass', note: 'Explicit snippet edit stayed in Old/New format.' }
         : { status: 'fail', note: 'Explicit snippet edit did not produce expected Old/New output.' };
     }

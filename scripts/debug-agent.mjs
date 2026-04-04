@@ -57,12 +57,13 @@ function getModelCapabilityProfile(model) {
     return {
       tier: 'medium',
       maxMessages: 14,
-      numCtx: 10240,
+      numCtx: 8192,
       maxReadOpsWithoutWrite: 2,
       maxNudgeRetriesCap: 4,
       toolNames: preferredToolNames,
       compactMandate: true,
       preferStepwiseExecution: true,
+      repeatPenalty: 1.15,
     };
   }
   if (/^llama3\.1(?:[:]|$)/.test(normalizedModel)) {
@@ -575,7 +576,16 @@ function buildModuleReferenceExample(createdPath, exportNames) {
 function resolveFilepathInfo(fp, options = {}) {
   if (!fp) return { path: '', recoveredToTarget: false, originalPath: '' };
   const originalPath = String(fp);
-  const resolved = path.normalize(path.isAbsolute(originalPath) ? originalPath : path.join(wsRoot, originalPath));
+  let resolved = path.normalize(path.isAbsolute(originalPath) ? originalPath : path.join(wsRoot, originalPath));
+  // Case-insensitive correction: if resolved path matches wsRoot case-insensitively but not literally,
+  // correct the workspace root prefix (models sometimes hallucinate wrong case on case-sensitive FS)
+  if (resolved !== wsRoot && !resolved.startsWith(`${wsRoot}${path.sep}`)) {
+    const wsRootLower = wsRoot.toLowerCase();
+    const resolvedLower = resolved.toLowerCase();
+    if (resolvedLower === wsRootLower || resolvedLower.startsWith(`${wsRootLower}${path.sep}`)) {
+      resolved = wsRoot + resolved.slice(wsRoot.length);
+    }
+  }
   const recoverTarget = options.recoverTarget === true;
   if (!recoverTarget) {
     return { path: resolved, recoveredToTarget: false, originalPath };
@@ -726,6 +736,10 @@ function pickVerifyCommandForPath(targetPath) {
     if (['.ts', '.tsx', '.mts', '.cts'].includes(latestExt)) return { command: `npx tsc --pretty false --noEmit ${quotedTargetPath} 2>&1 | head -30`, projectRoot, stack: 'typescript-file' };
     if (latestExt === '.go') return { command: `gofmt -d ${quotedTargetPath} 2>&1 | head -30`, projectRoot, stack: 'go-file' };
   }
+
+  // For .go files always prefer gofmt standalone verification over project-level commands
+  // (project root may contain package.json/tsconfig.json from a different stack)
+  if (latestExt === '.go') return { command: `gofmt -d ${quotedTargetPath} 2>&1 | head -30`, projectRoot, stack: 'go-file' };
 
   const packageJsonPath = path.join(projectRoot, 'package.json');
   if (existsSync(packageJsonPath)) {
@@ -1549,8 +1563,14 @@ async function executeTool(name, args) {
     }
 
     case 'create_or_edit_file': {
-      const recoveredCreateTarget = recoverRequestScopedCreatePath(args.filename ?? args.filepath ?? '');
-      const fp = recoveredCreateTarget.resolvedPath ?? resolveFilepath(args.filename ?? args.filepath ?? '');
+      const rawPathArg = args.filename ?? args.filepath ?? '';
+      // If model omits filename/filepath but a single known target exists, fall back to it
+      const recoveredCreateTarget = recoverRequestScopedCreatePath(
+        rawPathArg || (TARGET_ABS_FILE && existsSync(TARGET_ABS_FILE) ? TARGET_ABS_FILE : rawPathArg)
+      );
+      const fp = recoveredCreateTarget.resolvedPath ?? resolveFilepath(
+        rawPathArg || (TARGET_ABS_FILE && existsSync(TARGET_ABS_FILE) ? TARGET_ABS_FILE : rawPathArg)
+      );
       let content = String(args.content ?? '');
       if (!fp) return JSON.stringify({ error: 'filename is required.' });
       const withinWorkspace = fp === wsRoot || fp.startsWith(`${wsRoot}${path.sep}`);
@@ -1652,7 +1672,12 @@ async function executeTool(name, args) {
           ...(recoveredCreateTarget.recoveredFrom ? { note: `Recovered requested path ${recoveredCreateTarget.recoveredFrom} to exact target ${fp}. Use this exact target path for subsequent reads and edits.` } : {})
         });
       }
-      writeFileSync(fp, content, 'utf8');
+      try {
+        mkdirSync(path.dirname(fp), { recursive: true });
+        writeFileSync(fp, content, 'utf8');
+      } catch (writeErr) {
+        return JSON.stringify({ error: `Failed to write file: ${writeErr.message}` });
+      }
       return JSON.stringify({
         path: fp,
         bytesWritten: content.length,
@@ -2699,7 +2724,7 @@ function isDegenerateOutput(content) {
 }
 
 async function tryRecoverFromDegenerateOutput(messages, content, retryCount, turn) {
-  if (!IS_AGENT_LIKE) return false;
+  if (MANUL_MODE === 'chat') return false;
   if (MODEL_LIMITS.tier === 'large' || MODEL_LIMITS.tier === 'xlarge') return false;
 
   const degenerateNudgeCount = messages.filter(
@@ -3091,6 +3116,7 @@ async function main() {
   let blockImmediateTerminalAfterWrite = false;
   let pendingGreenfieldVerificationPath = '';
   let lastGreenfieldVerifiedPath = '';
+  let lastWriteVerifyPassed = true; // persists across turns: false if last verify failed and model hasn't fixed yet
   let sessionCompleted = false;
   preferredGreenfieldSuccessfulWriteCount = 0;
   dryRunFiles.clear(); // reset for this session
@@ -3305,7 +3331,9 @@ let args = rawArgs;
         const parsedVerify = JSON.parse(verifyResult);
         const verifyOutput = [String(parsedVerify.stdout ?? ''), String(parsedVerify.stderr ?? '')].filter(Boolean).join('\n').trim();
         buildVerifyFailedThisRound = Number(parsedVerify.exitCode ?? 1) !== 0;
-        if (Number(parsedVerify.exitCode ?? 1) === 0 && pendingGreenfieldVerificationPath) {
+        const verifyOk1 = !buildVerifyFailedThisRound;
+        lastWriteVerifyPassed = verifyOk1;
+        if (verifyOk1 && pendingGreenfieldVerificationPath) {
           lastGreenfieldVerifiedPath = pendingGreenfieldVerificationPath;
           pendingGreenfieldVerificationPath = '';
           blockImmediateTerminalAfterWrite = false;
@@ -3317,13 +3345,16 @@ let args = rawArgs;
             stack: verifyConfig.stack,
             command: verifyConfig.command,
             projectRoot: verifyConfig.projectRoot,
-            ok: Number(parsedVerify.exitCode ?? 1) === 0,
-            result: Number(parsedVerify.exitCode ?? 1) === 0
+            ok: verifyOk1,
+            result: verifyOk1
               ? `Build verification passed for ${verifyConfig.stack}.`
               : `Build verification failed for ${verifyConfig.stack}:\n${verifyOutput || '(no output)'}`
           }),
           tool_name: 'build_verify'
         });
+        if (!verifyOk1) {
+          messages.push({ role: 'user', content: `Syntax verification FAILED. Fix all errors shown above, then rewrite the entire file using create_or_edit_file with correct syntax. Do NOT say the task is complete until verification passes.` });
+        }
         }
       }
     }
@@ -3407,7 +3438,7 @@ let args = rawArgs;
     const body = {
       model: MODEL,
       stream: false,
-      options: { num_ctx: MODEL_LIMITS.numCtx },
+      options: { num_ctx: MODEL_LIMITS.numCtx, ...(MODEL_LIMITS.repeatPenalty ? { repeat_penalty: MODEL_LIMITS.repeatPenalty } : {}) },
       messages: [
         { role: 'system', content: MANUL_MODE === 'planner' ? buildPlannerMandate() : buildAgentMandate() },
         ...messagesForModel
@@ -3685,7 +3716,9 @@ let args = rawArgs;
           const parsedVerify = JSON.parse(verifyResult);
           const verifyOutput = [String(parsedVerify.stdout ?? ''), String(parsedVerify.stderr ?? '')].filter(Boolean).join('\n').trim();
           buildVerifyFailedThisRound = Number(parsedVerify.exitCode ?? 1) !== 0;
-          if (Number(parsedVerify.exitCode ?? 1) === 0 && pendingGreenfieldVerificationPath) {
+          const verifyOk2 = !buildVerifyFailedThisRound;
+          lastWriteVerifyPassed = verifyOk2;
+          if (verifyOk2 && pendingGreenfieldVerificationPath) {
             lastGreenfieldVerifiedPath = pendingGreenfieldVerificationPath;
             pendingGreenfieldVerificationPath = '';
             blockImmediateTerminalAfterWrite = false;
@@ -3697,13 +3730,16 @@ let args = rawArgs;
               stack: verifyConfig.stack,
               command: verifyConfig.command,
               projectRoot: verifyConfig.projectRoot,
-              ok: Number(parsedVerify.exitCode ?? 1) === 0,
-              result: Number(parsedVerify.exitCode ?? 1) === 0
+              ok: verifyOk2,
+              result: verifyOk2
                 ? `Build verification passed for ${verifyConfig.stack}.`
                 : `Build verification failed for ${verifyConfig.stack}:\n${verifyOutput || '(no output)'}`
             }),
             tool_name: 'build_verify'
           });
+          if (!verifyOk2) {
+            messages.push({ role: 'user', content: `Syntax verification FAILED. Fix all errors shown above, then rewrite the entire file using create_or_edit_file with correct syntax. Do NOT say the task is complete until verification passes.` });
+          }
           }
         }
       }
@@ -4039,7 +4075,7 @@ let args = rawArgs;
     const isNonSplitFinalAnswer = !IS_SPLIT_TASK && analysis.isLong && !analysis.looksLikePlan &&
       !analysis.mentionsToolButNotCalled && !hasPendingTextCall && !analysis.isHallucinatingToolResponse && !analysis.claimsFailure &&
       (!REQUIRES_FILE_WRITE || hadSuccessfulWrite);
-    if ((!writeStillPending && (!analysis.requiresContinuation || isDoneAfterWrite || isNonSplitFinalAnswer)) && !lastToolWasError) {
+    if ((!writeStillPending && (!analysis.requiresContinuation || isDoneAfterWrite || isNonSplitFinalAnswer)) && !lastToolWasError && (!hadSuccessfulWrite || lastWriteVerifyPassed)) {
       if (hasMissingExplicitWrites) {
         const missingWriteNudge = `You have not actually written all explicitly requested files yet. Missing successful writes for: ${missingExplicitRequestedWriteTargets.join(', ')}. Call create_or_edit_file or replace_in_file for the missing file now. Do NOT claim completion until every requested target has been written.`;
         label(Y, 'NUDGE (missing explicit writes)', missingWriteNudge);

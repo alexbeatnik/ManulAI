@@ -44,6 +44,8 @@ interface ModelCapabilityProfile {
   toolNames: string[];
   /** When true, do not send native Ollama tools array; inject text tool descriptions into mandate instead. */
   useTextTools?: boolean;
+  /** When set, passed as repeat_penalty to Ollama to reduce degenerate repetitive output. */
+  repeatPenalty?: number;
 }
 
 export class ManulAiChatProvider implements vscode.WebviewViewProvider {
@@ -4008,7 +4010,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       return {
         tier: 'medium',
         maxMessages: 14,
-        numCtx: 10240,
+        numCtx: 8192,
         workspaceTreeMaxDepth: 2,
         workspaceTreeFileCap: 120,
         summaryContextLimit: 4,
@@ -4019,7 +4021,8 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         preferStepwiseExecution: true,
         maxNudgeRetriesCap: 4,
         maxReadOpsWithoutWrite: 2,
-        toolNames: preferredToolNames
+        toolNames: preferredToolNames,
+        repeatPenalty: 1.15
       };
     }
 
@@ -5011,12 +5014,12 @@ If the user asks for a change but provides NO code:
       stream: false;
       messages: OllamaMessage[];
       tools?: ToolDefinition[];
-      options?: { num_ctx: number; think?: boolean };
+      options?: { num_ctx: number; think?: boolean; repeat_penalty?: number };
     } = {
       model,
       stream: false,
       messages: requestMessages,
-      options: { num_ctx: numCtx, ...(useTextTools ? { think: false } : {}) }
+      options: { num_ctx: numCtx, ...(useTextTools ? { think: false } : {}), ...(this.getModelCapabilityProfile().repeatPenalty ? { repeat_penalty: this.getModelCapabilityProfile().repeatPenalty } : {}) }
     };
 
     if (this.isAgentLike) {
