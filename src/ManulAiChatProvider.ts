@@ -145,6 +145,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     };
 
     this.chats.push(chat);
+    this.activeChatId = chat.id;
 
     // Cap in-memory chat list to prevent unbounded heap growth over a long session.
     // Drop the oldest chat(s) but never the currently active one.
@@ -154,8 +155,6 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       if (oldestIndex < 0) { break; }
       this.chats.splice(oldestIndex, 1);
     }
-
-    this.activeChatId = chat.id;
     return chat;
   }
 

@@ -105,7 +105,7 @@ export function isBlockedCommand(command: string): boolean {
     return true;
   }
   // Pipe-to-shell (curl/wget … | bash/sh)
-  if (/(?:curl|wget)\s+.*\|\s*(?:ba)?sh\b/.test(t)) {
+  if (/(?:curl|wget)\s+.*\|\s*(?:ba)?sh\b/i.test(t)) {
     return true;
   }
   return false;

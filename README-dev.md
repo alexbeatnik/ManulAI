@@ -17,7 +17,51 @@ This document covers development guidelines, constraints, and architecture for t
 
 ## Core Architecture
 
-ManulAI is a local-first, privacy-focused coding agent for VS Code. All intelligent operations are powered by a local Ollama process. It connects to the `/api/chat` native tooling flow for agentic execution.
+
+    http-equiv="Content-Security-Policy"
+    content="default-src 'none'; img-src {{cspSource}} https: data:; style-src 'unsafe-inline'; script-src 'nonce-{{nonce}}';"
+    content="default-src 'none'; img-src {{cspSource}} https: data:; style-src 'nonce-{{nonce}}'; script-src 'nonce-{{nonce}}';"
+  />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ManulAI Chat</title>
+  <style>
+  <style nonce="{{nonce}}">
+    :root {
+Copilot AI
+now
+With style-src 'nonce-{{nonce}}', inline style="..." attributes elsewhere in this HTML will be blocked (nonces apply to <style> blocks, not style attributes). This file currently contains at least one inline style attribute (e.g. the context-actions div later in the body), so the UI may break under the tightened CSP. Recommend removing inline style attributes (move rules into CSS classes) or adjusting CSP (prefer the former to keep CSP strict).
+
+Copilot uses AI. Check for mistakes.
+@alexbeatnik	Reply...
+src/providerSafetyUtils.ts
+    return true;
+  }
+  // Pipe-to-shell (curl/wget … | bash/sh)
+  if (/(?:curl|wget)\s+.*\|\s*(?:ba)?sh\b/.test(t)) {
+Copilot AI
+now
+isBlockedCommand uses a case-sensitive regex for the curl/wget pipe-to-shell check, so commands like CURL ... | bash or mixed-case variants would bypass the blocklist. Make this check case-insensitive (e.g., lower-case the input for the regex too, or add the /i flag) and consider adding a unit test for an uppercase/mixed-case example.
+
+Suggested change
+  if (/(?:curl|wget)\s+.*\|\s*(?:ba)?sh\b/.test(t)) {
+  if (/(?:curl|wget)\s+.*\|\s*(?:ba)?sh\b/i.test(t)) {
+Copilot uses AI. Check for mistakes.
+@alexbeatnik	Reply...
+src/ManulAiChatProvider.ts
+Comment on lines +149 to +156
+    // Cap in-memory chat list to prevent unbounded heap growth over a long session.
+    // Drop the oldest chat(s) but never the currently active one.
+    const MAX_CHATS = 50;
+    while (this.chats.length > MAX_CHATS) {
+      const oldestIndex = this.chats.findIndex(c => c.id !== this.activeChatId);
+      if (oldestIndex < 0) { break; }
+      this.chats.splice(oldestIndex, 1);
+    }
+Copilot AI
+now
+The chat eviction logic excludes this.activeChatId before activeChatId is updated to the newly created chat. If the previously-active chat is the oldest entry, this will evict the second oldest chat and keep the oldest (now inactive) chat, which contradicts the intent to evict the oldest non-active chat. Consider setting activeChatId = chat.id before the eviction loop (or exclude chat.id explicitly) so the eviction policy matches the comment.
+
+Copilot uses AI. Check for mistakes., privacy-focused coding agent for VS Code. All intelligent operations are powered by a local Ollama process. It connects to the `/api/chat` native tooling flow for agentic execution.
 
 - **UI Provider:** Built using `WebviewViewProvider` for the chat interface in the Secondary Sidebar.
 - **Agent Loop:** All context forwarding and tool results are handled by returning tool outputs directly to Ollama.
