@@ -1,0 +1,46 @@
+name: Create Release Tag
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: Tag to create, for example v0.0.8
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate tag format
+        run: |
+          case "${{ github.event.inputs.tag_name }}" in
+            v*) ;;
+            *)
+              echo "::error::Tag must start with v"
+              exit 1
+              ;;
+          esac
+
+      - name: Check if tag already exists
+        run: |
+          if git ls-remote --tags origin "refs/tags/${{ github.event.inputs.tag_name }}" | grep -q .; then
+            echo "::error::Tag ${{ github.event.inputs.tag_name }} already exists"
+            exit 1
+          fi
+
+      - name: Create and push tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag "${{ github.event.inputs.tag_name }}"
+          git push origin "${{ github.event.inputs.tag_name }}"

@@ -1,4 +1,4 @@
-import { ParsedToolCall, ToolDefinition, ToolFunctionCall } from './types';
+import type { ParsedToolCall, ToolDefinition, ToolFunctionCall } from './types';
 
 export function remapWeakModelToolName(name: string): string {
   const normalized = name.trim();

@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
 
-import { AgentModeValue, AttachedFileContext, ChatSession, ManulAiStoredSettings, OllamaMessage, PersistedAttachedFileContext, PersistedChatSession, PersistedChatState } from './types';
+import type { AgentModeValue, AttachedFileContext, ChatSession, ManulAiStoredSettings, OllamaMessage, PersistedAttachedFileContext, PersistedChatSession, PersistedChatState } from './types';
 
 export function getWorkspaceSettingsDirUri(workspaceRoot?: vscode.Uri): vscode.Uri | undefined {
   if (!workspaceRoot) {
