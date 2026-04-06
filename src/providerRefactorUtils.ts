@@ -1,6 +1,6 @@
 import * as path from 'path';
 
-import { ToolFunctionCall } from './types';
+import type { ToolFunctionCall } from './types';
 
 export interface NarratedReadContext {
   filepath: string;

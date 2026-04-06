@@ -2,7 +2,7 @@ import * as path from 'path';
 
 import type * as vscode from 'vscode';
 
-import { AttachedFileContext, OllamaMessage, WebviewActiveFileState, WebviewRenderableMessage } from './types';
+import type { AttachedFileContext, OllamaMessage, WebviewActiveFileState, WebviewRenderableMessage } from './types';
 
 export function getDisplayPath(file: AttachedFileContext, workspaceRoot?: string): string {
   const fsPath = file.uri.fsPath;

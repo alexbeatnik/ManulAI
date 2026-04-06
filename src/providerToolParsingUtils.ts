@@ -1,4 +1,4 @@
-import { ParsedToolCall, ToolDefinition, ToolFunctionCall } from './types';
+import type { ParsedToolCall, ToolDefinition, ToolFunctionCall } from './types';
 
 export function remapWeakModelToolName(name: string): string {
   const normalized = name.trim();
@@ -83,7 +83,7 @@ export function stripToolCallsFromContent(content: string): string {
   stripped = stripped.replace(/<tool_call>\s*[\s\S]*?\s*<\/tool_call>/gi, '');
   stripped = stripped.replace(/<function=[^>]+>\s*[\s\S]*?<\/function>/g, '');
   stripped = stripped.replace(/<\/?tool_call>/gi, '');
-  const toolNamePattern = /\{\s*"(?:name|function_name|function)"\s*:\s*"/g;
+  const toolNamePattern = /\{\s*"(?:name|function_name|function|tool|tool_name)"\s*:\s*"/g;
   let match: RegExpExecArray | null;
   while ((match = toolNamePattern.exec(stripped)) !== null) {
     const jsonStr = extractBalancedJson(stripped, match.index);
@@ -276,6 +276,41 @@ export function parseToolCallsFromContent(content: string, toolDefinitions: Tool
         const calls = normalizeParsedToolCalls(relaxed);
         if (calls.length > 0 && calls.every(c => knownToolNames.has(c.function.name))) {
           return calls;
+        }
+      }
+    }
+  }
+
+  // Match {"tool": "tool_name", "args": {...}} — text-tool format used by gemma4 and similar models
+  // that receive tool descriptions in the system prompt rather than native Ollama tools.
+  if (trimmed.includes('"tool"') || trimmed.includes('"tool_name"')) {
+    const toolKeyRe = /\{[\s]*"(?:tool|tool_name)"/g;
+    let tkm: RegExpExecArray | null;
+    while ((tkm = toolKeyRe.exec(trimmed)) !== null) {
+      const startIdx = tkm.index;
+      let jsonStr = extractBalancedJson(trimmed, startIdx);
+      let obj = jsonStr ? relaxedJsonParse(jsonStr) as Record<string, unknown> | null : null;
+      if (!obj) {
+        // Fallback for truncated content that didn't balance braces cleanly
+        const substr = trimmed.slice(startIdx);
+        for (let j = 0; j <= 5; j++) {
+           const candidate = substr + '}'.repeat(j);
+           obj = relaxedJsonParse(candidate) as Record<string, unknown> | null;
+           if (obj) {
+             break;
+           }
+        }
+      }
+
+      if (obj) {
+        const toolName = typeof obj?.tool === 'string' ? obj.tool
+          : typeof obj?.tool_name === 'string' ? obj.tool_name : undefined;
+        const args = (obj?.args ?? obj?.arguments ?? obj?.parameters) as Record<string, unknown> | undefined;
+        if (toolName && args !== null && args !== undefined && typeof args === 'object' && !Array.isArray(args)) {
+          const mappedName = remapWeakModelToolName(toolName);
+          if (knownToolNames.has(mappedName)) {
+            return [{ type: 'function', function: { name: mappedName, arguments: remapWeakModelArgumentAliases(args) } }];
+          }
         }
       }
     }
@@ -631,8 +666,11 @@ export function looksLikeToolCallContent(content: string, toolDefinitions: ToolD
     function?: { name?: unknown; arguments?: unknown } | string;
     name?: unknown;
     function_name?: unknown;
+    tool?: unknown;
+    tool_name?: unknown;
     arguments?: unknown;
     parameters?: unknown;
+    args?: unknown;
   };
 
   if (obj.type === 'function' && obj.function && typeof obj.function === 'object') {
@@ -647,6 +685,15 @@ export function looksLikeToolCallContent(content: string, toolDefinitions: ToolD
     const topLevelArgs = inferImplicitToolArguments(remapWeakModelToolName(obj.function), obj.arguments ?? obj.parameters, obj as Record<string, unknown>);
     return toolNames.has(remapWeakModelToolName(obj.function))
       && (typeof topLevelArgs === 'string' || (topLevelArgs !== null && typeof topLevelArgs === 'object'));
+  }
+
+  // Support {"tool": "name", "args": {...}} format emitted by gemma4 and similar text-tool models
+  const textToolName = obj.tool ?? obj.tool_name;
+  if (typeof textToolName === 'string') {
+    const mappedName = remapWeakModelToolName(textToolName);
+    const textToolArgs = obj.args ?? obj.arguments ?? obj.parameters;
+    return toolNames.has(mappedName)
+      && (typeof textToolArgs === 'string' || (textToolArgs !== null && typeof textToolArgs === 'object'));
   }
 
   const topLevelName = obj.name ?? obj.function_name;
@@ -676,7 +723,7 @@ export function looksLikeMalformedToolCallContent(content: string, toolDefinitio
     return false;
   }
 
-  if (!/["'](?:arguments|parameters)["']\s*:/.test(trimmed)) {
+  if (!/["'](?:arguments|parameters|args)["']\s*:/.test(trimmed)) {
     return false;
   }
 
@@ -685,7 +732,7 @@ export function looksLikeMalformedToolCallContent(content: string, toolDefinitio
 
 export function extractToolCallNameHint(content: string, toolDefinitions: ToolDefinition[]): string | undefined {
   const toolNames = new Set(toolDefinitions.map(t => t.function.name));
-  const directMatch = content.match(/["'](?:name|function_name|function)["']\s*:\s*["']([a-zA-Z0-9_:-]+)["']/);
+  const directMatch = content.match(/["'](?:name|function_name|function|tool|tool_name)["']\s*:\s*["']([a-zA-Z0-9_:-]+)["']/);
   const nestedMatch = content.match(/["']function["']\s*:\s*\{[\s\S]*?["']name["']\s*:\s*["']([a-zA-Z0-9_:-]+)["']/);
   const candidate = nestedMatch?.[1] ?? directMatch?.[1];
   if (!candidate) {
@@ -726,7 +773,7 @@ export function containsLeakedToolCallPayload(content: string, toolDefinitions: 
     }
   }
 
-  const toolCallObjectPattern = /\{\s*["'](?:name|function_name|function)["']\s*:/g;
+  const toolCallObjectPattern = /\{\s*["'](?:name|function_name|function|tool|tool_name)["']\s*:/g;
   while ((match = toolCallObjectPattern.exec(trimmed)) !== null) {
     const jsonStr = extractBalancedJson(trimmed, match.index);
     if (jsonStr && looksLikeToolCallContent(jsonStr, toolDefinitions)) {
@@ -868,12 +915,16 @@ function normalizeSingleParsedToolCall(rawValue: unknown): ToolFunctionCall | un
   }
 
   const record = rawValue as Record<string, unknown>;
+  // Support {"tool": "name", "args": {...}} format emitted by gemma4 and similar text-tool models
   const directName = typeof record.name === 'string' ? record.name.trim()
     : typeof record.function_name === 'string' ? record.function_name.trim()
     : typeof record.function === 'string' ? record.function.trim()
+    : typeof record.tool === 'string' ? record.tool.trim()
+    : typeof record.tool_name === 'string' ? record.tool_name.trim()
     : '';
   const normalizedToolName = remapWeakModelToolName(typeof record.function === 'string' ? record.function.trim() : directName);
-  const directArguments = inferImplicitToolArguments(normalizedToolName, record.arguments ?? record.parameters, record);
+  // Also look at record.args as fallback for record.arguments
+  const directArguments = inferImplicitToolArguments(normalizedToolName, record.arguments ?? record.parameters ?? record.args, record);
   const functionRecord = toObjectRecord(record.function);
   const normalizedArguments = normalizeParsedToolArguments(functionRecord?.arguments ?? directArguments);
 

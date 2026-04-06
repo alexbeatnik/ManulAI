@@ -3,7 +3,8 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as vscode from 'vscode';
 
-import { AgentModeValue, AttachedFileContext, ChatRole, ChatSession, DEFAULT_STORED_SETTINGS, ManulAiStoredSettings, OllamaMessage, OllamaResponse, ParsedToolCall, PersistedChatState, ToolDefinition, ToolFunctionCall, WebviewActiveFileState, WebviewChatSummary, WebviewInboundMessage, WebviewPendingApprovalState, WebviewRenderableMessage } from './types';
+import type { AgentModeValue, AttachedFileContext, ChatSession, ManulAiStoredSettings, OllamaMessage, OllamaResponse, ParsedToolCall, PersistedChatState, ToolDefinition, ToolFunctionCall, WebviewActiveFileState, WebviewChatSummary, WebviewInboundMessage, WebviewPendingApprovalState, WebviewRenderableMessage } from './types';
+import { ChatRole, DEFAULT_STORED_SETTINGS } from './types';
 import { deserializeAttachedFileContext as deserializePersistedAttachedFileContext, deserializeChatMessage as deserializePersistedChatMessage, deserializeChatSession as deserializePersistedChatSession, getChatStorageDirUri as getPersistedChatStorageDirUri, getChatStorageUri as getPersistedChatStorageUri, getWorkspaceSettingsDirUri as getPersistedWorkspaceSettingsDirUri, getWorkspaceSettingsUri as getPersistedWorkspaceSettingsUri, normalizePersistedChatSession as normalizeRestoredChatSession, normalizeStoredSettings as normalizePersistedSettings, restorePersistedChats as restorePersistedChatState, serializeChatState as serializePersistedChatState } from './providerPersistenceUtils';
 import { extractCodeBlockFileWrites as extractCodeBlockFileWritesHelper, extractDescribedFileDump as extractDescribedFileDumpHelper, extractDescribedReplacements as extractDescribedReplacementsHelper, extractInlineFileBlocks as extractInlineFileBlocksHelper, extractMarkerFileWrite as extractMarkerFileWriteHelper, extractNewFileCreation as extractNewFileCreationHelper, extractTrustedFullFileContent as extractTrustedFullFileContentHelper, extractUnifiedDiffWrite as extractUnifiedDiffWriteHelper, findAttachedFileForReplacements as findAttachedFileForReplacementsHelper, findMentionedFileForReplacements as findMentionedFileForReplacementsHelper, findMentionedFileInContent as findMentionedFileInContentHelper, isLikelyFileReference as isLikelyFileReferenceHelper, looksLikeChangeSummary as looksLikeChangeSummaryHelper, looksLikeDiffOutput as looksLikeDiffOutputHelper, matchResponseToActiveFile as matchResponseToActiveFileHelper, matchResponseToAttachedFile as matchResponseToAttachedFileHelper, sanitizeGeneratedFileContent as sanitizeGeneratedFileContentHelper, stripDiffPrefixes as stripDiffPrefixesHelper, truncateLargeCodeBlocks as truncateLargeCodeBlocksHelper } from './providerFileFallbackUtils';
 import { extractSymbolNamesFromGeneratedContent, inferRepeatedNarratedBootstrapToolCall, validateGeneratedModuleContent } from './providerRefactorUtils';
@@ -42,6 +43,10 @@ interface ModelCapabilityProfile {
   maxNudgeRetriesCap: number;
   maxReadOpsWithoutWrite: number;
   toolNames: string[];
+  /** When true, do not send native Ollama tools array; inject text tool descriptions into mandate instead. */
+  useTextTools?: boolean;
+  /** When set, passed as repeat_penalty to Ollama to reduce degenerate repetitive output. */
+  repeatPenalty?: number;
 }
 
 export class ManulAiChatProvider implements vscode.WebviewViewProvider {
@@ -299,11 +304,24 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     const normalized = model.trim().toLowerCase();
     return /^phi4-mini(?:[:]|$)/.test(normalized)
       || /^llama3\.1(?:[:]|$)/.test(normalized)
-      || /^qwen3-coder(?:[:]|$)/.test(normalized);
+      || /^qwen3-coder(?:[:]|$)/.test(normalized)
+      || /^gemma4(?:[:]|$)/.test(normalized);
   }
 
   private filterPreferredSupportedModels(models: string[]): string[] {
     return models.filter(model => this.isPreferredSupportedModel(model));
+  }
+
+  private sortDiscoveredModels(models: string[]): string[] {
+    const uniqueModels = Array.from(new Set(models.map(model => model.trim()).filter(Boolean)));
+    return uniqueModels.sort((left, right) => {
+      const leftPreferred = this.isPreferredSupportedModel(left);
+      const rightPreferred = this.isPreferredSupportedModel(right);
+      if (leftPreferred !== rightPreferred) {
+        return leftPreferred ? -1 : 1;
+      }
+      return left.localeCompare(right);
+    });
   }
 
   public async refreshModelCatalog(postStatusOnError = false): Promise<void> {
@@ -322,18 +340,21 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       const names = (payload.models ?? [])
         .map(model => String(model.name ?? '').trim())
         .filter(Boolean)
-        .filter(model => this.isPreferredSupportedModel(model))
         .sort((left, right) => left.localeCompare(right));
 
-      this.availableModels = Array.from(new Set(this.filterPreferredSupportedModels(names)));
+      const preferredNames = this.filterPreferredSupportedModels(names);
+
+      this.availableModels = this.sortDiscoveredModels(names);
       this.ollamaReachable = true;
 
       // Auto-select the only available model when none is currently chosen
-      if (!currentModel && names.length === 1) {
+      if (!currentModel && preferredNames.length === 1) {
+        await this.setSelectedModel(preferredNames[0]);
+      } else if (!currentModel && names.length === 1) {
         await this.setSelectedModel(names[0]);
       }
     } catch (error) {
-      this.availableModels = Array.from(new Set(this.filterPreferredSupportedModels(this.availableModels)));
+      this.availableModels = this.sortDiscoveredModels(this.availableModels);
       this.ollamaReachable = false;
 
       if (postStatusOnError) {
@@ -366,6 +387,10 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
 
   public getAvailableModels(): string[] {
     return [...this.availableModels];
+  }
+
+  public isValidatedModel(model: string): boolean {
+    return this.isPreferredSupportedModel(model);
   }
 
   public async handleConfigurationChange(): Promise<void> {
@@ -2785,9 +2810,13 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     if (this.containsLeakedToolCallPayload(finalContent) && leakedToolCallNudgeCount < 2) {
       this.debugLog('tool_call_leak_retry', { retryCount, contentPreview: finalContent.substring(0, 300) });
       messages.push({ role: 'assistant', content: finalContent, hiddenFromTranscript: true });
+      const useTextTools = this.getModelCapabilityProfile().useTextTools === true;
+      const leakNudgeContent = useTextTools
+        ? 'Your last response printed a tool call JSON without executing it. Output exactly ONE JSON object with no surrounding text:\n{"tool": "tool_name", "args": {"param": "value"}}\nDo not add any prose, explanation, or markdown around the JSON.'
+        : 'Your last response printed a raw tool call instead of executing it. Do NOT output JSON or fenced code blocks for tool calls. Call the appropriate tool now using the native tool-calling mechanism. If you need current file content first, call read_specific_file, then continue with replace_in_file or another tool.';
       messages.push({
         role: 'user',
-        content: 'Your last response printed a raw tool call instead of executing it. Do NOT output JSON or fenced code blocks for tool calls. Call the appropriate tool now using the native tool-calling mechanism. If you need current file content first, call read_specific_file, then continue with replace_in_file or another tool.',
+        content: leakNudgeContent,
         hiddenFromTranscript: true
       });
       this.postStatus('Raw tool call leaked into the response — nudging model to execute the tool...');
@@ -3961,7 +3990,10 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   private getModelSizeInBillions(): number {
     const model = this.getSelectedModel().toLowerCase();
     const sizeMatch = model.match(/(\d+\.?\d*)b/);
-    return sizeMatch ? parseFloat(sizeMatch[1]) : 0;
+    if (sizeMatch) return parseFloat(sizeMatch[1]);
+    // Family-specific fallback for models whose default tag has no size suffix
+    if (/^gemma4(?:[:]|$)/i.test(model) && /:(latest|instruct|it)$/i.test(model)) return 8;
+    return 0;
   }
 
   private getModelCapabilityProfile(): ModelCapabilityProfile {
@@ -3983,7 +4015,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       return {
         tier: 'medium',
         maxMessages: 14,
-        numCtx: 10240,
+        numCtx: 8192,
         workspaceTreeMaxDepth: 2,
         workspaceTreeFileCap: 120,
         summaryContextLimit: 4,
@@ -3994,7 +4026,8 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         preferStepwiseExecution: true,
         maxNudgeRetriesCap: 4,
         maxReadOpsWithoutWrite: 2,
-        toolNames: preferredToolNames
+        toolNames: preferredToolNames,
+        repeatPenalty: 1.15
       };
     }
 
@@ -4033,6 +4066,28 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         maxNudgeRetriesCap: 5,
         maxReadOpsWithoutWrite: 2,
         toolNames: preferredToolNames
+      };
+    }
+
+    // gemma4: native tool calling broken in Ollama — uses text-tool fallback mode instead
+    if (/^gemma4(?:[:]|$)/.test(selectedModel)) {
+      const isLarge = sizeB > 10; // gemma4:31b
+      return {
+        tier: isLarge ? 'large' : 'medium',
+        maxMessages: isLarge ? 28 : 20,
+        numCtx: isLarge ? 16384 : 12288,
+        workspaceTreeMaxDepth: 3,
+        workspaceTreeFileCap: isLarge ? 180 : 150,
+        summaryContextLimit: isLarge ? 6 : 5,
+        includeWorkspaceInstructions: true,
+        includeWorkspaceNotes: false,
+        includeRecentChatSummaries: true,
+        useCompactMandate: false,
+        preferStepwiseExecution: true,
+        maxNudgeRetriesCap: isLarge ? 4 : 3,
+        maxReadOpsWithoutWrite: 2,
+        toolNames: preferredToolNames,
+        useTextTools: true // do not send native tools array; inject text tool format into mandate
       };
     }
 
@@ -4143,6 +4198,9 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   private isDegenerateOutput(content: string): boolean {
     const trimmed = content.trim();
     if (trimmed.length < 80) { return false; }
+    // Bracket soup: high density of [ ] brackets typical of phi4-mini token soup
+    const bracketCount = (trimmed.match(/[\[\]]/g) ?? []).length;
+    if (bracketCount / trimmed.length > 0.08) { return true; }
     // Strip markdown formatting and punctuation, then tokenize
     const cleaned = trimmed.replace(/[*_~`#>|\-—=\[\](){}]/g, ' ');
     const words = cleaned.split(/\s+/).map(w => w.toLowerCase().replace(/[^a-z0-9]/g, '')).filter(w => w.length > 0);
@@ -4608,7 +4666,7 @@ ${wsRoot ? `Workspace root: ${wsRoot}\n` : ''}
 - If the user asks a direct question, answer briefly in text.
 - For edit or file tasks: do exactly ONE small tool call per response.
 - Prefer read_file_slice over large reads.
-- Keep responses short. No multi-step plans. No JSON in text.
+- Keep responses short. No multi-step plans.${capabilityProfile.useTextTools ? ' Print exactly one JSON tool object, no prose.' : ' No JSON in text.'}
 - Finish with a one-line summary when done.
 ` : `[IDENTITY]
 You are ManulAI, a local VS Code coding agent in Planner mode.
@@ -4628,6 +4686,10 @@ ${wsRoot ? `Workspace root: ${wsRoot}\n` : ''}
       const workspaceTree = await this.buildCompactWorkspaceTree();
       if (workspaceTree) {
         plannerMandate += '\n[WORKSPACE STRUCTURE]\n' + workspaceTree;
+      }
+
+      if (capabilityProfile.useTextTools) {
+        plannerMandate += `\n\n---\n\n[TOOL FORMAT]\n\nThis model must express tool calls in assistant text as JSON. This JSON-in-text format is the required tool-call mechanism here and overrides any earlier rule about not printing JSON.\n\nOutput tool calls as a single JSON object on its own line:\n{"tool": "tool_name", "args": {"param": "value"}}\n\nAvailable tools:\n- create_or_edit_file(filename, content) — Create or overwrite a file\n- replace_in_file(filepath, old_text, new_text) — Replace text in existing file\n- read_specific_file(filepath) — Read full file contents\n- read_file_slice(filepath, startLine, endLine) — Read a line range from a file\n- list_workspace_files(directory) — List files/folders in a directory\n- execute_terminal_command(command) — Run a shell command (no stdin)\n- launch_in_terminal(command) — Open integrated terminal for interactive commands\n- delete_file(filepath) — Delete a file\n- read_active_file() — Read the currently open file\n- project_scan() — Get a recursive tree of the entire workspace\n\nOutput ONE tool call JSON per response. No prose before the JSON. Do not wrap the JSON in markdown fences.`;
       }
 
       if (capabilityProfile.includeWorkspaceNotes) {
@@ -4751,10 +4813,14 @@ When splitting a file into smaller modules:
 
 [TOOL USAGE RULES]
 
-- ALWAYS use native tool calls
-- NEVER output raw JSON as a tool call substitute
-- NEVER write "Executing step N:" in text — call the tool instead
-- If fix is known → call the tool immediately
+${capabilityProfile.useTextTools
+  ? `- ALWAYS emit tool-call JSON in your response content using the required text-tool format
+- Do NOT use native tool calls — emit the JSON object directly in your response
+- NEVER output raw JSON as a tool call substitute (the structured JSON is the call, not a substitute)`
+  : `- ALWAYS use native tool calls
+- NEVER output raw JSON as a tool call substitute`}
+- NEVER write "Executing step N:" in text — ${capabilityProfile.useTextTools ? 'emit the tool-call JSON instead' : 'call the tool instead'}
+- If fix is known → ${capabilityProfile.useTextTools ? 'emit the tool-call JSON immediately' : 'call the tool immediately'}
 
 ---
 
@@ -4791,6 +4857,10 @@ If steps remain → continue with the next tool call.
 
       if (workspaceInstructions) {
         agentMandate += '\n\n<workspace_instructions>\n' + (capabilityProfile.useCompactMandate ? this.compactMemoryText(workspaceInstructions, 1200) : workspaceInstructions) + '\n</workspace_instructions>';
+      }
+
+      if (capabilityProfile.useTextTools) {
+        agentMandate += `\n\n---\n\n[TOOL FORMAT]\n\nOutput tool calls as a single JSON object on its own line:\n{"tool": "tool_name", "args": {"param": "value"}}\n\nAvailable tools:\n- create_or_edit_file(filename, content) — Create or overwrite a file\n- replace_in_file(filepath, old_text, new_text) — Replace text in existing file\n- read_specific_file(filepath) — Read full file contents\n- read_file_slice(filepath, startLine, endLine) — Read a line range from a file\n- list_workspace_files(directory) — List files/folders in a directory\n- execute_terminal_command(command) — Run a shell command (no stdin)\n- launch_in_terminal(command) — Open integrated terminal for interactive commands\n- delete_file(filepath) — Delete a file\n- read_active_file() — Read the currently open file\n- project_scan() — Get a recursive tree of the entire workspace\n\nOutput ONE tool call JSON per response. No prose before the JSON.`;
       }
 
       if (recentChatSummaries) {
@@ -4937,31 +5007,42 @@ If the user asks for a change but provides NO code:
       requestMessages.push({ role: 'system', content: systemPrompt, hiddenFromTranscript: true });
     }
 
+    const useTextTools = this.getModelCapabilityProfile().useTextTools === true;
+
     requestMessages.push(...messages.filter(m => !m.localOnly).map(m => {
       // Sanitize any degenerate assistant content that leaked into history (prevents context poisoning)
       if (m.role === 'assistant' && typeof m.content === 'string' && this.isDegenerateOutput(m.content)) {
         return { ...m, content: '[incoherent output removed]' };
       }
+      // For useTextTools models (e.g. gemma4), convert tool-role messages to user-role so they're understood
+      if (m.role === 'tool' && useTextTools) {
+        return { role: 'user' as const, content: `Tool result (${(m as OllamaMessage & { tool_name?: string }).tool_name ?? 'tool'}): ${m.content}`, hiddenFromTranscript: m.hiddenFromTranscript };
+      }
       return { ...m };
     }));
 
     const { numCtx } = this.getModelContextLimits();
-
     const body: {
       model: string;
-      stream: false;
+      stream: false;               
       messages: OllamaMessage[];
       tools?: ToolDefinition[];
-      options?: { num_ctx: number };
+      think?: boolean;
+      options?: { num_ctx: number; repeat_penalty?: number };
     } = {
       model,
       stream: false,
       messages: requestMessages,
-      options: { num_ctx: numCtx }
+      ...(useTextTools ? { think: false } : {}),
+      options: { num_ctx: numCtx, ...(this.getModelCapabilityProfile().repeatPenalty ? { repeat_penalty: this.getModelCapabilityProfile().repeatPenalty } : {}) }
     };
 
     if (this.isAgentLike) {
-      body.tools = this.getActiveToolDefinitions();
+      // useTextTools models (e.g. gemma4) do not support native Ollama tool calling;
+      // tool descriptions are injected into the system mandate as text instead.
+      if (!useTextTools) {
+        body.tools = this.getActiveToolDefinitions();
+      }
     }
 
     const abortController = new AbortController();
@@ -5711,6 +5792,15 @@ If the user asks for a change but provides NO code:
     }
 
     if (path.isAbsolute(normalizedTarget)) {
+      // Correct case-insensitive workspace root mismatch (e.g. model writes /Documents/manulai/ vs /Documents/ManulAI/)
+      const wsRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+      if (wsRoot) {
+        const normLower = normalizedTarget.toLowerCase();
+        const rootLower = wsRoot.toLowerCase();
+        if (normLower.startsWith(rootLower) && !normalizedTarget.startsWith(wsRoot)) {
+          return vscode.Uri.file(wsRoot + normalizedTarget.slice(wsRoot.length));
+        }
+      }
       return vscode.Uri.file(normalizedTarget);
     }
 
@@ -5925,7 +6015,8 @@ If the user asks for a change but provides NO code:
       }
       const latestExt = path.extname(latestWritePath).toLowerCase();
       if (latestExt === '.go' && !isProjectVerificationManifestFile(latestWritePath)) {
-        return !(await exists('go.mod'));
+        // Always use standalone gofmt for .go files — avoid falling through to package.json npm scripts
+        return true;
       }
       return false;
     };
@@ -8290,29 +8381,41 @@ If the user asks for a change but provides NO code:
   }
 
   private computeEditDistance(left: string, right: string): number {
-    const rows = left.length + 1;
-    const cols = right.length + 1;
-    const matrix = Array.from({ length: rows }, () => Array<number>(cols).fill(0));
+    if (left === right) return 0;
+    
+    // Short-circuit: we only accept matches with score <= 2.
+    if (Math.abs(left.length - right.length) > 2) return Infinity;
 
-    for (let row = 0; row < rows; row += 1) {
-      matrix[row][0] = row;
-    }
-    for (let col = 0; col < cols; col += 1) {
-      matrix[0][col] = col;
-    }
+    if (left.length === 0) return right.length;
+    if (right.length === 0) return left.length;
 
-    for (let row = 1; row < rows; row += 1) {
-      for (let col = 1; col < cols; col += 1) {
-        const cost = left[row - 1] === right[col - 1] ? 0 : 1;
-        matrix[row][col] = Math.min(
-          matrix[row - 1][col] + 1,
-          matrix[row][col - 1] + 1,
-          matrix[row - 1][col - 1] + cost
+    let prevRow = Array.from({ length: right.length + 1 }, (_, i) => i);
+    let currRow = Array<number>(right.length + 1).fill(0);
+
+    for (let i = 0; i < left.length; i += 1) {
+      currRow[0] = i + 1;
+      let minInRow = currRow[0]; // Track min edit distance for early bailout
+
+      for (let j = 0; j < right.length; j += 1) {
+        const cost = left[i] === right[j] ? 0 : 1;
+        currRow[j + 1] = Math.min(
+          currRow[j] + 1,        // insertion
+          prevRow[j + 1] + 1,    // deletion
+          prevRow[j] + cost      // substitution
         );
+        minInRow = Math.min(minInRow, currRow[j + 1]);
       }
+
+      // Early bailout if the minimum possible distance in this row is already > 2
+      if (minInRow > 2) return Infinity;
+
+      // Swap rows for the next iteration to minimize memory allocations
+      const temp = prevRow;
+      prevRow = currRow;
+      currRow = temp;
     }
 
-    return matrix[rows - 1][cols - 1];
+    return prevRow[right.length];
   }
 
   private extractAnnouncedNewFilePath(content: string): string | undefined {

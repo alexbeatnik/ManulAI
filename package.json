@@ -2,7 +2,7 @@
   "name": "manulai-local-agent",
   "displayName": "ManulAI Local Agent",
   "description": "ManulAI is a local AI coding assistant for Visual Studio Code powered entirely by your own Ollama runtime.",
-  "version": "0.0.7",
+  "version": "0.0.8",
   "publisher": "manul-engine",
   "icon": "icon.png",
   "license": "Apache-2.0",
@@ -164,7 +164,8 @@
     "vscode:prepublish": "npm run compile",
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
-    "lint": "eslint src --ext ts"
+    "lint": "eslint src --ext ts",
+    "test": "npm run compile && node --test out/*.test.js"
   },
   "devDependencies": {
     "@types/node": "^22.13.10",

@@ -1,6 +1,6 @@
 import * as path from 'path';
 
-import { AttachedFileContext } from './types';
+import type { AttachedFileContext } from './types';
 
 export interface FileWriteCandidate {
   fullMatch: string;

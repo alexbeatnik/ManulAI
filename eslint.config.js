@@ -8,7 +8,9 @@ module.exports = [
       parser: tsParser,
       parserOptions: {
         ecmaVersion: 2022,
-        sourceType: 'script'
+        sourceType: 'script',
+        project: './tsconfig.json',
+        tsconfigRootDir: __dirname
       }
     },
     plugins: {
@@ -18,6 +20,13 @@ module.exports = [
       '@typescript-eslint/consistent-type-imports': 'error',
       '@typescript-eslint/no-floating-promises': 'error',
       '@typescript-eslint/no-misused-promises': 'error'
+    }
+  },
+  {
+    // node:test runners return Promises from describe/it — those are intentionally unhandled
+    files: ['src/**/*.test.ts'],
+    rules: {
+      '@typescript-eslint/no-floating-promises': 'off'
     }
   }
 ];

@@ -34,14 +34,18 @@ const MAX_TURNS   = parseInt(process.env.MAX_TURNS ?? '30', 10);
 
 function getModelSizeInBillions(model) {
   const m = model.toLowerCase().match(/(\d+\.?\d*)b/);
-  return m ? parseFloat(m[1]) : 0;
+  if (m) return parseFloat(m[1]);
+  // Family-specific fallback for models whose default tag has no size suffix
+  if (/^gemma4(?:[:]|$)/i.test(model) && /:(latest|instruct|it)$/i.test(model)) return 8;
+  return 0;
 }
 
 function isPreferredSupportedModel(model) {
   const normalized = model.trim().toLowerCase();
   return /^phi4-mini(?:[:]|$)/.test(normalized)
     || /^llama3\.1(?:[:]|$)/.test(normalized)
-    || /^qwen3-coder(?:[:]|$)/.test(normalized);
+    || /^qwen3-coder(?:[:]|$)/.test(normalized)
+    || /^gemma4(?:[:]|$)/.test(normalized);
 }
 
 function getModelCapabilityProfile(model) {
@@ -53,12 +57,13 @@ function getModelCapabilityProfile(model) {
     return {
       tier: 'medium',
       maxMessages: 14,
-      numCtx: 10240,
+      numCtx: 8192,
       maxReadOpsWithoutWrite: 2,
       maxNudgeRetriesCap: 4,
       toolNames: preferredToolNames,
       compactMandate: true,
       preferStepwiseExecution: true,
+      repeatPenalty: 1.15,
     };
   }
   if (/^llama3\.1(?:[:]|$)/.test(normalizedModel)) {
@@ -83,6 +88,21 @@ function getModelCapabilityProfile(model) {
       toolNames: preferredToolNames,
       compactMandate: false,
       preferStepwiseExecution: true,
+    };
+  }
+  // gemma4: native tool calling broken in Ollama — uses text-tool fallback mode instead
+  if (/^gemma4(?:[:]|$)/.test(normalizedModel)) {
+    const isLarge = sizeB > 10; // gemma4:31b
+    return {
+      tier: isLarge ? 'large' : 'medium',
+      maxMessages: isLarge ? 28 : 20,
+      numCtx: isLarge ? 16384 : 12288,
+      maxReadOpsWithoutWrite: 2,
+      maxNudgeRetriesCap: isLarge ? 4 : 3,
+      toolNames: preferredToolNames,
+      compactMandate: false,
+      preferStepwiseExecution: true,
+      useTextTools: true, // do not send native tools array; inject text tool format into mandate
     };
   }
 
@@ -556,7 +576,16 @@ function buildModuleReferenceExample(createdPath, exportNames) {
 function resolveFilepathInfo(fp, options = {}) {
   if (!fp) return { path: '', recoveredToTarget: false, originalPath: '' };
   const originalPath = String(fp);
-  const resolved = path.normalize(path.isAbsolute(originalPath) ? originalPath : path.join(wsRoot, originalPath));
+  let resolved = path.normalize(path.isAbsolute(originalPath) ? originalPath : path.join(wsRoot, originalPath));
+  // Case-insensitive correction: if resolved path matches wsRoot case-insensitively but not literally,
+  // correct the workspace root prefix (models sometimes hallucinate wrong case on case-sensitive FS)
+  if (resolved !== wsRoot && !resolved.startsWith(`${wsRoot}${path.sep}`)) {
+    const wsRootLower = wsRoot.toLowerCase();
+    const resolvedLower = resolved.toLowerCase();
+    if (resolvedLower === wsRootLower || resolvedLower.startsWith(`${wsRootLower}${path.sep}`)) {
+      resolved = wsRoot + resolved.slice(wsRoot.length);
+    }
+  }
   const recoverTarget = options.recoverTarget === true;
   if (!recoverTarget) {
     return { path: resolved, recoveredToTarget: false, originalPath };
@@ -708,6 +737,10 @@ function pickVerifyCommandForPath(targetPath) {
     if (latestExt === '.go') return { command: `gofmt -d ${quotedTargetPath} 2>&1 | head -30`, projectRoot, stack: 'go-file' };
   }
 
+  // For .go files always prefer gofmt standalone verification over project-level commands
+  // (project root may contain package.json/tsconfig.json from a different stack)
+  if (latestExt === '.go') return { command: `gofmt -d ${quotedTargetPath} 2>&1 | head -30`, projectRoot, stack: 'go-file' };
+
   const packageJsonPath = path.join(projectRoot, 'package.json');
   if (existsSync(packageJsonPath)) {
     try {
@@ -760,6 +793,29 @@ function logEvent(event, data = {}) {
 
 // ─── System prompt (keep in sync with callOllama in ManulAiChatProvider.ts) ─
 function buildAgentMandate() {
+  const textToolSection = MODEL_LIMITS.useTextTools ? `
+---
+
+[TOOL FORMAT]
+
+Output tool calls as a single JSON object on its own line:
+{"tool": "tool_name", "args": {"param": "value"}}
+
+Available tools:
+- create_or_edit_file(filename, content) — Create or overwrite a file
+- replace_in_file(filepath, old_text, new_text) — Replace text in existing file
+- read_specific_file(filepath) — Read full file contents
+- read_file_slice(filepath, startLine, endLine) — Read a line range from a file
+- list_workspace_files(directory) — List files/folders in a directory
+- execute_terminal_command(command) — Run a shell command (no stdin)
+- launch_in_terminal(command) — Open integrated terminal for interactive commands
+- delete_file(filepath) — Delete a file
+- read_active_file() — Read the currently open file
+- project_scan() — Get a recursive tree of the entire workspace
+
+Output ONE tool call JSON per response. No prose before the JSON.
+` : '';
+
   if (MODEL_LIMITS.compactMandate) {
     return `[IDENTITY]
 You are ManulAI, a local VS Code coding agent.
@@ -770,10 +826,10 @@ Workspace root: ${wsRoot}
 - Prefer exactly ONE tool call per response.
 - Read before edit. Prefer read_file_slice for large files.
 - Use replace_in_file for small edits and create_or_edit_file for new files.
-- Do not narrate tool calls. Do not print JSON as text.
+- Do not narrate tool calls.${useTextTools ? ' Print exactly one JSON tool object, no prose.' : ' Do not print JSON as text.'}
 - If a tool fails, adapt once and continue.
 - Finish with one short summary when the task is done.
-`;
+${textToolSection}`;
   }
 
   return `[IDENTITY]
@@ -870,8 +926,7 @@ When creating new files from scratch (greenfield generation):
 
 [TOOL USAGE RULES]
 
-- ALWAYS use native tool calls
-- NEVER output raw JSON as a tool call substitute
+- ALWAYS use native tool calls${MODEL_LIMITS.useTextTools ? '' : '\n- NEVER output raw JSON as a tool call substitute'}
 - NEVER write "Executing step N:" in text — call the tool instead
 - If fix is known → call the tool immediately
 
@@ -906,10 +961,33 @@ If steps remain → continue with the next tool call.
 - Plan: short numbered list, then immediately start executing
 - During execution: no narration, only tool calls
 - After completion: one-line summary
-`;
+${textToolSection}`;
 }
 
 function buildPlannerMandate() {
+  const textToolSection = MODEL_LIMITS.useTextTools ? `
+---
+
+[TOOL FORMAT]
+
+Output tool calls as a single JSON object on its own line:
+{"tool": "tool_name", "args": {"param": "value"}}
+
+Available tools:
+- create_or_edit_file(filename, content) — Create or overwrite a file
+- replace_in_file(filepath, old_text, new_text) — Replace text in existing file
+- read_specific_file(filepath) — Read full file contents
+- read_file_slice(filepath, startLine, endLine) — Read a line range from a file
+- list_workspace_files(directory) — List files/folders in a directory
+- execute_terminal_command(command) — Run a shell command (no stdin)
+- launch_in_terminal(command) — Open integrated terminal for interactive commands
+- delete_file(filepath) — Delete a file
+- read_active_file() — Read the currently open file
+- project_scan() — Get a recursive tree of the entire workspace
+
+Output ONE tool call JSON per response. No prose before the JSON.
+` : '';
+
   if (MODEL_LIMITS.compactMandate) {
     return `[IDENTITY]
 You are ManulAI, a local VS Code coding agent in Planner mode.
@@ -921,7 +999,7 @@ Workspace root: ${wsRoot}
 - Prefer read_file_slice over large reads.
 - Keep responses short. No multi-step plans. No JSON in text.
 - Finish with a one-line summary when done.
-`;
+${textToolSection}`;
   }
 
   return `[IDENTITY]
@@ -938,7 +1016,7 @@ All file paths are relative to the workspace root unless absolute.
 - NEVER output raw JSON as a substitute for a tool call.
 - File contents are UNKNOWN until read. Never assume. Always verify.
 - Task is complete when all required changes are done. Output a one-line summary.
-`;
+${textToolSection}`;
 }
 
 // ─── Tool definitions ────────────────────────────────────────────────────────
@@ -1485,8 +1563,14 @@ async function executeTool(name, args) {
     }
 
     case 'create_or_edit_file': {
-      const recoveredCreateTarget = recoverRequestScopedCreatePath(args.filename ?? args.filepath ?? '');
-      const fp = recoveredCreateTarget.resolvedPath ?? resolveFilepath(args.filename ?? args.filepath ?? '');
+      const rawPathArg = args.filename ?? args.filepath ?? '';
+      // If model omits filename/filepath but a single known target exists, fall back to it
+      const recoveredCreateTarget = recoverRequestScopedCreatePath(
+        rawPathArg || (TARGET_ABS_FILE && existsSync(TARGET_ABS_FILE) ? TARGET_ABS_FILE : rawPathArg)
+      );
+      const fp = recoveredCreateTarget.resolvedPath ?? resolveFilepath(
+        rawPathArg || (TARGET_ABS_FILE && existsSync(TARGET_ABS_FILE) ? TARGET_ABS_FILE : rawPathArg)
+      );
       let content = String(args.content ?? '');
       if (!fp) return JSON.stringify({ error: 'filename is required.' });
       const withinWorkspace = fp === wsRoot || fp.startsWith(`${wsRoot}${path.sep}`);
@@ -1588,7 +1672,12 @@ async function executeTool(name, args) {
           ...(recoveredCreateTarget.recoveredFrom ? { note: `Recovered requested path ${recoveredCreateTarget.recoveredFrom} to exact target ${fp}. Use this exact target path for subsequent reads and edits.` } : {})
         });
       }
-      writeFileSync(fp, content, 'utf8');
+      try {
+        mkdirSync(path.dirname(fp), { recursive: true });
+        writeFileSync(fp, content, 'utf8');
+      } catch (writeErr) {
+        return JSON.stringify({ error: `Failed to write file: ${writeErr.message}` });
+      }
       return JSON.stringify({
         path: fp,
         bytesWritten: content.length,
@@ -2574,6 +2663,37 @@ function parseToolCallsFromText(content) {
     }
   }
 
+  // Match {"tool": "tool_name", "args": {...}} — text-tool format used by gemma4 and similar models
+  // that receive tool descriptions in the system prompt rather than native Ollama tools.
+  if (content.includes('"tool"') || content.includes('"tool_name"')) {
+    const toolKeyRe = /\{[\s]*"(?:tool|tool_name)"/g;
+    let tkm;
+    while ((tkm = toolKeyRe.exec(content)) !== null) {
+      const start = tkm.index;
+      let depth = 0, inString = false, escape = false, end = -1;
+      for (let j = start; j < content.length; j++) {
+        const ch = content[j];
+        if (escape) { escape = false; continue; }
+        if (ch === '\\' && inString) { escape = true; continue; }
+        if (ch === '"') { inString = !inString; continue; }
+        if (inString) continue;
+        if (ch === '{') depth++;
+        if (ch === '}') { depth--; if (depth === 0) { end = j; break; } }
+      }
+      if (end !== -1) {
+        let obj = null;
+        try { obj = JSON.parse(content.substring(start, end + 1)); } catch {
+          try { obj = JSON.parse(escapeJsonStringValues(content.substring(start, end + 1))); } catch { /* ignore */ }
+        }
+        const toolName = obj?.tool ?? obj?.tool_name;
+        const args = obj?.args ?? obj?.arguments ?? obj?.parameters;
+        if (toolName && typeof toolName === 'string' && args !== undefined && typeof args === 'object') {
+          results.push({ function: { name: remapToolName(toolName), arguments: remapArgs(args) } });
+        }
+      }
+    }
+  }
+
   return results;
 }
 
@@ -2600,11 +2720,30 @@ function isDegenerateOutput(content) {
   if (words.length >= 50 && freq.size / words.length < 0.05) {
     return true;
   }
+  // Identifier soup: random proper names / bracket tokens, no coherent code structure
+  // (phi4-mini style: "Mark Bob Kevin teacher X[] [ sequential ...")
+  const rawWords = trimmed.split(/\s+/);
+  if (rawWords.length >= 40) {
+    const upperOrBracket = rawWords.filter(w => /^[A-Z][a-z]+$/.test(w) || /^[\[\](){}<>]+$/.test(w));
+    const hasCodeLikeContent = /(?:function|const|let|var|return|import|export|package|func |class |interface |def |\bif\b|\bfor\b|\bwhile\b)/.test(trimmed);
+    if (!hasCodeLikeContent && upperOrBracket.length / rawWords.length > 0.35) {
+      return true;
+    }
+  }
+  // High bracket density with many tokens: token soup regardless of capitalization pattern
+  // (phi4-mini emits long strings with lots of [ ] brackets scattered throughout)
+  if (trimmed.length > 500 && rawWords.length >= 40) {
+    const bracketChars = (trimmed.match(/[\[\]{}]/g) ?? []).length;
+    const hasCodeFences = trimmed.includes('```');
+    if (!hasCodeFences && bracketChars / trimmed.length > 0.08) {
+      return true;
+    }
+  }
   return false;
 }
 
 async function tryRecoverFromDegenerateOutput(messages, content, retryCount, turn) {
-  if (!IS_AGENT_LIKE) return false;
+  if (MANUL_MODE === 'chat') return false;
   if (MODEL_LIMITS.tier === 'large' || MODEL_LIMITS.tier === 'xlarge') return false;
 
   const degenerateNudgeCount = messages.filter(
@@ -2996,6 +3135,7 @@ async function main() {
   let blockImmediateTerminalAfterWrite = false;
   let pendingGreenfieldVerificationPath = '';
   let lastGreenfieldVerifiedPath = '';
+  let lastWriteVerifyPassed = true; // persists across turns: false if last verify failed and model hasn't fixed yet
   let sessionCompleted = false;
   preferredGreenfieldSuccessfulWriteCount = 0;
   dryRunFiles.clear(); // reset for this session
@@ -3210,7 +3350,9 @@ let args = rawArgs;
         const parsedVerify = JSON.parse(verifyResult);
         const verifyOutput = [String(parsedVerify.stdout ?? ''), String(parsedVerify.stderr ?? '')].filter(Boolean).join('\n').trim();
         buildVerifyFailedThisRound = Number(parsedVerify.exitCode ?? 1) !== 0;
-        if (Number(parsedVerify.exitCode ?? 1) === 0 && pendingGreenfieldVerificationPath) {
+        const verifyOk1 = !buildVerifyFailedThisRound;
+        lastWriteVerifyPassed = verifyOk1;
+        if (verifyOk1 && pendingGreenfieldVerificationPath) {
           lastGreenfieldVerifiedPath = pendingGreenfieldVerificationPath;
           pendingGreenfieldVerificationPath = '';
           blockImmediateTerminalAfterWrite = false;
@@ -3222,13 +3364,16 @@ let args = rawArgs;
             stack: verifyConfig.stack,
             command: verifyConfig.command,
             projectRoot: verifyConfig.projectRoot,
-            ok: Number(parsedVerify.exitCode ?? 1) === 0,
-            result: Number(parsedVerify.exitCode ?? 1) === 0
+            ok: verifyOk1,
+            result: verifyOk1
               ? `Build verification passed for ${verifyConfig.stack}.`
               : `Build verification failed for ${verifyConfig.stack}:\n${verifyOutput || '(no output)'}`
           }),
           tool_name: 'build_verify'
         });
+        if (!verifyOk1) {
+          messages.push({ role: 'user', content: `Syntax verification FAILED. Fix all errors shown above, then rewrite the entire file using create_or_edit_file with correct syntax. Do NOT say the task is complete until verification passes.` });
+        }
         }
       }
     }
@@ -3300,15 +3445,24 @@ let args = rawArgs;
 
     logEvent('ollama_request', { turn, retryCount, messageCount: messages.length });
 
+    // useTextTools models (e.g. gemma4) do not support native tool calling in this Ollama version;
+    // they receive tool descriptions in the system mandate and emit {"tool":…} JSON in content instead.
+    const useTextTools = MODEL_LIMITS.useTextTools === true;
+    // For useTextTools models, convert role:'tool' messages to role:'user' so the model understands them.
+    const messagesForModel = useTextTools
+      ? messages.map(m => m.role === 'tool'
+          ? { role: 'user', content: `Tool result (${m.tool_name ?? 'tool'}): ${m.content}` }
+          : m)
+      : messages;
     const body = {
       model: MODEL,
       stream: false,
-      options: { num_ctx: MODEL_LIMITS.numCtx },
+      options: { num_ctx: MODEL_LIMITS.numCtx, ...(MODEL_LIMITS.repeatPenalty ? { repeat_penalty: MODEL_LIMITS.repeatPenalty } : {}) },
       messages: [
         { role: 'system', content: MANUL_MODE === 'planner' ? buildPlannerMandate() : buildAgentMandate() },
-        ...messages
+        ...messagesForModel
       ],
-      tools: getToolDefinitions()
+      ...(useTextTools ? {} : { tools: getToolDefinitions() })
     };
 
     let responseData;
@@ -3376,7 +3530,7 @@ let args = rawArgs;
         label(Y, 'TEXT TOOL CALL', `Detected ${textToolCalls.length} tool call(s) in text (not native) — executing anyway`);
       }
       label(G, 'TOOL CALLS', resolvedToolCalls.map(tc => tc.function?.name).join(', '));
-      messages.push({ role: 'assistant', content: wasNative ? content : '', tool_calls: wasNative ? nativeToolCalls : undefined });
+      messages.push({ role: 'assistant', content: wasNative ? content : (useTextTools ? content : ''), tool_calls: wasNative ? nativeToolCalls : undefined });
 
       // Collect reminder/continuation user messages to inject AFTER all tool results, not mid-loop
       const postToolMessages = [];
@@ -3581,7 +3735,9 @@ let args = rawArgs;
           const parsedVerify = JSON.parse(verifyResult);
           const verifyOutput = [String(parsedVerify.stdout ?? ''), String(parsedVerify.stderr ?? '')].filter(Boolean).join('\n').trim();
           buildVerifyFailedThisRound = Number(parsedVerify.exitCode ?? 1) !== 0;
-          if (Number(parsedVerify.exitCode ?? 1) === 0 && pendingGreenfieldVerificationPath) {
+          const verifyOk2 = !buildVerifyFailedThisRound;
+          lastWriteVerifyPassed = verifyOk2;
+          if (verifyOk2 && pendingGreenfieldVerificationPath) {
             lastGreenfieldVerifiedPath = pendingGreenfieldVerificationPath;
             pendingGreenfieldVerificationPath = '';
             blockImmediateTerminalAfterWrite = false;
@@ -3593,13 +3749,16 @@ let args = rawArgs;
               stack: verifyConfig.stack,
               command: verifyConfig.command,
               projectRoot: verifyConfig.projectRoot,
-              ok: Number(parsedVerify.exitCode ?? 1) === 0,
-              result: Number(parsedVerify.exitCode ?? 1) === 0
+              ok: verifyOk2,
+              result: verifyOk2
                 ? `Build verification passed for ${verifyConfig.stack}.`
                 : `Build verification failed for ${verifyConfig.stack}:\n${verifyOutput || '(no output)'}`
             }),
             tool_name: 'build_verify'
           });
+          if (!verifyOk2) {
+            messages.push({ role: 'user', content: `Syntax verification FAILED. Fix all errors shown above, then rewrite the entire file using create_or_edit_file with correct syntax. Do NOT say the task is complete until verification passes.` });
+          }
           }
         }
       }
@@ -3935,7 +4094,7 @@ let args = rawArgs;
     const isNonSplitFinalAnswer = !IS_SPLIT_TASK && analysis.isLong && !analysis.looksLikePlan &&
       !analysis.mentionsToolButNotCalled && !hasPendingTextCall && !analysis.isHallucinatingToolResponse && !analysis.claimsFailure &&
       (!REQUIRES_FILE_WRITE || hadSuccessfulWrite);
-    if ((!writeStillPending && (!analysis.requiresContinuation || isDoneAfterWrite || isNonSplitFinalAnswer)) && !lastToolWasError) {
+    if ((!writeStillPending && (!analysis.requiresContinuation || isDoneAfterWrite || isNonSplitFinalAnswer)) && !lastToolWasError && (!hadSuccessfulWrite || lastWriteVerifyPassed)) {
       if (hasMissingExplicitWrites) {
         const missingWriteNudge = `You have not actually written all explicitly requested files yet. Missing successful writes for: ${missingExplicitRequestedWriteTargets.join(', ')}. Call create_or_edit_file or replace_in_file for the missing file now. Do NOT claim completion until every requested target has been written.`;
         label(Y, 'NUDGE (missing explicit writes)', missingWriteNudge);
