@@ -2809,9 +2809,13 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     if (this.containsLeakedToolCallPayload(finalContent) && leakedToolCallNudgeCount < 2) {
       this.debugLog('tool_call_leak_retry', { retryCount, contentPreview: finalContent.substring(0, 300) });
       messages.push({ role: 'assistant', content: finalContent, hiddenFromTranscript: true });
+      const useTextTools = this.getModelCapabilityProfile().useTextTools === true;
+      const leakNudgeContent = useTextTools
+        ? 'Your last response printed a tool call JSON without executing it. Output exactly ONE JSON object with no surrounding text:\n{"tool": "tool_name", "args": {"param": "value"}}\nDo not add any prose, explanation, or markdown around the JSON.'
+        : 'Your last response printed a raw tool call instead of executing it. Do NOT output JSON or fenced code blocks for tool calls. Call the appropriate tool now using the native tool-calling mechanism. If you need current file content first, call read_specific_file, then continue with replace_in_file or another tool.';
       messages.push({
         role: 'user',
-        content: 'Your last response printed a raw tool call instead of executing it. Do NOT output JSON or fenced code blocks for tool calls. Call the appropriate tool now using the native tool-calling mechanism. If you need current file content first, call read_specific_file, then continue with replace_in_file or another tool.',
+        content: leakNudgeContent,
         hiddenFromTranscript: true
       });
       this.postStatus('Raw tool call leaked into the response — nudging model to execute the tool...');

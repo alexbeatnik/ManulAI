@@ -287,9 +287,22 @@ export function parseToolCallsFromContent(content: string, toolDefinitions: Tool
     const toolKeyRe = /\{[\s]*"(?:tool|tool_name)"/g;
     let tkm: RegExpExecArray | null;
     while ((tkm = toolKeyRe.exec(trimmed)) !== null) {
-      const jsonStr = extractBalancedJson(trimmed, tkm.index);
-      if (jsonStr) {
-        const obj = relaxedJsonParse(jsonStr) as Record<string, unknown> | null | undefined;
+      const startIdx = tkm.index;
+      let jsonStr = extractBalancedJson(trimmed, startIdx);
+      let obj = jsonStr ? relaxedJsonParse(jsonStr) as Record<string, unknown> | null : null;
+      if (!obj) {
+        // Fallback for truncated content that didn't balance braces cleanly
+        const substr = trimmed.slice(startIdx);
+        for (let j = 0; j <= 5; j++) {
+           const candidate = substr + '}'.repeat(j);
+           obj = relaxedJsonParse(candidate) as Record<string, unknown> | null;
+           if (obj) {
+             break;
+           }
+        }
+      }
+
+      if (obj) {
         const toolName = typeof obj?.tool === 'string' ? obj.tool
           : typeof obj?.tool_name === 'string' ? obj.tool_name : undefined;
         const args = (obj?.args ?? obj?.arguments ?? obj?.parameters) as Record<string, unknown> | undefined;
@@ -653,8 +666,11 @@ export function looksLikeToolCallContent(content: string, toolDefinitions: ToolD
     function?: { name?: unknown; arguments?: unknown } | string;
     name?: unknown;
     function_name?: unknown;
+    tool?: unknown;
+    tool_name?: unknown;
     arguments?: unknown;
     parameters?: unknown;
+    args?: unknown;
   };
 
   if (obj.type === 'function' && obj.function && typeof obj.function === 'object') {
@@ -669,6 +685,15 @@ export function looksLikeToolCallContent(content: string, toolDefinitions: ToolD
     const topLevelArgs = inferImplicitToolArguments(remapWeakModelToolName(obj.function), obj.arguments ?? obj.parameters, obj as Record<string, unknown>);
     return toolNames.has(remapWeakModelToolName(obj.function))
       && (typeof topLevelArgs === 'string' || (topLevelArgs !== null && typeof topLevelArgs === 'object'));
+  }
+
+  // Support {"tool": "name", "args": {...}} format emitted by gemma4 and similar text-tool models
+  const textToolName = obj.tool ?? obj.tool_name;
+  if (typeof textToolName === 'string') {
+    const mappedName = remapWeakModelToolName(textToolName);
+    const textToolArgs = obj.args ?? obj.arguments ?? obj.parameters;
+    return toolNames.has(mappedName)
+      && (typeof textToolArgs === 'string' || (textToolArgs !== null && typeof textToolArgs === 'object'));
   }
 
   const topLevelName = obj.name ?? obj.function_name;
@@ -698,7 +723,7 @@ export function looksLikeMalformedToolCallContent(content: string, toolDefinitio
     return false;
   }
 
-  if (!/["'](?:arguments|parameters)["']\s*:/.test(trimmed)) {
+  if (!/["'](?:arguments|parameters|args)["']\s*:/.test(trimmed)) {
     return false;
   }
 
@@ -707,7 +732,7 @@ export function looksLikeMalformedToolCallContent(content: string, toolDefinitio
 
 export function extractToolCallNameHint(content: string, toolDefinitions: ToolDefinition[]): string | undefined {
   const toolNames = new Set(toolDefinitions.map(t => t.function.name));
-  const directMatch = content.match(/["'](?:name|function_name|function)["']\s*:\s*["']([a-zA-Z0-9_:-]+)["']/);
+  const directMatch = content.match(/["'](?:name|function_name|function|tool|tool_name)["']\s*:\s*["']([a-zA-Z0-9_:-]+)["']/);
   const nestedMatch = content.match(/["']function["']\s*:\s*\{[\s\S]*?["']name["']\s*:\s*["']([a-zA-Z0-9_:-]+)["']/);
   const candidate = nestedMatch?.[1] ?? directMatch?.[1];
   if (!candidate) {
@@ -748,7 +773,7 @@ export function containsLeakedToolCallPayload(content: string, toolDefinitions: 
     }
   }
 
-  const toolCallObjectPattern = /\{\s*["'](?:name|function_name|function)["']\s*:/g;
+  const toolCallObjectPattern = /\{\s*["'](?:name|function_name|function|tool|tool_name)["']\s*:/g;
   while ((match = toolCallObjectPattern.exec(trimmed)) !== null) {
     const jsonStr = extractBalancedJson(trimmed, match.index);
     if (jsonStr && looksLikeToolCallContent(jsonStr, toolDefinitions)) {
