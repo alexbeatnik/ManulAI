@@ -826,7 +826,7 @@ Workspace root: ${wsRoot}
 - Prefer exactly ONE tool call per response.
 - Read before edit. Prefer read_file_slice for large files.
 - Use replace_in_file for small edits and create_or_edit_file for new files.
-- Do not narrate tool calls. Do not print JSON as text.
+- Do not narrate tool calls.${useTextTools ? ' Print exactly one JSON tool object, no prose.' : ' Do not print JSON as text.'}
 - If a tool fails, adapt once and continue.
 - Finish with one short summary when the task is done.
 ${textToolSection}`;

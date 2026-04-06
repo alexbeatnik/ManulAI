@@ -54,14 +54,15 @@ export function isTerminalReadOnlyInspectionCommand(command: string): boolean {
   }
 
   // Reject commands with shell control operators, redirections, newlines, or dangerous patterns
-  if (/[;&|<>`\n\r]|\$\(|\b-exec\b|\b-ok\b/.test(trimmed)) {
+  if (/[;&|<>`\n\r]|\$\(|\b-exec\b/.test(trimmed)) {
+    return false;
+  }
+  // Reject find-specific destructive flags that have leading dashes (-ok, -delete)
+  // \b doesn't work here because "-" is not a word character, so match by space/start boundary.
+  if (/\bfind\b/.test(normalized) && /(?:^|\s)-(?:ok|delete)(?:\s|$)/.test(normalized)) {
     return false;
   }
   if (/\bsed\b[^\n]*\s-i\b/.test(normalized)) {
-    return false;
-  }
-  // Reject find with destructive flags even when no shell operators are present
-  if (/\bfind\b/.test(normalized) && /-delete\b/.test(normalized)) {
     return false;
   }
 

@@ -50,9 +50,9 @@ if (mode === 'tools') body.tools = ONE_TOOL;
 if (mode === 'tools9') body.tools = FULL_TOOLS;
 if (mode === 'agent') body.tools = FULL_TOOLS;
 
-// thinking models (gemma4, deepseek-r1, etc.) need think:false for tool calling
+// thinking models (gemma4, deepseek-r1, etc.) need think:false for tool-driving modes
 const thinkingFamilies = /^gemma4(?:[:]|$)|^deepseek-r1(?:[:]|$)/i;
-if (thinkingFamilies.test(model) && body.tools) {
+if (thinkingFamilies.test(model) && (body.tools || mode === 'agent-text')) {
   body.think = false;
 }
 
