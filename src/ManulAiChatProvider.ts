@@ -8,7 +8,7 @@ import { ChatRole, DEFAULT_STORED_SETTINGS } from './types';
 import { deserializeAttachedFileContext as deserializePersistedAttachedFileContext, deserializeChatMessage as deserializePersistedChatMessage, deserializeChatSession as deserializePersistedChatSession, getChatStorageDirUri as getPersistedChatStorageDirUri, getChatStorageUri as getPersistedChatStorageUri, getWorkspaceSettingsDirUri as getPersistedWorkspaceSettingsDirUri, getWorkspaceSettingsUri as getPersistedWorkspaceSettingsUri, normalizePersistedChatSession as normalizeRestoredChatSession, normalizeStoredSettings as normalizePersistedSettings, restorePersistedChats as restorePersistedChatState, serializeChatState as serializePersistedChatState } from './providerPersistenceUtils';
 import { extractCodeBlockFileWrites as extractCodeBlockFileWritesHelper, extractDescribedFileDump as extractDescribedFileDumpHelper, extractDescribedReplacements as extractDescribedReplacementsHelper, extractInlineFileBlocks as extractInlineFileBlocksHelper, extractMarkerFileWrite as extractMarkerFileWriteHelper, extractNewFileCreation as extractNewFileCreationHelper, extractTrustedFullFileContent as extractTrustedFullFileContentHelper, extractUnifiedDiffWrite as extractUnifiedDiffWriteHelper, findAttachedFileForReplacements as findAttachedFileForReplacementsHelper, findMentionedFileForReplacements as findMentionedFileForReplacementsHelper, findMentionedFileInContent as findMentionedFileInContentHelper, isLikelyFileReference as isLikelyFileReferenceHelper, looksLikeChangeSummary as looksLikeChangeSummaryHelper, looksLikeDiffOutput as looksLikeDiffOutputHelper, matchResponseToActiveFile as matchResponseToActiveFileHelper, matchResponseToAttachedFile as matchResponseToAttachedFileHelper, sanitizeGeneratedFileContent as sanitizeGeneratedFileContentHelper, stripDiffPrefixes as stripDiffPrefixesHelper, truncateLargeCodeBlocks as truncateLargeCodeBlocksHelper } from './providerFileFallbackUtils';
 import { extractSymbolNamesFromGeneratedContent, inferRepeatedNarratedBootstrapToolCall, validateGeneratedModuleContent } from './providerRefactorUtils';
-import { buildBuildVerifyFailureNudge, buildPreviewSnippet, detectInvalidStructuredCreateContent, inferBuildVerifyStack, isGlobalPackageInstallCommand, isPlaceholderCreateResult, isPlaceholderReplacementText, isTerminalReadOnlyInspectionCommand, toolResultMatchesAnyTargetPath } from './providerSafetyUtils';
+import { buildBuildVerifyFailureNudge, buildPreviewSnippet, detectInvalidStructuredCreateContent, inferBuildVerifyStack, isBlockedCommand, isGlobalPackageInstallCommand, isPlaceholderCreateResult, isPlaceholderReplacementText, isTerminalReadOnlyInspectionCommand, toolResultMatchesAnyTargetPath, validateOllamaBaseUrl } from './providerSafetyUtils';
 import { containsLeakedToolCallPayload as containsLeakedToolCallPayloadHelper, escapeJsonStringValues as escapeJsonStringValuesHelper, extractBalancedJson as extractBalancedJsonHelper, extractRawToolCallPayloadFromOllamaError as extractRawToolCallPayloadFromOllamaErrorHelper, extractToolCallNameHint as extractToolCallNameHintHelper, extractToolCalls as extractToolCallsHelper, looksLikeMalformedToolCallContent as looksLikeMalformedToolCallContentHelper, looksLikeToolCallContent as looksLikeToolCallContentHelper, normalizeToolArguments as normalizeToolArgumentsHelper, parseToolCallsFromContent as parseToolCallsFromContentHelper, remapWeakModelArgumentAliases as remapWeakModelArgumentAliasesHelper, remapWeakModelToolName as remapWeakModelToolNameHelper, repairSingleQuotedJson as repairSingleQuotedJsonHelper, stripToolCallsFromContent as stripToolCallsFromContentHelper } from './providerToolParsingUtils';
 import { formatToolMessageForTranscript as formatTranscriptToolMessage, getActiveFileState as getWebviewActiveFileState, getDisplayPath as getWebviewDisplayPath, renderAttachmentContextMessage as renderWebviewAttachmentContextMessage } from './providerWebviewUtils';
 
@@ -99,6 +99,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   private chatStorageLoadPromise?: Promise<void>;
   private persistChatsTimeout?: NodeJS.Timeout;
   private lastPersistedChatState = '';
+  private readonly launchedTerminals: vscode.Terminal[] = [];
 
   public constructor(private readonly extensionContext: vscode.ExtensionContext) {
     this.createChatSession();
@@ -555,8 +556,8 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       await vscode.workspace.fs.createDirectory(storageDir);
       await vscode.workspace.fs.writeFile(storageUri, Buffer.from(serialized, 'utf8'));
       this.lastPersistedChatState = serialized;
-    } catch {
-      // Silently fail if chat state cannot be persisted.
+    } catch (error) {
+      this.debugLog('chat_persist_failed', { error: error instanceof Error ? error.message : String(error) });
     }
   }
 
@@ -589,7 +590,24 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   }
 
   private getOllamaBaseUrl(): string {
-    return this.getStringSetting('ollamaBaseUrl', DEFAULT_STORED_SETTINGS.ollamaBaseUrl).replace(/\/$/, '');
+    const raw = this.getStringSetting('ollamaBaseUrl', DEFAULT_STORED_SETTINGS.ollamaBaseUrl).replace(/\/$/, '');
+    return ManulAiChatProvider.validateOllamaBaseUrl(raw);
+  }
+
+  /**
+   * Validates an Ollama base URL. Strips embedded credentials from non-loopback
+   * URLs. Falls back to the default if parsing fails. Delegates to providerSafetyUtils.
+   */
+  public static validateOllamaBaseUrl(url: string): string {
+    return validateOllamaBaseUrl(url, DEFAULT_STORED_SETTINGS.ollamaBaseUrl);
+  }
+
+  /**
+   * Returns true if the command should be blocked for safety reasons.
+   * Delegates to the shared utility in providerSafetyUtils.
+   */
+  public static isBlockedCommand(command: string): boolean {
+    return isBlockedCommand(command);
   }
 
   private getSystemPrompt(): string {
@@ -2602,7 +2620,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         }
 
         this.postProgressStep(this.describeToolExecution(toolCall));
-        this.debugLog('tool_exec_start', { tool: toolName, args: toolCall.function?.arguments });
+        this.debugLog('tool_exec_start', { tool: toolName, args: this.redactArgsForLog(toolCall.function?.arguments) });
         const toolResult = await this.executeToolCall(toolCall);
         this.debugLog('tool_exec_result', { tool: toolName, result: toolResult.substring(0, 500) });
         this.throwIfRequestStopped();
@@ -5056,6 +5074,7 @@ If the user asks for a change but provides NO code:
       if (response.status === 400 && /does not support tools/i.test(errorText) && body.tools) {
         delete body.tools;
         this.postStatus('Model does not support tools — retrying as plain chat...');
+        abortController.abort();
         const retryController = new AbortController();
         this.currentRequestAbortController = retryController;
         const retryResponse = await this.fetchOllamaChatResponse(baseUrl, body as Record<string, unknown>, retryController);
@@ -7769,9 +7788,8 @@ If the user asks for a change but provides NO code:
       return JSON.stringify({ error: 'command is required.' });
     }
 
-    const forbiddenFragments = ['rm -rf /', 'sudo ', 'shutdown', 'reboot', 'mkfs', ':(){:|:&};:'];
-    if (forbiddenFragments.some(fragment => trimmed.includes(fragment))) {
-      return JSON.stringify({ error: 'Command rejected by basic safety policy.' });
+    if (ManulAiChatProvider.isBlockedCommand(trimmed)) {
+      return JSON.stringify({ error: 'Command rejected by safety policy.' });
     }
 
     const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
@@ -7806,9 +7824,8 @@ If the user asks for a change but provides NO code:
       return JSON.stringify({ error: 'command is required.' });
     }
 
-    const forbiddenFragments = ['rm -rf /', 'sudo ', 'shutdown', 'reboot', 'mkfs', ':(){:|:&};:'];
-    if (forbiddenFragments.some(fragment => trimmed.includes(fragment))) {
-      return JSON.stringify({ error: 'Command rejected by basic safety policy.' });
+    if (ManulAiChatProvider.isBlockedCommand(trimmed)) {
+      return JSON.stringify({ error: 'Command rejected by safety policy.' });
     }
 
     const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
@@ -7816,6 +7833,7 @@ If the user asks for a change but provides NO code:
       name: `ManulAI: ${trimmed.length > 40 ? trimmed.substring(0, 37) + '...' : trimmed}`,
       cwd
     });
+    this.launchedTerminals.push(terminal);
     terminal.show();
     terminal.sendText(trimmed);
 
@@ -8169,10 +8187,35 @@ If the user asks for a change but provides NO code:
     this.writeDebugEntry(event, data);
   }
 
+  /**
+   * Returns a sanitized copy of tool arguments safe for debug logging.
+   * Large text fields (content, new_text, old_text) are truncated to 80 chars
+   * to avoid writing full file contents into the debug log on disk.
+   */
+  private redactArgsForLog(args: Record<string, unknown> | string | undefined): unknown {
+    if (!args || typeof args !== 'object' || Array.isArray(args)) {
+      return args;
+    }
+    const sensitiveKeys = new Set(['content', 'new_text', 'old_text', 'text']);
+    const result: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(args)) {
+      if (sensitiveKeys.has(k) && typeof v === 'string' && v.length > 80) {
+        result[k] = `${v.slice(0, 80)}… [${v.length} chars]`;
+      } else {
+        result[k] = v;
+      }
+    }
+    return result;
+  }
+
   public dispose(): void {
     clearTimeout(this.persistChatsTimeout);
     void this.persistChatState();
     this.stopDebugSession();
+    for (const terminal of this.launchedTerminals) {
+      try { terminal.dispose(); } catch { /* ignore */ }
+    }
+    this.launchedTerminals.length = 0;
   }
 
   private synchronizeAttachmentContextMessage(chat: ChatSession = this.activeChat): void {

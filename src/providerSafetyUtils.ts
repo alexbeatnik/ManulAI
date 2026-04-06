@@ -80,6 +80,70 @@ export function isGlobalPackageInstallCommand(command: string): boolean {
   return /(?:^|\b)(?:npm\s+(?:install|i|add)\s+-g\b|pnpm\s+add\s+-g\b|yarn\s+global\s+add\b|bun\s+add\s+-g\b)/.test(normalized);
 }
 
+/**
+ * Returns true if the command should be blocked for safety reasons.
+ * Covers: fork bombs, broad recursive deletes, pipe-to-shell patterns,
+ * privilege escalation, and system-destructive commands.
+ */
+export function isBlockedCommand(command: string): boolean {
+  const t = command.trim();
+  const blockedFragments = [
+    'rm -rf /',
+    'rm -rf ~',
+    'rm -rf $HOME',
+    'rm -rf /home',
+    'sudo ',
+    'shutdown',
+    'reboot',
+    'mkfs',
+    ':(){:|:&};:',
+    'dd if=',
+    'chmod -R 777 /',
+    'chmod -R 777 ~',
+  ];
+  if (blockedFragments.some(fragment => t.toLowerCase().includes(fragment.toLowerCase()))) {
+    return true;
+  }
+  // Pipe-to-shell (curl/wget … | bash/sh)
+  if (/(?:curl|wget)\s+.*\|\s*(?:ba)?sh\b/.test(t)) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Validates an Ollama base URL. Strips embedded credentials from non-loopback
+ * URLs. Falls back to the default loopback URL if parsing fails or the scheme
+ * is not http/https.
+ */
+export function validateOllamaBaseUrl(url: string, defaultUrl: string): string {
+  const trimmed = url.trim();
+  if (!trimmed) {
+    return defaultUrl;
+  }
+  try {
+    const parsed = new URL(trimmed);
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      return defaultUrl;
+    }
+    const hostname = parsed.hostname.toLowerCase();
+    const isLoopback =
+      hostname === 'localhost' ||
+      hostname === '127.0.0.1' ||
+      hostname === '::1' ||
+      hostname.endsWith('.localhost');
+    if (!isLoopback) {
+      // Non-loopback is allowed but strip any accidentally embedded credentials.
+      parsed.username = '';
+      parsed.password = '';
+      return parsed.toString().replace(/\/$/, '');
+    }
+    return trimmed;
+  } catch {
+    return defaultUrl;
+  }
+}
+
 export function buildPreviewSnippet(content: string): string {
   const normalized = content.replace(/\r\n/g, '\n').trimEnd();
   if (!normalized.trim()) {
