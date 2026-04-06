@@ -2665,8 +2665,8 @@ function parseToolCallsFromText(content) {
 
   // Match {"tool": "tool_name", "args": {...}} — text-tool format used by gemma4 and similar models
   // that receive tool descriptions in the system prompt rather than native Ollama tools.
-  if (content.includes('"tool"')) {
-    const toolKeyRe = /\{[\s]*"tool"/g;
+  if (content.includes('"tool"') || content.includes('"tool_name"')) {
+    const toolKeyRe = /\{[\s]*"(?:tool|tool_name)"/g;
     let tkm;
     while ((tkm = toolKeyRe.exec(content)) !== null) {
       const start = tkm.index;

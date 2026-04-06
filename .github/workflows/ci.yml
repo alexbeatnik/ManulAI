@@ -38,7 +38,7 @@ jobs:
         run: npm test
 
       - name: Package VSIX
-        run: npm exec -- vsce package
+        run: npm exec -- @vscode/vsce package
 
       - name: Upload VSIX artifact
         if: always()

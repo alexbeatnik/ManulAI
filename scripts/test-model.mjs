@@ -34,7 +34,7 @@ const ONE_TOOL = [FULL_TOOLS[6]]; // create_or_edit_file only
 const body = {
   model,
   stream: false,
-  num_ctx: 8192,
+  options: { num_ctx: 8192 },
   messages: []
 };
 

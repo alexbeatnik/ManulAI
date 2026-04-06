@@ -83,7 +83,7 @@ export function stripToolCallsFromContent(content: string): string {
   stripped = stripped.replace(/<tool_call>\s*[\s\S]*?\s*<\/tool_call>/gi, '');
   stripped = stripped.replace(/<function=[^>]+>\s*[\s\S]*?<\/function>/g, '');
   stripped = stripped.replace(/<\/?tool_call>/gi, '');
-  const toolNamePattern = /\{\s*"(?:name|function_name|function)"\s*:\s*"/g;
+  const toolNamePattern = /\{\s*"(?:name|function_name|function|tool|tool_name)"\s*:\s*"/g;
   let match: RegExpExecArray | null;
   while ((match = toolNamePattern.exec(stripped)) !== null) {
     const jsonStr = extractBalancedJson(stripped, match.index);
@@ -306,7 +306,7 @@ export function parseToolCallsFromContent(content: string, toolDefinitions: Tool
         const toolName = typeof obj?.tool === 'string' ? obj.tool
           : typeof obj?.tool_name === 'string' ? obj.tool_name : undefined;
         const args = (obj?.args ?? obj?.arguments ?? obj?.parameters) as Record<string, unknown> | undefined;
-        if (toolName && args !== undefined && typeof args === 'object') {
+        if (toolName && args !== null && args !== undefined && typeof args === 'object' && !Array.isArray(args)) {
           const mappedName = remapWeakModelToolName(toolName);
           if (knownToolNames.has(mappedName)) {
             return [{ type: 'function', function: { name: mappedName, arguments: remapWeakModelArgumentAliases(args) } }];

@@ -32,6 +32,8 @@ describe('providerSafetyUtils', () => {
       assert.strictEqual(isTerminalReadOnlyInspectionCommand('ls && echo hi'), false);
       assert.strictEqual(isTerminalReadOnlyInspectionCommand('sed -i s/a/b/ file.txt'), false);
       assert.strictEqual(isTerminalReadOnlyInspectionCommand('find . -exec rm {} \\;'), false);
+      assert.strictEqual(isTerminalReadOnlyInspectionCommand('find . -delete'), false);
+      assert.strictEqual(isTerminalReadOnlyInspectionCommand('find . -ok rm {} \\;'), false);
     });
   });
 });

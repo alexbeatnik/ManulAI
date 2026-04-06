@@ -46,7 +46,7 @@ jobs:
         run: npm test
 
       - name: Package VSIX
-        run: npm exec -- vsce package
+        run: npm exec -- @vscode/vsce package
 
       - name: Resolve release metadata
         id: release_meta
