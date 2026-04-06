@@ -145,6 +145,16 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     };
 
     this.chats.push(chat);
+
+    // Cap in-memory chat list to prevent unbounded heap growth over a long session.
+    // Drop the oldest chat(s) but never the currently active one.
+    const MAX_CHATS = 50;
+    while (this.chats.length > MAX_CHATS) {
+      const oldestIndex = this.chats.findIndex(c => c.id !== this.activeChatId);
+      if (oldestIndex < 0) { break; }
+      this.chats.splice(oldestIndex, 1);
+    }
+
     this.activeChatId = chat.id;
     return chat;
   }
@@ -2535,7 +2545,18 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   private async processOllamaResponse(messages: OllamaMessage[], retryCount = 0): Promise<void> {
     this.throwIfRequestStopped();
 
-    // Context trimming: prevent overflow by keeping only recent model-visible messages.
+    // Hard absolute turn cap — prevents unbounded recursion regardless of which nudge
+    // branch fires. maxNudgeRetriesCap governs normal nudge paths; this is the backstop.
+    const absoluteMaxTurns = this.getModelCapabilityProfile().maxNudgeRetriesCap + 8;
+    if (retryCount > absoluteMaxTurns) {
+      this.debugLog('absolute_turn_cap_hit', { retryCount, absoluteMaxTurns });
+      messages.push({
+        role: 'assistant',
+        content: 'Agent loop stopped: maximum turn limit reached. Please review the partial results and try a more focused request.'
+      });
+      return;
+    }
+
     // localOnly progress messages don't go to Ollama (filtered in callOllama) so exclude them from the count.
     if (this.isAgentLike) {
       const { maxMessages } = this.getModelContextLimits();
@@ -2543,11 +2564,20 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       if (modelMessages.length > maxMessages) {
         // Strip all localOnly progress messages first — they are UI-only
         const stripped = messages.filter(m => !m.localOnly);
-        // Keep first 2 messages (user prompt + plan nudge) and most recent ones
+        // Keep first 2 messages (user prompt + plan nudge) and most recent ones.
+        // Adjust the tail start so it never begins on a `tool` role message —
+        // that would produce an orphaned tool result whose paired `assistant` message
+        // was discarded, causing model confusion. Walk forward until the tail start
+        // lands on a non-tool message.
         const headCount = 2;
-        const tailCount = maxMessages - headCount - 1; // -1 for the trim notice
+        let tailCount = maxMessages - headCount - 1; // -1 for the trim notice
+        let tailStart = stripped.length - tailCount;
+        while (tailStart > headCount && stripped[tailStart]?.role === 'tool') {
+          tailStart++;
+          tailCount--;
+        }
         const first = stripped.slice(0, headCount);
-        const recent = stripped.slice(-tailCount);
+        const recent = stripped.slice(tailStart);
         const trimNotice: OllamaMessage = {
           role: 'user',
           content: 'Context trimmed to prevent overflow. Continue with the task — execute the next required action.',
