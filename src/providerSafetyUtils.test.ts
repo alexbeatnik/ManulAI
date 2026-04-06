@@ -47,6 +47,7 @@ describe('providerSafetyUtils', () => {
 
     it('blocks privilege escalation and system commands', () => {
       assert.strictEqual(isBlockedCommand('sudo rm -rf /'), true);
+      assert.strictEqual(isBlockedCommand('sudo'), true);
       assert.strictEqual(isBlockedCommand('shutdown -h now'), true);
       assert.strictEqual(isBlockedCommand('reboot'), true);
       assert.strictEqual(isBlockedCommand('mkfs.ext4 /dev/sda'), true);

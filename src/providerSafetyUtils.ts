@@ -92,7 +92,6 @@ export function isBlockedCommand(command: string): boolean {
     'rm -rf ~',
     'rm -rf $HOME',
     'rm -rf /home',
-    'sudo ',
     'shutdown',
     'reboot',
     'mkfs',
@@ -102,6 +101,10 @@ export function isBlockedCommand(command: string): boolean {
     'chmod -R 777 ~',
   ];
   if (blockedFragments.some(fragment => t.toLowerCase().includes(fragment.toLowerCase()))) {
+    return true;
+  }
+  // Privilege escalation: sudo on its own or before any argument
+  if (/\bsudo\b/i.test(t)) {
     return true;
   }
   // Pipe-to-shell (curl/wget … | bash/sh)
