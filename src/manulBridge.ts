@@ -56,6 +56,7 @@ export class ManulBridge {
     const env: NodeJS.ProcessEnv = {
       ...process.env,
       MANUL_HEADLESS: this.options.headless ? '1' : '0',
+      MANUL_WORKSPACE_PATH: this.options.workspaceRoot,
     };
 
     this.proc = cp.spawn(this.options.pythonPath, [this.options.scriptPath], {
@@ -112,7 +113,11 @@ export class ManulBridge {
 
   // ── Request helper ──────────────────────────────────────────────────
 
-  private async request(tool: string, args?: Record<string, unknown>): Promise<ManulApiResult> {
+  /**
+   * Sends a request using the manul_runner.py protocol:
+   *   {"id": "N", "method": "<name>", "params": {...}}
+   */
+  private async request(method: string, params?: Record<string, unknown>): Promise<ManulApiResult> {
     let proc: cp.ChildProcess;
     try {
       proc = this.ensureProc();
@@ -126,7 +131,7 @@ export class ManulBridge {
     }
 
     const id = String(++this.reqIdCounter);
-    const payload = JSON.stringify({ id, tool, ...args });
+    const payload = JSON.stringify({ id, method, params: params ?? {} });
 
     return new Promise<ManulApiResult>((resolve) => {
       const timer = setTimeout(() => {
@@ -134,7 +139,7 @@ export class ManulBridge {
         resolve({
           ok: false,
           status: 408,
-          error: `ManulEngine tool '${tool}' timed out after ${this.options.timeoutMs / 1000}s.`,
+          error: `ManulEngine '${method}' timed out after ${this.options.timeoutMs / 1000}s.`,
         });
       }, this.options.timeoutMs);
 
@@ -145,47 +150,65 @@ export class ManulBridge {
 
   // ── Public API ──────────────────────────────────────────────────────
 
+  /** Run a single DSL step string. */
   public async runStep(step: string): Promise<ManulApiResult> {
-    return this.request('run_steps', { steps: step });
+    return this.request('run_steps', { steps: [step], headless: this.options.headless });
   }
 
+  /** Run multiple DSL step strings. */
   public async runSteps(steps: string[], context?: string, title?: string): Promise<ManulApiResult> {
     return this.request('run_steps', {
-      steps: steps.join('\n'),
+      steps,
+      context: context ?? '',
+      title: title ?? '',
+      headless: this.options.headless,
+    });
+  }
+
+  /** Reset session state (clears executed_steps, optionally updates context/title). Browser stays open. */
+  public async reset(context?: string, title?: string): Promise<ManulApiResult> {
+    return this.request('reset', {
       context: context ?? '',
       title: title ?? '',
     });
   }
 
-  /** Close the active browser session so the next call starts fresh. */
-  public async reset(_context?: string, _title?: string): Promise<ManulApiResult> {
-    if (this.proc && !this.proc.killed) {
-      await this.request('close');
-    }
-    return { ok: true, status: 200, data: {} };
-  }
-
+  /** Get current browser state (url, title, engine_version, etc.). */
   public async getState(): Promise<ManulApiResult> {
     return this.request('get_state');
   }
 
+  /** Return structured element list from the current page. */
   public async scanPage(): Promise<ManulApiResult> {
     return this.request('scan_page');
   }
 
+  /** Return the raw text of the current page. */
   public async readPageText(): Promise<ManulApiResult> {
     return this.request('read_page_text');
   }
 
+  /** Save a hunt file to disk (workspace-jailed in the runner). */
   public async saveHunt(filePath: string, content: string): Promise<ManulApiResult> {
     return this.request('save_hunt', { path: filePath, content });
   }
 
-  /** Kill the subprocess if it is still running. */
+  /** Return a hunt file proposal reconstructed from executed steps so far. */
+  public async proposeHunt(context?: string, title?: string): Promise<ManulApiResult> {
+    return this.request('propose_hunt', {
+      context: context ?? '',
+      title: title ?? '',
+    });
+  }
+
+  /** Gracefully shut down the subprocess, then kill it if needed. */
   public dispose(): void {
     if (this.proc && !this.proc.killed) {
+      try { this.request('shutdown'); } catch { /* best-effort */ }
       try { this.proc.stdin?.end(); } catch { /* ignore */ }
-      try { this.proc.kill(); } catch { /* ignore */ }
+      setTimeout(() => {
+        try { this.proc?.kill(); } catch { /* ignore */ }
+      }, 1500);
     }
     this.proc = undefined;
   }

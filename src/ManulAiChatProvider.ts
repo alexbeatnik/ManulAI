@@ -6940,7 +6940,12 @@ If the user asks for a change but provides NO code:
       ? await this.manulBridge.runSteps(steps, context, title)
       : await this.manulBridge.runStep(goal);
     if (result.ok) {
-      return JSON.stringify({ ...(result.data as object), _nextAction: 'Automation complete. Reconstruct the .hunt DSL from all steps executed (with @context:, @title:, STEP blocks, VERIFY after every action, DONE.), show it as a fenced code block preview, then ask the user if they want to save it as a hunt file.' });
+      const data = result.data as Record<string, unknown>;
+      const huntDsl = typeof data?.hunt_proposal === 'string' ? data.hunt_proposal : undefined;
+      const nextAction = huntDsl
+        ? `Automation complete. The .hunt DSL has been generated — show it as a fenced code block preview, then ask the user if they want to save it as a hunt file (e.g. tests/<name>.hunt).`
+        : `Automation complete. Reconstruct the .hunt DSL from all steps executed (with @context:, @title:, STEP blocks, VERIFY after every action, DONE.), show it as a fenced code block preview, then ask the user if they want to save it as a hunt file.`;
+      return JSON.stringify({ ...data, _nextAction: nextAction });
     }
     return JSON.stringify({ error: result.error, status: result.status });
   }
@@ -7008,7 +7013,12 @@ If the user asks for a change but provides NO code:
     const title = this.extractHuntHeader(dsl, '@title:');
     const result = await this.manulBridge.runSteps(runnableLines, context, title);
     if (result.ok) {
-      return JSON.stringify({ ...(result.data as object), _nextAction: 'Automation complete. Show the executed .hunt DSL as a fenced code block preview (with VERIFY after every action), then ask the user if they want to save it as a hunt file.' });
+      const data = result.data as Record<string, unknown>;
+      const huntDsl = typeof data?.hunt_proposal === 'string' ? data.hunt_proposal : undefined;
+      const nextAction = huntDsl
+        ? 'Automation complete. The .hunt DSL has been generated — show it as a fenced code block preview, then ask the user if they want to save it as a hunt file.'
+        : 'Automation complete. Show the executed .hunt DSL as a fenced code block preview (with VERIFY after every action), then ask the user if they want to save it as a hunt file.';
+      return JSON.stringify({ ...data, _nextAction: nextAction });
     }
     return JSON.stringify({ error: result.error, status: result.status });
   }
@@ -7041,7 +7051,12 @@ If the user asks for a change but provides NO code:
     const title = this.extractHuntHeader(dsl, '@title:');
     const result = await this.manulBridge.runSteps(runnableLines, context, title);
     if (result.ok) {
-      return JSON.stringify({ ...(result.data as object), filePath, stepCount: runnableLines.length, _nextAction: 'Hunt file execution complete. Show the executed .hunt DSL as a fenced code block preview (with VERIFY after every action), then ask the user if they want to save or overwrite it.' });
+      const data = result.data as Record<string, unknown>;
+      const huntDsl = typeof data?.hunt_proposal === 'string' ? data.hunt_proposal : undefined;
+      const nextAction = huntDsl
+        ? 'Hunt file execution complete. The .hunt DSL has been regenerated — show it as a fenced code block preview, then ask the user if they want to save or overwrite it.'
+        : 'Hunt file execution complete. Show the executed .hunt DSL as a fenced code block preview (with VERIFY after every action), then ask the user if they want to save or overwrite it.';
+      return JSON.stringify({ ...data, filePath, stepCount: runnableLines.length, _nextAction: nextAction });
     }
     return JSON.stringify({ error: result.error, status: result.status });
   }
