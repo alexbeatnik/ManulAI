@@ -210,6 +210,7 @@ const LOG_FILE    = process.env.LOG_FILE ?? path.join(logDir, `debug-${sessionId
 // In-session cache for DRY_RUN "written" files (module-level so executeTool can access it)
 const dryRunFiles = new Map();
 let preferredGreenfieldSuccessfulWriteCount = 0;
+let debugManulRecordedSteps = [];
 
 const userPrompt = cliArgs[0];
 if (!userPrompt) {
@@ -789,6 +790,34 @@ mkdirSync(logDir, { recursive: true });
 function logEvent(event, data = {}) {
   const line = JSON.stringify({ ts: new Date().toISOString(), event, ...data });
   writeFileSync(LOG_FILE, line + '\n', { flag: 'a' });
+}
+
+function buildDebugManulHuntProposal() {
+  if (debugManulRecordedSteps.length === 0) return undefined;
+  const lines = ['@context: Manul automation', '@title: Recorded Session', '', 'STEP 1: Recorded actions'];
+  for (const step of debugManulRecordedSteps) {
+    lines.push(`    ${step}`);
+    for (const verify of inferDebugManulVerifyLines(step)) {
+      lines.push(`    ${verify}`);
+    }
+  }
+  lines.push('', 'DONE.');
+  return lines.join('\n');
+}
+
+function inferDebugManulVerifyLines(step) {
+  if (/^\s*verify\b/i.test(step)) return [];
+  const fillMatch = step.match(/^Fill '([^']+)' field with '([^']+)'$/i);
+  if (fillMatch) return [`Verify '${fillMatch[1]}' field has value '${fillMatch[2]}'`];
+  const typeMatch = step.match(/^Type '([^']+)' into the '([^']+)' field$/i);
+  if (typeMatch) return [`Verify '${typeMatch[2]}' field has value '${typeMatch[1]}'`];
+  const selectMatch = step.match(/^Select '([^']+)' from the '([^']+)' dropdown$/i);
+  if (selectMatch) return [`VERIFY that '${selectMatch[1]}' is present`];
+  const checkMatch = step.match(/^Check the checkbox for '([^']+)'$/i);
+  if (checkMatch) return [`VERIFY that '${checkMatch[1]}' is checked`];
+  const uncheckMatch = step.match(/^Uncheck the checkbox for '([^']+)'$/i);
+  if (uncheckMatch) return [`VERIFY that '${uncheckMatch[1]}' is NOT checked`];
+  return [];
 }
 
 // ─── System prompt (keep in sync with callOllama in ManulAiChatProvider.ts) ─
@@ -1892,10 +1921,12 @@ async function executeTool(name, args) {
       const step = String(args.step ?? '');
       if (!step) return JSON.stringify({ error: 'step is required.' });
       console.log(`[MANUL_RUN_STEP] ${step}`);
+      debugManulRecordedSteps.push(step);
       const nextAction = /^\s*verify\b/i.test(step)
         ? 'If this VERIFY already satisfies the requested outcome, stop here. Show the .hunt preview and ask whether it should be saved. Do not repeat earlier steps or call manul_get_state just to double-check.'
         : 'If this was the last step, reconstruct the .hunt DSL from all steps, show it as a preview, and ask the user if they want to save it.';
-      return JSON.stringify({ ok: true, step, note: 'Debug stub — ManulEngine not running. In extension mode this executes the DSL step via Playwright.', _nextAction: nextAction });
+      const huntProposal = buildDebugManulHuntProposal();
+      return JSON.stringify({ ok: true, step, note: 'Debug stub — ManulEngine not running. In extension mode this executes the DSL step via Playwright.', ...(huntProposal ? { hunt_proposal: huntProposal } : {}), _nextAction: nextAction });
     }
 
     case 'manul_run_goal': {
@@ -1917,7 +1948,8 @@ async function executeTool(name, args) {
 
     case 'manul_get_state': {
       console.log('[MANUL_GET_STATE]');
-      return JSON.stringify({ ok: true, browserOpen: false, stepCount: 0, note: 'Debug stub — ManulEngine not running.' });
+      const huntProposal = buildDebugManulHuntProposal();
+      return JSON.stringify({ ok: true, browserOpen: false, stepCount: debugManulRecordedSteps.length, note: 'Debug stub — ManulEngine not running.', ...(huntProposal ? { hunt_proposal: huntProposal } : {}) });
     }
 
     case 'manul_save_hunt': {
@@ -1928,9 +1960,11 @@ async function executeTool(name, args) {
       const explicitSaveRequest = /(?:\bsave(?:\s+(?:it|this|that|the(?:\s+hunt)?(?:\s+file)?))?\b|\bcreate\b.{0,40}(?:\.hunt\b|hunt\s+file)|\bзбереж(?:и|іть|ти|емо|ення)\b|\bзапиш(?:и|іть|ти|емо)\b.{0,40}(?:\.hunt|hunt|файл)|\bствор(?:и|іть|ити|имо)\b.{0,40}(?:\.hunt|hunt|файл)|\bсохран(?:и|ить|ите)\b.{0,40}(?:\.hunt|hunt|файл))/i.test(userPrompt)
         && !/(?:\bdon'?t\s+save\b|\bdo\s+not\s+save\b|\bне\s+зберіг(?:ай|ати)\b|\bне\s+сохраня)/i.test(userPrompt);
       if (!explicitSaveRequest) {
+        const huntProposal = buildDebugManulHuntProposal();
         return JSON.stringify({
           error: 'manul_save_hunt is blocked until the user explicitly asks to save the hunt file.',
           save_allowed: false,
+          ...(huntProposal ? { hunt_proposal: huntProposal } : {}),
           _nextAction: 'Do not save yet. Show the .hunt preview in chat and ask the user whether it should be saved as a .hunt file.'
         });
       }
@@ -3344,6 +3378,7 @@ async function main() {
   let lastWriteVerifyPassed = true; // persists across turns: false if last verify failed and model hasn't fixed yet
   let sessionCompleted = false;
   preferredGreenfieldSuccessfulWriteCount = 0;
+  debugManulRecordedSteps = [];
   dryRunFiles.clear(); // reset for this session
 
   const hasMetExtractionGoal = () => {

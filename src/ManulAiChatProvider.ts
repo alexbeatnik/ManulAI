@@ -6929,7 +6929,7 @@ If the user asks for a change but provides NO code:
     }
     const verifyStep = this.isManulVerifyStep(step);
     const nextAction = verifyStep
-      ? 'If this VERIFY already satisfies the user\'s requested outcome, stop here. Show the .hunt preview and ask whether it should be saved. Do not repeat earlier steps or call manul_get_state just to double-check.'
+      ? 'If this VERIFY already satisfies the user\'s requested outcome, stop here. Show the provided hunt_proposal as the .hunt preview and ask whether it should be saved. Do not repeat earlier steps or call manul_get_state just to double-check.'
       : undefined;
     const data = await this.enrichManulResponseWithPreviewHints(result.data as Record<string, unknown>, nextAction, verifyStep);
     return JSON.stringify(data);
@@ -6950,10 +6950,10 @@ If the user asks for a change but provides NO code:
       ? await this.manulBridge.runSteps(steps, context, title)
       : await this.manulBridge.runStep(goal);
     if (result.ok) {
-      const data = result.data as Record<string, unknown>;
+      const data = await this.enrichManulResponseWithPreviewHints(result.data as Record<string, unknown>, undefined, true);
       const huntDsl = typeof data?.hunt_proposal === 'string' ? data.hunt_proposal : undefined;
       const nextAction = huntDsl
-        ? `Automation complete. The .hunt DSL has been generated — show it as a fenced code block preview, then ask the user if they want to save it as a hunt file (e.g. tests/<name>.hunt).`
+        ? `Automation complete. The .hunt DSL is already available in hunt_proposal — show it as a fenced code block preview, then ask the user if they want to save it as a hunt file (e.g. tests/<name>.hunt).`
         : `Automation complete. Reconstruct the .hunt DSL from all steps executed (with @context:, @title:, STEP blocks, VERIFY after every action, DONE.), show it as a fenced code block preview, then ask the user if they want to save it as a hunt file.`;
       return JSON.stringify({ ...data, _nextAction: nextAction });
     }
@@ -6978,7 +6978,7 @@ If the user asks for a change but provides NO code:
     const data = result.data as Record<string, unknown>;
     const executedSteps = this.readNumericValue(data.executed_steps ?? data.stepCount ?? data.step_count) ?? 0;
     const nextAction = executedSteps > 0
-      ? 'If the requested automation goal is already satisfied, do not repeat earlier steps. Show the .hunt preview and ask whether it should be saved.'
+      ? 'If the requested automation goal is already satisfied, do not repeat earlier steps. Show the provided hunt_proposal as the .hunt preview and ask whether it should be saved.'
       : undefined;
     const enriched = await this.enrichManulResponseWithPreviewHints(data, nextAction, executedSteps > 0);
     return JSON.stringify(enriched);
@@ -6997,7 +6997,7 @@ If the user asks for a change but provides NO code:
         error: 'manul_save_hunt is blocked until the user explicitly asks to save the hunt file in their latest message.',
         ...(huntProposal ? { hunt_proposal: huntProposal } : {}),
         save_allowed: false,
-        _nextAction: 'Do not save yet. Show the .hunt preview in chat and ask the user whether it should be saved as a .hunt file.'
+        _nextAction: 'Do not save yet. Show the provided hunt_proposal in chat and ask the user whether it should be saved as a .hunt file.'
       });
     }
     // Resolve to absolute path inside workspace
@@ -7041,10 +7041,10 @@ If the user asks for a change but provides NO code:
     const title = this.extractHuntHeader(dsl, '@title:');
     const result = await this.manulBridge.runSteps(runnableLines, context, title);
     if (result.ok) {
-      const data = result.data as Record<string, unknown>;
+      const data = await this.enrichManulResponseWithPreviewHints(result.data as Record<string, unknown>, undefined, true);
       const huntDsl = typeof data?.hunt_proposal === 'string' ? data.hunt_proposal : undefined;
       const nextAction = huntDsl
-        ? 'Automation complete. The .hunt DSL has been generated — show it as a fenced code block preview, then ask the user if they want to save it as a hunt file.'
+        ? 'Automation complete. The .hunt DSL is already available in hunt_proposal — show it as a fenced code block preview, then ask the user if they want to save it as a hunt file.'
         : 'Automation complete. Show the executed .hunt DSL as a fenced code block preview (with VERIFY after every action), then ask the user if they want to save it as a hunt file.';
       return JSON.stringify({ ...data, _nextAction: nextAction });
     }
@@ -7079,10 +7079,10 @@ If the user asks for a change but provides NO code:
     const title = this.extractHuntHeader(dsl, '@title:');
     const result = await this.manulBridge.runSteps(runnableLines, context, title);
     if (result.ok) {
-      const data = result.data as Record<string, unknown>;
+      const data = await this.enrichManulResponseWithPreviewHints(result.data as Record<string, unknown>, undefined, true);
       const huntDsl = typeof data?.hunt_proposal === 'string' ? data.hunt_proposal : undefined;
       const nextAction = huntDsl
-        ? 'Hunt file execution complete. The .hunt DSL has been regenerated — show it as a fenced code block preview, then ask the user if they want to save or overwrite it.'
+        ? 'Hunt file execution complete. The .hunt DSL is already available in hunt_proposal — show it as a fenced code block preview, then ask the user if they want to save or overwrite it.'
         : 'Hunt file execution complete. Show the executed .hunt DSL as a fenced code block preview (with VERIFY after every action), then ask the user if they want to save or overwrite it.';
       return JSON.stringify({ ...data, filePath, stepCount: runnableLines.length, _nextAction: nextAction });
     }
@@ -7118,10 +7118,11 @@ If the user asks for a change but provides NO code:
     forceProposal = false
   ): Promise<Record<string, unknown>> {
     const enriched: Record<string, unknown> = { ...data };
-    const hasProposal = typeof enriched.hunt_proposal === 'string' && enriched.hunt_proposal.trim().length > 0;
+    const existingProposal = typeof enriched.hunt_proposal === 'string' ? enriched.hunt_proposal.trim() : '';
+    const hasProposal = existingProposal.length > 0;
     const executedSteps = this.readNumericValue(enriched.executed_steps ?? enriched.stepCount ?? enriched.step_count) ?? 0;
-    if (!hasProposal && (forceProposal || executedSteps > 0)) {
-      const huntProposal = await this.getCurrentManulHuntProposal(enriched);
+    if (hasProposal || forceProposal || executedSteps > 0) {
+      const huntProposal = await this.getCurrentManulHuntProposal(enriched, data, existingProposal);
       if (huntProposal) {
         enriched.hunt_proposal = huntProposal;
       }
@@ -7132,16 +7133,237 @@ If the user asks for a change but provides NO code:
     return enriched;
   }
 
-  private async getCurrentManulHuntProposal(stateLike?: Record<string, unknown>): Promise<string | undefined> {
+  private async getCurrentManulHuntProposal(
+    stateLike?: Record<string, unknown>,
+    pendingPayload?: Record<string, unknown>,
+    existingProposal?: string
+  ): Promise<string | undefined> {
+    const localProposal = this.buildManulHuntProposalFromTranscript(stateLike, pendingPayload);
+    const normalizedExisting = existingProposal?.trim() ?? '';
+    if (localProposal && (!normalizedExisting || this.shouldPreferManulProposal(localProposal, normalizedExisting))) {
+      return localProposal;
+    }
+    if (normalizedExisting) {
+      return normalizedExisting;
+    }
     const context = typeof stateLike?.context === 'string' ? stateLike.context : undefined;
     const title = typeof stateLike?.title === 'string' ? stateLike.title : undefined;
     const result = await this.manulBridge.proposeHunt(context, title);
     if (!result.ok) {
-      return undefined;
+      return localProposal;
     }
     const data = result.data as Record<string, unknown>;
     const huntProposal = typeof data?.hunt_proposal === 'string' ? data.hunt_proposal.trim() : '';
-    return huntProposal || undefined;
+    if (localProposal && (!huntProposal || this.shouldPreferManulProposal(localProposal, huntProposal))) {
+      return localProposal;
+    }
+    return huntProposal || localProposal || undefined;
+  }
+
+  private buildManulHuntProposalFromTranscript(
+    stateLike?: Record<string, unknown>,
+    pendingPayload?: Record<string, unknown>
+  ): string | undefined {
+    const steps = this.collectSuccessfulManulStepsSinceLastUser(pendingPayload);
+    if (steps.length === 0) {
+      return undefined;
+    }
+    const { context, title } = this.getManulProposalContextAndTitle(stateLike);
+    const lines = [`@context: ${context}`, `@title: ${title}`, '', 'STEP 1: Recorded actions'];
+    for (const step of steps) {
+      lines.push(`    ${step.step}`);
+      for (const verifyLine of this.inferManulVerifyLines(step.step, step.pageScan)) {
+        lines.push(`    ${verifyLine}`);
+      }
+    }
+    lines.push('', 'DONE.');
+    return lines.join('\n');
+  }
+
+  private collectSuccessfulManulStepsSinceLastUser(
+    pendingPayload?: Record<string, unknown>
+  ): Array<{ step: string; pageScan: Array<{ type?: string; identifier?: string }> }> {
+    const entries: Array<{ step: string; pageScan: Array<{ type?: string; identifier?: string }> }> = [];
+    const startIndex = this.getLastVisibleUserMessageIndex(this.messages);
+    for (let index = Math.max(0, startIndex + 1); index < this.messages.length; index += 1) {
+      const message = this.messages[index];
+      if (message.role !== 'tool') {
+        continue;
+      }
+      if (!['manul_run_step', 'manul_run_goal', 'manul_run_hunt', 'manul_run_hunt_file'].includes(message.tool_name ?? '')) {
+        continue;
+      }
+      try {
+        const payload = JSON.parse(message.content) as Record<string, unknown>;
+        entries.push(...this.extractSuccessfulManulStepsFromPayload(payload));
+      } catch {
+        continue;
+      }
+    }
+    if (pendingPayload) {
+      entries.push(...this.extractSuccessfulManulStepsFromPayload(pendingPayload));
+    }
+    return entries;
+  }
+
+  private extractSuccessfulManulStepsFromPayload(
+    payload?: Record<string, unknown>
+  ): Array<{ step: string; pageScan: Array<{ type?: string; identifier?: string }> }> {
+    if (!payload || !Array.isArray(payload.results)) {
+      return [];
+    }
+    const entries: Array<{ step: string; pageScan: Array<{ type?: string; identifier?: string }> }> = [];
+    for (const rawResult of payload.results) {
+      if (!rawResult || typeof rawResult !== 'object') {
+        continue;
+      }
+      const result = rawResult as Record<string, unknown>;
+      const step = typeof result.step === 'string' ? result.step.trim() : '';
+      const status = typeof result.status === 'string' ? result.status.trim().toLowerCase() : '';
+      if (!step || (status && status !== 'pass')) {
+        continue;
+      }
+      const pageScan = Array.isArray(result.page_scan)
+        ? result.page_scan
+          .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === 'object')
+          .map(item => ({
+            type: typeof item.type === 'string' ? item.type : undefined,
+            identifier: typeof item.identifier === 'string' ? item.identifier : undefined,
+          }))
+        : [];
+      entries.push({ step, pageScan });
+    }
+    return entries;
+  }
+
+  private getManulProposalContextAndTitle(stateLike?: Record<string, unknown>): { context: string; title: string } {
+    let context = typeof stateLike?.context === 'string' ? stateLike.context.trim() : '';
+    let title = typeof stateLike?.title === 'string' ? stateLike.title.trim() : '';
+    if (context && title) {
+      return { context, title };
+    }
+    const startIndex = this.getLastVisibleUserMessageIndex(this.messages);
+    for (let index = this.messages.length - 1; index > startIndex; index -= 1) {
+      const message = this.messages[index];
+      if (message.role !== 'tool' || message.tool_name !== 'manul_get_state') {
+        continue;
+      }
+      try {
+        const payload = JSON.parse(message.content) as Record<string, unknown>;
+        if (!context && typeof payload.context === 'string' && payload.context.trim()) {
+          context = payload.context.trim();
+        }
+        if (!title && typeof payload.title === 'string' && payload.title.trim()) {
+          title = payload.title.trim();
+        }
+      } catch {
+        continue;
+      }
+      if (context && title) {
+        break;
+      }
+    }
+    return {
+      context: context || 'Manul automation',
+      title: title || 'Recorded Session',
+    };
+  }
+
+  private inferManulVerifyLines(
+    step: string,
+    pageScan: Array<{ type?: string; identifier?: string }>
+  ): string[] {
+    if (this.isManulVerifyStep(step)) {
+      return [];
+    }
+    const fillMatch = step.match(/^Fill '([^']+)' field with '([^']+)'$/i);
+    if (fillMatch) {
+      return [`Verify '${fillMatch[1]}' field has value '${fillMatch[2]}'`];
+    }
+    const typeMatch = step.match(/^Type '([^']+)' into the '([^']+)' field$/i);
+    if (typeMatch) {
+      return [`Verify '${typeMatch[2]}' field has value '${typeMatch[1]}'`];
+    }
+    const selectMatch = step.match(/^Select '([^']+)' from the '([^']+)' dropdown$/i);
+    if (selectMatch) {
+      return [`VERIFY that '${selectMatch[1]}' is present`];
+    }
+    const checkMatch = step.match(/^Check the checkbox for '([^']+)'$/i);
+    if (checkMatch) {
+      return [`VERIFY that '${checkMatch[1]}' is checked`];
+    }
+    const uncheckMatch = step.match(/^Uncheck the checkbox for '([^']+)'$/i);
+    if (uncheckMatch) {
+      return [`VERIFY that '${uncheckMatch[1]}' is NOT checked`];
+    }
+    if (/^(?:NAVIGATE\b|Click\b|DOUBLE CLICK\b|RIGHT CLICK\b|PRESS ENTER\b)/i.test(step)) {
+      const target = this.pickBestManulVerifyTarget(pageScan);
+      return target ? [`VERIFY that '${target}' is present`] : [];
+    }
+    return [];
+  }
+
+  private pickBestManulVerifyTarget(pageScan: Array<{ type?: string; identifier?: string }>): string | undefined {
+    let bestTarget: string | undefined;
+    let bestScore = Number.NEGATIVE_INFINITY;
+    for (const element of pageScan) {
+      const identifier = (element.identifier ?? '').trim();
+      if (!identifier) {
+        continue;
+      }
+      if (/^(?:Main content|Show\/Hide shortcuts.*)$/i.test(identifier)) {
+        continue;
+      }
+      if (/(?:alt\s*\+|shift\s*\+)/i.test(identifier)) {
+        continue;
+      }
+      if (/^\.[a-z]{2}$/i.test(identifier)) {
+        continue;
+      }
+      let score = 50;
+      switch ((element.type ?? '').toLowerCase()) {
+        case 'heading':
+          score = 120;
+          break;
+        case 'input':
+          score = 100;
+          break;
+        case 'button':
+          score = 80;
+          break;
+        case 'link':
+          score = 70;
+          break;
+        default:
+          score = 60;
+          break;
+      }
+      if (/\s/.test(identifier)) {
+        score += 10;
+      }
+      if (/(?:enter|email|search|sign in|login|password|account)/i.test(identifier)) {
+        score += 20;
+      }
+      if (/^(?:[a-z0-9_.-]+)$/i.test(identifier) && !/\s/.test(identifier)) {
+        score -= 35;
+      }
+      if (/^nav-[a-z0-9_-]+$/i.test(identifier)) {
+        score -= 50;
+      }
+      if (score > bestScore) {
+        bestScore = score;
+        bestTarget = identifier;
+      }
+    }
+    return bestTarget;
+  }
+
+  private shouldPreferManulProposal(candidate: string, current: string): boolean {
+    return this.countManulVerifyLines(candidate) > this.countManulVerifyLines(current);
+  }
+
+  private countManulVerifyLines(dsl: string): number {
+    return dsl.split(/\r?\n/).filter(line => /^\s*(?:VERIFY|Verify)\b/.test(line)).length;
   }
 
   private latestUserExplicitlyRequestsHuntSave(): boolean {
