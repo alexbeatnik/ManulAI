@@ -51,7 +51,6 @@ export interface ManulAiStoredSettings {
   autoApprove?: boolean;
   debugMode?: boolean;
   systemPrompt?: string;
-  manulEngineBaseUrl?: string;
 }
 
 export interface ChatSession {
@@ -99,7 +98,6 @@ export const DEFAULT_STORED_SETTINGS: Required<ManulAiStoredSettings> = {
   autoApprove: false,
   debugMode: false,
   systemPrompt: 'You are ManulAI, a privacy-first local coding assistant running inside VS Code. Work across any programming language. Prefer precise, minimal changes and explain results clearly.',
-  manulEngineBaseUrl: 'http://127.0.0.1:8000'
 };
 
 export interface ToolDefinition {

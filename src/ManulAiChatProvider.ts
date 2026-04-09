@@ -3,7 +3,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as vscode from 'vscode';
 
-import { ManulBridge } from './manulBridge';
+import { ManulBridge, resolveManulPython } from './manulBridge';
 import type { AgentModeValue, AttachedFileContext, ChatSession, ManulAiStoredSettings, OllamaMessage, OllamaResponse, ParsedToolCall, PersistedChatState, ToolDefinition, ToolFunctionCall, WebviewActiveFileState, WebviewChatSummary, WebviewInboundMessage, WebviewPendingApprovalState, WebviewRenderableMessage } from './types';
 import { ChatRole, DEFAULT_STORED_SETTINGS } from './types';
 import { deserializeAttachedFileContext as deserializePersistedAttachedFileContext, deserializeChatMessage as deserializePersistedChatMessage, deserializeChatSession as deserializePersistedChatSession, getChatStorageDirUri as getPersistedChatStorageDirUri, getChatStorageUri as getPersistedChatStorageUri, getWorkspaceSettingsDirUri as getPersistedWorkspaceSettingsDirUri, getWorkspaceSettingsUri as getPersistedWorkspaceSettingsUri, normalizePersistedChatSession as normalizeRestoredChatSession, normalizeStoredSettings as normalizePersistedSettings, restorePersistedChats as restorePersistedChatState, serializeChatState as serializePersistedChatState } from './providerPersistenceUtils';
@@ -102,14 +102,18 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   private lastPersistedChatState = '';
   private readonly launchedTerminals: vscode.Terminal[] = [];
 
-  /** Lazy ManulEngine HTTP bridge — created on first use. */
+  /** Lazy ManulEngine subprocess bridge — created on first use, reset on workspace change. */
   private _manulBridge?: ManulBridge;
   private get manulBridge(): ManulBridge {
     if (!this._manulBridge) {
+      const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd();
       this._manulBridge = new ManulBridge({
-        apiBaseUrl: this.getManulEngineBaseUrl(),
+        pythonPath: resolveManulPython(workspaceRoot),
+        scriptPath: path.join(this.extensionContext.extensionPath, 'media', 'manul_bridge_api.py'),
+        workspaceRoot,
         sessionId: this.extensionContext.globalState.get<string>('manulai.sessionId') ?? 'manulai-default',
-        timeoutMs: 60000
+        headless: false,
+        timeoutMs: 120000,
       });
     }
     return this._manulBridge;
@@ -418,7 +422,9 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   }
 
   public async handleConfigurationChange(): Promise<void> {
-    this._manulBridge = undefined; // reset so bridge picks up new URL on next use
+    // Dispose and recreate the bridge so it picks up any new workspace/settings on next use.
+    this._manulBridge?.dispose();
+    this._manulBridge = undefined;
     await this.initializeSettingsState();
   }
 
@@ -616,11 +622,6 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   private getOllamaBaseUrl(): string {
     const raw = this.getStringSetting('ollamaBaseUrl', DEFAULT_STORED_SETTINGS.ollamaBaseUrl).replace(/\/$/, '');
     return ManulAiChatProvider.validateOllamaBaseUrl(raw);
-  }
-
-  private getManulEngineBaseUrl(): string {
-    const raw = this.getStringSetting('manulEngineBaseUrl', DEFAULT_STORED_SETTINGS.manulEngineBaseUrl).replace(/\/$/, '').trim();
-    return raw || DEFAULT_STORED_SETTINGS.manulEngineBaseUrl;
   }
 
   /**
