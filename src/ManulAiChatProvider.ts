@@ -4777,7 +4777,7 @@ VERIFY after every action:
   Click → state change → VERIFY that '<new state>' is present
 
 [MANUL SESSION COMPLETION]
-After completing any automation with manul_* tools: (1) reconstruct the full .hunt DSL from all executed steps (or use hunt_proposal from the tool result), (2) show it as a fenced code block preview, (3) ask "Should I save this as a hunt file?", (4) WAIT — do NOT call manul_save_hunt until the user explicitly confirms.
+After completing any automation with manul_* tools: (1) reconstruct the full .hunt DSL from all executed steps (or use hunt_proposal from the tool result), (2) show it as a fenced code block preview, (3) ask "Should I save this as a hunt file?", (4) WAIT — do NOT call manul_save_hunt until the user explicitly confirms. If the most recent VERIFY already proves the requested outcome, stop there — do NOT repeat earlier steps or call manul_get_state just to double-check.
 `;
 
       const workspaceTree = await this.buildCompactWorkspaceTree();
@@ -4840,7 +4840,7 @@ You are an ACTION agent. Execute tasks using tools. Never describe what you inte
    Start with: manul_run_step for single DSL steps, manul_run_goal for multi-step flows
    Always call manul_scan_page after NAVIGATE to discover element identifiers
    After EVERY action that changes state → add a VERIFY step immediately (see [MANUL DSL REFERENCE])
-   After completing automation → show the reconstructed .hunt preview and offer to save it (see [MANUL SESSION COMPLETION])
+  After completing automation → show the reconstructed .hunt preview and offer to save it (see [MANUL SESSION COMPLETION]); if the last VERIFY already proves the requested outcome, stop there and do not repeat earlier steps
 4. Code understanding required → read files first with read_file_slice
 5. No tools required → respond concisely
 
@@ -5035,6 +5035,7 @@ After completing ANY automation task using manul_* tools:
 2. Show the hunt file as a fenced code block (preview) in your response.
 3. Ask the user: "Should I save this as a hunt file so it can be replayed later?"
 4. WAIT for the user to reply. Do NOT call manul_save_hunt automatically — only call it if the user explicitly confirms in their next message (e.g. "yes", "save it", "save").
+5. If the latest VERIFY already satisfied the request, do NOT replay earlier navigation/click steps or call manul_get_state just to re-check.
 
 Hunt file preview format:
   \`\`\`hunt
@@ -6923,7 +6924,15 @@ If the user asks for a change but provides NO code:
       return JSON.stringify({ error: 'step is required.' });
     }
     const result = await this.manulBridge.runStep(step);
-    return JSON.stringify(result.ok ? result.data : { error: result.error, status: result.status });
+    if (!result.ok) {
+      return JSON.stringify({ error: result.error, status: result.status });
+    }
+    const verifyStep = this.isManulVerifyStep(step);
+    const nextAction = verifyStep
+      ? 'If this VERIFY already satisfies the user\'s requested outcome, stop here. Show the .hunt preview and ask whether it should be saved. Do not repeat earlier steps or call manul_get_state just to double-check.'
+      : undefined;
+    const data = await this.enrichManulResponseWithPreviewHints(result.data as Record<string, unknown>, nextAction, verifyStep);
+    return JSON.stringify(data);
   }
 
   private async manulRunGoal(goal: string, title?: string, context?: string): Promise<string> {
@@ -6963,7 +6972,16 @@ If the user asks for a change but provides NO code:
 
   private async manulGetState(): Promise<string> {
     const result = await this.manulBridge.getState();
-    return JSON.stringify(result.ok ? result.data : { error: result.error, status: result.status });
+    if (!result.ok) {
+      return JSON.stringify({ error: result.error, status: result.status });
+    }
+    const data = result.data as Record<string, unknown>;
+    const executedSteps = this.readNumericValue(data.executed_steps ?? data.stepCount ?? data.step_count) ?? 0;
+    const nextAction = executedSteps > 0
+      ? 'If the requested automation goal is already satisfied, do not repeat earlier steps. Show the .hunt preview and ask whether it should be saved.'
+      : undefined;
+    const enriched = await this.enrichManulResponseWithPreviewHints(data, nextAction, executedSteps > 0);
+    return JSON.stringify(enriched);
   }
 
   private async manulSaveHunt(huntPath: string, content: string): Promise<string> {
@@ -6972,6 +6990,15 @@ If the user asks for a change but provides NO code:
     }
     if (!content.trim()) {
       return JSON.stringify({ error: 'content is required.' });
+    }
+    if (!this.latestUserExplicitlyRequestsHuntSave()) {
+      const huntProposal = await this.getCurrentManulHuntProposal();
+      return JSON.stringify({
+        error: 'manul_save_hunt is blocked until the user explicitly asks to save the hunt file in their latest message.',
+        ...(huntProposal ? { hunt_proposal: huntProposal } : {}),
+        save_allowed: false,
+        _nextAction: 'Do not save yet. Show the .hunt preview in chat and ask the user whether it should be saved as a .hunt file.'
+      });
     }
     // Resolve to absolute path inside workspace
     const wsRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
@@ -7066,6 +7093,92 @@ If the user asks for a change but provides NO code:
     const escaped = directive.replace(':', '\\s*:');
     const match = dsl.match(new RegExp(`^${escaped}\\s*(.+)$`, 'm'));
     return match ? match[1].trim() : undefined;
+  }
+
+  private isManulVerifyStep(step: string): boolean {
+    return /^\s*verify\b/i.test(step);
+  }
+
+  private readNumericValue(value: unknown): number | undefined {
+    if (typeof value === 'number' && Number.isFinite(value)) {
+      return value;
+    }
+    if (typeof value === 'string') {
+      const parsed = Number(value);
+      if (Number.isFinite(parsed)) {
+        return parsed;
+      }
+    }
+    return undefined;
+  }
+
+  private async enrichManulResponseWithPreviewHints(
+    data: Record<string, unknown>,
+    nextAction?: string,
+    forceProposal = false
+  ): Promise<Record<string, unknown>> {
+    const enriched: Record<string, unknown> = { ...data };
+    const hasProposal = typeof enriched.hunt_proposal === 'string' && enriched.hunt_proposal.trim().length > 0;
+    const executedSteps = this.readNumericValue(enriched.executed_steps ?? enriched.stepCount ?? enriched.step_count) ?? 0;
+    if (!hasProposal && (forceProposal || executedSteps > 0)) {
+      const huntProposal = await this.getCurrentManulHuntProposal(enriched);
+      if (huntProposal) {
+        enriched.hunt_proposal = huntProposal;
+      }
+    }
+    if (nextAction && typeof enriched._nextAction !== 'string') {
+      enriched._nextAction = nextAction;
+    }
+    return enriched;
+  }
+
+  private async getCurrentManulHuntProposal(stateLike?: Record<string, unknown>): Promise<string | undefined> {
+    const context = typeof stateLike?.context === 'string' ? stateLike.context : undefined;
+    const title = typeof stateLike?.title === 'string' ? stateLike.title : undefined;
+    const result = await this.manulBridge.proposeHunt(context, title);
+    if (!result.ok) {
+      return undefined;
+    }
+    const data = result.data as Record<string, unknown>;
+    const huntProposal = typeof data?.hunt_proposal === 'string' ? data.hunt_proposal.trim() : '';
+    return huntProposal || undefined;
+  }
+
+  private latestUserExplicitlyRequestsHuntSave(): boolean {
+    const latestUserRequest = this.getLatestVisibleUserRequest(this.messages).trim();
+    if (!latestUserRequest) {
+      return false;
+    }
+    if (/(?:\bdon'?t\s+save\b|\bdo\s+not\s+save\b|\bno\s+need\s+to\s+save\b|\bне\s+(?:треба|потрібно|нужно)\s+зберіг|\bне\s+зберіг(?:ай|ати)\b|\bне\s+сохраня)/i.test(latestUserRequest)) {
+      return false;
+    }
+    if (this.isExplicitHuntSaveRequest(latestUserRequest)) {
+      return true;
+    }
+    return this.isSimpleSaveAffirmation(latestUserRequest) && this.latestVisibleAssistantOfferedHuntSave();
+  }
+
+  private isExplicitHuntSaveRequest(text: string): boolean {
+    return /(?:\bsave(?:\s+(?:it|this|that|the(?:\s+hunt)?(?:\s+file)?))?\b|\bwrite(?:\s+out)?\b.{0,40}(?:\.hunt\b|hunt\s+file)|\bcreate\b.{0,40}(?:\.hunt\b|hunt\s+file)|\bstore\b.{0,40}(?:\.hunt\b|hunt\s+file)|\bpersist\b.{0,40}(?:\.hunt\b|hunt\s+file)|\bзбереж(?:и|іть|ти|емо|ення)\b|\bзапиш(?:и|іть|ти|емо)\b.{0,40}(?:\.hunt|hunt|файл)|\bствор(?:и|іть|ити|имо)\b.{0,40}(?:\.hunt|hunt|файл)|\bсохран(?:и|ить|ите)\b.{0,40}(?:\.hunt|hunt|файл))/i.test(text);
+  }
+
+  private isSimpleSaveAffirmation(text: string): boolean {
+    return /^(?:yes|yep|yeah|sure|ok(?:ay)?|please\s+do|go\s+ahead|так|ага|добре|ок(?:ей)?|да)\b/i.test(text.trim());
+  }
+
+  private latestVisibleAssistantOfferedHuntSave(): boolean {
+    for (let index = this.messages.length - 1; index >= 0; index -= 1) {
+      const message = this.messages[index];
+      if (message.role !== 'assistant' || message.hiddenFromTranscript || message.localOnly) {
+        continue;
+      }
+      const content = message.content.trim();
+      if (!content) {
+        continue;
+      }
+      return /(?:should\s+i\s+save\s+this\s+as\s+a\s+hunt\s+file|would\s+you\s+like\s+me\s+to\s+save\s+(?:this|it)\s+as\s+a\s+hunt\s+file|save\s+(?:this|it)\s+as\s+a\s+hunt\s+file\s+so\s+it\s+can\s+be\s+replayed\s+later|зберегти\s+(?:це|його|її)?\s*(?:як)?\s*\.hunt|зберегти\s+hunt\s+файл)/i.test(content);
+    }
+    return false;
   }
 
   private async projectScan(): Promise<string> {

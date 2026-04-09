@@ -1047,7 +1047,8 @@ After completing ANY automation task using manul_* tools:
 1. Reconstruct the full .hunt DSL from all steps that were executed.
 2. Show the hunt file as a fenced code block (preview) in your response.
 3. Ask the user: "Should I save this as a hunt file so it can be replayed later?"
-4. If the user agrees → call manul_save_hunt with path 'tests/<descriptive_name>.hunt'.
+4. WAIT for the user to reply. Do NOT call manul_save_hunt automatically.
+5. If the latest VERIFY already satisfied the request, do NOT replay earlier navigation/click steps or call manul_get_state just to double-check.
 
 ---
 
@@ -1139,7 +1140,7 @@ VERIFY after every action:
   Click → state change → VERIFY that '<new state>' is present
 
 [MANUL SESSION COMPLETION]
-After completing any automation with manul_* tools: (1) reconstruct the full .hunt DSL from all executed steps, (2) show it as a fenced code block preview, (3) ask "Should I save this as a hunt file?", (4) if yes → call manul_save_hunt with 'tests/<name>.hunt'.
+After completing any automation with manul_* tools: (1) reconstruct the full .hunt DSL from all executed steps, (2) show it as a fenced code block preview, (3) ask "Should I save this as a hunt file?", (4) WAIT — do NOT call manul_save_hunt until the user explicitly confirms, (5) if the latest VERIFY already satisfied the request, stop there and do not repeat earlier steps or call manul_get_state just to double-check.
 ${textToolSection}`;
 }
 
@@ -1891,7 +1892,10 @@ async function executeTool(name, args) {
       const step = String(args.step ?? '');
       if (!step) return JSON.stringify({ error: 'step is required.' });
       console.log(`[MANUL_RUN_STEP] ${step}`);
-      return JSON.stringify({ ok: true, step, note: 'Debug stub — ManulEngine not running. In extension mode this executes the DSL step via Playwright.', _nextAction: 'If this was the last step, reconstruct the .hunt DSL from all steps, show it as a preview, and ask the user if they want to save it.' });
+      const nextAction = /^\s*verify\b/i.test(step)
+        ? 'If this VERIFY already satisfies the requested outcome, stop here. Show the .hunt preview and ask whether it should be saved. Do not repeat earlier steps or call manul_get_state just to double-check.'
+        : 'If this was the last step, reconstruct the .hunt DSL from all steps, show it as a preview, and ask the user if they want to save it.';
+      return JSON.stringify({ ok: true, step, note: 'Debug stub — ManulEngine not running. In extension mode this executes the DSL step via Playwright.', _nextAction: nextAction });
     }
 
     case 'manul_run_goal': {
@@ -1921,6 +1925,15 @@ async function executeTool(name, args) {
       const content = String(args.content ?? '');
       if (!huntPath) return JSON.stringify({ error: 'path is required.' });
       if (!content) return JSON.stringify({ error: 'content is required.' });
+      const explicitSaveRequest = /(?:\bsave(?:\s+(?:it|this|that|the(?:\s+hunt)?(?:\s+file)?))?\b|\bcreate\b.{0,40}(?:\.hunt\b|hunt\s+file)|\bзбереж(?:и|іть|ти|емо|ення)\b|\bзапиш(?:и|іть|ти|емо)\b.{0,40}(?:\.hunt|hunt|файл)|\bствор(?:и|іть|ити|имо)\b.{0,40}(?:\.hunt|hunt|файл)|\bсохран(?:и|ить|ите)\b.{0,40}(?:\.hunt|hunt|файл))/i.test(userPrompt)
+        && !/(?:\bdon'?t\s+save\b|\bdo\s+not\s+save\b|\bне\s+зберіг(?:ай|ати)\b|\bне\s+сохраня)/i.test(userPrompt);
+      if (!explicitSaveRequest) {
+        return JSON.stringify({
+          error: 'manul_save_hunt is blocked until the user explicitly asks to save the hunt file.',
+          save_allowed: false,
+          _nextAction: 'Do not save yet. Show the .hunt preview in chat and ask the user whether it should be saved as a .hunt file.'
+        });
+      }
       if (!huntPath.endsWith('.hunt')) return JSON.stringify({ error: 'path must end in .hunt' });
       const absPath = path.isAbsolute(huntPath) ? huntPath : path.join(wsRoot, huntPath);
       try {
