@@ -4777,7 +4777,7 @@ VERIFY after every action:
   Click → state change → VERIFY that '<new state>' is present
 
 [MANUL SESSION COMPLETION]
-After completing any automation with manul_* tools: (1) reconstruct the full .hunt DSL from all executed steps, (2) show it as a fenced code block preview, (3) ask "Should I save this as a hunt file?", (4) if yes → call manul_save_hunt with 'tests/<name>.hunt'.
+After completing any automation with manul_* tools: (1) reconstruct the full .hunt DSL from all executed steps (or use hunt_proposal from the tool result), (2) show it as a fenced code block preview, (3) ask "Should I save this as a hunt file?", (4) WAIT — do NOT call manul_save_hunt until the user explicitly confirms.
 `;
 
       const workspaceTree = await this.buildCompactWorkspaceTree();
@@ -5031,10 +5031,10 @@ VERIFY after every action — mandatory table:
 [MANUL SESSION COMPLETION]
 
 After completing ANY automation task using manul_* tools:
-1. Reconstruct the full .hunt DSL from all steps that were executed.
+1. Reconstruct the full .hunt DSL from all steps that were executed (or use the hunt_proposal from the tool result if present).
 2. Show the hunt file as a fenced code block (preview) in your response.
 3. Ask the user: "Should I save this as a hunt file so it can be replayed later?"
-4. If the user agrees → call manul_save_hunt with path 'tests/<descriptive_name>.hunt' and the DSL content.
+4. WAIT for the user to reply. Do NOT call manul_save_hunt automatically — only call it if the user explicitly confirms in their next message (e.g. "yes", "save it", "save").
 
 Hunt file preview format:
   \`\`\`hunt
@@ -5873,7 +5873,7 @@ If the user asks for a change but provides NO code:
         type: 'function',
         function: {
           name: 'manul_save_hunt',
-          description: 'Save a .hunt automation file to disk. Call after manul_run_goal returns a hunt_proposal. Path must end in .hunt and should be under tests/.',
+          description: 'Save a .hunt automation file to disk. ONLY call this tool if the user has EXPLICITLY asked to save the hunt file in their most recent message (e.g. "yes", "save it", "save the hunt file"). Never call this tool automatically after automation completes — always show a preview first and wait for user confirmation.',
           parameters: {
             type: 'object',
             properties: {
@@ -6111,7 +6111,8 @@ If the user asks for a change but provides NO code:
         case 'manul_get_state':
           return await this.manulGetState();
         case 'manul_save_hunt':
-          return await this.manulSaveHunt(String(args.path ?? ''), String(args.content ?? ''));
+          // args.path is remapped to args.filepath by normalizeToolArguments; accept both
+          return await this.manulSaveHunt(String(args.filepath ?? args.path ?? ''), String(args.content ?? ''));
         case 'manul_run_hunt':
           return await this.manulRunHunt(String(args.dsl ?? ''));
         case 'manul_run_hunt_file':
