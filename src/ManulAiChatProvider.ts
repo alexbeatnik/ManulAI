@@ -4753,9 +4753,30 @@ ${wsRoot ? `Workspace root: ${wsRoot}\n` : ''}
 - Use file tools for reads/writes, execute_terminal_command for shell.
 - execute_terminal_command has no stdin. Never run interactive programs (input(), readline, read) — they will hang.
 - For interactive programs (games, REPLs, scripts that need user input), use launch_in_terminal instead.
+- For browser or web automation: use manul_* tools. After EVERY action that changes state add a VERIFY step. After completing automation show the reconstructed .hunt preview and offer to save it (see rules below).
 - Keep text output minimal between tool calls.
 - NEVER output raw JSON as a substitute for a tool call.
 - Task is complete when all required changes are done. Output a one-line summary.
+
+[MANUL DSL REFERENCE]
+
+Hunt file structure (flush-left headers, 4-space indented actions):
+  @context: <description>  @title: <name>  STEP 1: Description      NAVIGATE to 'url'      VERIFY that 'Landmark' is present  DONE.
+
+Key commands: NAVIGATE to 'url' | SCROLL DOWN [inside 'container'] | Click the 'L' button|link|element | DOUBLE CLICK the 'L' | RIGHT CLICK 'L' | Fill 'F' field with 'V' | Type 'V' into the 'F' field | Select 'O' from the 'D' dropdown | Check/Uncheck the checkbox for 'L' | HOVER over the 'L' | Drag 'S' and drop it into 'T' | PRESS ENTER|Escape|Key | WAIT N | Wait for 'E' to be visible|hidden|disappear | WAIT FOR RESPONSE "pattern" | EXTRACT the 'E' into {v} | SET {v} = value | CALL PYTHON module.fn [into {v}]
+
+VERIFY commands: VERIFY that 'text' is present|NOT present|ENABLED|DISABLED|checked|NOT checked | VERIFY SOFTLY that 'text' is present | Verify 'F' field has value 'V' | Verify 'F' field has text 'T'
+
+Contextual qualifiers: NEAR 'anchor' | ON HEADER | ON FOOTER | INSIDE 'container' row with 'text'
+
+VERIFY after every action:
+  NAVIGATE → VERIFY that '<landmark>' is present
+  Fill/Type → Verify '<Field>' field has value '<value>'
+  Click → new page → VERIFY that '<landmark>' is present
+  Click → state change → VERIFY that '<new state>' is present
+
+[MANUL SESSION COMPLETION]
+After completing any automation with manul_* tools: (1) reconstruct the full .hunt DSL from all executed steps, (2) show it as a fenced code block preview, (3) ask "Should I save this as a hunt file?", (4) if yes → call manul_save_hunt with 'tests/<name>.hunt'.
 `;
 
       const workspaceTree = await this.buildCompactWorkspaceTree();
@@ -4817,7 +4838,8 @@ You are an ACTION agent. Execute tasks using tools. Never describe what you inte
 3. Browser or web automation needed → use manul_* tools (ManulEngine integration)
    Start with: manul_run_step for single DSL steps, manul_run_goal for multi-step flows
    Always call manul_scan_page after NAVIGATE to discover element identifiers
-   Always VERIFY state with a VERIFY step after any action that changes state
+   After EVERY action that changes state → add a VERIFY step immediately (see [MANUL DSL REFERENCE])
+   After completing automation → show the reconstructed .hunt preview and offer to save it (see [MANUL SESSION COMPLETION])
 4. Code understanding required → read files first with read_file_slice
 5. No tools required → respond concisely
 
@@ -4933,6 +4955,96 @@ If steps remain → continue with the next tool call.
 - Plan: short numbered list, then immediately start executing
 - During execution: no narration, only tool calls
 - After completion: one-line summary
+
+---
+
+[MANUL DSL REFERENCE]
+
+Hunt file structure (always flush-left headers, 4-space indented actions):
+  @context: <what this automation verifies>
+  @title: <short suite name>
+  @var: {key} = value
+
+  STEP 1: Description
+      NAVIGATE to 'https://url'
+      VERIFY that 'Landmark' is present
+      ...
+
+  DONE.
+
+Key DSL commands (element names always in single quotes):
+  Navigation:
+  - NAVIGATE to 'url'                          — load URL, wait for DOM
+  - SCROLL DOWN                                — scroll one viewport
+  - SCROLL DOWN inside the 'container'         — scroll a specific container
+
+  Interaction:
+  - Click the 'Label' button|link|element
+  - DOUBLE CLICK the 'Label'
+  - RIGHT CLICK 'Label'
+  - Fill 'Field' field with 'Value'            — clears and types
+  - Type 'Value' into the 'Field' field
+  - Select 'Option' from the 'Dropdown' dropdown
+  - Check the checkbox for 'Label'
+  - Uncheck the checkbox for 'Label'
+  - HOVER over the 'Label'
+  - Drag 'Source' and drop it into 'Target'
+  - PRESS ENTER / PRESS Escape / PRESS Control+A
+  - UPLOAD 'file_path' to 'Input'
+
+  Waits:
+  - WAIT 2                                     — sleep N seconds (use only when no element to wait for)
+  - Wait for 'Element' to be visible|hidden|disappear
+  - WAIT FOR RESPONSE "url_pattern"            — wait for matching network response
+
+  Data:
+  - EXTRACT the 'Element' into {var}           — capture visible text
+  - SET {var} = value
+  - CALL PYTHON module.function [into {var}]   — run Python helper
+
+  VERIFY commands (assertion — stops on failure):
+  - VERIFY that 'text' is present
+  - VERIFY that 'text' is NOT present
+  - VERIFY that 'Element' is ENABLED|DISABLED
+  - VERIFY that 'Element' is checked|NOT checked
+  - VERIFY SOFTLY that 'text' is present       — non-fatal, continues on failure
+  - Verify 'Field' field has value 'Expected'  — strict current input value
+  - Verify 'Field' field has text 'Expected'   — strict visible inner text
+
+  Contextual qualifiers (disambiguate repeated elements):
+  - Click the 'Edit' button NEAR 'John Doe'
+  - Click the 'Logo' link ON HEADER
+  - Click the 'Terms' link ON FOOTER
+  - Click the 'Delete' button INSIDE 'Actions' row with 'John'
+
+VERIFY after every action — mandatory table:
+  NAVIGATE               → VERIFY that '<page heading or landmark>' is present
+  Fill / Type            → Verify '<Field>' field has value '<entered value>'
+  Click → new page       → VERIFY that '<landmark on new page>' is present
+  Click → state change   → VERIFY that '<new state text or element>' is present
+  Select dropdown        → VERIFY that '<selected option>' is present
+  Check / Uncheck        → VERIFY that '<checkbox label>' is checked|NOT checked
+
+---
+
+[MANUL SESSION COMPLETION]
+
+After completing ANY automation task using manul_* tools:
+1. Reconstruct the full .hunt DSL from all steps that were executed.
+2. Show the hunt file as a fenced code block (preview) in your response.
+3. Ask the user: "Should I save this as a hunt file so it can be replayed later?"
+4. If the user agrees → call manul_save_hunt with path 'tests/<descriptive_name>.hunt' and the DSL content.
+
+Hunt file preview format:
+  \`\`\`hunt
+  @context: <what was automated>
+  @title: <short_name>
+
+  STEP 1: <description>
+      <all steps executed, in order, with VERIFY after each action>
+
+  DONE.
+  \`\`\`
 `;
 
       if (workspaceInstructions) {
@@ -6826,7 +6938,10 @@ If the user asks for a change but provides NO code:
     const result = steps.length > 0
       ? await this.manulBridge.runSteps(steps, context, title)
       : await this.manulBridge.runStep(goal);
-    return JSON.stringify(result.ok ? result.data : { error: result.error, status: result.status });
+    if (result.ok) {
+      return JSON.stringify({ ...(result.data as object), _nextAction: 'Automation complete. Reconstruct the .hunt DSL from all steps executed (with @context:, @title:, STEP blocks, VERIFY after every action, DONE.), show it as a fenced code block preview, then ask the user if they want to save it as a hunt file.' });
+    }
+    return JSON.stringify({ error: result.error, status: result.status });
   }
 
   private async manulScanPage(): Promise<string> {
@@ -6891,7 +7006,10 @@ If the user asks for a change but provides NO code:
     const context = this.extractHuntHeader(dsl, '@context:');
     const title = this.extractHuntHeader(dsl, '@title:');
     const result = await this.manulBridge.runSteps(runnableLines, context, title);
-    return JSON.stringify(result.ok ? result.data : { error: result.error, status: result.status });
+    if (result.ok) {
+      return JSON.stringify({ ...(result.data as object), _nextAction: 'Automation complete. Show the executed .hunt DSL as a fenced code block preview (with VERIFY after every action), then ask the user if they want to save it as a hunt file.' });
+    }
+    return JSON.stringify({ error: result.error, status: result.status });
   }
 
   private async manulRunHuntFile(filePath: string): Promise<string> {
@@ -6921,9 +7039,10 @@ If the user asks for a change but provides NO code:
     const context = this.extractHuntHeader(dsl, '@context:');
     const title = this.extractHuntHeader(dsl, '@title:');
     const result = await this.manulBridge.runSteps(runnableLines, context, title);
-    return JSON.stringify(result.ok
-      ? { ...(result.data as object), filePath, stepCount: runnableLines.length }
-      : { error: result.error, status: result.status });
+    if (result.ok) {
+      return JSON.stringify({ ...(result.data as object), filePath, stepCount: runnableLines.length, _nextAction: 'Hunt file execution complete. Show the executed .hunt DSL as a fenced code block preview (with VERIFY after every action), then ask the user if they want to save or overwrite it.' });
+    }
+    return JSON.stringify({ error: result.error, status: result.status });
   }
 
   private extractHuntHeader(dsl: string, directive: string): string | undefined {
