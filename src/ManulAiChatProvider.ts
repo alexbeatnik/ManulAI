@@ -3,6 +3,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as vscode from 'vscode';
 
+import { ManulBridge } from './manulBridge';
 import type { AgentModeValue, AttachedFileContext, ChatSession, ManulAiStoredSettings, OllamaMessage, OllamaResponse, ParsedToolCall, PersistedChatState, ToolDefinition, ToolFunctionCall, WebviewActiveFileState, WebviewChatSummary, WebviewInboundMessage, WebviewPendingApprovalState, WebviewRenderableMessage } from './types';
 import { ChatRole, DEFAULT_STORED_SETTINGS } from './types';
 import { deserializeAttachedFileContext as deserializePersistedAttachedFileContext, deserializeChatMessage as deserializePersistedChatMessage, deserializeChatSession as deserializePersistedChatSession, getChatStorageDirUri as getPersistedChatStorageDirUri, getChatStorageUri as getPersistedChatStorageUri, getWorkspaceSettingsDirUri as getPersistedWorkspaceSettingsDirUri, getWorkspaceSettingsUri as getPersistedWorkspaceSettingsUri, normalizePersistedChatSession as normalizeRestoredChatSession, normalizeStoredSettings as normalizePersistedSettings, restorePersistedChats as restorePersistedChatState, serializeChatState as serializePersistedChatState } from './providerPersistenceUtils';
@@ -100,6 +101,19 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   private persistChatsTimeout?: NodeJS.Timeout;
   private lastPersistedChatState = '';
   private readonly launchedTerminals: vscode.Terminal[] = [];
+
+  /** Lazy ManulEngine HTTP bridge — created on first use. */
+  private _manulBridge?: ManulBridge;
+  private get manulBridge(): ManulBridge {
+    if (!this._manulBridge) {
+      this._manulBridge = new ManulBridge({
+        apiBaseUrl: this.getManulEngineBaseUrl(),
+        sessionId: this.extensionContext.globalState.get<string>('manulai.sessionId') ?? 'manulai-default',
+        timeoutMs: 60000
+      });
+    }
+    return this._manulBridge;
+  }
 
   public constructor(private readonly extensionContext: vscode.ExtensionContext) {
     this.createChatSession();
@@ -404,6 +418,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   }
 
   public async handleConfigurationChange(): Promise<void> {
+    this._manulBridge = undefined; // reset so bridge picks up new URL on next use
     await this.initializeSettingsState();
   }
 
@@ -601,6 +616,11 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   private getOllamaBaseUrl(): string {
     const raw = this.getStringSetting('ollamaBaseUrl', DEFAULT_STORED_SETTINGS.ollamaBaseUrl).replace(/\/$/, '');
     return ManulAiChatProvider.validateOllamaBaseUrl(raw);
+  }
+
+  private getManulEngineBaseUrl(): string {
+    const raw = this.getStringSetting('manulEngineBaseUrl', DEFAULT_STORED_SETTINGS.manulEngineBaseUrl).replace(/\/$/, '').trim();
+    return raw || DEFAULT_STORED_SETTINGS.manulEngineBaseUrl;
   }
 
   /**
@@ -4055,7 +4075,14 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       'execute_terminal_command',
       'launch_in_terminal',
       'delete_file',
-      'list_workspace_files'
+      'list_workspace_files',
+      'manul_run_step',
+      'manul_run_goal',
+      'manul_scan_page',
+      'manul_read_page_text',
+      'manul_get_state',
+      'manul_save_hunt',
+      'manul_run_hunt'
     ];
 
     if (/^phi4-mini(?:[:]|$)/.test(selectedModel)) {
@@ -4172,7 +4199,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         preferStepwiseExecution: true,
         maxNudgeRetriesCap: 2,
         maxReadOpsWithoutWrite: 2,
-        toolNames: ['read_active_file', 'read_specific_file', 'read_file_slice', 'create_or_edit_file', 'replace_in_file', 'list_workspace_files', 'execute_terminal_command']
+        toolNames: ['read_active_file', 'read_specific_file', 'read_file_slice', 'create_or_edit_file', 'replace_in_file', 'list_workspace_files', 'execute_terminal_command', 'manul_run_step', 'manul_scan_page']
       };
     }
 
@@ -4736,7 +4763,7 @@ ${wsRoot ? `Workspace root: ${wsRoot}\n` : ''}
       }
 
       if (capabilityProfile.useTextTools) {
-        plannerMandate += `\n\n---\n\n[TOOL FORMAT]\n\nThis model must express tool calls in assistant text as JSON. This JSON-in-text format is the required tool-call mechanism here and overrides any earlier rule about not printing JSON.\n\nOutput tool calls as a single JSON object on its own line:\n{"tool": "tool_name", "args": {"param": "value"}}\n\nAvailable tools:\n- create_or_edit_file(filename, content) — Create or overwrite a file\n- replace_in_file(filepath, old_text, new_text) — Replace text in existing file\n- read_specific_file(filepath) — Read full file contents\n- read_file_slice(filepath, startLine, endLine) — Read a line range from a file\n- list_workspace_files(directory) — List files/folders in a directory\n- execute_terminal_command(command) — Run a shell command (no stdin)\n- launch_in_terminal(command) — Open integrated terminal for interactive commands\n- delete_file(filepath) — Delete a file\n- read_active_file() — Read the currently open file\n- project_scan() — Get a recursive tree of the entire workspace\n\nOutput ONE tool call JSON per response. No prose before the JSON. Do not wrap the JSON in markdown fences.`;
+        plannerMandate += `\n\n---\n\n[TOOL FORMAT]\n\nThis model must express tool calls in assistant text as JSON. This JSON-in-text format is the required tool-call mechanism here and overrides any earlier rule about not printing JSON.\n\nOutput tool calls as a single JSON object on its own line:\n{"tool": "tool_name", "args": {"param": "value"}}\n\nAvailable tools:\n- create_or_edit_file(filename, content) — Create or overwrite a file\n- replace_in_file(filepath, old_text, new_text) — Replace text in existing file\n- read_specific_file(filepath) — Read full file contents\n- read_file_slice(filepath, startLine, endLine) — Read a line range from a file\n- list_workspace_files(directory) — List files/folders in a directory\n- execute_terminal_command(command) — Run a shell command (no stdin)\n- launch_in_terminal(command) — Open integrated terminal for interactive commands\n- delete_file(filepath) — Delete a file\n- read_active_file() — Read the currently open file\n- project_scan() — Get a recursive tree of the entire workspace\n- manul_run_step(step) — Run one browser automation step (DSL or natural language)\n- manul_run_goal(goal, title?, context?) — Run multi-step browser automation goal\n- manul_scan_page() — Scan page for interactive elements after navigation\n- manul_read_page_text() — Read all visible text from the current browser page\n- manul_get_state() — Get ManulEngine browser session state\n- manul_save_hunt(path, content) — Save a .hunt automation file to disk\n- manul_run_hunt(dsl) — Execute a full .hunt DSL document\n\nOutput ONE tool call JSON per response. No prose before the JSON. Do not wrap the JSON in markdown fences.`;
       }
 
       if (capabilityProfile.includeWorkspaceNotes) {
@@ -4756,7 +4783,7 @@ ${wsRoot ? `Workspace root: ${wsRoot}\n` : ''}
       });
     } else {
     let agentMandate = capabilityProfile.useCompactMandate ? `[IDENTITY]
-  You are ManulAI, a local VS Code coding agent.
+  You are ManulAI, a local VS Code coding agent with browser automation via ManulEngine.
   ${wsRoot ? `Workspace root: ${wsRoot}\n` : ''}
 
   [RULES]
@@ -4764,11 +4791,12 @@ ${wsRoot ? `Workspace root: ${wsRoot}\n` : ''}
   - Prefer exactly ONE tool call per response.
   - Read before edit. Prefer read_file_slice for large files.
   - Use replace_in_file for small edits and create_or_edit_file for new files.
+  - For browser tasks: use manul_run_step for single steps, manul_run_goal for multi-step flows.
   - Do not narrate tool calls. Do not print JSON as text.
   - If a tool fails, adapt once and continue.
   - Finish with one short summary when the task is done.
   ` : `[IDENTITY]
-You are ManulAI, a local VS Code coding agent.
+You are ManulAI, a local VS Code coding agent with browser automation via ManulEngine.
 ${wsRoot ? `Workspace root: ${wsRoot}\n` : ''}
 All file paths are relative to the workspace root unless absolute.
 
@@ -4785,8 +4813,12 @@ You are an ACTION agent. Execute tasks using tools. Never describe what you inte
 1. File or code modification needed → use file tools
 2. Command execution needed → use execute_terminal_command (no stdin — never run interactive programs)
    For interactive programs (games, REPLs, scripts with user input) → use launch_in_terminal
-3. Code understanding required → read files first with read_file_slice
-4. No tools required → respond concisely
+3. Browser or web automation needed → use manul_* tools (ManulEngine integration)
+   Start with: manul_run_step for single DSL steps, manul_run_goal for multi-step flows
+   Always call manul_scan_page after NAVIGATE to discover element identifiers
+   Always VERIFY state with a VERIFY step after any action that changes state
+4. Code understanding required → read files first with read_file_slice
+5. No tools required → respond concisely
 
 ---
 
@@ -4907,7 +4939,7 @@ If steps remain → continue with the next tool call.
       }
 
       if (capabilityProfile.useTextTools) {
-        agentMandate += `\n\n---\n\n[TOOL FORMAT]\n\nOutput tool calls as a single JSON object on its own line:\n{"tool": "tool_name", "args": {"param": "value"}}\n\nAvailable tools:\n- create_or_edit_file(filename, content) — Create or overwrite a file\n- replace_in_file(filepath, old_text, new_text) — Replace text in existing file\n- read_specific_file(filepath) — Read full file contents\n- read_file_slice(filepath, startLine, endLine) — Read a line range from a file\n- list_workspace_files(directory) — List files/folders in a directory\n- execute_terminal_command(command) — Run a shell command (no stdin)\n- launch_in_terminal(command) — Open integrated terminal for interactive commands\n- delete_file(filepath) — Delete a file\n- read_active_file() — Read the currently open file\n- project_scan() — Get a recursive tree of the entire workspace\n\nOutput ONE tool call JSON per response. No prose before the JSON.`;
+        agentMandate += `\n\n---\n\n[TOOL FORMAT]\n\nOutput tool calls as a single JSON object on its own line:\n{"tool": "tool_name", "args": {"param": "value"}}\n\nAvailable tools:\n- create_or_edit_file(filename, content) — Create or overwrite a file\n- replace_in_file(filepath, old_text, new_text) — Replace text in existing file\n- read_specific_file(filepath) — Read full file contents\n- read_file_slice(filepath, startLine, endLine) — Read a line range from a file\n- list_workspace_files(directory) — List files/folders in a directory\n- execute_terminal_command(command) — Run a shell command (no stdin)\n- launch_in_terminal(command) — Open integrated terminal for interactive commands\n- delete_file(filepath) — Delete a file\n- read_active_file() — Read the currently open file\n- project_scan() — Get a recursive tree of the entire workspace\n- manul_run_step(step) — Run one browser automation step (DSL or natural language)\n- manul_run_goal(goal, title?, context?) — Run multi-step browser automation goal\n- manul_scan_page() — Scan page for interactive elements after navigation\n- manul_read_page_text() — Read all visible text from the current browser page\n- manul_get_state() — Get ManulEngine browser session state\n- manul_save_hunt(path, content) — Save a .hunt automation file to disk\n- manul_run_hunt(dsl) — Execute a full .hunt DSL document\n\nOutput ONE tool call JSON per response. No prose before the JSON.`;
       }
 
       if (recentChatSummaries) {
@@ -5642,6 +5674,126 @@ If the user asks for a change but provides NO code:
             additionalProperties: false
           }
         }
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'manul_run_step',
+          description: 'Run a single Manul DSL step in the live browser session (opened automatically on first call). Use for one-step browser actions such as NAVIGATE, Click, Fill, VERIFY, etc. Accepts raw DSL or natural-language input. Always VERIFY state after actions that change it.',
+          parameters: {
+            type: 'object',
+            properties: {
+              step: {
+                type: 'string',
+                description: 'A single Manul DSL step or natural-language action. E.g. "NAVIGATE to https://example.com" or "Click the Login button".'
+              }
+            },
+            required: ['step'],
+            additionalProperties: false
+          }
+        }
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'manul_run_goal',
+          description: 'Convert a natural-language automation goal into Manul DSL steps and execute them all in the live browser session. Returns a ready-to-save .hunt file proposal. Use for multi-step browser flows.',
+          parameters: {
+            type: 'object',
+            properties: {
+              goal: {
+                type: 'string',
+                description: 'Natural-language automation goal, e.g. "Navigate to Amazon and search for MacBook Pro".'
+              },
+              title: {
+                type: 'string',
+                description: 'Optional short title for the generated .hunt file.'
+              },
+              context: {
+                type: 'string',
+                description: 'Optional strategic context to embed as @context: in the .hunt file.'
+              }
+            },
+            required: ['goal'],
+            additionalProperties: false
+          }
+        }
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'manul_scan_page',
+          description: 'Scan the currently open browser page and return all interactive elements (inputs, buttons, selects, checkboxes, links). Call after NAVIGATE or state-changing clicks to discover exact element identifiers before the next step.',
+          parameters: {
+            type: 'object',
+            properties: {},
+            additionalProperties: false
+          }
+        }
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'manul_read_page_text',
+          description: 'Return all visible text content from the currently open browser page. Use to read prices, labels, headings, or static text not returned by manul_scan_page.',
+          parameters: {
+            type: 'object',
+            properties: {},
+            additionalProperties: false
+          }
+        }
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'manul_get_state',
+          description: 'Return the current ManulEngine runner state: whether the browser is open, number of executed steps, last error, and accumulated .hunt file proposal.',
+          parameters: {
+            type: 'object',
+            properties: {},
+            additionalProperties: false
+          }
+        }
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'manul_save_hunt',
+          description: 'Save a .hunt automation file to disk. Call after manul_run_goal returns a hunt_proposal. Path must end in .hunt and should be under tests/.',
+          parameters: {
+            type: 'object',
+            properties: {
+              path: {
+                type: 'string',
+                description: 'Workspace-relative or absolute path to write, e.g. "tests/my_flow.hunt".'
+              },
+              content: {
+                type: 'string',
+                description: 'Full .hunt file content to write.'
+              }
+            },
+            required: ['path', 'content'],
+            additionalProperties: false
+          }
+        }
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'manul_run_hunt',
+          description: 'Validate and run a full .hunt DSL document in the live browser session.',
+          parameters: {
+            type: 'object',
+            properties: {
+              dsl: {
+                type: 'string',
+                description: 'Full .hunt file content to execute.'
+              }
+            },
+            required: ['dsl'],
+            additionalProperties: false
+          }
+        }
       }
     ];
   }
@@ -5812,6 +5964,24 @@ If the user asks for a change but provides NO code:
         case 'write_workspace_notes':
           this.workspaceSnapshotCache = null; // notes changed — invalidate structure cache too
           return await this.writeWorkspaceNotes(String(args.content ?? ''), String(args.mode ?? 'append'));
+        case 'manul_run_step':
+          return await this.manulRunStep(String(args.step ?? ''));
+        case 'manul_run_goal':
+          return await this.manulRunGoal(
+            String(args.goal ?? ''),
+            typeof args.title === 'string' ? args.title : undefined,
+            typeof args.context === 'string' ? args.context : undefined
+          );
+        case 'manul_scan_page':
+          return await this.manulScanPage();
+        case 'manul_read_page_text':
+          return await this.manulReadPageText();
+        case 'manul_get_state':
+          return await this.manulGetState();
+        case 'manul_save_hunt':
+          return await this.manulSaveHunt(String(args.path ?? ''), String(args.content ?? ''));
+        case 'manul_run_hunt':
+          return await this.manulRunHunt(String(args.dsl ?? ''));
         default:
           return JSON.stringify({ error: `Unknown tool: ${name}` });
       }
@@ -6609,6 +6779,96 @@ If the user asks for a change but provides NO code:
     } catch (error) {
       return JSON.stringify({ error: error instanceof Error ? error.message : 'Failed to write notes.' });
     }
+  }
+
+  // ── ManulEngine browser automation tools ─────────────────────────────────
+
+  private async manulRunStep(step: string): Promise<string> {
+    if (!step.trim()) {
+      return JSON.stringify({ error: 'step is required.' });
+    }
+    const result = await this.manulBridge.runStep(step);
+    return JSON.stringify(result.ok ? result.data : { error: result.error, status: result.status });
+  }
+
+  private async manulRunGoal(goal: string, title?: string, context?: string): Promise<string> {
+    if (!goal.trim()) {
+      return JSON.stringify({ error: 'goal is required.' });
+    }
+    // Reset hunt proposal accumulator for this goal invocation
+    await this.manulBridge.reset(context ?? goal, title ?? goal);
+    // Split goal on newlines/periods and run as steps
+    const steps = goal
+      .split(/\n|(?<=\w)\.\s+|(?:,\s*)?(?:and\s+then|then)\s+/gi)
+      .map(s => s.trim())
+      .filter(s => s.length > 0);
+    const result = steps.length > 0
+      ? await this.manulBridge.runSteps(steps, context, title)
+      : await this.manulBridge.runStep(goal);
+    return JSON.stringify(result.ok ? result.data : { error: result.error, status: result.status });
+  }
+
+  private async manulScanPage(): Promise<string> {
+    const result = await this.manulBridge.scanPage();
+    return JSON.stringify(result.ok ? result.data : { error: result.error, status: result.status });
+  }
+
+  private async manulReadPageText(): Promise<string> {
+    const result = await this.manulBridge.readPageText();
+    return JSON.stringify(result.ok ? result.data : { error: result.error, status: result.status });
+  }
+
+  private async manulGetState(): Promise<string> {
+    const result = await this.manulBridge.getState();
+    return JSON.stringify(result.ok ? result.data : { error: result.error, status: result.status });
+  }
+
+  private async manulSaveHunt(huntPath: string, content: string): Promise<string> {
+    if (!huntPath.trim()) {
+      return JSON.stringify({ error: 'path is required.' });
+    }
+    if (!content.trim()) {
+      return JSON.stringify({ error: 'content is required.' });
+    }
+    // Resolve to absolute path inside workspace
+    const wsRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    let resolvedPath = huntPath;
+    if (wsRoot && !path.isAbsolute(huntPath)) {
+      resolvedPath = path.join(wsRoot, huntPath);
+    }
+    if (!resolvedPath.endsWith('.hunt')) {
+      return JSON.stringify({ error: 'path must end in .hunt' });
+    }
+    const result = await this.manulBridge.saveHunt(resolvedPath, content);
+    if (!result.ok) {
+      // Fallback: write locally via VS Code FS so hunt files can be saved even
+      // when the ManulEngine backend is not running.
+      try {
+        const uri = vscode.Uri.file(resolvedPath);
+        await vscode.workspace.fs.createDirectory(vscode.Uri.file(path.dirname(resolvedPath)));
+        await vscode.workspace.fs.writeFile(uri, Buffer.from(content, 'utf8'));
+        return JSON.stringify({ success: true, path: resolvedPath, note: 'Saved locally (ManulEngine not reachable).' });
+      } catch (fsErr) {
+        return JSON.stringify({ error: result.error, fsError: fsErr instanceof Error ? fsErr.message : String(fsErr) });
+      }
+    }
+    return JSON.stringify(result.ok ? result.data : { error: result.error, status: result.status });
+  }
+
+  private async manulRunHunt(dsl: string): Promise<string> {
+    if (!dsl.trim()) {
+      return JSON.stringify({ error: 'dsl is required.' });
+    }
+    // Extract runnable lines (non-metadata, non-comment, non-empty) and run as steps
+    const runnableLines = dsl
+      .split(/\r?\n/)
+      .map(l => l.trim())
+      .filter(l => l.length > 0 && !l.startsWith('#') && !l.startsWith('@') && !l.startsWith('DONE') && !/^STEP\s+\d+:/i.test(l));
+    if (runnableLines.length === 0) {
+      return JSON.stringify({ error: 'No runnable steps found in DSL.' });
+    }
+    const result = await this.manulBridge.runSteps(runnableLines);
+    return JSON.stringify(result.ok ? result.data : { error: result.error, status: result.status });
   }
 
   private async projectScan(): Promise<string> {
@@ -8828,6 +9088,20 @@ If the user asks for a change but provides NO code:
         return `Running ${String(args.command ?? '').trim() || 'terminal command'}`;
       case 'launch_in_terminal':
         return `Launching in terminal: ${String(args.command ?? '').trim() || 'interactive program'}`;
+      case 'manul_run_step':
+        return `Browser: ${String(args.step ?? '').trim() || 'running step'}`;
+      case 'manul_run_goal':
+        return `Browser automation: ${String(args.goal ?? '').trim() || 'running goal'}`;
+      case 'manul_scan_page':
+        return 'Scanning browser page elements';
+      case 'manul_read_page_text':
+        return 'Reading browser page text';
+      case 'manul_get_state':
+        return 'Checking ManulEngine state';
+      case 'manul_save_hunt':
+        return `Saving hunt file: ${String(args.path ?? '').trim() || 'unknown path'}`;
+      case 'manul_run_hunt':
+        return 'Running .hunt automation file';
       default:
         return `Executing ${toolName}`;
     }
