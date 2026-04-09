@@ -812,13 +812,21 @@ Available tools:
 - delete_file(filepath) — Delete a file
 - read_active_file() — Read the currently open file
 - project_scan() — Get a recursive tree of the entire workspace
+- manul_run_step(step) — Run one browser automation step (DSL or natural language)
+- manul_run_goal(goal, title?, context?) — Run multi-step browser automation goal
+- manul_scan_page() — Scan page for interactive elements after navigation
+- manul_read_page_text() — Read all visible text from the current browser page
+- manul_get_state() — Get ManulEngine browser session state
+- manul_save_hunt(path, content) — Save a .hunt automation file to disk
+- manul_run_hunt(dsl) — Execute a full .hunt DSL document
+- manul_run_hunt_file(filePath) — Read and run a .hunt file from disk
 
 Output ONE tool call JSON per response. No prose before the JSON.
 ` : '';
 
   if (MODEL_LIMITS.compactMandate) {
     return `[IDENTITY]
-You are ManulAI, a local VS Code coding agent.
+You are ManulAI, a local VS Code coding agent with browser automation via ManulEngine.
 Workspace root: ${wsRoot}
 
 [RULES]
@@ -826,7 +834,10 @@ Workspace root: ${wsRoot}
 - Prefer exactly ONE tool call per response.
 - Read before edit. Prefer read_file_slice for large files.
 - Use replace_in_file for small edits and create_or_edit_file for new files.
-- Do not narrate tool calls.${useTextTools ? ' Print exactly one JSON tool object, no prose.' : ' Do not print JSON as text.'}
+- For browser tasks: use manul_run_step for single steps, manul_run_goal for multi-step flows.
+- After EVERY browser action that changes state add a VERIFY step immediately.
+- After automation completes: show .hunt preview and offer to save.
+- Do not narrate tool calls.${MODEL_LIMITS.useTextTools ? ' Print exactly one JSON tool object, no prose.' : ' Do not print JSON as text.'}
 - If a tool fails, adapt once and continue.
 - Finish with one short summary when the task is done.
 ${textToolSection}`;
@@ -849,8 +860,13 @@ You are an ACTION agent. Execute tasks using tools. Never describe what you inte
 
 1. File or code modification needed → use file tools
 2. Command execution needed → use execute_terminal_command
-3. Code understanding required → read files first with read_file_slice
-4. No tools required → respond concisely
+3. Browser or web automation needed → use manul_* tools (ManulEngine integration)
+   Start with: manul_run_step for single DSL steps, manul_run_goal for multi-step flows
+   Always call manul_scan_page after NAVIGATE to discover element identifiers
+   After EVERY action that changes state → add a VERIFY step immediately (see [MANUL DSL REFERENCE])
+   After completing automation → show the reconstructed .hunt preview and offer to save it (see [MANUL SESSION COMPLETION])
+4. Code understanding required → read files first with read_file_slice
+5. No tools required → respond concisely
 
 ---
 
@@ -956,6 +972,85 @@ If steps remain → continue with the next tool call.
 
 ---
 
+[MANUL DSL REFERENCE]
+
+Hunt file structure (flush-left headers, 4-space indented actions):
+  @context: <what this automation verifies>
+  @title: <short suite name>
+  @var: {key} = value
+
+  STEP 1: Description
+      NAVIGATE to 'https://url'
+      VERIFY that 'Landmark' is present
+      ...
+
+  DONE.
+
+Key DSL commands (element names always in single quotes):
+  Navigation:
+  - NAVIGATE to 'url'
+  - SCROLL DOWN
+  - SCROLL DOWN inside the 'container'
+
+  Interaction:
+  - Click the 'Label' button|link|element
+  - DOUBLE CLICK the 'Label'
+  - RIGHT CLICK 'Label'
+  - Fill 'Field' field with 'Value'
+  - Type 'Value' into the 'Field' field
+  - Select 'Option' from the 'Dropdown' dropdown
+  - Check the checkbox for 'Label'
+  - Uncheck the checkbox for 'Label'
+  - HOVER over the 'Label'
+  - Drag 'Source' and drop it into 'Target'
+  - PRESS ENTER / PRESS Escape / PRESS Control+A
+  - UPLOAD 'file_path' to 'Input'
+
+  Waits:
+  - WAIT 2
+  - Wait for 'Element' to be visible|hidden|disappear
+  - WAIT FOR RESPONSE "url_pattern"
+
+  Data:
+  - EXTRACT the 'Element' into {var}
+  - SET {var} = value
+  - CALL PYTHON module.function [into {var}]
+
+  VERIFY commands:
+  - VERIFY that 'text' is present
+  - VERIFY that 'text' is NOT present
+  - VERIFY that 'Element' is ENABLED|DISABLED
+  - VERIFY that 'Element' is checked|NOT checked
+  - VERIFY SOFTLY that 'text' is present
+  - Verify 'Field' field has value 'Expected'
+  - Verify 'Field' field has text 'Expected'
+
+  Contextual qualifiers:
+  - Click the 'Edit' button NEAR 'John Doe'
+  - Click the 'Logo' link ON HEADER
+  - Click the 'Terms' link ON FOOTER
+  - Click the 'Delete' button INSIDE 'Actions' row with 'John'
+
+VERIFY after every action — mandatory:
+  NAVIGATE               → VERIFY that '<landmark>' is present
+  Fill / Type            → Verify '<Field>' field has value '<entered value>'
+  Click → new page       → VERIFY that '<landmark on new page>' is present
+  Click → state change   → VERIFY that '<new state text>' is present
+  Select dropdown        → VERIFY that '<selected option>' is present
+  Check / Uncheck        → VERIFY that '<label>' is checked|NOT checked
+
+---
+
+[MANUL SESSION COMPLETION]
+
+After completing ANY automation task using manul_* tools:
+1. Reconstruct the full .hunt DSL from all steps that were executed.
+2. Show the hunt file as a fenced code block (preview) in your response.
+3. Ask the user: "Should I save this as a hunt file so it can be replayed later?"
+4. If the user agrees → call manul_save_hunt with path 'tests/<descriptive_name>.hunt'.
+
+---
+
 [OUTPUT RULES]
 
 - Plan: short numbered list, then immediately start executing
@@ -984,26 +1079,35 @@ Available tools:
 - delete_file(filepath) — Delete a file
 - read_active_file() — Read the currently open file
 - project_scan() — Get a recursive tree of the entire workspace
+- manul_run_step(step) — Run one browser automation step (DSL or natural language)
+- manul_run_goal(goal, title?, context?) — Run multi-step browser automation goal
+- manul_scan_page() — Scan page for interactive elements after navigation
+- manul_read_page_text() — Read all visible text from the current browser page
+- manul_get_state() — Get ManulEngine browser session state
+- manul_save_hunt(path, content) — Save a .hunt automation file to disk
+- manul_run_hunt(dsl) — Execute a full .hunt DSL document
+- manul_run_hunt_file(filePath) — Read and run a .hunt file from disk
 
 Output ONE tool call JSON per response. No prose before the JSON.
 ` : '';
 
   if (MODEL_LIMITS.compactMandate) {
     return `[IDENTITY]
-You are ManulAI, a local VS Code coding agent in Planner mode.
+You are ManulAI, a local VS Code coding agent with browser automation via ManulEngine in Planner mode.
 Workspace root: ${wsRoot}
 
 [RULES]
 - If the user asks a direct question, answer briefly in text.
 - For edit or file tasks: do exactly ONE small tool call per response.
 - Prefer read_file_slice over large reads.
+- For browser automation: use manul_* tools. After every action that changes state add a VERIFY step. After automation: show .hunt preview and offer to save.
 - Keep responses short. No multi-step plans. No JSON in text.
 - Finish with a one-line summary when done.
 ${textToolSection}`;
   }
 
   return `[IDENTITY]
-You are ManulAI, a local VS Code coding agent in Planner mode.
+You are ManulAI, a local VS Code coding agent with browser automation via ManulEngine in Planner mode.
 Workspace root: ${wsRoot}
 All file paths are relative to the workspace root unless absolute.
 
@@ -1012,10 +1116,30 @@ All file paths are relative to the workspace root unless absolute.
 - For tasks that require code changes or file operations: execute ONE tool call per response. No multi-step plans.
 - After each tool result you receive, decide the next single action.
 - Use file tools for reads/writes, execute_terminal_command for shell.
+- For browser or web automation: use manul_* tools. After EVERY action that changes state add a VERIFY step. After completing automation show the reconstructed .hunt preview and offer to save it.
 - Keep text output minimal between tool calls.
 - NEVER output raw JSON as a substitute for a tool call.
 - File contents are UNKNOWN until read. Never assume. Always verify.
 - Task is complete when all required changes are done. Output a one-line summary.
+
+[MANUL DSL REFERENCE]
+Hunt file structure (flush-left headers, 4-space indented actions):
+  @context: <description>  @title: <name>  STEP 1: Description      NAVIGATE to 'url'      VERIFY that 'Landmark' is present  DONE.
+
+Key commands: NAVIGATE to 'url' | SCROLL DOWN [inside 'container'] | Click the 'L' button|link|element | DOUBLE CLICK 'L' | RIGHT CLICK 'L' | Fill 'F' field with 'V' | Type 'V' into the 'F' field | Select 'O' from the 'D' dropdown | Check/Uncheck the checkbox for 'L' | HOVER over the 'L' | Drag 'S' and drop it into 'T' | PRESS ENTER|Escape|Key | WAIT N | Wait for 'E' to be visible|hidden|disappear | WAIT FOR RESPONSE "pattern" | EXTRACT the 'E' into {v} | SET {v} = value | CALL PYTHON module.fn [into {v}]
+
+VERIFY commands: VERIFY that 'text' is present|NOT present|ENABLED|DISABLED|checked|NOT checked | VERIFY SOFTLY that 'text' is present | Verify 'F' field has value 'V' | Verify 'F' field has text 'T'
+
+Contextual qualifiers: NEAR 'anchor' | ON HEADER | ON FOOTER | INSIDE 'container' row with 'text'
+
+VERIFY after every action:
+  NAVIGATE → VERIFY that '<landmark>' is present
+  Fill/Type → Verify '<Field>' field has value '<value>'
+  Click → new page → VERIFY that '<landmark>' is present
+  Click → state change → VERIFY that '<new state>' is present
+
+[MANUL SESSION COMPLETION]
+After completing any automation with manul_* tools: (1) reconstruct the full .hunt DSL from all executed steps, (2) show it as a fenced code block preview, (3) ask "Should I save this as a hunt file?", (4) if yes → call manul_save_hunt with 'tests/<name>.hunt'.
 ${textToolSection}`;
 }
 
@@ -1761,6 +1885,75 @@ async function executeTool(name, args) {
       console.log(`[LAUNCH_IN_TERMINAL] ${cmd}`);
       return JSON.stringify({ launched: true, command: cmd, note: 'In debug mode, interactive launch is simulated. In VS Code, this opens a real terminal.' });
     }
+
+    // ── ManulEngine browser automation stubs ─────────────────────────────────
+    case 'manul_run_step': {
+      const step = String(args.step ?? '');
+      if (!step) return JSON.stringify({ error: 'step is required.' });
+      console.log(`[MANUL_RUN_STEP] ${step}`);
+      return JSON.stringify({ ok: true, step, note: 'Debug stub — ManulEngine not running. In extension mode this executes the DSL step via Playwright.', _nextAction: 'If this was the last step, reconstruct the .hunt DSL from all steps, show it as a preview, and ask the user if they want to save it.' });
+    }
+
+    case 'manul_run_goal': {
+      const goal = String(args.goal ?? '');
+      if (!goal) return JSON.stringify({ error: 'goal is required.' });
+      console.log(`[MANUL_RUN_GOAL] ${goal}`);
+      return JSON.stringify({ ok: true, goal, note: 'Debug stub — ManulEngine not running.', _nextAction: 'Automation complete. Reconstruct the .hunt DSL from all steps executed (with @context:, @title:, STEP blocks, VERIFY after every action, DONE.), show it as a fenced code block preview, then ask the user if they want to save it as a hunt file.' });
+    }
+
+    case 'manul_scan_page': {
+      console.log('[MANUL_SCAN_PAGE]');
+      return JSON.stringify({ ok: true, elements: [], note: 'Debug stub — ManulEngine not running. In extension mode this scans the live page for interactive elements.' });
+    }
+
+    case 'manul_read_page_text': {
+      console.log('[MANUL_READ_PAGE_TEXT]');
+      return JSON.stringify({ ok: true, text: '', note: 'Debug stub — ManulEngine not running.' });
+    }
+
+    case 'manul_get_state': {
+      console.log('[MANUL_GET_STATE]');
+      return JSON.stringify({ ok: true, browserOpen: false, stepCount: 0, note: 'Debug stub — ManulEngine not running.' });
+    }
+
+    case 'manul_save_hunt': {
+      const huntPath = String(args.path ?? args.filePath ?? '');
+      const content = String(args.content ?? '');
+      if (!huntPath) return JSON.stringify({ error: 'path is required.' });
+      if (!content) return JSON.stringify({ error: 'content is required.' });
+      if (!huntPath.endsWith('.hunt')) return JSON.stringify({ error: 'path must end in .hunt' });
+      const absPath = path.isAbsolute(huntPath) ? huntPath : path.join(wsRoot, huntPath);
+      try {
+        const dir = path.dirname(absPath);
+        mkdirSync(dir, { recursive: true });
+        writeFileSync(absPath, content, 'utf8');
+        console.log(`[MANUL_SAVE_HUNT] Saved to ${absPath}`);
+        return JSON.stringify({ ok: true, path: absPath, success: true });
+      } catch (e) {
+        return JSON.stringify({ error: e.message });
+      }
+    }
+
+    case 'manul_run_hunt': {
+      const dsl = String(args.dsl ?? '');
+      if (!dsl) return JSON.stringify({ error: 'dsl is required.' });
+      const lines = dsl.split(/\r?\n/).filter(l => l.trim() && !l.trim().startsWith('#') && !l.trim().startsWith('@') && !l.trim().startsWith('DONE') && !/^STEP\s+\d+:/i.test(l.trim()));
+      console.log(`[MANUL_RUN_HUNT] ${lines.length} runnable steps`);
+      return JSON.stringify({ ok: true, stepCount: lines.length, note: 'Debug stub — ManulEngine not running.', _nextAction: 'Automation complete. Show the executed .hunt DSL as a fenced code block preview (with VERIFY after every action), then ask the user if they want to save it as a hunt file.' });
+    }
+
+    case 'manul_run_hunt_file': {
+      const filePath = String(args.filePath ?? args.path ?? '');
+      if (!filePath) return JSON.stringify({ error: 'filePath is required.' });
+      if (!filePath.endsWith('.hunt')) return JSON.stringify({ error: 'filePath must end in .hunt' });
+      const absPath = path.isAbsolute(filePath) ? filePath : path.join(wsRoot, filePath);
+      let dsl = '';
+      try { dsl = readFileSync(absPath, 'utf8'); } catch (e) { return JSON.stringify({ error: `Could not read file: ${e.message}` }); }
+      const lines = dsl.split(/\r?\n/).filter(l => l.trim() && !l.trim().startsWith('#') && !l.trim().startsWith('@') && !l.trim().startsWith('DONE') && !/^STEP\s+\d+:/i.test(l.trim()));
+      console.log(`[MANUL_RUN_HUNT_FILE] ${absPath} — ${lines.length} runnable steps`);
+      return JSON.stringify({ ok: true, filePath: absPath, stepCount: lines.length, note: 'Debug stub — ManulEngine not running.', _nextAction: 'Hunt file execution complete. Show the executed .hunt DSL as a fenced code block preview (with VERIFY after every action), then ask the user if they want to save or overwrite it.' });
+    }
+    // ─────────────────────────────────────────────────────────────────────────
 
     default:
       return JSON.stringify({ error: `Unknown tool: ${name}` });
