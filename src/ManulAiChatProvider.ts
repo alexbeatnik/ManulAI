@@ -134,6 +134,13 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       this.autoApprove = Boolean(config.get('autoApprove', DEFAULT_STORED_SETTINGS.autoApprove));
       this.debugMode = Boolean(config.get('debugMode', DEFAULT_STORED_SETTINGS.debugMode));
     }
+
+    this.extensionContext.subscriptions.push({
+      dispose: () => {
+        this._manulBridge?.dispose();
+        this._manulBridge = undefined;
+      },
+    });
   }
 
   private get activeChat(): ChatSession {
@@ -7008,8 +7015,13 @@ If the user asks for a change but provides NO code:
         _nextAction: 'Do not save yet. Show the provided hunt_proposal in chat and ask the user whether it should be saved as a .hunt file.'
       });
     }
-    // Resolve to absolute path inside the workspace root (or current process cwd when no file-backed workspace exists).
-    const wsRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd();
+    const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
+    if (!workspaceFolder) {
+      return JSON.stringify({ error: 'manul_save_hunt requires an open workspace folder.' });
+    }
+
+    // Resolve to an absolute path inside the first workspace folder.
+    const wsRoot = workspaceFolder.uri.fsPath;
     let resolvedPath = huntPath;
     if (!path.isAbsolute(huntPath)) {
       resolvedPath = path.join(wsRoot, huntPath);

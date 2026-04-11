@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Manul MCP Python Runner
-========================
+ManulAI Python Subprocess Bridge
+================================
 Persistent subprocess that holds an open ManulSession (browser stays alive
-across tool calls).  Speaks a JSON-line protocol over stdin/stdout so the
-Node.js MCP bridge can send commands and receive results without any HTTP server.
+across tool calls). Speaks a JSON-line protocol over stdin/stdout so the
+parent ManulAI process can send commands and receive results without any HTTP server.
 
 Protocol
 --------
@@ -256,14 +256,13 @@ class ManulRunner:
 
         failed = False
         failure_error: str | None = None
-        for i, step in enumerate(steps):
-            is_last = i == len(steps) - 1
+        for step in steps:
             _log(f"Step: {step}")
             try:
                 result = await self._session.run_steps(step)  # type: ignore[union-attr]
                 status = getattr(result, "status", "pass")
-                # Only scan page on the last step or on failure to reduce overhead
-                page_scan = await self._scan_current_page() if (is_last or status != "pass") else []
+                # Capture page state after every step so VERIFY inference has enough context.
+                page_scan = await self._scan_current_page()
                 if status == "pass":
                     newly_succeeded.append(step)
                     results.append({"step": step, "status": "pass", "page_scan": page_scan})

@@ -105,6 +105,11 @@ export class ManulBridge {
       }
     });
 
+    this.proc.stderr?.on('data', (chunk: Buffer) => {
+      // Drain stderr so the Python subprocess cannot block on a full pipe.
+      void chunk.toString();
+    });
+
     this.proc.on('error', (error) => {
       const message = error instanceof Error ? error.message : String(error);
       this.resolvePendingRequests(`ManulEngine subprocess error: ${message}`);
@@ -230,22 +235,22 @@ export class ManulBridge {
  * Resolves the best Python executable that has manul-engine installed.
  *
  * Priority:
- *   1. Workspace virtualenv / .venv
- *   2. pipx manul-engine virtualenv
- *   3. System Python launcher fallback
+ *   1. pipx manul-engine virtualenv
+ *   2. System Python launcher fallback
+ *   3. Workspace virtualenv / .venv (last resort)
  */
 export function resolveManulPython(workspaceRoot: string): string {
   const candidates = process.platform === 'win32'
     ? [
-      path.join(workspaceRoot, '.venv', 'Scripts', 'python.exe'),
-      path.join(workspaceRoot, 'venv', 'Scripts', 'python.exe'),
       path.join(os.homedir(), 'AppData', 'Local', 'pipx', 'venvs', 'manul-engine', 'Scripts', 'python.exe'),
       path.join(os.homedir(), '.local', 'pipx', 'venvs', 'manul-engine', 'Scripts', 'python.exe'),
+      path.join(workspaceRoot, '.venv', 'Scripts', 'python.exe'),
+      path.join(workspaceRoot, 'venv', 'Scripts', 'python.exe'),
     ]
     : [
+      path.join(os.homedir(), '.local', 'share', 'pipx', 'venvs', 'manul-engine', 'bin', 'python3'),
       path.join(workspaceRoot, '.venv', 'bin', 'python3'),
       path.join(workspaceRoot, 'venv', 'bin', 'python3'),
-      path.join(os.homedir(), '.local', 'share', 'pipx', 'venvs', 'manul-engine', 'bin', 'python3'),
     ];
   for (const p of candidates) {
     try {

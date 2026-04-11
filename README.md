@@ -358,10 +358,11 @@ Deployment notes:
 
 Run ManulAI locally, point it at a real workspace, and evaluate it against an actual product task: repo triage, release-readiness scanning, guided documentation support, or safe file editing inside an internal IDE flow.
 
-- Marketplace: `<MARKETPLACE_URL>`
-- GitHub: `<GITHUB_REPO_URL>`
-- Docs: `<DOCS_URL>`
-- Enterprise contact: `<ENTERPRISE_CONTACT>`
+- Marketplace: https://marketplace.visualstudio.com/items?itemName=manul-engine.manulai-local-agent
+- Open VSX: https://open-vsx.org/extension/manul-engine/manulai-local-agent
+- GitHub: https://github.com/manulai/manulai-local-agent
+- Docs: https://github.com/manulai/manulai-local-agent/blob/main/README-dev.md
+- Enterprise integration guidance: https://github.com/manulai/manulai-local-agent/issues
 
 ## What's New
 
