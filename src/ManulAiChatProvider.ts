@@ -4,6 +4,7 @@ import * as path from 'path';
 import * as vscode from 'vscode';
 
 import { ManulBridge, resolveManulPython } from './manulBridge';
+import type { ManulApiResult } from './manulBridge';
 import type { AgentModeValue, AttachedFileContext, ChatSession, ManulAiStoredSettings, OllamaMessage, OllamaResponse, ParsedToolCall, PersistedChatState, ToolDefinition, ToolFunctionCall, WebviewActiveFileState, WebviewChatSummary, WebviewInboundMessage, WebviewPendingApprovalState, WebviewRenderableMessage } from './types';
 import { ChatRole, DEFAULT_STORED_SETTINGS } from './types';
 import { deserializeAttachedFileContext as deserializePersistedAttachedFileContext, deserializeChatMessage as deserializePersistedChatMessage, deserializeChatSession as deserializePersistedChatSession, getChatStorageDirUri as getPersistedChatStorageDirUri, getChatStorageUri as getPersistedChatStorageUri, getWorkspaceSettingsDirUri as getPersistedWorkspaceSettingsDirUri, getWorkspaceSettingsUri as getPersistedWorkspaceSettingsUri, normalizePersistedChatSession as normalizeRestoredChatSession, normalizeStoredSettings as normalizePersistedSettings, restorePersistedChats as restorePersistedChatState, serializeChatState as serializePersistedChatState } from './providerPersistenceUtils';
@@ -6919,13 +6920,20 @@ If the user asks for a change but provides NO code:
 
   // ── ManulEngine browser automation tools ─────────────────────────────────
 
+  private formatManulBridgeFailure(result: ManulApiResult): string {
+    const data = result.data && typeof result.data === 'object' && !Array.isArray(result.data)
+      ? result.data as Record<string, unknown>
+      : undefined;
+    return JSON.stringify({ ...(data ?? {}), error: result.error, status: result.status });
+  }
+
   private async manulRunStep(step: string): Promise<string> {
     if (!step.trim()) {
       return JSON.stringify({ error: 'step is required.' });
     }
     const result = await this.manulBridge.runStep(step);
     if (!result.ok) {
-      return JSON.stringify({ error: result.error, status: result.status });
+      return this.formatManulBridgeFailure(result);
     }
     const verifyStep = this.isManulVerifyStep(step);
     const nextAction = verifyStep
@@ -6957,7 +6965,7 @@ If the user asks for a change but provides NO code:
         : `Automation complete. Reconstruct the .hunt DSL from all steps executed (with @context:, @title:, STEP blocks, VERIFY after every action, DONE.), show it as a fenced code block preview, then ask the user if they want to save it as a hunt file.`;
       return JSON.stringify({ ...data, _nextAction: nextAction });
     }
-    return JSON.stringify({ error: result.error, status: result.status });
+    return this.formatManulBridgeFailure(result);
   }
 
   private async manulScanPage(): Promise<string> {
@@ -6973,7 +6981,7 @@ If the user asks for a change but provides NO code:
   private async manulGetState(): Promise<string> {
     const result = await this.manulBridge.getState();
     if (!result.ok) {
-      return JSON.stringify({ error: result.error, status: result.status });
+      return this.formatManulBridgeFailure(result);
     }
     const data = result.data as Record<string, unknown>;
     const executedSteps = this.readNumericValue(data.executed_steps ?? data.stepCount ?? data.step_count) ?? 0;
@@ -7000,11 +7008,16 @@ If the user asks for a change but provides NO code:
         _nextAction: 'Do not save yet. Show the provided hunt_proposal in chat and ask the user whether it should be saved as a .hunt file.'
       });
     }
-    // Resolve to absolute path inside workspace
-    const wsRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    // Resolve to absolute path inside the workspace root (or current process cwd when no file-backed workspace exists).
+    const wsRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd();
     let resolvedPath = huntPath;
-    if (wsRoot && !path.isAbsolute(huntPath)) {
+    if (!path.isAbsolute(huntPath)) {
       resolvedPath = path.join(wsRoot, huntPath);
+    }
+    const normalizedRoot = path.resolve(wsRoot);
+    const normalizedTarget = path.resolve(resolvedPath);
+    if (normalizedTarget !== normalizedRoot && !normalizedTarget.startsWith(`${normalizedRoot}${path.sep}`)) {
+      return JSON.stringify({ error: `path must stay inside the workspace root (${wsRoot})` });
     }
     if (!resolvedPath.endsWith('.hunt')) {
       return JSON.stringify({ error: 'path must end in .hunt' });
@@ -7048,7 +7061,7 @@ If the user asks for a change but provides NO code:
         : 'Automation complete. Show the executed .hunt DSL as a fenced code block preview (with VERIFY after every action), then ask the user if they want to save it as a hunt file.';
       return JSON.stringify({ ...data, _nextAction: nextAction });
     }
-    return JSON.stringify({ error: result.error, status: result.status });
+    return this.formatManulBridgeFailure(result);
   }
 
   private async manulRunHuntFile(filePath: string): Promise<string> {
@@ -7086,7 +7099,7 @@ If the user asks for a change but provides NO code:
         : 'Hunt file execution complete. Show the executed .hunt DSL as a fenced code block preview (with VERIFY after every action), then ask the user if they want to save or overwrite it.';
       return JSON.stringify({ ...data, filePath, stepCount: runnableLines.length, _nextAction: nextAction });
     }
-    return JSON.stringify({ error: result.error, status: result.status });
+    return this.formatManulBridgeFailure(result);
   }
 
   private extractHuntHeader(dsl: string, directive: string): string | undefined {
@@ -9640,11 +9653,11 @@ If the user asks for a change but provides NO code:
       case 'manul_get_state':
         return 'Checking ManulEngine state';
       case 'manul_save_hunt':
-        return `Saving hunt file: ${String(args.path ?? '').trim() || 'unknown path'}`;
+        return `Saving hunt file: ${String(args.filepath ?? args.path ?? args.filePath ?? '').trim() || 'unknown path'}`;
       case 'manul_run_hunt':
         return 'Running .hunt automation file';
       case 'manul_run_hunt_file':
-        return `Running hunt file: ${String(args.filePath ?? '').trim() || 'unknown path'}`;
+        return `Running hunt file: ${String(args.filepath ?? args.filePath ?? args.path ?? '').trim() || 'unknown path'}`;
       default:
         return `Executing ${toolName}`;
     }

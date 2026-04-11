@@ -21,6 +21,7 @@ export interface ManulBridgeOptions {
   readonly scriptPath: string;
   /** Working directory for the subprocess (usually workspace root). */
   readonly workspaceRoot: string;
+  /** Opaque session identifier forwarded to the runner for correlation/debugging. */
   readonly sessionId: string;
   /** false = show browser window (default); true = headless. */
   readonly headless: boolean;
@@ -46,6 +47,14 @@ export class ManulBridge {
 
   public constructor(private readonly options: ManulBridgeOptions) {}
 
+  private resolvePendingRequests(error: string, status = 0): void {
+    for (const [, entry] of this.pending) {
+      clearTimeout(entry.timer);
+      entry.resolve({ ok: false, status, error });
+    }
+    this.pending.clear();
+  }
+
   // ── Subprocess lifecycle ─────────────────────────────────────────────
 
   private ensureProc(): cp.ChildProcess {
@@ -57,6 +66,7 @@ export class ManulBridge {
       ...process.env,
       MANUL_HEADLESS: this.options.headless ? '1' : '0',
       MANUL_WORKSPACE_PATH: this.options.workspaceRoot,
+      MANUL_SESSION_ID: this.options.sessionId,
     };
 
     this.proc = cp.spawn(this.options.pythonPath, [this.options.scriptPath], {
@@ -95,16 +105,14 @@ export class ManulBridge {
       }
     });
 
+    this.proc.on('error', (error) => {
+      const message = error instanceof Error ? error.message : String(error);
+      this.resolvePendingRequests(`ManulEngine subprocess error: ${message}`);
+      this.proc = undefined;
+    });
+
     this.proc.on('exit', () => {
-      for (const [, entry] of this.pending) {
-        clearTimeout(entry.timer);
-        entry.resolve({
-          ok: false,
-          status: 0,
-          error: 'ManulEngine subprocess exited unexpectedly.',
-        });
-      }
-      this.pending.clear();
+      this.resolvePendingRequests('ManulEngine subprocess exited unexpectedly.');
       this.proc = undefined;
     });
 
@@ -222,19 +230,27 @@ export class ManulBridge {
  * Resolves the best Python executable that has manul-engine installed.
  *
  * Priority:
- *   1. Workspace .venv/bin/python3  (created by `python -m venv .venv`)
- *   2. pipx manul-engine venv       (~/.local/share/pipx/venvs/manul-engine/bin/python3)
- *   3. System python3               (fallback — may not have manul-engine)
+ *   1. Workspace virtualenv / .venv
+ *   2. pipx manul-engine virtualenv
+ *   3. System Python launcher fallback
  */
 export function resolveManulPython(workspaceRoot: string): string {
-  const candidates = [
-    path.join(workspaceRoot, '.venv', 'bin', 'python3'),
-    path.join(os.homedir(), '.local', 'share', 'pipx', 'venvs', 'manul-engine', 'bin', 'python3'),
-  ];
+  const candidates = process.platform === 'win32'
+    ? [
+      path.join(workspaceRoot, '.venv', 'Scripts', 'python.exe'),
+      path.join(workspaceRoot, 'venv', 'Scripts', 'python.exe'),
+      path.join(os.homedir(), 'AppData', 'Local', 'pipx', 'venvs', 'manul-engine', 'Scripts', 'python.exe'),
+      path.join(os.homedir(), '.local', 'pipx', 'venvs', 'manul-engine', 'Scripts', 'python.exe'),
+    ]
+    : [
+      path.join(workspaceRoot, '.venv', 'bin', 'python3'),
+      path.join(workspaceRoot, 'venv', 'bin', 'python3'),
+      path.join(os.homedir(), '.local', 'share', 'pipx', 'venvs', 'manul-engine', 'bin', 'python3'),
+    ];
   for (const p of candidates) {
     try {
       if (fs.existsSync(p)) { return p; }
     } catch { /* ignore */ }
   }
-  return 'python3';
+  return process.platform === 'win32' ? 'python' : 'python3';
 }

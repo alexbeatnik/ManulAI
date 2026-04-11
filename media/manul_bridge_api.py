@@ -199,6 +199,7 @@ class ManulRunner:
         self._context: str = "Manul automation"
         self._title: str = "Recorded Session"
         self._executed_steps: list[str] = []
+        self._session_id: str = os.environ.get("MANUL_SESSION_ID", "").strip()
 
     # ── session lifecycle ──────────────────────────────────────────────────────
 
@@ -254,6 +255,7 @@ class ManulRunner:
         newly_succeeded: list[str] = []
 
         failed = False
+        failure_error: str | None = None
         for i, step in enumerate(steps):
             is_last = i == len(steps) - 1
             _log(f"Step: {step}")
@@ -271,12 +273,14 @@ class ManulRunner:
                     results.append({"step": step, "status": status, "error": err, "page_scan": page_scan})
                     _log(f"Step failed ({status}): {step}")
                     failed = True
+                    failure_error = str(err)
                     break  # stop on first failure — like the real engine does
             except Exception as exc:  # noqa: BLE001
                 page_scan = await self._scan_current_page()
                 results.append({"step": step, "status": "error", "error": str(exc), "page_scan": page_scan})
                 _log(f"Step exception: {exc}")
                 failed = True
+                failure_error = str(exc)
                 break
 
         # Keep the browser alive on failure so the user can inspect/retry.
@@ -286,16 +290,21 @@ class ManulRunner:
         hunt_proposal = _build_hunt(self._context, self._title, self._executed_steps)
 
         pass_count = sum(1 for r in results if r["status"] == "pass")
-        return {
-            "ok": True,
-            "data": {
-                "results": results,
-                "pass_count": pass_count,
-                "total": len(steps),
-                "executed_total": len(self._executed_steps),
-                "hunt_proposal": hunt_proposal,
-            },
+        data = {
+            "results": results,
+            "pass_count": pass_count,
+            "total": len(steps),
+            "executed_steps": len(self._executed_steps),
+            "executed_total": len(self._executed_steps),
+            "hunt_proposal": hunt_proposal,
         }
+        if failed:
+            return {
+                "ok": False,
+                "error": failure_error or "One or more Manul steps failed.",
+                "data": data,
+            }
+        return {"ok": True, "data": data}
 
     async def _handle_get_state(self, _params: dict[str, Any]) -> dict[str, Any]:
         try:
@@ -311,9 +320,11 @@ class ManulRunner:
                 "engine_version": version,
                 "browser_open": self._session is not None,
                 "headless": self._headless,
+                "session_id": self._session_id,
                 "context": self._context,
                 "title": self._title,
                 "executed_steps": len(self._executed_steps),
+                "hunt_proposal": _build_hunt(self._context, self._title, self._executed_steps),
                 "status": "ready" if self._session is not None else "idle",
             },
         }
@@ -322,7 +333,7 @@ class ManulRunner:
         context = params.get("context") or self._context
         title = params.get("title") or self._title
         hunt = _build_hunt(context, title, self._executed_steps)
-        return {"ok": True, "data": {"hunt": hunt}}
+        return {"ok": True, "data": {"hunt_proposal": hunt, "hunt": hunt}}
 
     async def _handle_save_hunt(self, params: dict[str, Any]) -> dict[str, Any]:
         path: str = params.get("path", "").strip()
