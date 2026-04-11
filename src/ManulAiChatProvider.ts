@@ -7170,10 +7170,19 @@ If the user asks for a change but provides NO code:
     }
     const { context, title } = this.getManulProposalContextAndTitle(stateLike);
     const lines = [`@context: ${context}`, `@title: ${title}`, '', 'STEP 1: Recorded actions'];
+    let lastActionLine = '';
     for (const step of steps) {
-      lines.push(`    ${step.step}`);
+      const actionLine = `    ${step.step}`;
+      if (actionLine !== lastActionLine) {
+        lines.push(actionLine);
+        lastActionLine = actionLine;
+      }
       for (const verifyLine of this.inferManulVerifyLines(step.step, step.pageScan)) {
-        lines.push(`    ${verifyLine}`);
+        const renderedVerifyLine = `    ${verifyLine}`;
+        if (renderedVerifyLine !== lastActionLine) {
+          lines.push(renderedVerifyLine);
+          lastActionLine = renderedVerifyLine;
+        }
       }
     }
     lines.push('', 'DONE.');

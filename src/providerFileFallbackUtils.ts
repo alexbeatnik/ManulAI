@@ -617,7 +617,7 @@ export function extractNewFileCreation(
   const blockLang = langMatch && langMatch[1] ? langMatch[1].toLowerCase() : '';
   const shellLangs = new Set(['sh', 'bash', 'zsh', 'shell', 'powershell', 'pwsh']);
   if (blockLang === 'diff' || blockLang === 'patch' || shellLangs.has(blockLang) ||
-      blockLang === 'json' || blockLang === 'tool' || blockLang === 'tool_call') {
+      blockLang === 'json' || blockLang === 'tool' || blockLang === 'tool_call' || blockLang === 'hunt') {
     return undefined;
   }
   const blockContent = rawBlock.replace(/^```[\w.+-]*\n/, '').replace(/\n?```$/, '');
