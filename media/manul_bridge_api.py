@@ -236,6 +236,16 @@ class ManulRunner:
         except Exception:  # noqa: BLE001
             return []
 
+    def _should_capture_page_scan(self, step: str) -> bool:
+        normalized = step.strip().lower()
+        return normalized.startswith((
+            "navigate ",
+            "click ",
+            "double click ",
+            "right click ",
+            "press enter",
+        ))
+
     # ── method handlers ────────────────────────────────────────────────────────
 
     async def _handle_run_steps(self, params: dict[str, Any]) -> dict[str, Any]:
@@ -261,8 +271,7 @@ class ManulRunner:
             try:
                 result = await self._session.run_steps(step)  # type: ignore[union-attr]
                 status = getattr(result, "status", "pass")
-                # Capture page state after every step so VERIFY inference has enough context.
-                page_scan = await self._scan_current_page()
+                page_scan = await self._scan_current_page() if self._should_capture_page_scan(step) else []
                 if status == "pass":
                     newly_succeeded.append(step)
                     results.append({"step": step, "status": "pass", "page_scan": page_scan})
@@ -275,7 +284,7 @@ class ManulRunner:
                     failure_error = str(err)
                     break  # stop on first failure — like the real engine does
             except Exception as exc:  # noqa: BLE001
-                page_scan = await self._scan_current_page()
+                page_scan = await self._scan_current_page() if self._should_capture_page_scan(step) else []
                 results.append({"step": step, "status": "error", "error": str(exc), "page_scan": page_scan})
                 _log(f"Step exception: {exc}")
                 failed = True

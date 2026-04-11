@@ -3,7 +3,9 @@
 ![Alpha](https://img.shields.io/badge/status-alpha-bf5b04)
 ![Manul Product Line](https://img.shields.io/badge/product%20line-Manul-111827)
 
-ManulAI is a **local, embeddable AI agent for software products and developer workflows**. It runs inside VS Code on top of Ollama, but its real value is as a **predictable product component** teams can wire into IDE plugins, CI jobs, internal tools, and documentation-assisted support flows.
+ManulAI is a **local AI coding assistant for VS Code** built on top of Ollama. It keeps chat in the right-side Secondary Sidebar, works with local files and terminal actions, and avoids cloud APIs or remote inference by default.
+
+It is also designed as a **predictable local-agent building block** for teams that want the same local-first patterns in IDE plugins, CI jobs, internal tools, and documentation-assisted support flows.
 
 **Default: local models only.** ManulAI keeps model execution, file access, tool actions, and workspace state on your machine or inside your controlled environment.
 

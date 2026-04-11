@@ -58,7 +58,12 @@ export class ManulBridge {
   // ── Subprocess lifecycle ─────────────────────────────────────────────
 
   private ensureProc(): cp.ChildProcess {
-    if (this.proc && !this.proc.killed) {
+    if (
+      this.proc
+      && !this.proc.killed
+      && this.proc.exitCode === null
+      && this.proc.signalCode === null
+    ) {
       return this.proc;
     }
 

@@ -7039,6 +7039,10 @@ If the user asks for a change but provides NO code:
       // Fallback: write locally via VS Code FS so hunt files can be saved even
       // when the ManulEngine backend is not running.
       try {
+        const fallbackPathError = await this.validateManulFallbackSavePath(wsRoot, resolvedPath);
+        if (fallbackPathError) {
+          return JSON.stringify({ error: result.error, fsError: fallbackPathError });
+        }
         const uri = vscode.Uri.file(resolvedPath);
         await vscode.workspace.fs.createDirectory(vscode.Uri.file(path.dirname(resolvedPath)));
         await vscode.workspace.fs.writeFile(uri, Buffer.from(content, 'utf8'));
@@ -7048,6 +7052,57 @@ If the user asks for a change but provides NO code:
       }
     }
     return JSON.stringify(result.ok ? result.data : { error: result.error, status: result.status });
+  }
+
+  private async validateManulFallbackSavePath(workspaceRoot: string, targetPath: string): Promise<string | undefined> {
+    try {
+      const realRoot = await fs.promises.realpath(workspaceRoot);
+      const nearestExistingParent = await this.findNearestExistingPath(path.dirname(targetPath));
+      const realParent = await fs.promises.realpath(nearestExistingParent);
+      if (realParent !== realRoot && !realParent.startsWith(`${realRoot}${path.sep}`)) {
+        return `path resolves outside the workspace root (${workspaceRoot})`;
+      }
+
+      try {
+        const targetStats = await fs.promises.lstat(targetPath);
+        if (targetStats.isSymbolicLink()) {
+          const realTarget = await fs.promises.realpath(targetPath);
+          if (realTarget !== realRoot && !realTarget.startsWith(`${realRoot}${path.sep}`)) {
+            return `refusing to write through symlink to ${realTarget}`;
+          }
+        }
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code !== 'ENOENT') {
+          throw error;
+        }
+      }
+
+      return undefined;
+    } catch (error) {
+      return error instanceof Error ? error.message : String(error);
+    }
+  }
+
+  private async findNearestExistingPath(targetPath: string): Promise<string> {
+    let currentPath = path.resolve(targetPath);
+    while (true) {
+      try {
+        await fs.promises.lstat(currentPath);
+        return currentPath;
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code !== 'ENOENT') {
+          throw error;
+        }
+      }
+
+      const parentPath = path.dirname(currentPath);
+      if (parentPath === currentPath) {
+        throw new Error(`Unable to resolve an existing parent path for ${targetPath}`);
+      }
+      currentPath = parentPath;
+    }
   }
 
   private async manulRunHunt(dsl: string): Promise<string> {
