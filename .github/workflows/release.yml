@@ -72,3 +72,23 @@ jobs:
           tag_name: ${{ steps.release_meta.outputs.tag_name }}
           generate_release_notes: true
           files: ${{ steps.release_meta.outputs.vsix_file }}
+
+      - name: Warn when VS Code Marketplace token is missing
+        if: ${{ secrets.VSCE_PAT == '' }}
+        run: echo "::warning::VSCE_PAT secret is not configured. Skipping VS Code Marketplace publish."
+
+      - name: Publish to VS Code Marketplace
+        if: ${{ secrets.VSCE_PAT != '' }}
+        env:
+          VSCE_PAT: ${{ secrets.VSCE_PAT }}
+        run: npm exec -- @vscode/vsce publish --packagePath "${{ steps.release_meta.outputs.vsix_file }}" --pat "$VSCE_PAT"
+
+      - name: Warn when Open VSX token is missing
+        if: ${{ secrets.OPEN_VSX_TOKEN == '' }}
+        run: echo "::warning::OPEN_VSX_TOKEN secret is not configured. Skipping Open VSX publish."
+
+      - name: Publish to Open VSX
+        if: ${{ secrets.OPEN_VSX_TOKEN != '' }}
+        env:
+          OPEN_VSX_TOKEN: ${{ secrets.OPEN_VSX_TOKEN }}
+        run: npm exec --yes --package ovsx -- ovsx publish "${{ steps.release_meta.outputs.vsix_file }}" -p "$OPEN_VSX_TOKEN"

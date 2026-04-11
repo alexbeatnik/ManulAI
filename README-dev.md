@@ -247,3 +247,31 @@ To create a VSIX package for distribution:
 ```bash
 npx @vscode/vsce package
 ```
+
+## Automatic Marketplace Publishing
+
+GitHub Actions release publishing is defined in `.github/workflows/release.yml`.
+
+Trigger behavior:
+
+- push a tag like `v0.0.10` to build the VSIX, create a GitHub release, and publish to marketplaces
+- or run `workflow_dispatch` and pass an existing tag name
+
+Required repository secrets:
+
+- `VSCE_PAT` — Personal Access Token for the VS Code Marketplace publisher
+- `OPEN_VSX_TOKEN` — access token for `https://open-vsx.org/`
+
+Workflow behavior:
+
+- always builds, tests, packages, and attaches the VSIX to the GitHub release
+- publishes to the VS Code Marketplace when `VSCE_PAT` is configured
+- publishes to Open VSX when `OPEN_VSX_TOKEN` is configured
+- if one or both tokens are missing, the workflow emits a warning and skips that publish target instead of failing the whole release
+
+Typical release flow:
+
+```bash
+git tag v0.0.10
+git push origin v0.0.10
+```
