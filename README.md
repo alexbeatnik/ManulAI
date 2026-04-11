@@ -1,122 +1,140 @@
-# 😼 ManulAI Local Agent
+# ManulAI Local Agent
 
 ![Alpha](https://img.shields.io/badge/status-alpha-bf5b04)
 ![Manul Product Line](https://img.shields.io/badge/product%20line-Manul-111827)
 
-ManulAI is a local AI coding assistant for Visual Studio Code powered entirely by your own Ollama runtime.
+ManulAI is a **local AI coding assistant for VS Code** built on top of Ollama. It keeps chat in the right-side Secondary Sidebar, works with local files and terminal actions, and avoids cloud APIs or remote inference by default.
 
-It is built for developers who want workspace-aware chat and local tool execution inside the editor without cloud APIs, remote inference, or account-based workflow. ManulAI keeps the chat in the right-side Secondary Sidebar, forwards local file context to Ollama, and runs file and terminal actions through Ollama native tool-calling flow.
+It is also designed as a **predictable local-agent building block** for teams that want the same local-first patterns in IDE plugins, CI jobs, internal tools, and documentation-assisted support flows.
 
-> The Manul goes hunting and never returns without its prey.
+**Default: local models only.** ManulAI keeps model execution, file access, tool actions, and workspace state on your machine or inside your controlled environment.
 
 > **Status: Alpha.**
-> **Developed by a single person.**
->
-> ManulAI is already useful for real work, but it is still being battle-tested on real-world projects. Bugs, rough edges, and behavioral changes are expected while the product matures. The priority is transparent local behavior, predictable tool execution, and strong Ollama-first integration rather than polished marketing promises.
+> ManulAI is already useful for real work, but it is still being hardened through real-world use. The priority is local control, safe edits, predictable tool execution, and practical integration with existing engineering systems.
 
----
+## What This Enables For Your Product
 
-## Why Use ManulAI
+- **Embed a local agent into product workflows** without sending code or prompts to a cloud AI provider.
+- **Add workspace-aware assistance to internal tools** such as engineering dashboards, product CLIs, or support consoles.
+- **Run safe, reviewable code edits in gated flows** with approvals, diffs, and revertable changes.
+- **Power internal IDE experiences** with a right-side assistant that understands files, tools, and project structure.
+- **Generate structured reports in CI** from local scans, bounded reads, and deterministic tool output.
+- **Keep product teams in control** with local models, command restrictions, debug logs, and file-backed workspace state.
 
-ManulAI is designed for developers who already want Ollama as the model runtime and need a practical assistant inside VS Code:
+## Quick Demo
 
-- local-first by default
-- no cloud AI dependency or remote model API
-- chat and tools stay close to the code you are editing
-- works across any programming language opened in VS Code
-- keeps attached file context and conversation history available during the session
-- supports both plain chat and agent-driven tool execution
+### Hands-On In VS Code
 
----
+Minimal path from install to a real file write:
 
-## What It Does
+```bash
+ollama serve
+ollama pull qwen3-coder:30b
+```
 
-### Right-Side Chat UI
+Open VS Code, install the ManulAI extension, then run:
 
-- dedicated ManulAI chat view in the Secondary Sidebar
-- chat stays beside the editor instead of replacing the main work area
-- conversation history is kept in memory for follow-up requests
-- multiple chats can be created, switched, cleared, and deleted from the sidebar, and file-backed workspaces persist them under `.manulai/chats.json`
-- the sidebar layout is compacted for narrow widths and low-height laptop screens so chat history remains visible above the composer
-- the chat picker, chat actions, and composer controls use a denser toolbar-style layout so more history stays visible in the sidebar
+```text
+ManulAI: Open Secondary Sidebar
+ManulAI: Select Ollama Model
+Attach Active File to ManulAI Chat
+```
+
+Prompt the agent:
+
+```text
+Create src/hello.ts with a function that returns "hello from ManulAI".
+```
+
+Expected transcript shape:
+
+```text
+User: Create src/hello.ts with a function that returns "hello from ManulAI".
+
+Assistant tool: create_or_edit_file
+Path: src/hello.ts
+
+Preview:
+export function hello(): string {
+  return 'hello from ManulAI';
+}
+
+Assistant: Created src/hello.ts with a small exported helper.
+```
+
+Outcome: **a local model creates a real file through a visible, approval-aware tool action instead of only suggesting code in chat.**
+
+### Chat, Agent, Planner
+
+- **Chat**: plain text only. Use it for explanation, review, and discussion when no file changes should happen.
+- **Agent**: tool-enabled execution. Use it for reads, edits, scans, terminal commands, and automation.
+- **Planner**: constrained stepwise execution. Use it when you want smaller, more deliberate actions with less prompt overhead.
+
+### Integration Patterns
+
+#### Embed ManulAI Into Another VS Code Extension Or Web IDE
+
+Use ManulAI as the execution layer while your product owns the surrounding UI, approvals, and workflow triggers. The core pattern is: collect workspace context, send a bounded request, expose only the tools you want, and render tool output back into your own product surface.
+
+```ts
+type ProductTask = {
+  prompt: string;
+  mode: 'chat' | 'agent' | 'planner';
+  allowedTools: string[];
+};
+
+const task: ProductTask = {
+  prompt: 'Scan this workspace and summarize release risks.',
+  mode: 'planner',
+  allowedTools: ['project_scan', 'read_file_slice', 'read_workspace_notes']
+};
+
+console.log('Dispatch task to local ManulAI runtime', task);
+```
+
+Outcome: **your product gets a workspace-aware local assistant without needing to build a full agent loop from scratch.**
+
+#### Run ManulAI In CI For Structured Reports
+
+Use ManulAI as a local analysis step that reads the repo, produces structured output, and hands the result to downstream policy or reporting systems.
+
+```bash
+ollama serve &
+npm ci
+npm run compile
+node scripts/debug-agent.mjs --prompt "Run project_scan and return a structured JSON report of entry points, frameworks, and likely risk areas."
+```
+
+Outcome: **CI gets a local workspace summary that can feed release checks, dashboards, or internal reporting pipelines.**
+
+#### Power A Product Support Assistant
+
+Use ManulAI to read docs, README files, and targeted source files before suggesting a fix path to support or solution-engineering teams.
+
+```text
+Read README.md, README-dev.md, and the provider entrypoints, then suggest the smallest safe fix for a failing tool-call workflow.
+```
+
+Outcome: **support teams get product-aware guidance grounded in real repo content instead of generic model guesses.**
+
+## Integration And Extension Points
 
 ### Local Ollama Integration
 
-- uses your local Ollama server through `/api/chat`
-- supports native Ollama tool-calling flow with `tool` role responses
-- no hard request timeout inside the extension; long-running local responses can finish naturally
-- model selection is exposed inside the extension UI and settings
-- the built-in model picker shows the currently reliable local agent models first: `phi4-mini:3.8b`, `llama3.1:8b`, `qwen3-coder:30b`, `gemma4:latest`, and `gemma4:31b`, but other installed Ollama models remain selectable for manual testing
-- if no local model is selected, the UI stays empty instead of showing a fake fallback model
+ManulAI talks to **your local Ollama runtime** through `/api/chat` and keeps model selection explicit. The extension is intentionally **Ollama-only** and does not add a cloud AI dependency.
 
-### Tested Local Models
+- Local runtime: `http://localhost:11434` by default
+- Recommended baseline models: `phi4-mini:3.8b`, `llama3.1:8b`, `qwen3-coder:30b`, `gemma4:latest`, `gemma4:31b`
+- `gemma4` models use a text-tool fallback because native tool calling is currently unreliable in Ollama for those thinking models
 
-These results come from direct Ollama `/api/chat` checks, standalone ManulAI debug-harness runs, and the local regression matrix across Chat, Agent, and Planner tasks. The suite now covers more than simple greenfield creation: it includes plain-text explain cases, visible-snippet edit behavior, missing-code edit behavior, exact `package.json` reads, Go explanation tasks, multi-file create flows, explicit nested-path create flows, and temp-file edit checks. This is still not a universal benchmark for every prompt, but it is the current practical baseline for agent use inside ManulAI.
+### Tool Surface
 
-- `qwen3-coder:30b` is the strongest tested model so far. It produces the most reliable native tool calls, usually starts greenfield tasks by creating the first concrete file immediately, and is the least likely to fall into repetitive or malformed output.
-- `gemma4:31b` is also strong. It is a thinking model that is incompatible with Ollama's native tool-calling API in 0.20.0, so ManulAI uses a text-tool fallback mode where tool descriptions are injected as prompt text and tool calls are returned as JSON in content. Performance compares well with `qwen3-coder:30b` across chat, agent, and planner tasks.
-- `gemma4:latest` (8B thinking model) works via the same text-tool fallback. In the latest full regression run it achieved a perfect 14/14 score across all Chat, Agent, and Planner tasks, outperforming `llama3.1:8b` on the current suite.
-- `llama3.1:8b` is usable and generally coherent. Raw coding output is solid, and it behaves much better than the weaker `qwen2.5-coder` tiers, but it is still not as consistent as `qwen3-coder:30b` for multi-step agent loops.
-- `phi4-mini:3.8b` is also usable and much better than the weak small models, especially for short direct coding tasks. Its main weakness is tool-call formatting: it can still leak pseudo-tool text or need recovery more often than `qwen3-coder:30b`.
-- `gpt-oss:20b` is still manual-test-only. It now benefits from deterministic recovery for exact `package.json` and `README.md` read requests, a one-shot transient Ollama fetch retry, and auto-completion after successful explicit create-only writes, but it is not yet reliable enough for the curated picker. In current testing it still falls over too often in Agent and Planner create/edit loops, and recent full reruns also exposed intermittent Ollama model-load/resource failures on this machine.
-- `qwen2.5-coder:7b` is not reliable enough for the built-in picker. It can produce partially reasonable raw English coding output, but in planner or agent loops it still tends to degrade into broken, repetitive, or malformed responses too often.
-- `qwen2.5-coder:1.5b` is not currently viable for dependable agent behavior here. In testing it collapsed into low-quality repetitive output even on simple generation tasks.
-- `qwen2.5-coder:0.5b` is not currently viable for real agent use. It regularly fails even before the tool loop matters, so the product no longer treats this class as a reliable default model.
-
-In practical terms, the difference is mostly this:
-
-- stronger models can follow the tool loop, choose a sane first action, and keep moving without getting trapped in scans, malformed tool syntax, or repetitive garbage
-- weaker models may still answer something, but they are much more likely to narrate instead of acting, emit broken tool-call text, repeat themselves, or fail after the first write step
-
-That is why the built-in picker is intentionally narrowed to the currently validated families instead of exposing every local Ollama model as if all of them were equally agent-capable.
-
-### Agent Mode And Chat Mode
-
-ManulAI has three working modes:
-
-- `Chat Mode` disables tools and responds as plain chat only
-- in `Chat Mode`, direct code-explanation or review questions should be answered in plain text, while explicit visible-snippet edit requests should stay in manual `Old:` / `New:` suggestion format
-- in `Chat Mode`, file-creation requests should stay as brief manual guidance and should not return full file dumps; switch to Agent Mode for actual file creation
-- `Agent Mode` enables local tools and lets Ollama continue the tool loop automatically
-- `Planner Mode` uses the same tools as Agent Mode but with a condensed system mandate focused on step-by-step planning and execution; it can also answer direct text questions without requiring tool calls
-- tiny local models are simplified automatically by model size: smaller context windows, shorter mandates, fewer hidden notes/summaries, and a reduced tool menu for ultra-small models so even `0.5b`-class models have a chance to stay on task
-- the currently preferred agent-capable models also get extra tuning: `phi4-mini`, `llama3.1`, `qwen3-coder`, and `gemma4` are biased toward one-step execution and a smaller core tool set so they spend less time on unnecessary scans and more time on concrete file work; `gemma4` models additionally run in text-tool fallback mode where tool calls are sent as structured JSON in content instead of native Ollama tool-calling, which is required for thinking models in the current Ollama version; for greenfield create tasks preferred models reject obvious placeholder scaffolds including trivial dumps like `...`, block overly thin first source files, recover some plain-text code dumps back into real file writes, require syntax verification before arbitrary terminal runs after the first source-file write, and block global package installs from the agent loop
-- in chat-only mode, ManulAI should not claim that files were changed
-- `Auto-Approve` can be turned on to execute tools immediately or off to require confirmation for every tool call
-
-### File Context Flow
-
-- attach the active editor file to the chat
-- attach files from the Explorer context menu
-- browse and attach files from disk
-- attach the whole workspace as a scan snapshot when the user asks to scan or remember the project
-- keep attached file context visible in the UI
-- forward attached content into the model context for the next requests
-
-### Project Scan And File Discovery
-
-- project scan requests can attach a workspace snapshot with the file tree and a capped set of file contents
-- scan requests push the agent to keep reading and fixing instead of stopping after the first directory or first issue
-- edit requests can auto-discover likely targets such as `README.md`, `LICENSE`, `package.json`, `tsconfig.json`, and explicit file paths even if those files were not attached first
-- when a likely target file is auto-discovered, the chat prints that discovery as a visible progress step before the next tool actions
-
-### Visible Tool Transcript
-
-- tool execution results are rendered in the chat with compact summaries, diffs for file edits, previews for new or first-fill file writes, or full terminal output as appropriate
-- terminal actions show the command, exit code, stdout, stderr, and tool error text when present
-- file creation and rewrite actions show a preview, including when an empty file was filled for the first time
-- revertable file edits expose a `Revert changes` action directly in the transcript while the written file still matches the saved snapshot
-- multi-step actions can print progress step-by-step while tools are running
-
-### Built-In Workspace Tools
-
-Agent Mode currently exposes these tools to Ollama:
+ManulAI exposes a practical local tool layer for product use:
 
 - `read_active_file`
 - `read_specific_file`
 - `read_file_slice`
 - `create_or_edit_file`
-- `write_to_file`
 - `replace_in_file`
 - `execute_terminal_command`
 - `launch_in_terminal`
@@ -125,134 +143,232 @@ Agent Mode currently exposes these tools to Ollama:
 - `project_scan`
 - `read_workspace_notes`
 - `write_workspace_notes`
+- `manul_run_step`
+- `manul_run_goal`
+- `manul_scan_page`
+- `manul_read_page_text`
+- `manul_get_state`
+- `manul_save_hunt`
+- `manul_run_hunt`
+- `manul_run_hunt_file`
 
-These cover the main local coding tasks: reading files, targeted edits, full rewrites when necessary, file creation, file deletion, listing workspace directories, running local shell commands, and launching interactive programs.
+For product deployments, the important pattern is not just the tools themselves, but **which tools you expose to which workflow**.
 
-For very small models, ManulAI automatically narrows this tool surface. Ultra-small models get a compact read/edit/list tool subset instead of the full menu, and small models get shorter prompts plus tighter retry/read limits to reduce planning loops and context overload.
+Recommended restrictions:
 
-For any model tier, a few exact known-file read requests can bypass the normal agent loop entirely when the target is unambiguous. Today that includes reading `package.json` name/version and reading the `README.md` title. Ultra-small models additionally keep deterministic fast paths for exact-line replacement in one known file and single explicit-file creation, so a `0.5b`-class model does not need to survive the full tool-planning cycle for those narrow cases.
+- **Docs assistant**: `project_scan`, `read_specific_file`, `read_file_slice`
+- **Guided editor flow**: add `replace_in_file`, `create_or_edit_file`
+- **Controlled automation**: add `execute_terminal_command` only behind approvals
+- **Browser automation**: enable `manul_*` tools only when ManulEngine is installed and the workflow explicitly needs it
 
-`execute_terminal_command` runs a shell command and captures stdout/stderr. It has no stdin support, so interactive programs (games, REPLs, scripts using `input()` or `readline`) will hang and time out. When a timeout occurs because the process was killed, the error message explicitly hints that stdin is unavailable.
+### Workspace State
 
-`launch_in_terminal` opens a visible VS Code integrated terminal and runs the given command there. The user can interact with the program directly (type input, respond to prompts). The tool returns immediately — the model does not see the terminal output.
+File-backed workspaces store ManulAI state under `.manulai/`:
 
-`project_scan` returns a higher-level summary of the workspace, including likely entry points, key files, package manager hints, language hints, project type hints, `frameworkHints`, and important modules across common ecosystems such as JavaScript/TypeScript, Python, Go, Rust, Java/Kotlin, C#, PHP, Ruby, Swift, and C/C++. It also does deeper manifest parsing for Python, Java, C#, Rust, and Go to recover framework and entry-point signals from their manifest files.
+- `.manulai/settings.json`: workspace-level settings
+- `.manulai/chats.json`: persisted chat sessions
+- `.manulai/notes/<chatId>.md`: per-chat notes and memory
+- `.manulai/logs/`: debug JSONL logs when debug mode is enabled
 
-`read_workspace_notes` and `write_workspace_notes` persist compact per-chat project memory under `.manulai/notes/<chatId>.md` so important architectural facts and recent completed-task notes survive across VS Code restarts. Notes are scoped to the active chat and automatically deleted when that chat is deleted.
+This makes ManulAI easier to integrate into product workflows because state is **file-backed, inspectable, and scriptable**.
 
-`list_workspace_files` accepts both workspace-relative directories and absolute paths inside the current machine workspace context.
+### Webhook And CLI Patterns For CI
 
-`read_file_slice` reads only a bounded 1-based line range from a file and is intended for large files where a full-file read would waste context or push a weaker local model into summary-only behavior.
+ManulAI itself is a VS Code extension, but product teams can still use its surrounding runtime patterns in CI and internal tooling:
 
-After successful file edits, ManulAI also tries to run a stack-appropriate verification command automatically when the workspace provides one, instead of assuming every project is TypeScript-only. For standalone greenfield files from a different stack, ManulAI now skips unrelated workspace verification rather than dragging the model into the wrong tool loop, and preferred-model greenfield flows now keep arbitrary terminal commands blocked until that syntax verification step has completed.
+1. Start Ollama locally on the runner.
+2. Open the workspace in a controlled extension host or use the debug harness.
+3. Run `project_scan` or bounded read tasks.
+4. Capture JSON or transcript output.
+5. Feed the result into policy checks, dashboards, or release reports.
 
-### Safer Editing Behavior
+Example structured scan pattern:
 
-The extension now pushes stricter file-editing rules into the agent prompt:
+```bash
+node scripts/debug-agent.mjs \
+  --prompt "Run project_scan and return only JSON with entryPoints, frameworkHints, importantModules, and risks." \
+  > manulai-project-scan.json
+```
 
-- make surgical edits for small requests instead of rewriting entire files
-- never remove content that the user did not explicitly ask to remove
-- prefer targeted replacement over full-file overwrite when possible
-- read the file before editing so the model has the full structure
-- do not claim a file changed unless a real tool changed it
-- do not treat a failed replacement or failed terminal command as a completed fix
-- do not stop on partial plans like `Step 1/3` when more reading or fixing is still required
-- for ultra-small tiers, do not plan at all; execute one bounded action immediately
-- do not declare success unless all required steps ran and the relevant tool calls succeeded
-- if the user explicitly requested multiple target files, do not declare success until each requested file has a real successful write result
-- if the user explicitly requested concrete file paths, recover shallow or wrong-directory create writes back toward those exact requested targets instead of accepting repo-root aliases like `main.js`
-- if Ollama returns a malformed tool-call parse error but the raw payload still contains a recoverable tool call, recover that tool intent instead of immediately failing the whole loop
-- do not modify a file before reading it first
-- if unsure, read more files and gather more context instead of guessing
-- for large refactor requests, inspect structure first, then split the work into small module/file steps instead of attempting a one-shot rewrite
-- prefer `read_file_slice` over whole-file reads when a large file only needs bounded inspection
-- do not leak raw or malformed tool-call JSON into fallback file writes; those responses are retried as tool calls instead of being treated as file content
-- raw function-call text like `list_workspace_files()` or `create_or_edit_file(...)` is treated as a broken tool call and pushed back into recovery instead of being accepted as a final answer
-- if a small or medium local model falls into repetitive garbage output, ManulAI retries once with a much stricter one-step recovery nudge instead of failing immediately
-- do not treat shell command blocks as file content during fallback file-write extraction
-- reject suspicious pseudo-filenames such as numeric dotted names or names with trailing dots before writing files
+Outcome: **downstream tooling receives machine-consumable output from a local, workspace-aware agent step.**
 
-This exists specifically to reduce destructive edits like replacing an entire README when the request was only to remove one line or one image block.
+## Safety, Auditability, And Operational Controls
 
-### Direct Command Handling
+ManulAI is designed to be useful in real product environments, not just interactive demos.
 
-For common requests, ManulAI also has direct handlers before the full agent loop:
+- **Recommended: `autoApprove = false`** for any workflow that can write files or run commands.
+- **Manual approval support** lets teams gate tool execution before a file write or terminal action happens.
+- **Command blocklist** rejects dangerous shell patterns such as destructive deletes, pipe-to-shell installers, privileged commands, and machine-level shutdown/reboot operations.
+- **Debug JSONL logs** capture user requests, tool calls, fallback decisions, and runtime behavior for local inspection.
+- **Model-aware context trimming** keeps smaller local models usable by reducing context and tool scope instead of overwhelming them.
+- **Revertable edits** keep snapshots so transcript-visible file changes can be rolled back.
+- **Per-chat notes** preserve important project facts without replaying the full history every time.
+- **Safe editing behavior** prefers read-before-edit, bounded reads, targeted replacements, and visible tool output over blind rewrites.
 
-- title rename in Markdown files
-- LICENSE author rename
+For product deployments, policy enforcement usually means:
 
-This helps simple edits complete faster and more predictably.
+- keep a curated local model list
+- disable or gate terminal tools
+- keep debug logging on in non-production evaluation environments
+- require manual approval for file mutations
+- restrict browser automation tools to explicitly provisioned environments
 
----
+## Quickstart For Product Teams
 
-## Commands
+### Runtime Setup
 
-The extension contributes these VS Code commands:
+Install Ollama and a supported local model:
 
-- `ManulAI: Open Chat`
-- `ManulAI: Open Secondary Sidebar`
-- `ManulAI: Select Ollama Model`
-- `Attach to ManulAI Chat`
-- `Attach Active File to ManulAI Chat`
-- `Attach Explorer Selection to ManulAI Chat`
-- `ManulAI: Send Prompt (Dev/Test)`
+```bash
+ollama serve
+ollama pull qwen3-coder:30b
+```
 
----
+Optional browser automation runtime:
 
-## Configuration
+```bash
+pip install manul-engine
+playwright install
+```
 
-The extension exposes these settings:
+No separate `manul serve` process is required in the extension workflow. ManulAI launches its bundled Python bridge on the first `manul_*` tool call.
 
-- `manulai.ollamaModel` — local Ollama model used for chat and tool calling
-- `manulai.ollamaBaseUrl` — base URL for the local Ollama server
-- `manulai.agentMode` — working mode: `chat` (plain text), `agent` (tool-enabled), or `planner` (condensed step-by-step planning with tools)
-- `manulai.autoApprove` — skips approval prompts for tool execution when enabled
-- `manulai.debugMode` — saves detailed local debug logs when enabled, including the ManulAI extension version in each JSONL entry and the user requests sent into the agent pipeline
-- `manulai.systemPrompt` — extra system prompt text prepended to each Ollama request
+Build the extension locally:
 
-When a file-backed workspace is open, ManulAI treats `.manulai/settings.json` as the only workspace-level source of truth for these values. It does not keep workspace state in `.vscode/settings.json` anymore.
+```bash
+npm ci
+npm run compile
+```
 
-That file is created on first write and stores the settings that the ManulAI UI manages inside the workspace.
+### Recommended Workspace Defaults
 
-Example `.manulai/settings.json`:
+Create `.manulai/settings.json`:
 
 ```json
 {
-	"ollamaModel": "",
-	"ollamaBaseUrl": "http://localhost:11434",
-	"agentMode": "agent",
-	"autoApprove": false,
-	"debugMode": false,
-	"systemPrompt": "You are ManulAI, a privacy-first local coding assistant running inside VS Code. Work across any programming language. Prefer precise, minimal changes and explain results clearly."
+  "ollamaModel": "qwen3-coder:30b",
+  "ollamaBaseUrl": "http://localhost:11434",
+  "agentMode": "agent",
+  "autoApprove": false,
+  "debugMode": true,
+  "systemPrompt": "You are ManulAI, a local product-grade coding assistant. Prefer bounded reads, precise edits, visible tool results, and safe execution."
 }
 ```
 
-If an older workspace still has `manulai.*` values in `.vscode/settings.json`, ManulAI migrates those workspace values into `.manulai/settings.json` and clears the old workspace entries.
+Recommended defaults for product integration:
 
-Default values:
+- **default: local models only**
+- **recommended: `autoApprove = false`**
+- **recommended: `debugMode = true` in evaluation and CI**
+- **recommended: start with `planner` for new gated flows**
 
-- model: empty until you choose a local Ollama model
-- Ollama base URL: `http://localhost:11434`
-- agent mode: `agent`
-- auto-approve: `false`
-- debug mode: `false`
+### Headless Project Scan For CI Consumption
 
----
+Use the regression/debug harness to run a local scan and capture output:
 
-## Notes
+```bash
+ollama serve &
+node scripts/debug-agent.mjs \
+  --prompt "Run project_scan and return JSON only with languageHints, frameworkHints, entryPoints, importantModules, and risks." \
+  > artifacts/manulai-scan.json
+```
 
-- `icon.png` is used as the extension icon in the VS Code manifest
-- `media/manulai-icon.svg` is used for the contributed sidebar container and view icon
-- the project is intentionally Ollama-only and local-first
-- workspace-owned ManulAI state lives under `.manulai/`; settings use `.manulai/settings.json`, chats use `.manulai/chats.json`, and debug logs use `.manulai/logs/` when the workspace is file-backed
-- workspace-owned ManulAI state also includes per-chat notes under `.manulai/notes/` for persistent project memory scoped to each chat; notes are deleted when the chat is deleted
-- chats now persist a compact per-chat summary memory in addition to the full transcript so future requests can reuse prior dialog outcomes without replaying the whole conversation
-- the README describes current behavior and avoids cloud-oriented setup or product marketing fluff
+Outcome: **your CI job gets a local JSON artifact that other tools can parse without exposing repo code to a hosted AI service.**
 
----
+## Ecosystem And Examples
+
+### VS Code Extension
+
+ManulAI is a compact right-side assistant for VS Code with:
+
+- Chat, Agent, and Planner modes
+- workspace file attachments
+- visible tool transcript output
+- local Ollama model selection
+- file-backed workspace state
+
+### MCP And Programmatic Control Patterns
+
+For product teams that need automation beyond the chat UI, the practical approach is to use the same local patterns ManulAI uses internally: scoped tools, predictable outputs, local files as state, and explicit approvals. ManulAI also integrates with ManulEngine for browser automation through a local bridge.
+
+Example MCP-style bridge usage pattern:
+
+```ts
+async function requestWorkspaceSummary() {
+  return {
+    tool: 'project_scan',
+    args: {},
+    policy: {
+      allowWrites: false,
+      allowTerminal: false
+    }
+  };
+}
+```
+
+Example browser automation bridge pattern:
+
+```ts
+const huntRequest = {
+  tool: 'manul_run_goal',
+  args: {
+    goal: 'Open the docs site, search for API keys, and verify that the settings page mentions local models only.',
+    title: 'docs_local_model_check',
+    context: 'Validate docs messaging for product release readiness'
+  }
+};
+
+console.log(huntRequest);
+```
+
+Example Python-side runtime bootstrap for internal tooling:
+
+```bash
+pip install manul-engine
+playwright install
+python -c "from manul_engine import ManulSession; print('manul-engine ready')"
+```
+
+Outcome: **teams can embed local agent behavior into IDEs, dashboards, QA flows, and automation surfaces without changing the local-first operating model.**
+
+## Contribute And Deploy
+
+Product teams extending ManulAI typically do three things:
+
+- add curated model profiles for their local environment
+- narrow or expand the exposed tool surface for a specific workflow
+- package the extension and settings for internal distribution
+
+Useful local commands:
+
+```bash
+npm run compile
+npm run lint
+npm run test
+node scripts/debug-agent.mjs
+node scripts/run-regression-matrix.mjs
+```
+
+Deployment notes:
+
+- keep internal builds pinned to validated local model families
+- test new prompts and tool policies through the regression harness before rollout
+- update `README.md`, `README-dev.md`, and versioned packaging metadata together when product behavior changes
+- prefer incremental tool and policy changes over broad prompt rewrites
+
+## Try It In Your Product Workflow
+
+Run ManulAI locally, point it at a real workspace, and evaluate it against an actual product task: repo triage, release-readiness scanning, guided documentation support, or safe file editing inside an internal IDE flow.
+
+- Marketplace: https://marketplace.visualstudio.com/items?itemName=manul-engine.manulai-local-agent
+- Open VSX: https://open-vsx.org/extension/manul-engine/manulai-local-agent
+- GitHub: https://github.com/manulai/manulai-local-agent
+- Docs: https://github.com/manulai/manulai-local-agent/blob/main/README-dev.md
+- Enterprise integration guidance: https://github.com/manulai/manulai-local-agent/issues
 
 ## What's New
 
+- **0.0.10:** ManulEngine browser automation integration. ManulAI now bridges directly to the [ManulEngine](https://github.com/alexbeatnik/ManulEngine) Python runtime through a bundled subprocess runner (`media/manul_bridge_api.py`) launched by `src/manulBridge.ts`. ManulEngine (`pip install manul-engine`) is a separate Python runtime — distinct from ManulMcpServer (the VS Code Copilot bridge extension). Eight new browser automation tools are available in Agent and Planner Mode: `manul_run_step`, `manul_run_goal`, `manul_scan_page`, `manul_read_page_text`, `manul_get_state`, `manul_save_hunt`, `manul_run_hunt`, and `manul_run_hunt_file`. The full Hunt DSL command set (NAVIGATE, Click, Fill, HOVER, Drag, VERIFY, EXTRACT, SCROLL, WAIT, PRESS, UPLOAD and more) and all contextual qualifiers (NEAR, ON HEADER, ON FOOTER, INSIDE row with) are documented inline in the agent and planner mandates so the model knows the correct syntax without guessing. A VERIFY-after-every-action table is included: after Fill/Type the model verifies the entered value, after navigation it verifies a landmark, after a click that changes state it verifies the new state. After completing any browser automation session, ManulAI reconstructs the executed steps as a `.hunt` file preview and proposes saving it for later replay; `manul_save_hunt` is confirmation-gated and is rejected unless the latest user message explicitly asks to save the file. Hunt previews are now also reconstructed locally from successful Manul tool results, using returned `page_scan` data to infer missing VERIFY lines after navigation and click actions so the preview is not left without post-action assertions. `manul_get_state` and successful terminal VERIFY steps now also surface `hunt_proposal` / `_nextAction` hints when a session already has executed steps so the model can stop after success instead of replaying earlier navigation/click steps. `manul_save_hunt` still writes the file to disk when explicitly requested even if the subprocess bridge cannot complete the save, using VS Code FS as a fallback inside the workspace root. The `manul_run_hunt_file` tool reads an existing `.hunt` file from the workspace and runs it. `scripts/debug-agent.mjs` was updated in the same release: all 8 tool stubs are present in `executeTool()`, the same confirmation-gated save rule is documented there, and both `buildAgentMandate()` and `buildPlannerMandate()` carry the same DSL reference, VERIFY table, and session completion rule as the extension provider. Packaging version updated to `0.0.10`.
 - **0.0.9:** Security and reliability hardening. Terminal command blocklist expanded (`isBlockedCommand`) to cover `rm -rf ~`, `$HOME`-targeting removes, `sudo`, `shutdown`/`reboot`, `mkfs`, `dd if=`, fork-bomb pattern, `chmod -R 777 /`, and curl/wget pipe-to-shell; both `execute_terminal_command` and `launch_in_terminal` now delegate to this shared check. The `ollamaBaseUrl` setting is validated before use to strip embedded credentials and reject non-HTTP/HTTPS schemes, preventing SSRF-class requests. An AbortController race on the retry path is fixed so the previous request is always cancelled before a retry controller is assigned. Terminals created by `launch_in_terminal` are now tracked and disposed when the extension deactivates. The agent loop now enforces a hard absolute turn cap (`maxNudgeRetriesCap + 8`) at `processOllamaResponse` entry, surfacing a user-readable message instead of unbounded recursion. Context trimming no longer orphans `tool`-role messages at the tail: the trim window now walks forward past any leading `tool` messages so every tool result in the kept window has its paired `assistant` call. Persistence failures are now logged instead of swallowed silently. Large `content`/`new_text`/`old_text` fields in debug log tool-call entries are capped at 80 characters to prevent full file bodies from leaking into the log. The webview CSP is tightened from `style-src 'unsafe-inline'` to nonce-based `style-src 'nonce-…'`. In-memory chat list is capped at 50 entries, evicting the oldest non-active chat when the limit is reached. `engines.vscode` lowered to `^1.107.0` for compatibility with Antigravity and comparable VS Code forks. Packaging version updated to `0.0.9`.
 - **0.0.8:** Added support for `gemma4:latest` and `gemma4:31b`. Both are thinking models that return empty responses when Ollama's native tools array is present (Ollama 0.20.0 behavior). ManulAI now detects these models via a new `useTextTools` profile flag and automatically switches to a text-tool fallback mode: tool descriptions are injected into the system prompt as structured text, tool calls are returned as `{"tool": "name", "args": {...}}` JSON in the model's text content, and tool results are forwarded as user-role messages. The `think: false` option is also sent to suppress internal thinking tokens from consuming context. Both gemma4 variants are now part of the validated picker baseline and appear first in the model selector alongside `phi4-mini:3.8b`, `llama3.1:8b`, and `qwen3-coder:30b`. Additional agent reliability fixes in this release: Go files now always use standalone `gofmt` for syntax verification instead of falling through to `npm run compile` when a `package.json` is present in the project; degenerate-output detection now catches bracket-soup token patterns typical of `phi4-mini` at the limits of its context window; case-insensitive workspace path correction prevents writes to wrong-case absolute paths when small models reproduce the workspace root with the wrong letter casing; `phi4-mini` now runs with `repeat_penalty: 1.15` to reduce repetitive-loop output; and a verify-failure nudge was added so that after a failed syntax verification the model is immediately pushed to fix the errors rather than continuing or declaring completion. Full regression matrix results for this release (5 models × 14 tasks = 70 runs): `gemma4:31b` 14/14, `gemma4:latest` 14/14, `qwen3-coder:30b` 13/14, `llama3.1:8b` 12/14, `phi4-mini:3.8b` 5/14 — total 58/70. Packaging version updated to `0.0.8`.
 - **0.0.7:** Agent and Planner behavior is now model-aware. Smaller Ollama models run with shorter mandates, tighter retry budgets, bounded-read bias, and a reduced tool set so weak local models are less likely to stall or ramble. The runtime also recovers more aggressively from malformed tool output: raw leaked tool-call text can be re-parsed, exact `package.json` name/version and `README.md` title requests can be answered deterministically, and explicit create-path requests are handled more reliably instead of drifting to the wrong file. Preferred local models are now curated around the currently validated baseline `phi4-mini:3.8b`, `llama3.1:8b`, and `qwen3-coder:30b`, with stronger greenfield-create nudges and tighter guardrails against placeholder scaffolds. The standalone debug harness was kept in sync with the extension runtime for the same recovery and model-profile behavior. Packaging version updated to `0.0.7`.

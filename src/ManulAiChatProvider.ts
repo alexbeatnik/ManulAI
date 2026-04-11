@@ -3,6 +3,8 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as vscode from 'vscode';
 
+import { ManulBridge, resolveManulPython } from './manulBridge';
+import type { ManulApiResult } from './manulBridge';
 import type { AgentModeValue, AttachedFileContext, ChatSession, ManulAiStoredSettings, OllamaMessage, OllamaResponse, ParsedToolCall, PersistedChatState, ToolDefinition, ToolFunctionCall, WebviewActiveFileState, WebviewChatSummary, WebviewInboundMessage, WebviewPendingApprovalState, WebviewRenderableMessage } from './types';
 import { ChatRole, DEFAULT_STORED_SETTINGS } from './types';
 import { deserializeAttachedFileContext as deserializePersistedAttachedFileContext, deserializeChatMessage as deserializePersistedChatMessage, deserializeChatSession as deserializePersistedChatSession, getChatStorageDirUri as getPersistedChatStorageDirUri, getChatStorageUri as getPersistedChatStorageUri, getWorkspaceSettingsDirUri as getPersistedWorkspaceSettingsDirUri, getWorkspaceSettingsUri as getPersistedWorkspaceSettingsUri, normalizePersistedChatSession as normalizeRestoredChatSession, normalizeStoredSettings as normalizePersistedSettings, restorePersistedChats as restorePersistedChatState, serializeChatState as serializePersistedChatState } from './providerPersistenceUtils';
@@ -101,6 +103,23 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   private lastPersistedChatState = '';
   private readonly launchedTerminals: vscode.Terminal[] = [];
 
+  /** Lazy ManulEngine subprocess bridge — created on first use, reset on workspace change. */
+  private _manulBridge?: ManulBridge;
+  private get manulBridge(): ManulBridge {
+    if (!this._manulBridge) {
+      const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd();
+      this._manulBridge = new ManulBridge({
+        pythonPath: resolveManulPython(workspaceRoot),
+        scriptPath: path.join(this.extensionContext.extensionPath, 'media', 'manul_bridge_api.py'),
+        workspaceRoot,
+        sessionId: this.extensionContext.globalState.get<string>('manulai.sessionId') ?? 'manulai-default',
+        headless: false,
+        timeoutMs: 120000,
+      });
+    }
+    return this._manulBridge;
+  }
+
   public constructor(private readonly extensionContext: vscode.ExtensionContext) {
     this.createChatSession();
 
@@ -115,6 +134,13 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       this.autoApprove = Boolean(config.get('autoApprove', DEFAULT_STORED_SETTINGS.autoApprove));
       this.debugMode = Boolean(config.get('debugMode', DEFAULT_STORED_SETTINGS.debugMode));
     }
+
+    this.extensionContext.subscriptions.push({
+      dispose: () => {
+        this._manulBridge?.dispose();
+        this._manulBridge = undefined;
+      },
+    });
   }
 
   private get activeChat(): ChatSession {
@@ -404,6 +430,9 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   }
 
   public async handleConfigurationChange(): Promise<void> {
+    // Dispose and recreate the bridge so it picks up any new workspace/settings on next use.
+    this._manulBridge?.dispose();
+    this._manulBridge = undefined;
     await this.initializeSettingsState();
   }
 
@@ -4055,7 +4084,15 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       'execute_terminal_command',
       'launch_in_terminal',
       'delete_file',
-      'list_workspace_files'
+      'list_workspace_files',
+      'manul_run_step',
+      'manul_run_goal',
+      'manul_scan_page',
+      'manul_read_page_text',
+      'manul_get_state',
+      'manul_save_hunt',
+      'manul_run_hunt',
+      'manul_run_hunt_file'
     ];
 
     if (/^phi4-mini(?:[:]|$)/.test(selectedModel)) {
@@ -4172,7 +4209,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         preferStepwiseExecution: true,
         maxNudgeRetriesCap: 2,
         maxReadOpsWithoutWrite: 2,
-        toolNames: ['read_active_file', 'read_specific_file', 'read_file_slice', 'create_or_edit_file', 'replace_in_file', 'list_workspace_files', 'execute_terminal_command']
+        toolNames: ['read_active_file', 'read_specific_file', 'read_file_slice', 'create_or_edit_file', 'replace_in_file', 'list_workspace_files', 'execute_terminal_command', 'manul_run_step', 'manul_scan_page', 'manul_run_hunt_file']
       };
     }
 
@@ -4725,9 +4762,30 @@ ${wsRoot ? `Workspace root: ${wsRoot}\n` : ''}
 - Use file tools for reads/writes, execute_terminal_command for shell.
 - execute_terminal_command has no stdin. Never run interactive programs (input(), readline, read) — they will hang.
 - For interactive programs (games, REPLs, scripts that need user input), use launch_in_terminal instead.
+- For browser or web automation: use manul_* tools. After EVERY action that changes state add a VERIFY step. After completing automation show the reconstructed .hunt preview and offer to save it (see rules below).
 - Keep text output minimal between tool calls.
 - NEVER output raw JSON as a substitute for a tool call.
 - Task is complete when all required changes are done. Output a one-line summary.
+
+[MANUL DSL REFERENCE]
+
+Hunt file structure (flush-left headers, 4-space indented actions):
+  @context: <description>  @title: <name>  STEP 1: Description      NAVIGATE to 'url'      VERIFY that 'Landmark' is present  DONE.
+
+Key commands: NAVIGATE to 'url' | SCROLL DOWN [inside 'container'] | Click the 'L' button|link|element | DOUBLE CLICK the 'L' | RIGHT CLICK 'L' | Fill 'F' field with 'V' | Type 'V' into the 'F' field | Select 'O' from the 'D' dropdown | Check/Uncheck the checkbox for 'L' | HOVER over the 'L' | Drag 'S' and drop it into 'T' | PRESS ENTER|Escape|Key | WAIT N | Wait for 'E' to be visible|hidden|disappear | WAIT FOR RESPONSE "pattern" | EXTRACT the 'E' into {v} | SET {v} = value | CALL PYTHON module.fn [into {v}]
+
+VERIFY commands: VERIFY that 'text' is present|NOT present|ENABLED|DISABLED|checked|NOT checked | VERIFY SOFTLY that 'text' is present | Verify 'F' field has value 'V' | Verify 'F' field has text 'T'
+
+Contextual qualifiers: NEAR 'anchor' | ON HEADER | ON FOOTER | INSIDE 'container' row with 'text'
+
+VERIFY after every action:
+  NAVIGATE → VERIFY that '<landmark>' is present
+  Fill/Type → Verify '<Field>' field has value '<value>'
+  Click → new page → VERIFY that '<landmark>' is present
+  Click → state change → VERIFY that '<new state>' is present
+
+[MANUL SESSION COMPLETION]
+After completing any automation with manul_* tools: (1) reconstruct the full .hunt DSL from all executed steps (or use hunt_proposal from the tool result), (2) show it as a fenced code block preview, (3) ask "Should I save this as a hunt file?", (4) WAIT — do NOT call manul_save_hunt until the user explicitly confirms. If the most recent VERIFY already proves the requested outcome, stop there — do NOT repeat earlier steps or call manul_get_state just to double-check.
 `;
 
       const workspaceTree = await this.buildCompactWorkspaceTree();
@@ -4736,7 +4794,7 @@ ${wsRoot ? `Workspace root: ${wsRoot}\n` : ''}
       }
 
       if (capabilityProfile.useTextTools) {
-        plannerMandate += `\n\n---\n\n[TOOL FORMAT]\n\nThis model must express tool calls in assistant text as JSON. This JSON-in-text format is the required tool-call mechanism here and overrides any earlier rule about not printing JSON.\n\nOutput tool calls as a single JSON object on its own line:\n{"tool": "tool_name", "args": {"param": "value"}}\n\nAvailable tools:\n- create_or_edit_file(filename, content) — Create or overwrite a file\n- replace_in_file(filepath, old_text, new_text) — Replace text in existing file\n- read_specific_file(filepath) — Read full file contents\n- read_file_slice(filepath, startLine, endLine) — Read a line range from a file\n- list_workspace_files(directory) — List files/folders in a directory\n- execute_terminal_command(command) — Run a shell command (no stdin)\n- launch_in_terminal(command) — Open integrated terminal for interactive commands\n- delete_file(filepath) — Delete a file\n- read_active_file() — Read the currently open file\n- project_scan() — Get a recursive tree of the entire workspace\n\nOutput ONE tool call JSON per response. No prose before the JSON. Do not wrap the JSON in markdown fences.`;
+        plannerMandate += `\n\n---\n\n[TOOL FORMAT]\n\nThis model must express tool calls in assistant text as JSON. This JSON-in-text format is the required tool-call mechanism here and overrides any earlier rule about not printing JSON.\n\nOutput tool calls as a single JSON object on its own line:\n{"tool": "tool_name", "args": {"param": "value"}}\n\nAvailable tools:\n- create_or_edit_file(filename, content) — Create or overwrite a file\n- replace_in_file(filepath, old_text, new_text) — Replace text in existing file\n- read_specific_file(filepath) — Read full file contents\n- read_file_slice(filepath, startLine, endLine) — Read a line range from a file\n- list_workspace_files(directory) — List files/folders in a directory\n- execute_terminal_command(command) — Run a shell command (no stdin)\n- launch_in_terminal(command) — Open integrated terminal for interactive commands\n- delete_file(filepath) — Delete a file\n- read_active_file() — Read the currently open file\n- project_scan() — Get a recursive tree of the entire workspace\n- manul_run_step(step) — Run one browser automation step (DSL or natural language)\n- manul_run_goal(goal, title?, context?) — Run multi-step browser automation goal\n- manul_scan_page() — Scan page for interactive elements after navigation\n- manul_read_page_text() — Read all visible text from the current browser page\n- manul_get_state() — Get ManulEngine browser session state\n- manul_save_hunt(path, content) — Save a .hunt automation file to disk\n- manul_run_hunt(dsl) — Execute a full .hunt DSL document\n- manul_run_hunt_file(filePath) — Read and run a .hunt file from disk\n\nOutput ONE tool call JSON per response. No prose before the JSON. Do not wrap the JSON in markdown fences.`;
       }
 
       if (capabilityProfile.includeWorkspaceNotes) {
@@ -4756,7 +4814,7 @@ ${wsRoot ? `Workspace root: ${wsRoot}\n` : ''}
       });
     } else {
     let agentMandate = capabilityProfile.useCompactMandate ? `[IDENTITY]
-  You are ManulAI, a local VS Code coding agent.
+  You are ManulAI, a local VS Code coding agent with browser automation via ManulEngine.
   ${wsRoot ? `Workspace root: ${wsRoot}\n` : ''}
 
   [RULES]
@@ -4764,11 +4822,12 @@ ${wsRoot ? `Workspace root: ${wsRoot}\n` : ''}
   - Prefer exactly ONE tool call per response.
   - Read before edit. Prefer read_file_slice for large files.
   - Use replace_in_file for small edits and create_or_edit_file for new files.
+  - For browser tasks: use manul_run_step for single steps, manul_run_goal for multi-step flows.
   - Do not narrate tool calls. Do not print JSON as text.
   - If a tool fails, adapt once and continue.
   - Finish with one short summary when the task is done.
   ` : `[IDENTITY]
-You are ManulAI, a local VS Code coding agent.
+You are ManulAI, a local VS Code coding agent with browser automation via ManulEngine.
 ${wsRoot ? `Workspace root: ${wsRoot}\n` : ''}
 All file paths are relative to the workspace root unless absolute.
 
@@ -4785,8 +4844,13 @@ You are an ACTION agent. Execute tasks using tools. Never describe what you inte
 1. File or code modification needed → use file tools
 2. Command execution needed → use execute_terminal_command (no stdin — never run interactive programs)
    For interactive programs (games, REPLs, scripts with user input) → use launch_in_terminal
-3. Code understanding required → read files first with read_file_slice
-4. No tools required → respond concisely
+3. Browser or web automation needed → use manul_* tools (ManulEngine integration)
+   Start with: manul_run_step for single DSL steps, manul_run_goal for multi-step flows
+   Always call manul_scan_page after NAVIGATE to discover element identifiers
+   After EVERY action that changes state → add a VERIFY step immediately (see [MANUL DSL REFERENCE])
+  After completing automation → show the reconstructed .hunt preview and offer to save it (see [MANUL SESSION COMPLETION]); if the last VERIFY already proves the requested outcome, stop there and do not repeat earlier steps
+4. Code understanding required → read files first with read_file_slice
+5. No tools required → respond concisely
 
 ---
 
@@ -4900,6 +4964,97 @@ If steps remain → continue with the next tool call.
 - Plan: short numbered list, then immediately start executing
 - During execution: no narration, only tool calls
 - After completion: one-line summary
+
+---
+
+[MANUL DSL REFERENCE]
+
+Hunt file structure (always flush-left headers, 4-space indented actions):
+  @context: <what this automation verifies>
+  @title: <short suite name>
+  @var: {key} = value
+
+  STEP 1: Description
+      NAVIGATE to 'https://url'
+      VERIFY that 'Landmark' is present
+      ...
+
+  DONE.
+
+Key DSL commands (element names always in single quotes):
+  Navigation:
+  - NAVIGATE to 'url'                          — load URL, wait for DOM
+  - SCROLL DOWN                                — scroll one viewport
+  - SCROLL DOWN inside the 'container'         — scroll a specific container
+
+  Interaction:
+  - Click the 'Label' button|link|element
+  - DOUBLE CLICK the 'Label'
+  - RIGHT CLICK 'Label'
+  - Fill 'Field' field with 'Value'            — clears and types
+  - Type 'Value' into the 'Field' field
+  - Select 'Option' from the 'Dropdown' dropdown
+  - Check the checkbox for 'Label'
+  - Uncheck the checkbox for 'Label'
+  - HOVER over the 'Label'
+  - Drag 'Source' and drop it into 'Target'
+  - PRESS ENTER / PRESS Escape / PRESS Control+A
+  - UPLOAD 'file_path' to 'Input'
+
+  Waits:
+  - WAIT 2                                     — sleep N seconds (use only when no element to wait for)
+  - Wait for 'Element' to be visible|hidden|disappear
+  - WAIT FOR RESPONSE "url_pattern"            — wait for matching network response
+
+  Data:
+  - EXTRACT the 'Element' into {var}           — capture visible text
+  - SET {var} = value
+  - CALL PYTHON module.function [into {var}]   — run Python helper
+
+  VERIFY commands (assertion — stops on failure):
+  - VERIFY that 'text' is present
+  - VERIFY that 'text' is NOT present
+  - VERIFY that 'Element' is ENABLED|DISABLED
+  - VERIFY that 'Element' is checked|NOT checked
+  - VERIFY SOFTLY that 'text' is present       — non-fatal, continues on failure
+  - Verify 'Field' field has value 'Expected'  — strict current input value
+  - Verify 'Field' field has text 'Expected'   — strict visible inner text
+
+  Contextual qualifiers (disambiguate repeated elements):
+  - Click the 'Edit' button NEAR 'John Doe'
+  - Click the 'Logo' link ON HEADER
+  - Click the 'Terms' link ON FOOTER
+  - Click the 'Delete' button INSIDE 'Actions' row with 'John'
+
+VERIFY after every action — mandatory table:
+  NAVIGATE               → VERIFY that '<page heading or landmark>' is present
+  Fill / Type            → Verify '<Field>' field has value '<entered value>'
+  Click → new page       → VERIFY that '<landmark on new page>' is present
+  Click → state change   → VERIFY that '<new state text or element>' is present
+  Select dropdown        → VERIFY that '<selected option>' is present
+  Check / Uncheck        → VERIFY that '<checkbox label>' is checked|NOT checked
+
+---
+
+[MANUL SESSION COMPLETION]
+
+After completing ANY automation task using manul_* tools:
+1. Reconstruct the full .hunt DSL from all steps that were executed (or use the hunt_proposal from the tool result if present).
+2. Show the hunt file as a fenced code block (preview) in your response.
+3. Ask the user: "Should I save this as a hunt file so it can be replayed later?"
+4. WAIT for the user to reply. Do NOT call manul_save_hunt automatically — only call it if the user explicitly confirms in their next message (e.g. "yes", "save it", "save").
+5. If the latest VERIFY already satisfied the request, do NOT replay earlier navigation/click steps or call manul_get_state just to re-check.
+
+Hunt file preview format:
+  \`\`\`hunt
+  @context: <what was automated>
+  @title: <short_name>
+
+  STEP 1: <description>
+      <all steps executed, in order, with VERIFY after each action>
+
+  DONE.
+  \`\`\`
 `;
 
       if (workspaceInstructions) {
@@ -4907,7 +5062,7 @@ If steps remain → continue with the next tool call.
       }
 
       if (capabilityProfile.useTextTools) {
-        agentMandate += `\n\n---\n\n[TOOL FORMAT]\n\nOutput tool calls as a single JSON object on its own line:\n{"tool": "tool_name", "args": {"param": "value"}}\n\nAvailable tools:\n- create_or_edit_file(filename, content) — Create or overwrite a file\n- replace_in_file(filepath, old_text, new_text) — Replace text in existing file\n- read_specific_file(filepath) — Read full file contents\n- read_file_slice(filepath, startLine, endLine) — Read a line range from a file\n- list_workspace_files(directory) — List files/folders in a directory\n- execute_terminal_command(command) — Run a shell command (no stdin)\n- launch_in_terminal(command) — Open integrated terminal for interactive commands\n- delete_file(filepath) — Delete a file\n- read_active_file() — Read the currently open file\n- project_scan() — Get a recursive tree of the entire workspace\n\nOutput ONE tool call JSON per response. No prose before the JSON.`;
+        agentMandate += `\n\n---\n\n[TOOL FORMAT]\n\nOutput tool calls as a single JSON object on its own line:\n{"tool": "tool_name", "args": {"param": "value"}}\n\nAvailable tools:\n- create_or_edit_file(filename, content) — Create or overwrite a file\n- replace_in_file(filepath, old_text, new_text) — Replace text in existing file\n- read_specific_file(filepath) — Read full file contents\n- read_file_slice(filepath, startLine, endLine) — Read a line range from a file\n- list_workspace_files(directory) — List files/folders in a directory\n- execute_terminal_command(command) — Run a shell command (no stdin)\n- launch_in_terminal(command) — Open integrated terminal for interactive commands\n- delete_file(filepath) — Delete a file\n- read_active_file() — Read the currently open file\n- project_scan() — Get a recursive tree of the entire workspace\n- manul_run_step(step) — Run one browser automation step (DSL or natural language)\n- manul_run_goal(goal, title?, context?) — Run multi-step browser automation goal\n- manul_scan_page() — Scan page for interactive elements after navigation\n- manul_read_page_text() — Read all visible text from the current browser page\n- manul_get_state() — Get ManulEngine browser session state\n- manul_save_hunt(path, content) — Save a .hunt automation file to disk\n- manul_run_hunt(dsl) — Execute a full .hunt DSL document\n- manul_run_hunt_file(filePath) — Read and run a .hunt file from disk\n\nOutput ONE tool call JSON per response. No prose before the JSON.`;
       }
 
       if (recentChatSummaries) {
@@ -5642,6 +5797,144 @@ If the user asks for a change but provides NO code:
             additionalProperties: false
           }
         }
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'manul_run_step',
+          description: 'Run a single Manul DSL step in the live browser session (opened automatically on first call). Use for one-step browser actions such as NAVIGATE, Click, Fill, VERIFY, etc. Accepts raw DSL or natural-language input. Always VERIFY state after actions that change it.',
+          parameters: {
+            type: 'object',
+            properties: {
+              step: {
+                type: 'string',
+                description: 'A single Manul DSL step or natural-language action. E.g. "NAVIGATE to https://example.com" or "Click the Login button".'
+              }
+            },
+            required: ['step'],
+            additionalProperties: false
+          }
+        }
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'manul_run_goal',
+          description: 'Convert a natural-language automation goal into Manul DSL steps and execute them all in the live browser session. Returns a ready-to-save .hunt file proposal. Use for multi-step browser flows.',
+          parameters: {
+            type: 'object',
+            properties: {
+              goal: {
+                type: 'string',
+                description: 'Natural-language automation goal, e.g. "Navigate to Amazon and search for MacBook Pro".'
+              },
+              title: {
+                type: 'string',
+                description: 'Optional short title for the generated .hunt file.'
+              },
+              context: {
+                type: 'string',
+                description: 'Optional strategic context to embed as @context: in the .hunt file.'
+              }
+            },
+            required: ['goal'],
+            additionalProperties: false
+          }
+        }
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'manul_scan_page',
+          description: 'Scan the currently open browser page and return all interactive elements (inputs, buttons, selects, checkboxes, links). Call after NAVIGATE or state-changing clicks to discover exact element identifiers before the next step.',
+          parameters: {
+            type: 'object',
+            properties: {},
+            additionalProperties: false
+          }
+        }
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'manul_read_page_text',
+          description: 'Return all visible text content from the currently open browser page. Use to read prices, labels, headings, or static text not returned by manul_scan_page.',
+          parameters: {
+            type: 'object',
+            properties: {},
+            additionalProperties: false
+          }
+        }
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'manul_get_state',
+          description: 'Return the current ManulEngine runner state: whether the browser is open, number of executed steps, last error, and accumulated .hunt file proposal.',
+          parameters: {
+            type: 'object',
+            properties: {},
+            additionalProperties: false
+          }
+        }
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'manul_save_hunt',
+          description: 'Save a .hunt automation file to disk. ONLY call this tool if the user has EXPLICITLY asked to save the hunt file in their most recent message (e.g. "yes", "save it", "save the hunt file"). Never call this tool automatically after automation completes — always show a preview first and wait for user confirmation.',
+          parameters: {
+            type: 'object',
+            properties: {
+              path: {
+                type: 'string',
+                description: 'Workspace-relative or absolute path to write, e.g. "tests/my_flow.hunt".'
+              },
+              content: {
+                type: 'string',
+                description: 'Full .hunt file content to write.'
+              }
+            },
+            required: ['path', 'content'],
+            additionalProperties: false
+          }
+        }
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'manul_run_hunt',
+          description: 'Validate and run a full .hunt DSL document in the live browser session.',
+          parameters: {
+            type: 'object',
+            properties: {
+              dsl: {
+                type: 'string',
+                description: 'Full .hunt file content to execute.'
+              }
+            },
+            required: ['dsl'],
+            additionalProperties: false
+          }
+        }
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'manul_run_hunt_file',
+          description: 'Read a .hunt file from the workspace, validate it, and run it in the live browser session. Use to replay an existing saved automation script.',
+          parameters: {
+            type: 'object',
+            properties: {
+              filePath: {
+                type: 'string',
+                description: 'Workspace-relative or absolute path to the .hunt file, e.g. "tests/my_flow.hunt".'
+              }
+            },
+            required: ['filePath'],
+            additionalProperties: false
+          }
+        }
       }
     ];
   }
@@ -5812,6 +6105,27 @@ If the user asks for a change but provides NO code:
         case 'write_workspace_notes':
           this.workspaceSnapshotCache = null; // notes changed — invalidate structure cache too
           return await this.writeWorkspaceNotes(String(args.content ?? ''), String(args.mode ?? 'append'));
+        case 'manul_run_step':
+          return await this.manulRunStep(String(args.step ?? ''));
+        case 'manul_run_goal':
+          return await this.manulRunGoal(
+            String(args.goal ?? ''),
+            typeof args.title === 'string' ? args.title : undefined,
+            typeof args.context === 'string' ? args.context : undefined
+          );
+        case 'manul_scan_page':
+          return await this.manulScanPage();
+        case 'manul_read_page_text':
+          return await this.manulReadPageText();
+        case 'manul_get_state':
+          return await this.manulGetState();
+        case 'manul_save_hunt':
+          // args.path is remapped to args.filepath by normalizeToolArguments; accept both
+          return await this.manulSaveHunt(String(args.filepath ?? args.path ?? ''), String(args.content ?? ''));
+        case 'manul_run_hunt':
+          return await this.manulRunHunt(String(args.dsl ?? ''));
+        case 'manul_run_hunt_file':
+          return await this.manulRunHuntFile(String(args.filePath ?? args.filepath ?? ''));
         default:
           return JSON.stringify({ error: `Unknown tool: ${name}` });
       }
@@ -6609,6 +6923,573 @@ If the user asks for a change but provides NO code:
     } catch (error) {
       return JSON.stringify({ error: error instanceof Error ? error.message : 'Failed to write notes.' });
     }
+  }
+
+  // ── ManulEngine browser automation tools ─────────────────────────────────
+
+  private formatManulBridgeFailure(result: ManulApiResult): string {
+    const data = result.data && typeof result.data === 'object' && !Array.isArray(result.data)
+      ? result.data as Record<string, unknown>
+      : undefined;
+    return JSON.stringify({ ...(data ?? {}), error: result.error, status: result.status });
+  }
+
+  private async manulRunStep(step: string): Promise<string> {
+    if (!step.trim()) {
+      return JSON.stringify({ error: 'step is required.' });
+    }
+    const result = await this.manulBridge.runStep(step);
+    if (!result.ok) {
+      return this.formatManulBridgeFailure(result);
+    }
+    const verifyStep = this.isManulVerifyStep(step);
+    const nextAction = verifyStep
+      ? 'If this VERIFY already satisfies the user\'s requested outcome, stop here. Show the provided hunt_proposal as the .hunt preview and ask whether it should be saved. Do not repeat earlier steps or call manul_get_state just to double-check.'
+      : undefined;
+    const data = await this.enrichManulResponseWithPreviewHints(result.data as Record<string, unknown>, nextAction, verifyStep);
+    return JSON.stringify(data);
+  }
+
+  private async manulRunGoal(goal: string, title?: string, context?: string): Promise<string> {
+    if (!goal.trim()) {
+      return JSON.stringify({ error: 'goal is required.' });
+    }
+    // Reset hunt proposal accumulator for this goal invocation
+    await this.manulBridge.reset(context ?? goal, title ?? goal);
+    // Split goal on newlines/periods and run as steps
+    const steps = goal
+      .split(/\n|(?<=\w)\.\s+|(?:,\s*)?(?:and\s+then|then)\s+/gi)
+      .map(s => s.trim())
+      .filter(s => s.length > 0);
+    const result = steps.length > 0
+      ? await this.manulBridge.runSteps(steps, context, title)
+      : await this.manulBridge.runStep(goal);
+    if (result.ok) {
+      const data = await this.enrichManulResponseWithPreviewHints(result.data as Record<string, unknown>, undefined, true);
+      const huntDsl = typeof data?.hunt_proposal === 'string' ? data.hunt_proposal : undefined;
+      const nextAction = huntDsl
+        ? `Automation complete. The .hunt DSL is already available in hunt_proposal — show it as a fenced code block preview, then ask the user if they want to save it as a hunt file (e.g. tests/<name>.hunt).`
+        : `Automation complete. Reconstruct the .hunt DSL from all steps executed (with @context:, @title:, STEP blocks, VERIFY after every action, DONE.), show it as a fenced code block preview, then ask the user if they want to save it as a hunt file.`;
+      return JSON.stringify({ ...data, _nextAction: nextAction });
+    }
+    return this.formatManulBridgeFailure(result);
+  }
+
+  private async manulScanPage(): Promise<string> {
+    const result = await this.manulBridge.scanPage();
+    return JSON.stringify(result.ok ? result.data : { error: result.error, status: result.status });
+  }
+
+  private async manulReadPageText(): Promise<string> {
+    const result = await this.manulBridge.readPageText();
+    return JSON.stringify(result.ok ? result.data : { error: result.error, status: result.status });
+  }
+
+  private async manulGetState(): Promise<string> {
+    const result = await this.manulBridge.getState();
+    if (!result.ok) {
+      return this.formatManulBridgeFailure(result);
+    }
+    const data = result.data as Record<string, unknown>;
+    const executedSteps = this.readNumericValue(data.executed_steps ?? data.stepCount ?? data.step_count) ?? 0;
+    const nextAction = executedSteps > 0
+      ? 'If the requested automation goal is already satisfied, do not repeat earlier steps. Show the provided hunt_proposal as the .hunt preview and ask whether it should be saved.'
+      : undefined;
+    const enriched = await this.enrichManulResponseWithPreviewHints(data, nextAction, executedSteps > 0);
+    return JSON.stringify(enriched);
+  }
+
+  private async manulSaveHunt(huntPath: string, content: string): Promise<string> {
+    if (!huntPath.trim()) {
+      return JSON.stringify({ error: 'path is required.' });
+    }
+    if (!content.trim()) {
+      return JSON.stringify({ error: 'content is required.' });
+    }
+    if (!this.latestUserExplicitlyRequestsHuntSave()) {
+      const huntProposal = await this.getCurrentManulHuntProposal();
+      return JSON.stringify({
+        error: 'manul_save_hunt is blocked until the user explicitly asks to save the hunt file in their latest message.',
+        ...(huntProposal ? { hunt_proposal: huntProposal } : {}),
+        save_allowed: false,
+        _nextAction: 'Do not save yet. Show the provided hunt_proposal in chat and ask the user whether it should be saved as a .hunt file.'
+      });
+    }
+    const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
+    if (!workspaceFolder) {
+      return JSON.stringify({ error: 'manul_save_hunt requires an open workspace folder.' });
+    }
+
+    // Resolve to an absolute path inside the first workspace folder.
+    const wsRoot = workspaceFolder.uri.fsPath;
+    let resolvedPath = huntPath;
+    if (!path.isAbsolute(huntPath)) {
+      resolvedPath = path.join(wsRoot, huntPath);
+    }
+    const normalizedRoot = path.resolve(wsRoot);
+    const normalizedTarget = path.resolve(resolvedPath);
+    if (normalizedTarget !== normalizedRoot && !normalizedTarget.startsWith(`${normalizedRoot}${path.sep}`)) {
+      return JSON.stringify({ error: `path must stay inside the workspace root (${wsRoot})` });
+    }
+    if (!resolvedPath.endsWith('.hunt')) {
+      return JSON.stringify({ error: 'path must end in .hunt' });
+    }
+    const result = await this.manulBridge.saveHunt(resolvedPath, content);
+    if (!result.ok) {
+      // Fallback: write locally via VS Code FS so hunt files can be saved even
+      // when the ManulEngine backend is not running.
+      try {
+        const fallbackPathError = await this.validateManulFallbackSavePath(wsRoot, resolvedPath);
+        if (fallbackPathError) {
+          return JSON.stringify({ error: result.error, fsError: fallbackPathError });
+        }
+        const uri = vscode.Uri.file(resolvedPath);
+        await vscode.workspace.fs.createDirectory(vscode.Uri.file(path.dirname(resolvedPath)));
+        await vscode.workspace.fs.writeFile(uri, Buffer.from(content, 'utf8'));
+        return JSON.stringify({ success: true, path: resolvedPath, note: 'Saved locally (ManulEngine not reachable).' });
+      } catch (fsErr) {
+        return JSON.stringify({ error: result.error, fsError: fsErr instanceof Error ? fsErr.message : String(fsErr) });
+      }
+    }
+    return JSON.stringify(result.ok ? result.data : { error: result.error, status: result.status });
+  }
+
+  private async validateManulFallbackSavePath(workspaceRoot: string, targetPath: string): Promise<string | undefined> {
+    try {
+      const realRoot = await fs.promises.realpath(workspaceRoot);
+      const nearestExistingParent = await this.findNearestExistingPath(path.dirname(targetPath));
+      const realParent = await fs.promises.realpath(nearestExistingParent);
+      if (realParent !== realRoot && !realParent.startsWith(`${realRoot}${path.sep}`)) {
+        return `path resolves outside the workspace root (${workspaceRoot})`;
+      }
+
+      try {
+        const targetStats = await fs.promises.lstat(targetPath);
+        if (targetStats.isSymbolicLink()) {
+          const realTarget = await fs.promises.realpath(targetPath);
+          if (realTarget !== realRoot && !realTarget.startsWith(`${realRoot}${path.sep}`)) {
+            return `refusing to write through symlink to ${realTarget}`;
+          }
+        }
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code !== 'ENOENT') {
+          throw error;
+        }
+      }
+
+      return undefined;
+    } catch (error) {
+      return error instanceof Error ? error.message : String(error);
+    }
+  }
+
+  private async findNearestExistingPath(targetPath: string): Promise<string> {
+    let currentPath = path.resolve(targetPath);
+    while (true) {
+      try {
+        await fs.promises.lstat(currentPath);
+        return currentPath;
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code !== 'ENOENT') {
+          throw error;
+        }
+      }
+
+      const parentPath = path.dirname(currentPath);
+      if (parentPath === currentPath) {
+        throw new Error(`Unable to resolve an existing parent path for ${targetPath}`);
+      }
+      currentPath = parentPath;
+    }
+  }
+
+  private async manulRunHunt(dsl: string): Promise<string> {
+    if (!dsl.trim()) {
+      return JSON.stringify({ error: 'dsl is required.' });
+    }
+    // Extract runnable lines (non-metadata, non-comment, non-empty) and run as steps
+    const runnableLines = dsl
+      .split(/\r?\n/)
+      .map(l => l.trim())
+      .filter(l => l.length > 0 && !l.startsWith('#') && !l.startsWith('@') && !l.startsWith('DONE') && !/^STEP\s+\d+:/i.test(l));
+    if (runnableLines.length === 0) {
+      return JSON.stringify({ error: 'No runnable steps found in DSL.' });
+    }
+    const context = this.extractHuntHeader(dsl, '@context:');
+    const title = this.extractHuntHeader(dsl, '@title:');
+    const result = await this.manulBridge.runSteps(runnableLines, context, title);
+    if (result.ok) {
+      const data = await this.enrichManulResponseWithPreviewHints(result.data as Record<string, unknown>, undefined, true);
+      const huntDsl = typeof data?.hunt_proposal === 'string' ? data.hunt_proposal : undefined;
+      const nextAction = huntDsl
+        ? 'Automation complete. The .hunt DSL is already available in hunt_proposal — show it as a fenced code block preview, then ask the user if they want to save it as a hunt file.'
+        : 'Automation complete. Show the executed .hunt DSL as a fenced code block preview (with VERIFY after every action), then ask the user if they want to save it as a hunt file.';
+      return JSON.stringify({ ...data, _nextAction: nextAction });
+    }
+    return this.formatManulBridgeFailure(result);
+  }
+
+  private async manulRunHuntFile(filePath: string): Promise<string> {
+    if (!filePath.trim()) {
+      return JSON.stringify({ error: 'filePath is required.' });
+    }
+    if (!filePath.endsWith('.hunt')) {
+      return JSON.stringify({ error: 'filePath must end in .hunt' });
+    }
+    let dsl: string;
+    try {
+      const uri = path.isAbsolute(filePath)
+        ? vscode.Uri.file(filePath)
+        : this.resolveWorkspaceUri(filePath);
+      const bytes = await vscode.workspace.fs.readFile(uri);
+      dsl = Buffer.from(bytes).toString('utf8');
+    } catch (err) {
+      return JSON.stringify({ error: `Could not read file: ${err instanceof Error ? err.message : String(err)}` });
+    }
+    const runnableLines = dsl
+      .split(/\r?\n/)
+      .map(l => l.trim())
+      .filter(l => l.length > 0 && !l.startsWith('#') && !l.startsWith('@') && !l.startsWith('DONE') && !/^STEP\s+\d+:/i.test(l));
+    if (runnableLines.length === 0) {
+      return JSON.stringify({ error: 'No runnable steps found in .hunt file.' });
+    }
+    const context = this.extractHuntHeader(dsl, '@context:');
+    const title = this.extractHuntHeader(dsl, '@title:');
+    const result = await this.manulBridge.runSteps(runnableLines, context, title);
+    if (result.ok) {
+      const data = await this.enrichManulResponseWithPreviewHints(result.data as Record<string, unknown>, undefined, true);
+      const huntDsl = typeof data?.hunt_proposal === 'string' ? data.hunt_proposal : undefined;
+      const nextAction = huntDsl
+        ? 'Hunt file execution complete. The .hunt DSL is already available in hunt_proposal — show it as a fenced code block preview, then ask the user if they want to save or overwrite it.'
+        : 'Hunt file execution complete. Show the executed .hunt DSL as a fenced code block preview (with VERIFY after every action), then ask the user if they want to save or overwrite it.';
+      return JSON.stringify({ ...data, filePath, stepCount: runnableLines.length, _nextAction: nextAction });
+    }
+    return this.formatManulBridgeFailure(result);
+  }
+
+  private extractHuntHeader(dsl: string, directive: string): string | undefined {
+    const escaped = directive.replace(':', '\\s*:');
+    const match = dsl.match(new RegExp(`^${escaped}\\s*(.+)$`, 'm'));
+    return match ? match[1].trim() : undefined;
+  }
+
+  private isManulVerifyStep(step: string): boolean {
+    return /^\s*verify\b/i.test(step);
+  }
+
+  private readNumericValue(value: unknown): number | undefined {
+    if (typeof value === 'number' && Number.isFinite(value)) {
+      return value;
+    }
+    if (typeof value === 'string') {
+      const parsed = Number(value);
+      if (Number.isFinite(parsed)) {
+        return parsed;
+      }
+    }
+    return undefined;
+  }
+
+  private async enrichManulResponseWithPreviewHints(
+    data: Record<string, unknown>,
+    nextAction?: string,
+    forceProposal = false
+  ): Promise<Record<string, unknown>> {
+    const enriched: Record<string, unknown> = { ...data };
+    const existingProposal = typeof enriched.hunt_proposal === 'string' ? enriched.hunt_proposal.trim() : '';
+    const hasProposal = existingProposal.length > 0;
+    const executedSteps = this.readNumericValue(enriched.executed_steps ?? enriched.stepCount ?? enriched.step_count) ?? 0;
+    if (hasProposal || forceProposal || executedSteps > 0) {
+      const huntProposal = await this.getCurrentManulHuntProposal(enriched, data, existingProposal);
+      if (huntProposal) {
+        enriched.hunt_proposal = huntProposal;
+      }
+    }
+    if (nextAction && typeof enriched._nextAction !== 'string') {
+      enriched._nextAction = nextAction;
+    }
+    return enriched;
+  }
+
+  private async getCurrentManulHuntProposal(
+    stateLike?: Record<string, unknown>,
+    pendingPayload?: Record<string, unknown>,
+    existingProposal?: string
+  ): Promise<string | undefined> {
+    const localProposal = this.buildManulHuntProposalFromTranscript(stateLike, pendingPayload);
+    const normalizedExisting = existingProposal?.trim() ?? '';
+    if (localProposal && (!normalizedExisting || this.shouldPreferManulProposal(localProposal, normalizedExisting))) {
+      return localProposal;
+    }
+    if (normalizedExisting) {
+      return normalizedExisting;
+    }
+    const context = typeof stateLike?.context === 'string' ? stateLike.context : undefined;
+    const title = typeof stateLike?.title === 'string' ? stateLike.title : undefined;
+    const result = await this.manulBridge.proposeHunt(context, title);
+    if (!result.ok) {
+      return localProposal;
+    }
+    const data = result.data as Record<string, unknown>;
+    const huntProposal = typeof data?.hunt_proposal === 'string' ? data.hunt_proposal.trim() : '';
+    if (localProposal && (!huntProposal || this.shouldPreferManulProposal(localProposal, huntProposal))) {
+      return localProposal;
+    }
+    return huntProposal || localProposal || undefined;
+  }
+
+  private buildManulHuntProposalFromTranscript(
+    stateLike?: Record<string, unknown>,
+    pendingPayload?: Record<string, unknown>
+  ): string | undefined {
+    const steps = this.collectSuccessfulManulStepsSinceLastUser(pendingPayload);
+    if (steps.length === 0) {
+      return undefined;
+    }
+    const { context, title } = this.getManulProposalContextAndTitle(stateLike);
+    const lines = [`@context: ${context}`, `@title: ${title}`, '', 'STEP 1: Recorded actions'];
+    let lastActionLine = '';
+    for (const step of steps) {
+      const actionLine = `    ${step.step}`;
+      if (actionLine !== lastActionLine) {
+        lines.push(actionLine);
+        lastActionLine = actionLine;
+      }
+      for (const verifyLine of this.inferManulVerifyLines(step.step, step.pageScan)) {
+        const renderedVerifyLine = `    ${verifyLine}`;
+        if (renderedVerifyLine !== lastActionLine) {
+          lines.push(renderedVerifyLine);
+          lastActionLine = renderedVerifyLine;
+        }
+      }
+    }
+    lines.push('', 'DONE.');
+    return lines.join('\n');
+  }
+
+  private collectSuccessfulManulStepsSinceLastUser(
+    pendingPayload?: Record<string, unknown>
+  ): Array<{ step: string; pageScan: Array<{ type?: string; identifier?: string }> }> {
+    const entries: Array<{ step: string; pageScan: Array<{ type?: string; identifier?: string }> }> = [];
+    const startIndex = this.getLastVisibleUserMessageIndex(this.messages);
+    for (let index = Math.max(0, startIndex + 1); index < this.messages.length; index += 1) {
+      const message = this.messages[index];
+      if (message.role !== 'tool') {
+        continue;
+      }
+      if (!['manul_run_step', 'manul_run_goal', 'manul_run_hunt', 'manul_run_hunt_file'].includes(message.tool_name ?? '')) {
+        continue;
+      }
+      try {
+        const payload = JSON.parse(message.content) as Record<string, unknown>;
+        entries.push(...this.extractSuccessfulManulStepsFromPayload(payload));
+      } catch {
+        continue;
+      }
+    }
+    if (pendingPayload) {
+      entries.push(...this.extractSuccessfulManulStepsFromPayload(pendingPayload));
+    }
+    return entries;
+  }
+
+  private extractSuccessfulManulStepsFromPayload(
+    payload?: Record<string, unknown>
+  ): Array<{ step: string; pageScan: Array<{ type?: string; identifier?: string }> }> {
+    if (!payload || !Array.isArray(payload.results)) {
+      return [];
+    }
+    const entries: Array<{ step: string; pageScan: Array<{ type?: string; identifier?: string }> }> = [];
+    for (const rawResult of payload.results) {
+      if (!rawResult || typeof rawResult !== 'object') {
+        continue;
+      }
+      const result = rawResult as Record<string, unknown>;
+      const step = typeof result.step === 'string' ? result.step.trim() : '';
+      const status = typeof result.status === 'string' ? result.status.trim().toLowerCase() : '';
+      if (!step || (status && status !== 'pass')) {
+        continue;
+      }
+      const pageScan = Array.isArray(result.page_scan)
+        ? result.page_scan
+          .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === 'object')
+          .map(item => ({
+            type: typeof item.type === 'string' ? item.type : undefined,
+            identifier: typeof item.identifier === 'string' ? item.identifier : undefined,
+          }))
+        : [];
+      entries.push({ step, pageScan });
+    }
+    return entries;
+  }
+
+  private getManulProposalContextAndTitle(stateLike?: Record<string, unknown>): { context: string; title: string } {
+    let context = typeof stateLike?.context === 'string' ? stateLike.context.trim() : '';
+    let title = typeof stateLike?.title === 'string' ? stateLike.title.trim() : '';
+    if (context && title) {
+      return { context, title };
+    }
+    const startIndex = this.getLastVisibleUserMessageIndex(this.messages);
+    for (let index = this.messages.length - 1; index > startIndex; index -= 1) {
+      const message = this.messages[index];
+      if (message.role !== 'tool' || message.tool_name !== 'manul_get_state') {
+        continue;
+      }
+      try {
+        const payload = JSON.parse(message.content) as Record<string, unknown>;
+        if (!context && typeof payload.context === 'string' && payload.context.trim()) {
+          context = payload.context.trim();
+        }
+        if (!title && typeof payload.title === 'string' && payload.title.trim()) {
+          title = payload.title.trim();
+        }
+      } catch {
+        continue;
+      }
+      if (context && title) {
+        break;
+      }
+    }
+    return {
+      context: context || 'Manul automation',
+      title: title || 'Recorded Session',
+    };
+  }
+
+  private inferManulVerifyLines(
+    step: string,
+    pageScan: Array<{ type?: string; identifier?: string }>
+  ): string[] {
+    if (this.isManulVerifyStep(step)) {
+      return [];
+    }
+    const fillMatch = step.match(/^Fill '([^']+)' field with '([^']+)'$/i);
+    if (fillMatch) {
+      return [`Verify '${fillMatch[1]}' field has value '${fillMatch[2]}'`];
+    }
+    const typeMatch = step.match(/^Type '([^']+)' into the '([^']+)' field$/i);
+    if (typeMatch) {
+      return [`Verify '${typeMatch[2]}' field has value '${typeMatch[1]}'`];
+    }
+    const selectMatch = step.match(/^Select '([^']+)' from the '([^']+)' dropdown$/i);
+    if (selectMatch) {
+      return [`VERIFY that '${selectMatch[1]}' is present`];
+    }
+    const checkMatch = step.match(/^Check the checkbox for '([^']+)'$/i);
+    if (checkMatch) {
+      return [`VERIFY that '${checkMatch[1]}' is checked`];
+    }
+    const uncheckMatch = step.match(/^Uncheck the checkbox for '([^']+)'$/i);
+    if (uncheckMatch) {
+      return [`VERIFY that '${uncheckMatch[1]}' is NOT checked`];
+    }
+    if (/^(?:NAVIGATE\b|Click\b|DOUBLE CLICK\b|RIGHT CLICK\b|PRESS ENTER\b)/i.test(step)) {
+      const target = this.pickBestManulVerifyTarget(pageScan);
+      return target ? [`VERIFY that '${target}' is present`] : [];
+    }
+    return [];
+  }
+
+  private pickBestManulVerifyTarget(pageScan: Array<{ type?: string; identifier?: string }>): string | undefined {
+    let bestTarget: string | undefined;
+    let bestScore = Number.NEGATIVE_INFINITY;
+    for (const element of pageScan) {
+      const identifier = (element.identifier ?? '').trim();
+      if (!identifier) {
+        continue;
+      }
+      if (/^(?:Main content|Show\/Hide shortcuts.*)$/i.test(identifier)) {
+        continue;
+      }
+      if (/(?:alt\s*\+|shift\s*\+)/i.test(identifier)) {
+        continue;
+      }
+      if (/^\.[a-z]{2}$/i.test(identifier)) {
+        continue;
+      }
+      let score = 50;
+      switch ((element.type ?? '').toLowerCase()) {
+        case 'heading':
+          score = 120;
+          break;
+        case 'input':
+          score = 100;
+          break;
+        case 'button':
+          score = 80;
+          break;
+        case 'link':
+          score = 70;
+          break;
+        default:
+          score = 60;
+          break;
+      }
+      if (/\s/.test(identifier)) {
+        score += 10;
+      }
+      if (/(?:enter|email|search|sign in|login|password|account)/i.test(identifier)) {
+        score += 20;
+      }
+      if (/^(?:[a-z0-9_.-]+)$/i.test(identifier) && !/\s/.test(identifier)) {
+        score -= 35;
+      }
+      if (/^nav-[a-z0-9_-]+$/i.test(identifier)) {
+        score -= 50;
+      }
+      if (score > bestScore) {
+        bestScore = score;
+        bestTarget = identifier;
+      }
+    }
+    return bestTarget;
+  }
+
+  private shouldPreferManulProposal(candidate: string, current: string): boolean {
+    return this.countManulVerifyLines(candidate) > this.countManulVerifyLines(current);
+  }
+
+  private countManulVerifyLines(dsl: string): number {
+    return dsl.split(/\r?\n/).filter(line => /^\s*(?:VERIFY|Verify)\b/.test(line)).length;
+  }
+
+  private latestUserExplicitlyRequestsHuntSave(): boolean {
+    const latestUserRequest = this.getLatestVisibleUserRequest(this.messages).trim();
+    if (!latestUserRequest) {
+      return false;
+    }
+    if (/(?:\bdon'?t\s+save\b|\bdo\s+not\s+save\b|\bno\s+need\s+to\s+save\b|\bне\s+(?:треба|потрібно|нужно)\s+зберіг|\bне\s+зберіг(?:ай|ати)\b|\bне\s+сохраня)/i.test(latestUserRequest)) {
+      return false;
+    }
+    if (this.isExplicitHuntSaveRequest(latestUserRequest)) {
+      return true;
+    }
+    return this.isSimpleSaveAffirmation(latestUserRequest) && this.latestVisibleAssistantOfferedHuntSave();
+  }
+
+  private isExplicitHuntSaveRequest(text: string): boolean {
+    return /(?:\bsave(?:\s+(?:it|this|that|the(?:\s+hunt)?(?:\s+file)?))?\b|\bwrite(?:\s+out)?\b.{0,40}(?:\.hunt\b|hunt\s+file)|\bcreate\b.{0,40}(?:\.hunt\b|hunt\s+file)|\bstore\b.{0,40}(?:\.hunt\b|hunt\s+file)|\bpersist\b.{0,40}(?:\.hunt\b|hunt\s+file)|\bзбереж(?:и|іть|ти|емо|ення)\b|\bзапиш(?:и|іть|ти|емо)\b.{0,40}(?:\.hunt|hunt|файл)|\bствор(?:и|іть|ити|имо)\b.{0,40}(?:\.hunt|hunt|файл)|\bсохран(?:и|ить|ите)\b.{0,40}(?:\.hunt|hunt|файл))/i.test(text);
+  }
+
+  private isSimpleSaveAffirmation(text: string): boolean {
+    return /^(?:yes|yep|yeah|sure|ok(?:ay)?|please\s+do|go\s+ahead|так|ага|добре|ок(?:ей)?|да)\b/i.test(text.trim());
+  }
+
+  private latestVisibleAssistantOfferedHuntSave(): boolean {
+    for (let index = this.messages.length - 1; index >= 0; index -= 1) {
+      const message = this.messages[index];
+      if (message.role !== 'assistant' || message.hiddenFromTranscript || message.localOnly) {
+        continue;
+      }
+      const content = message.content.trim();
+      if (!content) {
+        continue;
+      }
+      return /(?:should\s+i\s+save\s+this\s+as\s+a\s+hunt\s+file|would\s+you\s+like\s+me\s+to\s+save\s+(?:this|it)\s+as\s+a\s+hunt\s+file|save\s+(?:this|it)\s+as\s+a\s+hunt\s+file\s+so\s+it\s+can\s+be\s+replayed\s+later|зберегти\s+(?:це|його|її)?\s*(?:як)?\s*\.hunt|зберегти\s+hunt\s+файл)/i.test(content);
+    }
+    return false;
   }
 
   private async projectScan(): Promise<string> {
@@ -8828,6 +9709,22 @@ If the user asks for a change but provides NO code:
         return `Running ${String(args.command ?? '').trim() || 'terminal command'}`;
       case 'launch_in_terminal':
         return `Launching in terminal: ${String(args.command ?? '').trim() || 'interactive program'}`;
+      case 'manul_run_step':
+        return `Browser: ${String(args.step ?? '').trim() || 'running step'}`;
+      case 'manul_run_goal':
+        return `Browser automation: ${String(args.goal ?? '').trim() || 'running goal'}`;
+      case 'manul_scan_page':
+        return 'Scanning browser page elements';
+      case 'manul_read_page_text':
+        return 'Reading browser page text';
+      case 'manul_get_state':
+        return 'Checking ManulEngine state';
+      case 'manul_save_hunt':
+        return `Saving hunt file: ${String(args.filepath ?? args.path ?? args.filePath ?? '').trim() || 'unknown path'}`;
+      case 'manul_run_hunt':
+        return 'Running .hunt automation file';
+      case 'manul_run_hunt_file':
+        return `Running hunt file: ${String(args.filepath ?? args.filePath ?? args.path ?? '').trim() || 'unknown path'}`;
       default:
         return `Executing ${toolName}`;
     }

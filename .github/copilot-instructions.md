@@ -81,6 +81,9 @@ This repository contains a VS Code extension named ManulAI.
 - When `execute_terminal_command` times out because the child process was killed, the error must hint that stdin is unavailable and the program should not be retried.
 - Keep workspace notes per-chat: store under `.manulai/notes/<chatId>.md` and delete the notes file when the chat is deleted.
 - When the latest user message is conversational (greeting, small talk) and no tools were called in the current exchange, do not nudge the model to execute stale tasks from earlier context; let it respond naturally.
+- Keep browser-automation hunt saving confirmation-gated: `manul_save_hunt` must be rejected unless the latest visible user message explicitly asks to save the `.hunt` file or directly affirms the immediately preceding save question.
+- When a Manul session already has executed steps, prefer returning `hunt_proposal` / `_nextAction` hints from VERIFY-completion and `manul_get_state` flows so the model stops after the goal is verified instead of replaying earlier navigation/click steps.
+- When ManulEngine's own hunt proposal is incomplete, reconstruct the preview locally from successful `manul_run_*` tool results and infer VERIFY lines from `page_scan` plus executed step text so the chat preview still contains post-action assertions.
 
 ## Debug Script Parity
 
