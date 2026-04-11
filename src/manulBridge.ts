@@ -204,7 +204,9 @@ export class ManulBridge {
   /** Gracefully shut down the subprocess, then kill it if needed. */
   public dispose(): void {
     if (this.proc && !this.proc.killed) {
-      try { this.request('shutdown'); } catch { /* best-effort */ }
+      void this.request('shutdown').catch(() => {
+        /* best-effort */
+      });
       try { this.proc.stdin?.end(); } catch { /* ignore */ }
       setTimeout(() => {
         try { this.proc?.kill(); } catch { /* ignore */ }
