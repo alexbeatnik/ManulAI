@@ -2641,12 +2641,24 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         const headCount = 2;
         let tailCount = maxMessages - headCount - 1; // -1 for the trim notice
         let tailStart = stripped.length - tailCount;
-        while (tailStart > headCount && stripped[tailStart]?.role === 'tool') {
+        // Advance past leading `tool` messages so the tail never starts on an
+        // orphaned tool result whose paired assistant was discarded.
+        while (tailStart < stripped.length - 1 && stripped[tailStart]?.role === 'tool') {
           tailStart++;
-          tailCount--;
         }
         const first = stripped.slice(0, headCount);
-        const recent = stripped.slice(tailStart);
+        const recent = stripped.slice(tailStart).map((m, idx) => {
+          // Boundary assistant: if the retained tail starts with an assistant
+          // that still carries `tool_calls`, their paired `tool` responses were
+          // discarded upstream. Strip the tool_calls to avoid poisoning the next
+          // turn with phantom call IDs Ollama will wait on.
+          if (idx === 0 && m.role === 'assistant' && (m as { tool_calls?: unknown }).tool_calls) {
+            const clone = { ...m } as OllamaMessage & { tool_calls?: unknown };
+            delete clone.tool_calls;
+            return clone;
+          }
+          return m;
+        });
         const trimNotice: OllamaMessage = {
           role: 'user',
           content: 'Context trimmed to prevent overflow. Continue with the task — execute the next required action.',
@@ -4767,7 +4779,15 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     return status === 503 || status === 502 || status === 504;
   }
 
-  private computeOllamaRetryDelay(attempt: number): number {
+  private computeOllamaRetryDelay(attempt: number, reason: 'fetch' | 'model_loading' = 'fetch'): number {
+    if (reason === 'model_loading') {
+      // Ollama 503 is emitted while a model is still loading from disk. Large
+      // models (30B+) routinely need 10-60s of warm-up, so using the short
+      // network-retry curve causes spurious failures on cold-start requests.
+      const base = 5000 * Math.pow(2, Math.max(0, attempt));
+      const jitter = Math.floor(Math.random() * 1500);
+      return Math.min(base + jitter, 20000);
+    }
     const base = 500 * Math.pow(2, Math.max(0, attempt));
     const jitter = Math.floor(Math.random() * 250);
     return Math.min(base + jitter, 3000);
@@ -4820,13 +4840,17 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         });
 
         if (this.isRetryableOllamaHttpStatus(response.status) && attempt < this.OLLAMA_MAX_RETRIES) {
+          const isModelLoading = response.status === 503;
           this.debugLog('ollama_http_retry', {
             attempt: attempt + 1,
             status: response.status,
+            reason: isModelLoading ? 'model_loading' : 'fetch',
             model: this.getSelectedModel()
           });
-          this.postStatus(`Ollama returned HTTP ${response.status} — retrying...`);
-          await new Promise(resolve => setTimeout(resolve, this.computeOllamaRetryDelay(attempt)));
+          this.postStatus(isModelLoading
+            ? `Ollama is loading the model (HTTP 503) — waiting before retry...`
+            : `Ollama returned HTTP ${response.status} — retrying...`);
+          await new Promise(resolve => setTimeout(resolve, this.computeOllamaRetryDelay(attempt, isModelLoading ? 'model_loading' : 'fetch')));
           continue;
         }
 
@@ -5421,6 +5445,58 @@ If the user asks for a change but provides NO code:
               }
             };
           }
+        }
+      }
+
+      // Emergency context-overflow recovery: Ollama returns HTTP 5xx with a body
+      // mentioning token/context limits when num_ctx is undersized for the prompt.
+      // Halve the retained tail in-place and retry exactly once before bubbling up.
+      if ((response.status === 500 || response.status === 413)
+          && /context|token.{0,12}(limit|exceed)|exceed|too\s+(long|large|many)|prompt\s+is\s+too/i.test(errorText)) {
+        const retained = body.messages as OllamaMessage[];
+        if (retained.length > 6) {
+          const systemEnd = retained.findIndex(m => m.role !== 'system');
+          const head = systemEnd > 0 ? retained.slice(0, systemEnd) : [];
+          const nonSystem = systemEnd >= 0 ? retained.slice(systemEnd) : retained;
+          const tailKeep = Math.max(4, Math.floor(nonSystem.length / 2));
+          let tailStart = nonSystem.length - tailKeep;
+          while (tailStart < nonSystem.length - 1 && nonSystem[tailStart]?.role === 'tool') {
+            tailStart++;
+          }
+          const tail = nonSystem.slice(tailStart).map(m => {
+            // Strip tool_calls from the boundary assistant — its paired tool
+            // responses were discarded, so leaving them creates orphaned calls.
+            if (m === nonSystem[tailStart] && m.role === 'assistant' && (m as { tool_calls?: unknown }).tool_calls) {
+              const clone = { ...m } as OllamaMessage & { tool_calls?: unknown };
+              delete clone.tool_calls;
+              return clone;
+            }
+            return m;
+          });
+          const emergencyBody = {
+            ...body,
+            messages: [
+              ...head,
+              { role: 'user' as const, content: 'Context was truncated after an overflow. Continue with the next required tool call or a one-line summary — do not restate prior steps.' },
+              ...tail
+            ]
+          };
+          this.debugLog('ollama_context_overflow_retry', {
+            status: response.status,
+            originalCount: retained.length,
+            trimmedCount: emergencyBody.messages.length,
+            numCtx,
+            errorPreview: errorText.substring(0, 200)
+          });
+          this.postStatus('Model context overflowed — trimming history and retrying once...');
+          const overflowController = new AbortController();
+          this.currentRequestAbortController = overflowController;
+          const overflowResponse = await this.fetchOllamaChatResponse(baseUrl, emergencyBody as Record<string, unknown>, overflowController);
+          if (overflowResponse.ok) {
+            return await this.parseOllamaChatResponse(overflowResponse);
+          }
+          const overflowErrorText = await overflowResponse.text();
+          throw new Error(`Ollama HTTP ${overflowResponse.status} (after overflow trim): ${overflowErrorText}`);
         }
       }
 
