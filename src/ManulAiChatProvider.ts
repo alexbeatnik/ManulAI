@@ -371,6 +371,9 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   }
 
   public async submitPromptForTesting(text: string, autoApprove?: boolean): Promise<void> {
+    if (this.disposed) {
+      throw new Error('Provider has been disposed.');
+    }
     const normalized = text.trim();
     if (!normalized) {
       throw new Error('Prompt is required.');
@@ -419,7 +422,10 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
 
       const payload = await this.parseOllamaTagsResponse(response);
       const names = payload.models
-        .map(model => String(model.name ?? '').trim())
+        .map(model => {
+          const m = model as unknown as Record<string, unknown> | null;
+          return String(m?.name ?? '').trim();
+        })
         .filter(Boolean)
         .sort((left, right) => left.localeCompare(right));
 
@@ -9729,13 +9735,19 @@ If the user asks for a change but provides NO code:
   }
 
   private getWebviewHtml(webview: vscode.Webview): string {
-    const htmlUri = vscode.Uri.joinPath(this.extensionContext.extensionUri, 'media', 'webview.html');
-    const htmlBytes = fs.readFileSync(htmlUri.fsPath);
-    const nonce = this.createNonce();
-    return Buffer.from(htmlBytes)
-      .toString('utf8')
-      .replaceAll('{{nonce}}', nonce)
-      .replaceAll('{{cspSource}}', webview.cspSource);
+    try {
+      const htmlUri = vscode.Uri.joinPath(this.extensionContext.extensionUri, 'media', 'webview.html');
+      const htmlBytes = fs.readFileSync(htmlUri.fsPath);
+      const nonce = this.createNonce();
+      return Buffer.from(htmlBytes)
+        .toString('utf8')
+        .replaceAll('{{nonce}}', nonce)
+        .replaceAll('{{cspSource}}', webview.cspSource);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.debugLog('webview_html_load_failed', { error: message });
+      return `<!DOCTYPE html><html><body><h1>ManulAI</h1><p>Error loading chat UI: ${message}</p></body></html>`;
+    }
   }
 
   private postStateToWebview(): void {
