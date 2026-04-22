@@ -316,7 +316,16 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     webviewView.webview.html = this.getWebviewHtml(webviewView.webview);
     webviewView.webview.onDidReceiveMessage(
       async (message: WebviewInboundMessage) => {
-        await this.handleWebviewMessage(message);
+        try {
+          if (this.disposed) {
+            return;
+          }
+          await this.handleWebviewMessage(message);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          this.debugLog('webview_message_error', { error: msg, command: (message as unknown as Record<string, unknown>).command });
+          this.postStatus(`Error handling webview message: ${msg}`);
+        }
       },
       undefined,
       this.extensionContext.subscriptions
@@ -478,6 +487,9 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   }
 
   private async initializeSettingsState(): Promise<void> {
+    if (this.disposed) {
+      return;
+    }
     await this.migrateWorkspaceConfigurationToStorage();
     await this.ensureWorkspaceSettingsLoaded();
     await this.ensureChatStorageLoaded();
@@ -792,6 +804,9 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   }
 
   private async handleWebviewMessage(message: WebviewInboundMessage): Promise<void> {
+    if (this.disposed) {
+      return;
+    }
     switch (message.command) {
       case 'ready':
         await this.initializeSettingsState();
@@ -918,6 +933,9 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     frontendAttachments?: Array<{ name: string; content: string }>,
     frontendAutoApprove?: boolean
   ): Promise<void> {
+    if (this.disposed) {
+      return;
+    }
     if (this.requestInFlight) {
       this.postStatus('A request is already running. Wait for the current response to finish.');
       return;
@@ -4741,7 +4759,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   }
 
   /**
-   * LLM interaction hardening knobs (0.0.11). Kept as instance fields rather
+   * LLM interaction hardening knobs (0.0.12). Kept as instance fields rather
    * than module-level constants so later builds can override them in tests
    * without touching module scope.
    */
@@ -5507,6 +5525,9 @@ If the user asks for a change but provides NO code:
   }
 
   private stopActiveRequest(): void {
+    if (this.disposed) {
+      return;
+    }
     if (!this.requestInFlight) {
       this.postStatus('No active request to stop.');
       return;
@@ -9406,12 +9427,20 @@ If the user asks for a change but provides NO code:
       this.persistChatsTimeout = undefined;
     }
     try { this.currentRequestAbortController?.abort(); } catch { /* ignore */ }
+    // Resolve any pending approval so awaiting callers don't hang forever.
+    if (this.pendingApprovalResolver) {
+      this.pendingApprovalResolver(false);
+      this.pendingApprovalResolver = undefined;
+      this.pendingApproval = undefined;
+    }
     void this.persistChatState();
     this.stopDebugSession();
     for (const terminal of this.launchedTerminals) {
       try { terminal.dispose(); } catch { /* ignore */ }
     }
     this.launchedTerminals.length = 0;
+    this._manulBridge?.dispose();
+    this._manulBridge = undefined;
     this.webviewView = undefined;
   }
 
@@ -9710,6 +9739,9 @@ If the user asks for a change but provides NO code:
   }
 
   private postStateToWebview(): void {
+    if (this.disposed) {
+      return;
+    }
     if (this.chatStorageLoaded) {
       this.schedulePersistedChats();
     }
