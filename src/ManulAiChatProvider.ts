@@ -100,7 +100,9 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   private chatStorageLoaded = false;
   private chatStorageLoadPromise?: Promise<void>;
   private persistChatsTimeout?: NodeJS.Timeout;
+  private initStateTimeout?: NodeJS.Timeout;
   private lastPersistedChatState = '';
+  private disposed = false;
   private readonly launchedTerminals: vscode.Terminal[] = [];
 
   /** Lazy ManulEngine subprocess bridge — created on first use, reset on workspace change. */
@@ -141,6 +143,17 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         this._manulBridge = undefined;
       },
     });
+
+    // Prune closed terminals so the launched-terminals array can't grow
+    // unbounded across long sessions.
+    this.extensionContext.subscriptions.push(
+      vscode.window.onDidCloseTerminal(closed => {
+        const index = this.launchedTerminals.indexOf(closed);
+        if (index >= 0) {
+          this.launchedTerminals.splice(index, 1);
+        }
+      })
+    );
   }
 
   private get activeChat(): ChatSession {
@@ -309,16 +322,37 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       this.extensionContext.subscriptions
     );
 
-    webviewView.onDidChangeVisibility(() => {
-      if (webviewView.visible) {
-        this.postStateToWebview();
-      }
-    });
+    this.extensionContext.subscriptions.push(
+      webviewView.onDidChangeVisibility(() => {
+        if (this.disposed) {
+          return;
+        }
+        if (webviewView.visible) {
+          this.postStateToWebview();
+        }
+      })
+    );
+
+    this.extensionContext.subscriptions.push(
+      webviewView.onDidDispose(() => {
+        if (this.webviewView === webviewView) {
+          this.webviewView = undefined;
+        }
+      })
+    );
 
     void this.initializeSettingsState();
 
-    // Push initial state once the webview is ready
-    setTimeout(() => {
+    // Push initial state once the webview is ready. Track the handle so we
+    // never run against a disposed provider / webview.
+    if (this.initStateTimeout) {
+      clearTimeout(this.initStateTimeout);
+    }
+    this.initStateTimeout = setTimeout(() => {
+      this.initStateTimeout = undefined;
+      if (this.disposed) {
+        return;
+      }
       void this.initializeSettingsState();
     }, 100);
   }
@@ -9119,13 +9153,23 @@ If the user asks for a change but provides NO code:
   }
 
   public dispose(): void {
-    clearTimeout(this.persistChatsTimeout);
+    this.disposed = true;
+    if (this.initStateTimeout) {
+      clearTimeout(this.initStateTimeout);
+      this.initStateTimeout = undefined;
+    }
+    if (this.persistChatsTimeout) {
+      clearTimeout(this.persistChatsTimeout);
+      this.persistChatsTimeout = undefined;
+    }
+    try { this.currentRequestAbortController?.abort(); } catch { /* ignore */ }
     void this.persistChatState();
     this.stopDebugSession();
     for (const terminal of this.launchedTerminals) {
       try { terminal.dispose(); } catch { /* ignore */ }
     }
     this.launchedTerminals.length = 0;
+    this.webviewView = undefined;
   }
 
   private synchronizeAttachmentContextMessage(chat: ChatSession = this.activeChat): void {
