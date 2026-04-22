@@ -397,17 +397,19 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   public async refreshModelCatalog(postStatusOnError = false): Promise<void> {
     const currentModel = this.getSelectedModel();
 
+    const tagsController = new AbortController();
+    const tagsTimer = setTimeout(() => tagsController.abort(), this.OLLAMA_TAGS_TIMEOUT_MS);
     try {
       const baseUrl = this.getOllamaBaseUrl();
-      const response = await fetch(`${baseUrl}/api/tags`);
+      const response = await fetch(`${baseUrl}/api/tags`, { signal: tagsController.signal });
 
       if (!response.ok) {
         const errorText = await response.text();
         throw new Error(`Ollama HTTP ${response.status}: ${errorText}`);
       }
 
-      const payload = (await response.json()) as { models?: Array<{ name?: string }> };
-      const names = (payload.models ?? [])
+      const payload = await this.parseOllamaTagsResponse(response);
+      const names = payload.models
         .map(model => String(model.name ?? '').trim())
         .filter(Boolean)
         .sort((left, right) => left.localeCompare(right));
@@ -428,9 +430,14 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       this.ollamaReachable = false;
 
       if (postStatusOnError) {
-        const message = error instanceof Error ? error.message : 'Failed to load Ollama models.';
+        const rawMessage = error instanceof Error ? error.message : 'Failed to load Ollama models.';
+        const message = tagsController.signal.aborted
+          ? `Timed out after ${this.OLLAMA_TAGS_TIMEOUT_MS / 1000}s.`
+          : rawMessage;
         this.postStatus(`Unable to refresh Ollama models: ${message}`);
       }
+    } finally {
+      clearTimeout(tagsTimer);
     }
   }
 
@@ -4721,37 +4728,131 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     });
   }
 
+  /**
+   * LLM interaction hardening knobs (0.0.11). Kept as instance fields rather
+   * than module-level constants so later builds can override them in tests
+   * without touching module scope.
+   */
+  private readonly OLLAMA_CHAT_TIMEOUT_MS = 600_000;
+  private readonly OLLAMA_TAGS_TIMEOUT_MS = 20_000;
+  private readonly OLLAMA_MAX_RETRIES = 2;
+
   private isRetryableOllamaFetchError(error: unknown): boolean {
-    if (this.isAbortError(error)) {
+    // User-initiated aborts are never retryable. Timeout-originated aborts are
+    // rewritten upstream into a distinct Error so they don't end up here.
+    if (error instanceof Error && error.message === 'REQUEST_ABORTED') {
       return false;
     }
 
-    const message = error instanceof Error ? error.message : String(error ?? '');
-    return /fetch failed|networkerror|econnreset|econnrefused|socket hang up|timed out|timeout/i.test(message);
+    const messages: string[] = [];
+    const collect = (value: unknown, depth = 0): void => {
+      if (depth > 4 || value === undefined || value === null) { return; }
+      if (value instanceof Error) {
+        messages.push(value.name, value.message);
+        const cause = (value as { cause?: unknown }).cause;
+        if (cause !== undefined && cause !== value) { collect(cause, depth + 1); }
+      } else {
+        messages.push(String(value));
+      }
+    };
+    collect(error);
+
+    const joined = messages.join(' | ');
+    return /fetch failed|networkerror|econnreset|econnrefused|eai_again|socket hang up|timed out|timeout|etimedout|undici/i.test(joined);
+  }
+
+  private isRetryableOllamaHttpStatus(status: number): boolean {
+    // 503 is what Ollama returns while a model is still loading from disk.
+    // 502/504 occur when a reverse proxy sits in front of Ollama.
+    return status === 503 || status === 502 || status === 504;
+  }
+
+  private computeOllamaRetryDelay(attempt: number): number {
+    const base = 500 * Math.pow(2, Math.max(0, attempt));
+    const jitter = Math.floor(Math.random() * 250);
+    return Math.min(base + jitter, 3000);
+  }
+
+  /**
+   * Returns an AbortSignal that fires when either the caller signal aborts
+   * (user Stop) or the watchdog timer expires. `wasTimedOut()` lets callers
+   * distinguish the timeout case from a user abort at catch time.
+   */
+  private linkSignalsWithTimeout(userSignal: AbortSignal, timeoutMs: number): {
+    signal: AbortSignal;
+    cleanup: () => void;
+    wasTimedOut: () => boolean;
+  } {
+    const watchdog = new AbortController();
+    let timedOut = false;
+    const onUserAbort = (): void => { watchdog.abort(); };
+    if (userSignal.aborted) {
+      watchdog.abort();
+    } else {
+      userSignal.addEventListener('abort', onUserAbort, { once: true });
+    }
+    const timer = setTimeout(() => {
+      timedOut = true;
+      watchdog.abort();
+    }, timeoutMs);
+    return {
+      signal: watchdog.signal,
+      cleanup: () => {
+        clearTimeout(timer);
+        userSignal.removeEventListener('abort', onUserAbort);
+      },
+      wasTimedOut: () => timedOut,
+    };
   }
 
   private async fetchOllamaChatResponse(baseUrl: string, body: Record<string, unknown>, abortController: AbortController): Promise<Response> {
     let lastError: unknown;
-    for (let attempt = 0; attempt < 2; attempt += 1) {
+    for (let attempt = 0; attempt <= this.OLLAMA_MAX_RETRIES; attempt += 1) {
+      const watchdog = this.linkSignalsWithTimeout(abortController.signal, this.OLLAMA_CHAT_TIMEOUT_MS);
       try {
-        return await fetch(`${baseUrl}/api/chat`, {
+        const response = await fetch(`${baseUrl}/api/chat`, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json'
           },
           body: JSON.stringify(body),
-          signal: abortController.signal
+          signal: watchdog.signal
         });
+
+        if (this.isRetryableOllamaHttpStatus(response.status) && attempt < this.OLLAMA_MAX_RETRIES) {
+          this.debugLog('ollama_http_retry', {
+            attempt: attempt + 1,
+            status: response.status,
+            model: this.getSelectedModel()
+          });
+          this.postStatus(`Ollama returned HTTP ${response.status} — retrying...`);
+          await new Promise(resolve => setTimeout(resolve, this.computeOllamaRetryDelay(attempt)));
+          continue;
+        }
+
+        return response;
       } catch (error) {
-        lastError = error;
-        if (attempt >= 1 || !this.isRetryableOllamaFetchError(error)) {
+        // True user stop: bubble up unchanged so the outer handler short-circuits.
+        if (abortController.signal.aborted && !watchdog.wasTimedOut()) {
           throw error;
         }
 
-        const message = error instanceof Error ? error.message : String(error ?? 'unknown fetch error');
+        // Watchdog timeout: rewrite to a readable error BEFORE the retry classifier
+        // sees it, otherwise the AbortError would be treated as a user stop.
+        lastError = watchdog.wasTimedOut()
+          ? new Error(`Ollama '/api/chat' timed out after ${this.OLLAMA_CHAT_TIMEOUT_MS / 1000}s.`)
+          : error;
+
+        if (attempt >= this.OLLAMA_MAX_RETRIES || !this.isRetryableOllamaFetchError(lastError)) {
+          throw lastError instanceof Error ? lastError : new Error(String(lastError));
+        }
+
+        const message = lastError instanceof Error ? lastError.message : String(lastError ?? 'unknown fetch error');
         this.debugLog('ollama_fetch_retry', { attempt: attempt + 1, error: message, model: this.getSelectedModel() });
-        this.postStatus('Ollama request failed transiently — retrying once...');
-        await new Promise(resolve => setTimeout(resolve, 700));
+        this.postStatus('Ollama request failed transiently — retrying...');
+        await new Promise(resolve => setTimeout(resolve, this.computeOllamaRetryDelay(attempt)));
+      } finally {
+        watchdog.cleanup();
       }
     }
 
@@ -5300,7 +5401,7 @@ If the user asks for a change but provides NO code:
           const retryError = await retryResponse.text();
           throw new Error(`Ollama HTTP ${retryResponse.status}: ${retryError}`);
         }
-        return (await retryResponse.json()) as OllamaResponse;
+        return await this.parseOllamaChatResponse(retryResponse);
       }
 
       if (response.status === 500 && body.tools) {
@@ -5326,7 +5427,7 @@ If the user asks for a change but provides NO code:
       throw new Error(`Ollama HTTP ${response.status}: ${errorText}`);
     }
 
-    return (await response.json()) as OllamaResponse;
+    return await this.parseOllamaChatResponse(response);
   }
 
   private stopActiveRequest(): void {
@@ -5355,6 +5456,72 @@ If the user asks for a change but provides NO code:
     }
 
     return false;
+  }
+
+  /**
+   * Validates the shape of an Ollama `/api/chat` response body so malformed
+   * output surfaces a readable error instead of a bare SyntaxError or a cast
+   * that explodes deeper in the agent loop.
+   */
+  private async parseOllamaChatResponse(response: Response): Promise<OllamaResponse> {
+    let body: unknown;
+    try {
+      body = await response.json();
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error ?? 'unknown');
+      throw new Error(`Ollama returned a non-JSON response for /api/chat: ${reason}`);
+    }
+
+    if (!body || typeof body !== 'object') {
+      throw new Error('Ollama /api/chat returned an empty or non-object body.');
+    }
+
+    const candidate = body as { message?: unknown; done?: unknown };
+    if (typeof candidate.done !== 'boolean') {
+      throw new Error("Ollama /api/chat response is missing the boolean 'done' field.");
+    }
+    if (candidate.message !== undefined) {
+      if (!candidate.message || typeof candidate.message !== 'object') {
+        throw new Error("Ollama /api/chat response 'message' field is not an object.");
+      }
+      const m = candidate.message as { role?: unknown; content?: unknown };
+      if (typeof m.role !== 'string') {
+        throw new Error("Ollama /api/chat response 'message.role' is not a string.");
+      }
+      if (m.content !== undefined && typeof m.content !== 'string') {
+        throw new Error("Ollama /api/chat response 'message.content' is not a string.");
+      }
+    }
+
+    return body as OllamaResponse;
+  }
+
+  /**
+   * Validates the shape of an Ollama `/api/tags` response body. Returns an
+   * empty array when `models` is absent so the model picker degrades to an
+   * empty list instead of throwing on a partial payload.
+   */
+  private async parseOllamaTagsResponse(response: Response): Promise<{ models: Array<{ name?: string }> }> {
+    let body: unknown;
+    try {
+      body = await response.json();
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error ?? 'unknown');
+      throw new Error(`Ollama returned a non-JSON response for /api/tags: ${reason}`);
+    }
+
+    if (!body || typeof body !== 'object') {
+      throw new Error('Ollama /api/tags returned an empty or non-object body.');
+    }
+
+    const models = (body as { models?: unknown }).models;
+    if (models === undefined || models === null) {
+      return { models: [] };
+    }
+    if (!Array.isArray(models)) {
+      throw new Error("Ollama /api/tags response 'models' field is not an array.");
+    }
+    return { models: models as Array<{ name?: string }> };
   }
 
   private extractToolCalls(message: OllamaMessage): ToolFunctionCall[] {
