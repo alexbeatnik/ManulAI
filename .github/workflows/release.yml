@@ -73,22 +73,39 @@ jobs:
           generate_release_notes: true
           files: ${{ steps.release_meta.outputs.vsix_file }}
 
+      - name: Detect publish secrets
+        id: publish_secrets
+        env:
+          VSCE_PAT: ${{ secrets.VSCE_PAT }}
+          OPEN_VSX_TOKEN: ${{ secrets.OPEN_VSX_TOKEN }}
+        run: |
+          if [ -n "$VSCE_PAT" ]; then
+            echo "has_vsce=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_vsce=false" >> "$GITHUB_OUTPUT"
+          fi
+          if [ -n "$OPEN_VSX_TOKEN" ]; then
+            echo "has_ovsx=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_ovsx=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Warn when VS Code Marketplace token is missing
-        if: ${{ secrets.VSCE_PAT == '' }}
+        if: steps.publish_secrets.outputs.has_vsce != 'true'
         run: echo "::warning::VSCE_PAT secret is not configured. Skipping VS Code Marketplace publish."
 
       - name: Publish to VS Code Marketplace
-        if: ${{ secrets.VSCE_PAT != '' }}
+        if: steps.publish_secrets.outputs.has_vsce == 'true'
         env:
           VSCE_PAT: ${{ secrets.VSCE_PAT }}
         run: npm exec -- @vscode/vsce publish --packagePath "${{ steps.release_meta.outputs.vsix_file }}" --pat "$VSCE_PAT"
 
       - name: Warn when Open VSX token is missing
-        if: ${{ secrets.OPEN_VSX_TOKEN == '' }}
+        if: steps.publish_secrets.outputs.has_ovsx != 'true'
         run: echo "::warning::OPEN_VSX_TOKEN secret is not configured. Skipping Open VSX publish."
 
       - name: Publish to Open VSX
-        if: ${{ secrets.OPEN_VSX_TOKEN != '' }}
+        if: steps.publish_secrets.outputs.has_ovsx == 'true'
         env:
           OPEN_VSX_TOKEN: ${{ secrets.OPEN_VSX_TOKEN }}
         run: npm exec --yes --package ovsx -- ovsx publish "${{ steps.release_meta.outputs.vsix_file }}" -p "$OPEN_VSX_TOKEN"
