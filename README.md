@@ -362,9 +362,9 @@ Run ManulAI locally, point it at a real workspace, and evaluate it against an ac
 
 - Marketplace: https://marketplace.visualstudio.com/items?itemName=manul-engine.manulai-local-agent
 - Open VSX: https://open-vsx.org/extension/manul-engine/manulai-local-agent
-- GitHub: https://github.com/manulai/manulai-local-agent
-- Docs: https://github.com/manulai/manulai-local-agent/blob/main/README-dev.md
-- Enterprise integration guidance: https://github.com/manulai/manulai-local-agent/issues
+- GitHub: https://github.com/alexbeatnik/ManulAI
+- Docs: https://github.com/alexbeatnik/ManulAI/blob/main/README-dev.md
+- Enterprise integration guidance: https://github.com/alexbeatnik/ManulAI/issues
 
 ## What's New
 
