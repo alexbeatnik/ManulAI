@@ -90,6 +90,8 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   private pendingGreenfieldVerificationPath = '';
   private lastGreenfieldVerifiedPath = '';
   private failedCommandCounts = new Map<string, number>();
+  private failedCommandRootCounts = new Map<string, { count: number; variations: Set<string>; lastStderr: string }>();
+  private nudgedRootFailures = new Set<string>();
   private lastNudgedResponseContent = '';
   private consecutiveIdenticalResponses = 0;
   private repeatedNarratedToolSignature: string | null = null;
@@ -1097,6 +1099,8 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     this.successfulReadOps = 0;
     this.currentRequestRequiresWrite = this.looksLikeWriteIntent(text);
     this.failedCommandCounts.clear();
+    this.failedCommandRootCounts.clear();
+    this.nudgedRootFailures.clear();
     this.lastNudgedResponseContent = '';
     this.consecutiveIdenticalResponses = 0;
     await this.runAgentLoop(exchangeStartIndex);
@@ -2816,8 +2820,40 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
               const coreSig = cmdStr.replace(/^cd\s+\S+\s*&&\s*/, '').trim();
               const count = (this.failedCommandCounts.get(coreSig) ?? 0) + 1;
               this.failedCommandCounts.set(coreSig, count);
+              const stderr = String(cmdResult.stderr ?? cmdResult.error ?? '');
+
+              // Cross-variation root-command failure tracking: even if each exact command is only
+              // tried once, repeated failures on the same root (e.g. `npx tailwindcss ...` with
+              // different flags) indicate the model is varying arguments when the real issue is
+              // the binary, CLI version, or approach itself.
+              const rootSig = this.extractCommandRootSignature(coreSig);
+              if (rootSig) {
+                const rootEntry = this.failedCommandRootCounts.get(rootSig)
+                  ?? { count: 0, variations: new Set<string>(), lastStderr: '' };
+                rootEntry.count++;
+                rootEntry.variations.add(coreSig);
+                rootEntry.lastStderr = stderr.substring(0, 200);
+                this.failedCommandRootCounts.set(rootSig, rootEntry);
+
+                const shouldNudgeRoot = rootEntry.variations.size >= 2
+                  && rootEntry.count >= 2
+                  && !this.nudgedRootFailures.has(rootSig);
+                if (shouldNudgeRoot) {
+                  this.nudgedRootFailures.add(rootSig);
+                  this.debugLog('repeated_command_root_failure', {
+                    rootSig, count: rootEntry.count,
+                    variations: Array.from(rootEntry.variations),
+                    lastStderr: rootEntry.lastStderr
+                  });
+                  const variationList = Array.from(rootEntry.variations).slice(0, 4).join('; ');
+                  const stderrHint = rootEntry.lastStderr ? ` (last stderr: "${rootEntry.lastStderr}")` : '';
+                  const rootNudge = `You have run "${rootSig} ..." ${rootEntry.count} times with different arguments and all failed${stderrHint}. Variations tried: ${variationList}. Varying arguments further will not help — the underlying issue is different: the CLI may not exist in the installed package version, the subcommand may have been removed, a dependency may be missing, or this tool requires a different integration path. STOP varying "${rootSig}" arguments. Instead, read the installed package's README or package.json (for the "bin" field and scripts) with read_specific_file, or switch to a completely different approach (write the config manually, use a different library, or ask the user which integration path to use).`;
+                  this.postProgressStep(`Root command "${rootSig}" failed across ${rootEntry.variations.size} variations — nudging`);
+                  messages.push({ role: 'user', content: rootNudge, hiddenFromTranscript: true });
+                }
+              }
+
               if (count >= 2) {
-                const stderr = String(cmdResult.stderr ?? cmdResult.error ?? '');
                 this.debugLog('repeated_command_failure', { command: coreSig, count, exitCode });
 
                 if (this.autoApprove) {
@@ -2842,10 +2878,15 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
                 }
               }
             } else {
-              // Successful execution — clear failure count for this command
+              // Successful execution — clear failure counts for this command and its root
               const cmdStr = String(cmdResult.command ?? '');
               const coreSig = cmdStr.replace(/^cd\s+\S+\s*&&\s*/, '').trim();
               this.failedCommandCounts.delete(coreSig);
+              const rootSig = this.extractCommandRootSignature(coreSig);
+              if (rootSig) {
+                this.failedCommandRootCounts.delete(rootSig);
+                this.nudgedRootFailures.delete(rootSig);
+              }
             }
           } catch {
             // Ignore JSON parse errors on tool results
@@ -9015,6 +9056,31 @@ If the user asks for a change but provides NO code:
       };
     }
     return undefined;
+  }
+
+  private extractCommandRootSignature(command: string): string {
+    // Returns a normalized root for clustering failures across argument variations.
+    // "npx tailwindcss init -p"         → "npx tailwindcss"
+    // "npx tailwindcss init"            → "npx tailwindcss"
+    // "npm install react react-dom"     → "npm install"
+    // "pip install foo --upgrade"       → "pip install"
+    // "cargo run --release"             → "cargo run"
+    // "ls -la"                          → "ls"
+    const cleaned = String(command ?? '').trim();
+    if (!cleaned) return '';
+    const tokens = cleaned.split(/\s+/);
+    if (tokens.length === 0) return '';
+    const first = tokens[0].toLowerCase();
+    // Package runners: signature is runner + subject package (second token)
+    if (/^(npx|pnpm|yarn|bun|bunx|deno|uvx|pipx)$/.test(first) && tokens.length >= 2 && !tokens[1].startsWith('-')) {
+      return `${first} ${tokens[1].toLowerCase()}`;
+    }
+    // Package managers / build tools with subcommands: signature is tool + subcommand
+    if (/^(npm|pip|pip3|cargo|go|gem|brew|apt|apt-get|dnf|yum|docker|git|make|mvn|gradle|dotnet)$/.test(first)
+      && tokens.length >= 2 && !tokens[1].startsWith('-')) {
+      return `${first} ${tokens[1].toLowerCase()}`;
+    }
+    return first;
   }
 
   private async executeTerminalCommand(command: string): Promise<string> {

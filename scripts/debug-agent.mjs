@@ -221,6 +221,25 @@ if (!userPrompt) {
 // Detect whether this run is a file-splitting task — only then enforce extractionCount gate
 const IS_SPLIT_TASK = /розбий|split|refactor.*module|extract.*module/i.test(userPrompt);
 
+function extractCommandRootSignature(command) {
+  // Cluster repeated failures across argument variations so changes to flags/args on the same
+  // root command (e.g. "npx tailwindcss init -p" vs "npx tailwindcss init") count toward the
+  // same pattern. Mirrors ManulAiChatProvider.extractCommandRootSignature.
+  const cleaned = String(command ?? '').trim();
+  if (!cleaned) return '';
+  const tokens = cleaned.split(/\s+/);
+  if (tokens.length === 0) return '';
+  const first = tokens[0].toLowerCase();
+  if (/^(npx|pnpm|yarn|bun|bunx|deno|uvx|pipx)$/.test(first) && tokens.length >= 2 && !tokens[1].startsWith('-')) {
+    return `${first} ${tokens[1].toLowerCase()}`;
+  }
+  if (/^(npm|pip|pip3|cargo|go|gem|brew|apt|apt-get|dnf|yum|docker|git|make|mvn|gradle|dotnet)$/.test(first)
+    && tokens.length >= 2 && !tokens[1].startsWith('-')) {
+    return `${first} ${tokens[1].toLowerCase()}`;
+  }
+  return first;
+}
+
 function looksLikeWriteIntent(text) {
   const normalized = text.trim().toLowerCase();
   if (!normalized) return false;
@@ -3380,6 +3399,8 @@ async function main() {
   let totalReadOps = 0;           // total read operations across the session (for summarize nudge)
   let hadReadWorkspaceNotes = false; // short-circuit repeated reads
   const failedCommandCounts = new Map(); // command signature -> failure count
+  const failedCommandRootCounts = new Map(); // root signature -> { count, variations:Set, lastStderr }
+  const nudgedRootFailures = new Set();
   let lastNudgedResponseContent = '';  // track identical responses
   let consecutiveIdenticalResponses = 0;
   let blockImmediateTerminalAfterWrite = false;
@@ -3960,9 +3981,32 @@ let args = rawArgs;
             const cmdParsed = JSON.parse(result);
             const exitCode = Number(cmdParsed.exitCode ?? 0);
             const coreSig = String(cmdParsed.command ?? '').replace(/^cd\s+\S+\s*&&\s*/, '').trim();
+            const stderr = String(cmdParsed.stderr ?? cmdParsed.error ?? '');
             if (exitCode !== 0 && coreSig) {
               const count = (failedCommandCounts.get(coreSig) ?? 0) + 1;
               failedCommandCounts.set(coreSig, count);
+
+              // Cross-variation root-command failure tracking.
+              const rootSig = extractCommandRootSignature(coreSig);
+              if (rootSig) {
+                const rootEntry = failedCommandRootCounts.get(rootSig)
+                  ?? { count: 0, variations: new Set(), lastStderr: '' };
+                rootEntry.count++;
+                rootEntry.variations.add(coreSig);
+                rootEntry.lastStderr = stderr.substring(0, 200);
+                failedCommandRootCounts.set(rootSig, rootEntry);
+
+                if (rootEntry.variations.size >= 2 && rootEntry.count >= 2 && !nudgedRootFailures.has(rootSig)) {
+                  nudgedRootFailures.add(rootSig);
+                  const variationList = Array.from(rootEntry.variations).slice(0, 4).join('; ');
+                  const stderrHint = rootEntry.lastStderr ? ` (last stderr: "${rootEntry.lastStderr}")` : '';
+                  const rootNudge = `You have run "${rootSig} ..." ${rootEntry.count} times with different arguments and all failed${stderrHint}. Variations tried: ${variationList}. Varying arguments further will not help — the underlying issue is different: the CLI may not exist in the installed package version, the subcommand may have been removed, a dependency may be missing, or this tool requires a different integration path. STOP varying "${rootSig}" arguments. Instead, read the installed package's README or package.json (for the "bin" field and scripts) with read_specific_file, or switch to a completely different approach (write the config manually, use a different library, or ask the user which integration path to use).`;
+                  label(Y, 'ROOT-CMD NUDGE', `${rootSig} failed across ${rootEntry.variations.size} variations`);
+                  logEvent('repeated_command_root_failure', { rootSig, count: rootEntry.count, variations: Array.from(rootEntry.variations), lastStderr: rootEntry.lastStderr });
+                  messages.push({ role: 'user', content: rootNudge });
+                }
+              }
+
               if (count >= 2) {
                 const nudge = `The command "${coreSig}" has failed ${count} times with the same error (exit code ${exitCode}). STOP retrying it. Try a completely different approach — for example, write the config file manually instead of relying on a CLI tool, or use a different package/tool.`;
                 label(Y, 'FAILING-CMD NUDGE', nudge.substring(0, 200));
@@ -3970,6 +4014,11 @@ let args = rawArgs;
               }
             } else if (exitCode === 0 && coreSig) {
               failedCommandCounts.delete(coreSig);
+              const rootSig = extractCommandRootSignature(coreSig);
+              if (rootSig) {
+                failedCommandRootCounts.delete(rootSig);
+                nudgedRootFailures.delete(rootSig);
+              }
             }
           } catch (_) { /* non-JSON result — skip */ }
         }
