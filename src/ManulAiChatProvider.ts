@@ -80,6 +80,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   private debugSessionId = '';
   private progressStepCounter = 0;
   private totalReadOps = 0;
+  private successfulReadOps = 0;
   private currentRequestRequiresWrite = true;
   private currentRequestIsPreferredGreenfield = false;
   private currentRequestIsExplicitCreateOnly = false;
@@ -1093,6 +1094,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
 
     this.postStateToWebview();
     this.totalReadOps = 0;
+    this.successfulReadOps = 0;
     this.currentRequestRequiresWrite = this.looksLikeWriteIntent(text);
     this.failedCommandCounts.clear();
     this.lastNudgedResponseContent = '';
@@ -1520,6 +1522,17 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   private async recoverRequestScopedCreateTargetPath(targetPath: string): Promise<{ resolvedPath?: string; recoveredFrom?: string }> {
     const normalizedTarget = targetPath.trim();
     if (!normalizedTarget) {
+      return {};
+    }
+
+    // Recovery is only safe for CREATE-intent flows. In an EDIT task the user's targets already
+    // exist on disk, and redirecting the model's unrelated write (e.g. a .gitignore dump) to
+    // those targets silently corrupts them with content that has nothing to do with the edit.
+    // Gate recovery on the task modes where the content the model produces is semantically
+    // about the target.
+    if (!this.currentRequestIsExplicitCreateOnly
+      && !this.currentRequestIsPreferredGreenfield
+      && !this.isLargeRefactorScenario()) {
       return {};
     }
 
@@ -2784,6 +2797,12 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         // Count read operations for read-loop nudge
         if (toolName === 'read_file_slice' || toolName === 'read_specific_file') {
           this.totalReadOps++;
+          try {
+            const parsedRead = JSON.parse(toolResult) as Record<string, unknown>;
+            if (!parsedRead.error && typeof parsedRead.content === 'string') {
+              this.successfulReadOps++;
+            }
+          } catch { /* malformed result — don't count as success */ }
         }
 
         // Track repeated failing terminal commands
@@ -2891,9 +2910,12 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       }
 
       // For non-write tasks (summarize, explain, review), nudge the model to stop reading and produce output
-      if (!this.currentRequestRequiresWrite && this.totalReadOps >= this.getModelCapabilityProfile().maxReadOpsWithoutWrite && !hadSuccessfulWrite) {
-        const readNudge = `You have already read ${this.totalReadOps} sections of the file(s). You now have enough context. STOP reading additional sections and produce your summary/analysis/answer as a text response NOW. Do NOT call any more tools.`;
-        this.debugLog('read_loop_nudge', { totalReadOps: this.totalReadOps });
+      if (!this.currentRequestRequiresWrite
+        && this.totalReadOps >= this.getModelCapabilityProfile().maxReadOpsWithoutWrite
+        && !hadSuccessfulWrite
+        && this.successfulReadOps > 0) {
+        const readNudge = `You have already read ${this.successfulReadOps} sections of the file(s). You now have enough context. STOP reading additional sections and produce your summary/analysis/answer as a text response NOW. Do NOT call any more tools.`;
+        this.debugLog('read_loop_nudge', { totalReadOps: this.totalReadOps, successfulReadOps: this.successfulReadOps });
         messages.push({ role: 'user', content: readNudge, hiddenFromTranscript: true });
       }
 

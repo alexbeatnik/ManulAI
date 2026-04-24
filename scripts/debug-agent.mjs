@@ -633,6 +633,11 @@ function targetExistsForCreateRecovery(targetPath) {
 }
 
 function recoverRequestScopedCreatePath(requestedPath) {
+  // Recovery is only safe for CREATE-intent flows. For EDIT tasks the user's targets already
+  // exist on disk, and redirecting the model's unrelated write (e.g. a .gitignore dump) to
+  // those targets silently corrupts them. Gate recovery on the task modes where the content
+  // the model produces is semantically about the target.
+  if (!IS_EXPLICIT_CREATE_ONLY_TASK && !IS_PREFERRED_GREENFIELD_REQUEST && !IS_SPLIT_TASK) return {};
   const explicitTargets = getExplicitWriteRequestTargets();
   if (!requestedPath || explicitTargets.length === 0) return {};
 
@@ -1865,7 +1870,10 @@ async function executeTool(name, args) {
           error: 'new_text is a placeholder comment, not a valid extraction replacement. Replace the original block with the correct module reference or equivalent real code update — never with "Code will be inserted here".'
         });
       }
-      if (removedLines.length <= 1 && addedLines.length <= 1 && !/^\s*import\b/.test(newText)) {
+      // Single-line rename guard is specific to SPLIT/extraction flows. A trivial 1-line
+      // replace_in_file is legitimate for ordinary surgical edits ("change 'foo' to 'bar'"),
+      // so only reject it when we're actually in a split/refactor task.
+      if (IS_SPLIT_TASK && removedLines.length <= 1 && addedLines.length <= 1 && !/^\s*import\b/.test(newText)) {
         return JSON.stringify({
           error: 'Single-line rename without an import replacement is not a valid extraction step. ' +
             'Extract a self-contained block (multiple lines) and replace it with the appropriate module reference or equivalent update.'
@@ -2863,7 +2871,9 @@ function parseToolCallsFromText(content) {
 
   // Bare read_specific_file with no path argument — default to the primary source file.
   // Handles "Executing step 1: read_specific_file" style (model forgets to specify path).
-  if (results.length === 0 &&
+  // Only meaningful for SPLIT flows where TARGET_FILE is the intended subject; for unrelated
+  // tasks the TARGET_FILE default is just noise that pollutes context with an unrelated read.
+  if (IS_SPLIT_TASK && results.length === 0 &&
       /\bread_specific_file\b/.test(content) &&
       !results.some(r => r.function?.name === 'read_specific_file')) {
     results.push({ function: { name: 'read_specific_file', arguments: { filepath: TARGET_FILE } } });
@@ -3637,10 +3647,12 @@ let args = rawArgs;
     }
 
     // For non-write tasks, nudge after 3+ reads
-    if (!REQUIRES_FILE_WRITE && totalReadOps >= MODEL_LIMITS.maxReadOpsWithoutWrite && !hadSuccessfulWrite) {
-      const linesRead = recentReads.length > 0
-        ? `lines ${recentReads[0].startLine || 1}–${recentReads[recentReads.length - 1].endLine || '?'}`
-        : `${totalReadOps} sections`;
+    // Only nudge "stop reading, you have context" when at least one read SUCCEEDED.
+    // totalReadOps counts attempts including failed reads (wrong path, ENOENT), so without this
+    // guard the model gets told it has context when in fact all reads failed and it has nothing.
+    if (!REQUIRES_FILE_WRITE && totalReadOps >= MODEL_LIMITS.maxReadOpsWithoutWrite
+      && !hadSuccessfulWrite && recentReads.length > 0) {
+      const linesRead = `lines ${recentReads[0].startLine || 1}–${recentReads[recentReads.length - 1].endLine || '?'}`;
       const readNudge = `You have already read ${linesRead} of the file. You now have enough context. STOP reading additional sections and produce your summary/analysis/answer as a text response NOW. Do NOT call any more tools.`;
       label(Y, 'READ-LOOP NUDGE', readNudge.substring(0, 200));
       messages.push({ role: 'user', content: readNudge });

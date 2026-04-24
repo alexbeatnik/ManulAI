@@ -84,6 +84,8 @@ All long-lived resources must be disposed correctly to avoid leaking memory, sub
 - If retry exhaustion is reached and the model still returns pseudo-progress or plan text, surface a deterministic backend failure message instead of leaking raw `Step 1/3`-style output.
 - For explicit multi-file write requests, do not accept final completion text until the recorded successful file-tool writes cover every requested target file.
 - For explicit file-path create requests, recover weak-model shallow or wrong-directory writes back toward the exact requested targets when that mapping is unambiguous.
+- Never apply request-target path recovery on EDIT tasks. Path recovery is only safe when the model's content is semantically about the requested target (explicit create-only, preferred-model greenfield, or large-refactor split flows). On an ordinary edit, redirecting a model's unrelated write (e.g. an accidental `.gitignore` dump) to an existing edit target silently corrupts that target with content that has nothing to do with the requested edit.
+- The "you have enough context, stop reading" nudge must only fire after at least one SUCCESSFUL read. Failed reads (ENOENT on hallucinated paths, permission errors) do not create context, so nudging the model to answer from them produces empty or invented summaries. Track successful reads separately from total read attempts.
 - For large refactor requests, nudge the model toward short module/file plans and iterative execution instead of one-shot whole-file rewrites.
 - Keep context trimming model-aware; derive sliding-window size and `num_ctx` from the model size tag rather than using hardcoded limits.
 - Keep prompt/context simplification model-aware too: ultra-small models should receive shorter mandates, less injected workspace memory, tighter retry budgets, and fewer tools when that improves reliability.
@@ -109,6 +111,8 @@ All long-lived resources must be disposed correctly to avoid leaking memory, sub
 - When a behavioral fix (hallucination detection, JSON parsing, fallback logic, nudge conditions) proves correct in `debug-agent.mjs`, treat it as a required backport — do not leave the production provider diverged.
 - Keep helper logic (e.g. `escapeJsonStringValues`, analysis flags, done-condition guards) in sync between the two files; if a helper is added or changed in the debug script, update the provider counterpart.
 - Keep tool definitions in `scripts/test-model.mjs` aligned with the extension's real parameter names (e.g. `filename` not `filepath` for `create_or_edit_file`).
+- In `scripts/debug-agent.mjs`, the trivial-single-line `replace_in_file` rejection ("Single-line rename without an import replacement is not a valid extraction step") must only fire for `IS_SPLIT_TASK` flows. A one-line edit like "change 'hello world' to 'hi there'" is a legitimate surgical edit and must not be rejected as a non-extraction step.
+- In `scripts/debug-agent.mjs`, the bare-mention `read_specific_file` fallback inside `parseToolCallsFromText` (which substitutes `TARGET_FILE` when only the tool name appears in text without arguments) must also be gated on `IS_SPLIT_TASK`. For non-split tasks the `TARGET_FILE` default is unrelated to the user's request and produces spurious reads of `src/ManulAiChatProvider.ts`.
 
 ## Documentation
 
