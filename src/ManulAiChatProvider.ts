@@ -80,6 +80,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   private debugSessionId = '';
   private progressStepCounter = 0;
   private totalReadOps = 0;
+  private successfulReadOps = 0;
   private currentRequestRequiresWrite = true;
   private currentRequestIsPreferredGreenfield = false;
   private currentRequestIsExplicitCreateOnly = false;
@@ -316,7 +317,16 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     webviewView.webview.html = this.getWebviewHtml(webviewView.webview);
     webviewView.webview.onDidReceiveMessage(
       async (message: WebviewInboundMessage) => {
-        await this.handleWebviewMessage(message);
+        try {
+          if (this.disposed) {
+            return;
+          }
+          await this.handleWebviewMessage(message);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          this.debugLog('webview_message_error', { error: msg, command: (message as unknown as Record<string, unknown>).command });
+          this.postStatus(`Error handling webview message: ${msg}`);
+        }
       },
       undefined,
       this.extensionContext.subscriptions
@@ -362,6 +372,9 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   }
 
   public async submitPromptForTesting(text: string, autoApprove?: boolean): Promise<void> {
+    if (this.disposed) {
+      throw new Error('Provider has been disposed.');
+    }
     const normalized = text.trim();
     if (!normalized) {
       throw new Error('Prompt is required.');
@@ -410,7 +423,10 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
 
       const payload = await this.parseOllamaTagsResponse(response);
       const names = payload.models
-        .map(model => String(model.name ?? '').trim())
+        .map(model => {
+          const m = model as unknown as Record<string, unknown> | null;
+          return String(m?.name ?? '').trim();
+        })
         .filter(Boolean)
         .sort((left, right) => left.localeCompare(right));
 
@@ -478,6 +494,9 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   }
 
   private async initializeSettingsState(): Promise<void> {
+    if (this.disposed) {
+      return;
+    }
     await this.migrateWorkspaceConfigurationToStorage();
     await this.ensureWorkspaceSettingsLoaded();
     await this.ensureChatStorageLoaded();
@@ -792,6 +811,9 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   }
 
   private async handleWebviewMessage(message: WebviewInboundMessage): Promise<void> {
+    if (this.disposed) {
+      return;
+    }
     switch (message.command) {
       case 'ready':
         await this.initializeSettingsState();
@@ -918,6 +940,9 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
     frontendAttachments?: Array<{ name: string; content: string }>,
     frontendAutoApprove?: boolean
   ): Promise<void> {
+    if (this.disposed) {
+      return;
+    }
     if (this.requestInFlight) {
       this.postStatus('A request is already running. Wait for the current response to finish.');
       return;
@@ -1069,6 +1094,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
 
     this.postStateToWebview();
     this.totalReadOps = 0;
+    this.successfulReadOps = 0;
     this.currentRequestRequiresWrite = this.looksLikeWriteIntent(text);
     this.failedCommandCounts.clear();
     this.lastNudgedResponseContent = '';
@@ -1496,6 +1522,17 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   private async recoverRequestScopedCreateTargetPath(targetPath: string): Promise<{ resolvedPath?: string; recoveredFrom?: string }> {
     const normalizedTarget = targetPath.trim();
     if (!normalizedTarget) {
+      return {};
+    }
+
+    // Recovery is only safe for CREATE-intent flows. In an EDIT task the user's targets already
+    // exist on disk, and redirecting the model's unrelated write (e.g. a .gitignore dump) to
+    // those targets silently corrupts them with content that has nothing to do with the edit.
+    // Gate recovery on the task modes where the content the model produces is semantically
+    // about the target.
+    if (!this.currentRequestIsExplicitCreateOnly
+      && !this.currentRequestIsPreferredGreenfield
+      && !this.isLargeRefactorScenario()) {
       return {};
     }
 
@@ -2760,6 +2797,12 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
         // Count read operations for read-loop nudge
         if (toolName === 'read_file_slice' || toolName === 'read_specific_file') {
           this.totalReadOps++;
+          try {
+            const parsedRead = JSON.parse(toolResult) as Record<string, unknown>;
+            if (!parsedRead.error && typeof parsedRead.content === 'string') {
+              this.successfulReadOps++;
+            }
+          } catch { /* malformed result — don't count as success */ }
         }
 
         // Track repeated failing terminal commands
@@ -2867,9 +2910,12 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
       }
 
       // For non-write tasks (summarize, explain, review), nudge the model to stop reading and produce output
-      if (!this.currentRequestRequiresWrite && this.totalReadOps >= this.getModelCapabilityProfile().maxReadOpsWithoutWrite && !hadSuccessfulWrite) {
-        const readNudge = `You have already read ${this.totalReadOps} sections of the file(s). You now have enough context. STOP reading additional sections and produce your summary/analysis/answer as a text response NOW. Do NOT call any more tools.`;
-        this.debugLog('read_loop_nudge', { totalReadOps: this.totalReadOps });
+      if (!this.currentRequestRequiresWrite
+        && this.totalReadOps >= this.getModelCapabilityProfile().maxReadOpsWithoutWrite
+        && !hadSuccessfulWrite
+        && this.successfulReadOps > 0) {
+        const readNudge = `You have already read ${this.successfulReadOps} sections of the file(s). You now have enough context. STOP reading additional sections and produce your summary/analysis/answer as a text response NOW. Do NOT call any more tools.`;
+        this.debugLog('read_loop_nudge', { totalReadOps: this.totalReadOps, successfulReadOps: this.successfulReadOps });
         messages.push({ role: 'user', content: readNudge, hiddenFromTranscript: true });
       }
 
@@ -4741,7 +4787,7 @@ export class ManulAiChatProvider implements vscode.WebviewViewProvider {
   }
 
   /**
-   * LLM interaction hardening knobs (0.0.11). Kept as instance fields rather
+   * LLM interaction hardening knobs (0.0.12). Kept as instance fields rather
    * than module-level constants so later builds can override them in tests
    * without touching module scope.
    */
@@ -5507,6 +5553,9 @@ If the user asks for a change but provides NO code:
   }
 
   private stopActiveRequest(): void {
+    if (this.disposed) {
+      return;
+    }
     if (!this.requestInFlight) {
       this.postStatus('No active request to stop.');
       return;
@@ -9406,12 +9455,20 @@ If the user asks for a change but provides NO code:
       this.persistChatsTimeout = undefined;
     }
     try { this.currentRequestAbortController?.abort(); } catch { /* ignore */ }
+    // Resolve any pending approval so awaiting callers don't hang forever.
+    if (this.pendingApprovalResolver) {
+      this.pendingApprovalResolver(false);
+      this.pendingApprovalResolver = undefined;
+      this.pendingApproval = undefined;
+    }
     void this.persistChatState();
     this.stopDebugSession();
     for (const terminal of this.launchedTerminals) {
       try { terminal.dispose(); } catch { /* ignore */ }
     }
     this.launchedTerminals.length = 0;
+    this._manulBridge?.dispose();
+    this._manulBridge = undefined;
     this.webviewView = undefined;
   }
 
@@ -9700,16 +9757,25 @@ If the user asks for a change but provides NO code:
   }
 
   private getWebviewHtml(webview: vscode.Webview): string {
-    const htmlUri = vscode.Uri.joinPath(this.extensionContext.extensionUri, 'media', 'webview.html');
-    const htmlBytes = fs.readFileSync(htmlUri.fsPath);
-    const nonce = this.createNonce();
-    return Buffer.from(htmlBytes)
-      .toString('utf8')
-      .replaceAll('{{nonce}}', nonce)
-      .replaceAll('{{cspSource}}', webview.cspSource);
+    try {
+      const htmlUri = vscode.Uri.joinPath(this.extensionContext.extensionUri, 'media', 'webview.html');
+      const htmlBytes = fs.readFileSync(htmlUri.fsPath);
+      const nonce = this.createNonce();
+      return Buffer.from(htmlBytes)
+        .toString('utf8')
+        .replaceAll('{{nonce}}', nonce)
+        .replaceAll('{{cspSource}}', webview.cspSource);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.debugLog('webview_html_load_failed', { error: message });
+      return `<!DOCTYPE html><html><body><h1>ManulAI</h1><p>Error loading chat UI: ${message}</p></body></html>`;
+    }
   }
 
   private postStateToWebview(): void {
+    if (this.disposed) {
+      return;
+    }
     if (this.chatStorageLoaded) {
       this.schedulePersistedChats();
     }
