@@ -353,7 +353,13 @@ export class ManulAiChatParticipant {
         effectiveSystemPrompt += '\n3. Do NOT scan the project or list files after creating/editing files unless the user asked.';
         effectiveSystemPrompt += '\n4. If the user asked to create a file — create it and STOP. Do not read it back.';
         effectiveSystemPrompt += '\n5. If the user asked to edit a file — edit it and STOP. Do not read it back.';
-        effectiveSystemPrompt += '\n6. After outputting a tool JSON, STOP. Do not write any additional text.';
+        effectiveSystemPrompt += '\n6. NEVER read the same file more than once. If you already read a file, use the information from that read.';
+        effectiveSystemPrompt += '\n7. After outputting a tool JSON, STOP. Do not write any additional text.';
+        effectiveSystemPrompt += '\n\nPLANNING PHASE (required for multi-step tasks):';
+        effectiveSystemPrompt += '\n- When the user asks for something that requires multiple tools (e.g. "scan and create", "read and edit"), FIRST output a brief 1-sentence plan, THEN execute step by step.';
+        effectiveSystemPrompt += '\n- Example: "Plan: I will scan the project structure, read the key files, then create description.md." Then call project_scan.';
+        effectiveSystemPrompt += '\n- NEVER call more than 3 tools in a single turn. If you need more, do them in the next turn.';
+        effectiveSystemPrompt += '\n- After receiving a tool result, ALWAYS state your next step in 1 sentence BEFORE calling the next tool.';
         effectiveSystemPrompt += '\n\n' + getAgentToolInstructions();
       } else if (agentMode === 'planner') {
         effectiveSystemPrompt += '\n\nYou are in Planner mode. Prefer concise, step-by-step responses. Use tools for small deliberate actions.';
@@ -422,11 +428,20 @@ export class ManulAiChatParticipant {
       token.onCancellationRequested(() => abort.abort());
 
       try {
-        await this.runAgentLoop(baseUrl, model, messages, response, abort, isAgentLike);
+        await this.runAgentLoop(baseUrl, model, messages, response, abort, isAgentLike, userPrompt);
       } catch (err: any) {
         this.log(`[ManulAiChatParticipant] error: ${err?.message || String(err)}`);
         this.debugLog('agent_error', { error: err?.message || String(err), stack: err?.stack || null });
-        response.markdown(`\n\n**Error:** ${err?.message || String(err)}`);
+        let errorMsg = err?.message || String(err);
+        // If it looks like an OOM, append fallback model suggestions
+        const isOom = /model failed to load|resource limitations|exit status 2/i.test(errorMsg);
+        if (isOom) {
+          const fallback = await this.getFallbackModelSuggestion(baseUrl, model);
+          if (fallback) {
+            errorMsg += fallback;
+          }
+        }
+        response.markdown(`\n\n**Error:** ${errorMsg}`);
       }
     };
   }
@@ -440,12 +455,32 @@ export class ManulAiChatParticipant {
     messages: ChatMessage[],
     response: vscode.ChatResponseStream,
     abort: AbortController,
-    isAgentLike: boolean
+    isAgentLike: boolean,
+    originalUserPrompt: string
   ): Promise<void> {
     const MAX_TURNS = 15;
     const MAX_SAME_TOOL_REPEAT = 3;
     let turnCount = 0;
     const recentToolSignatures: string[] = [];
+    const readFilesThisSession = new Set<string>();
+    let hasProjectScanned = false;
+    let consecutiveReadOrListTurns = 0;
+
+    // Extract likely target filename from user prompt
+    const extractTargetFilename = (prompt: string): string | undefined => {
+      // Match patterns like "create file.md", "write description.md", "edit config.ts"
+      const patterns = [
+        /\b(?:create|write|make|generate|build)\s+(?:a\s+|the\s+)?(?:file\s+)?[`"']?(\S+\.(?:md|txt|ts|js|py|json|yml|yaml|html|css|scss|go|rs|java|kt|cs|cpp|c|h|sh|bash|sql|xml))[`"']?/i,
+        /\b(?:edit|modify|update|fix|change)\s+(?:file\s+)?[`"']?(\S+\.(?:md|txt|ts|js|py|json|yml|yaml|html|css|scss|go|rs|java|kt|cs|cpp|c|h|sh|bash|sql|xml))[`"']?/i,
+        /[`"'](\S+\.(?:md|txt|ts|js|py|json|yml|yaml|html|css|scss|go|rs|java|kt|cs|cpp|c|h|sh|bash|sql|xml))[`"']/i,
+      ];
+      for (const p of patterns) {
+        const m = prompt.match(p);
+        if (m) { return m[1]; }
+      }
+      return undefined;
+    };
+    const targetFilename = extractTargetFilename(originalUserPrompt);
 
     while (turnCount < MAX_TURNS) {
       if (abort.signal.aborted) {
@@ -460,7 +495,7 @@ export class ManulAiChatParticipant {
       response.progress(isAgentLike ? 'Thinking…' : 'Typing…');
 
       const trimmedMessages = await this.truncateMessagesToFit(messages, model, baseUrl, abort);
-      const assistantText = await this.streamAndCollect(baseUrl, model, trimmedMessages, response, abort);
+      const assistantText = await this.streamAndCollect(baseUrl, model, trimmedMessages, response, abort, isAgentLike);
 
       if (!assistantText) {
         return;
@@ -492,6 +527,32 @@ export class ManulAiChatParticipant {
         tools: toolCalls.map((tc) => tc.function.name),
       });
 
+      // Show the assistant's plan/thinking before executing tools
+      if (cleanText && cleanText.trim()) {
+        response.markdown(`\n\n${cleanText.trim()}\n\n`);
+      } else if (isAgentLike && toolCalls.length > 0) {
+        // Auto-generate a plan description from the tool calls
+        const planDesc = toolCalls.map((tc) => {
+          const name = tc.function.name;
+          const args = tc.function.arguments;
+          switch (name) {
+            case 'project_scan': return '🔍 Scanning project structure';
+            case 'read_specific_file':
+            case 'read_file_slice': return `📖 Reading \`${args.filepath || args.path}\``;
+            case 'list_workspace_files': return `📂 Listing files in \`${args.directory || '.'}\``;
+            case 'create_or_edit_file': return `📝 Creating \`${args.filename || args.filepath}\``;
+            case 'replace_in_file': return `✏️ Editing \`${args.filepath}\``;
+            case 'execute_terminal_command': {
+              const cmd = String(args.command ?? args.cmd ?? '');
+              return `💻 Running \`${cmd.substring(0, 60)}\``;
+            }
+            case 'delete_file': return `🗑️ Deleting \`${args.filepath || args.path}\``;
+            default: return `⚙️ ${name}`;
+          }
+        }).join('\n');
+        response.markdown(`\n\n**Next step:**\n${planDesc}\n\n`);
+      }
+
       // Add assistant message (with stripped tools) to history
       messages.push({ role: 'assistant', content: cleanText || '(tool call)' });
 
@@ -519,8 +580,27 @@ export class ManulAiChatParticipant {
 
       let lastToolWasWrite = false;
       let lastToolWasTerminal = false;
+      const MAX_TOOLS_PER_TURN = 3;
 
-      for (const toolCall of toolCalls) {
+      // Limit tools per turn to prevent context explosion
+      let toolsToExecute = toolCalls;
+      if (toolCalls.length > MAX_TOOLS_PER_TURN) {
+        // Prioritize write operations; if none, just take the first N
+        const writeOps = toolCalls.filter((tc) => tc.function.name === 'create_or_edit_file' || tc.function.name === 'replace_in_file');
+        const terminalOps = toolCalls.filter((tc) => tc.function.name === 'execute_terminal_command');
+        const readOps = toolCalls.filter((tc) => tc.function.name === 'read_specific_file' || tc.function.name === 'read_file_slice' || tc.function.name === 'list_workspace_files' || tc.function.name === 'project_scan');
+        if (writeOps.length > 0) {
+          toolsToExecute = writeOps.slice(0, MAX_TOOLS_PER_TURN);
+        } else if (terminalOps.length > 0) {
+          toolsToExecute = terminalOps.slice(0, MAX_TOOLS_PER_TURN);
+        } else {
+          toolsToExecute = readOps.slice(0, MAX_TOOLS_PER_TURN);
+        }
+        this.log(`[agent] limiting ${toolCalls.length} tools to ${toolsToExecute.length} (max ${MAX_TOOLS_PER_TURN})`);
+        this.debugLog('tools_limited', { originalCount: toolCalls.length, limitedTo: toolsToExecute.length, kept: toolsToExecute.map((tc) => tc.function.name) });
+      }
+
+      for (const toolCall of toolsToExecute) {
         if (abort.signal.aborted) {
           return;
         }
@@ -545,6 +625,31 @@ export class ManulAiChatParticipant {
           response.markdown(`\n\n**⚠️ Agent stopped:** detected an infinite loop.`);
           return;
         }
+
+        // Early nudge for repeated reads of the same file (before hitting MAX_SAME_TOOL_REPEAT)
+        if (repeatCount >= 1 && (name === 'read_specific_file' || name === 'read_file_slice')) {
+          const filePath = String(args.filepath ?? args.path ?? '');
+          const nudge = `You have already read \`${filePath}\`. Do NOT read it again. Use the information you already have to complete the user's request.`;
+          messages.push({ role: 'system', content: nudge });
+          this.log(`[agent] nudge: repeated read of ${filePath}`);
+          this.debugLog('repeated_read_nudge', { turn: turnCount, tool: name, filepath: filePath, repeatCount });
+        }
+
+        // Block redundant list_workspace_files after project_scan
+        if (name === 'list_workspace_files' && hasProjectScanned) {
+          const nudge = `You already scanned the entire project with project_scan. You do NOT need to list files again. Use the information from project_scan to complete the task.`;
+          messages.push({ role: 'system', content: nudge });
+          this.log(`[agent] blocked redundant list_workspace_files after project_scan`);
+          this.debugLog('redundant_list_blocked', { turn: turnCount, tool: name, args });
+          // Skip executing the tool, but still add a fake result so the model sees it was "done"
+          messages.push({
+            role: 'tool',
+            content: JSON.stringify({ note: 'Skipped — project_scan already provided full directory listing.' }),
+            tool_name: name,
+          });
+          continue;
+        }
+
         recentToolSignatures.push(signature);
         if (recentToolSignatures.length > 10) {
           recentToolSignatures.shift();
@@ -578,12 +683,19 @@ export class ManulAiChatParticipant {
           tool_name: name,
         });
 
-        // Track if this was a write or terminal operation
+        // Track session state for smarter nudges
         if ((name === 'create_or_edit_file' || name === 'replace_in_file') && !result.error) {
           lastToolWasWrite = true;
         }
         if (name === 'execute_terminal_command' && !result.error) {
           lastToolWasTerminal = true;
+        }
+        if (name === 'read_specific_file' || name === 'read_file_slice') {
+          const fp = String(args.filepath ?? args.path ?? '');
+          if (fp) { readFilesThisSession.add(fp); }
+        }
+        if (name === 'project_scan') {
+          hasProjectScanned = true;
         }
 
         // Stream brief result to user — human-friendly formatting
@@ -620,6 +732,15 @@ export class ManulAiChatParticipant {
               response.markdown(`\n🗑️ **Deleted** \`${filePath}\`\n`);
               break;
             }
+            case 'list_workspace_files': {
+              const dir = String(args.directory ?? '.');
+              response.markdown(`\n📂 **Listed files** in \`${dir}\`\n`);
+              break;
+            }
+            case 'project_scan': {
+              response.markdown(`\n🔍 **Scanned project**\n`);
+              break;
+            }
             default:
               response.markdown(`\n✅ \`${name}\` completed\n`);
           }
@@ -638,6 +759,33 @@ export class ManulAiChatParticipant {
             // Ignore parse errors
           }
         }
+      }
+
+      // Track consecutive read/list turns for auto-bootstrap
+      const allReadsOrLists = toolCalls.every((tc) =>
+        tc.function.name === 'read_specific_file' ||
+        tc.function.name === 'read_file_slice' ||
+        tc.function.name === 'list_workspace_files' ||
+        tc.function.name === 'project_scan'
+      );
+      if (allReadsOrLists) {
+        consecutiveReadOrListTurns++;
+      } else {
+        consecutiveReadOrListTurns = 0;
+      }
+
+      // Auto-bootstrap: if stuck in read-only loop for 2+ turns, force a create instruction
+      if (consecutiveReadOrListTurns >= 2) {
+        const readFilesList = Array.from(readFilesThisSession).map(f => `- ${f}`).join('\n');
+        const fileHint = targetFilename ? ` The target file is \`${targetFilename}\`.` : '';
+        const bootstrapNudge =
+          `STOP. You are stuck in a read loop. You have already read these files:\n${readFilesList || '- (project scanned)'}` +
+          `\n\nDO NOT read any more files. DO NOT list files. You already have all the information you need.` +
+          `\n\nThe user asked you to CREATE a file.${fileHint} Output ONLY a create_or_edit_file tool call NOW with the correct filename. No text, no explanation — just the tool JSON.` +
+          (targetFilename ? `\n\nIMPORTANT: You MUST use filename "${targetFilename}". Any other filename is wrong.` : '');
+        messages.push({ role: 'system', content: bootstrapNudge });
+        this.log('[agent] auto-bootstrap: forcing create after read-only loop');
+        this.debugLog('auto_bootstrap_read_loop', { turn: turnCount, consecutiveReadOrListTurns, readFiles: Array.from(readFilesThisSession) });
       }
 
       // If the last tool was a successful write, stop the loop
@@ -671,7 +819,8 @@ export class ManulAiChatParticipant {
     model: string,
     messages: ChatMessage[],
     response: vscode.ChatResponseStream,
-    abort: AbortController
+    abort: AbortController,
+    suppressRawContent = false
   ): Promise<string> {
     let reasoningOpen = false;
     let answerStarted = false;
@@ -688,7 +837,7 @@ export class ManulAiChatParticipant {
           }
           response.markdown(chunk.reasoning.replace(/\n/g, '\n> '));
         }
-        // Stream content in real-time (for debugging / transparency)
+        // Stream content in real-time (only in chat mode; hide raw tool JSON in agent/planner)
         if (chunk.content) {
           if (reasoningOpen && !answerStarted) {
             response.markdown('\n\n');
@@ -696,7 +845,9 @@ export class ManulAiChatParticipant {
           }
           answerStarted = true;
           collectedText += chunk.content;
-          response.markdown(chunk.content);
+          if (!suppressRawContent) {
+            response.markdown(chunk.content);
+          }
         }
         if (chunk.error) {
           response.markdown(`\n\n**Error:** ${chunk.error}`);
@@ -727,10 +878,51 @@ export class ManulAiChatParticipant {
   }
 
   /**
+   * Suggests fallback models when the current model fails to load (usually OOM).
+   * Checks /api/tags and recommends installed smaller models.
+   */
+  private async getFallbackModelSuggestion(baseUrl: string, failedModel: string): Promise<string> {
+    const sizeMatch = failedModel.match(/:(\d+)[bm]$/i);
+    const sizeB = sizeMatch ? parseInt(sizeMatch[1], 10) : 0;
+    if (sizeB < 15) {
+      return '';
+    }
+
+    const fallbackCandidates = [
+      'qwen3-coder:8b', 'qwen3-coder:4b', 'qwen3-coder:1.7b',
+      'llama3.1:8b', 'llama3.2:3b', 'llama3.2:1b',
+      'phi4-mini:3.8b', 'gemma4:9b', 'gemma4:4b',
+    ];
+
+    try {
+      const res = await fetch(`${baseUrl}/api/tags`, { signal: AbortSignal.timeout(5000) });
+      if (!res.ok) { return ''; }
+      const data = await res.json() as { models?: Array<{ name?: string }> };
+      const installed = (data.models ?? []).map((m) => m.name ?? '');
+      const available = fallbackCandidates.filter((c) => installed.includes(c));
+
+      if (available.length > 0) {
+        return `\n\n**💡 You already have smaller models installed:**\n` +
+               available.map((m) => `- \`${m}\``).join('\n') +
+               `\n\nSwitch with: \`@manulai /selectModel\``;
+      }
+    } catch {
+      // ignore
+    }
+
+    return `\n\n**💡 Recommended smaller models:**\n` +
+           `- \`qwen3-coder:8b\` (~5 GB) — great for coding\n` +
+           `- \`llama3.1:8b\` (~5 GB) — general purpose\n` +
+           `- \`phi4-mini:3.8b\` (~2.5 GB) — lightweight\n` +
+           `\nInstall one with \`ollama pull <model>\`, then switch with \`@manulai /selectModel\`.`;
+  }
+
+  /**
    * Fetches from Ollama with retry for model-loading transient failures.
    * Retries on HTTP 503/500 that mention "model is loading" or "model failed to load".
    */
   private async fetchWithModelRetry(
+    baseUrl: string,
     url: string,
     body: Record<string, unknown>,
     abortController: AbortController,
@@ -777,7 +969,8 @@ export class ManulAiChatParticipant {
         this.log(`[ollama] waiting ${delay}ms before retry…`);
         await new Promise(resolve => setTimeout(resolve, delay));
       } else {
-        // All retries exhausted — throw a user-friendly error
+        // All retries exhausted — build a user-friendly error with fallback suggestions
+        const fallback = await this.getFallbackModelSuggestion(baseUrl, model);
         throw new Error(
           `Ollama could not load model "${model}" after ${maxRetries + 1} attempts.\n\n` +
           `This usually means:\n` +
@@ -788,7 +981,8 @@ export class ManulAiChatParticipant {
           `1. Run \`ollama ps\` to check loaded models\n` +
           `2. Run \`ollama pull ${model}\` to verify the model is available\n` +
           `3. Try a smaller model (e.g. \`phi4-mini:3.8b\` or \`llama3.1:8b\`)\n` +
-          `4. Check Ollama server logs: \`ollama logs\` or \`journalctl -u ollama\``
+          `4. Check Ollama server logs: \`journalctl -u ollama\`` +
+          fallback
         );
       }
     }
@@ -822,7 +1016,7 @@ export class ManulAiChatParticipant {
       url,
     });
 
-    const response = await this.fetchWithModelRetry(url, body, abortController, model);
+    const response = await this.fetchWithModelRetry(baseUrl, url, body, abortController, model);
 
     if (!response.ok) {
       const text = await response.text();
@@ -881,7 +1075,7 @@ export class ManulAiChatParticipant {
       stream: false,
     };
 
-    const response = await this.fetchWithModelRetry(url, body, abortController, model);
+    const response = await this.fetchWithModelRetry(baseUrl, url, body, abortController, model);
 
     if (!response.ok) {
       const text = await response.text();
