@@ -287,6 +287,10 @@ async function toolCreateOrEditFile(filename: string, content: string): Promise<
   if (!filename.trim()) {
     return { content: '', error: 'filename is required.' };
   }
+  const blocked = isBlockedFilePath(filename);
+  if (blocked.blocked) {
+    return { content: '', error: `Write blocked for safety: ${blocked.reason}` };
+  }
   const uri = resolveWorkspaceUri(filename, true);
   try {
     await vscode.workspace.fs.writeFile(uri, Buffer.from(content, 'utf8'));
@@ -309,6 +313,10 @@ async function toolReplaceInFile(
 ): Promise<AgentToolResult> {
   if (!filepath.trim()) {
     return { content: '', error: 'filepath is required.' };
+  }
+  const blocked = isBlockedFilePath(filepath);
+  if (blocked.blocked) {
+    return { content: '', error: `Edit blocked for safety: ${blocked.reason}` };
   }
   if (!oldText) {
     return { content: '', error: 'old_text is required.' };
@@ -398,6 +406,10 @@ async function toolLaunchInTerminal(command: string): Promise<AgentToolResult> {
 async function toolDeleteFile(filepath: string): Promise<AgentToolResult> {
   if (!filepath.trim()) {
     return { content: '', error: 'filepath is required.' };
+  }
+  const blocked = isBlockedFilePath(filepath);
+  if (blocked.blocked) {
+    return { content: '', error: `Delete blocked for safety: ${blocked.reason}` };
   }
   const uri = resolveWorkspaceUri(filepath);
   try {
@@ -495,28 +507,151 @@ function resolveWorkspaceUri(targetPath: string, allowCreate = false): vscode.Ur
 }
 
 function isBlockedCommand(command: string): boolean {
-  const lower = command.toLowerCase();
+  const lower = command.toLowerCase().trim();
+
+  // Exact dangerous command fragments
   const dangerous = [
     'rm -rf /',
     'rm -rf ~',
     'rm -rf $home',
+    'rm -rf /home',
+    'rm -rf /usr',
+    'rm -rf /etc',
+    'rm -rf /var',
+    'rm -rf /bin',
+    'rm -rf /sbin',
+    'rm -rf /lib',
+    'rm -rf /lib64',
+    'rm -rf /boot',
+    'rm -rf /opt',
+    'rm -rf /snap',
+    'rm -rf /sys',
+    'rm -rf /dev',
+    'rm -rf /proc',
+    'rm -rf /tmp',
+    'rm -rf /*',
     'sudo',
     'shutdown',
     'reboot',
+    'poweroff',
+    'halt',
     'mkfs',
+    'mkswap',
     'dd if=',
+    'dd of=/dev/',
     ':(){:|:&};:',
     'chmod -r 777 /',
     'chmod -r 777 ~',
+    'chmod -r 000 /',
+    'chown -r root',
+    'kill -9',
+    'pkill -9',
+    'killall',
+    'init 0',
+    'init 6',
+    'telinit 0',
+    'telinit 6',
+    'systemctl poweroff',
+    'systemctl reboot',
+    'journalctl --flush',
+    'passwd',
+    'userdel',
+    'groupdel',
+    'visudo',
+    'crontab -r',
+    'history -c',
+    'wget -o-',
+    'curl -fsSL',
   ];
   for (const d of dangerous) {
     if (lower.includes(d)) {
       return true;
     }
   }
+
   // curl/wget piped to shell
-  if (/\b(curl|wget)\b.*\|.*\b(sh|bash)\b/.test(lower)) {
+  if (/\b(curl|wget)\b.*\|.*\b(sh|bash|zsh)\b/.test(lower)) {
     return true;
   }
+
+  // Any rm -rf without a specific safe path pattern
+  if (/\brm\s+-[a-z]*f/.test(lower)) {
+    // Block if it targets system directories or uses wildcards at root level
+    if (/\s+(\/|\~|\$home|\$HOME|\/\.\*|\/\*\/?\s*$)/i.test(lower)) {
+      return true;
+    }
+  }
+
+  // Block commands that write directly to device files
+  if (/\b(dd|cat|echo)\b.*>?\s*\/dev\//.test(lower)) {
+    return true;
+  }
+
+  // Block npm/pip/gem global uninstalls that could break the system
+  if (/\b(npm|yarn|pnpm)\s+uninstall\s+-g\b/.test(lower)) {
+    return true;
+  }
+  if (/\bpip\s+uninstall\b/.test(lower) && !/\b-?-user\b/.test(lower)) {
+    return true;
+  }
+
   return false;
+}
+
+/**
+ * Checks if a file path targets a critical system or project file.
+ * Used to block destructive writes/deletes to protected paths.
+ */
+function isBlockedFilePath(filepath: string): { blocked: boolean; reason?: string } {
+  const normalized = filepath.toLowerCase().trim();
+
+  // System-critical paths
+  const systemPaths = [
+    '/etc/', '/usr/', '/bin/', '/sbin/', '/lib', '/lib64/',
+    '/boot/', '/sys/', '/dev/', '/proc/', '/run/', '/var/log/',
+    '/snap/', '/opt/',
+  ];
+  for (const sp of systemPaths) {
+    if (normalized.startsWith(sp)) {
+      return { blocked: true, reason: `System path blocked: ${filepath}` };
+    }
+  }
+
+  // Home directory root deletion
+  if (/^~\/?$/.test(normalized) || /^\$home\/?$/i.test(normalized)) {
+    return { blocked: true, reason: `Home directory deletion blocked: ${filepath}` };
+  }
+
+  // Project-critical files (prevent accidental deletion/overwrites)
+  const criticalFiles = [
+    '.git', '.gitignore', '.gitattributes',
+    'package.json', 'package-lock.json', 'yarn.lock', 'pnpm-lock.yaml',
+    'tsconfig.json', 'jsconfig.json', '.eslintrc', '.prettierrc',
+    'vite.config.', 'webpack.config.', 'rollup.config.', 'esbuild.config.',
+    'next.config.', 'nuxt.config.', 'astro.config.',
+    'dockerfile', 'docker-compose',
+    'makefile', 'cmake', ' Cargo.toml', 'Cargo.lock',
+    'go.mod', 'go.sum',
+    'requirements.txt', 'pipfile', 'poetry.lock',
+    'gemfile', 'gemfile.lock',
+    'composer.json', 'composer.lock',
+    '.env', '.env.local', '.env.production', '.env.development',
+    'LICENSE', 'LICENSE.txt', 'LICENSE.md',
+    'README.md', 'README.rst', 'README',
+    'CLAUDE.md', 'AGENTS.md', 'CLAUDE.md', '.cursorrules',
+  ];
+  const basename = normalized.split('/').pop() ?? '';
+  for (const cf of criticalFiles) {
+    if (basename === cf.toLowerCase() || normalized.endsWith('/' + cf.toLowerCase())) {
+      return { blocked: true, reason: `Critical project file blocked: ${filepath}` };
+    }
+  }
+
+  // Block deletion of the entire workspace root
+  const workspaceRoot = getWorkspaceRoot().toLowerCase();
+  if (normalized === workspaceRoot || normalized + '/' === workspaceRoot + '/') {
+    return { blocked: true, reason: `Workspace root deletion blocked: ${filepath}` };
+  }
+
+  return { blocked: false };
 }
