@@ -24,10 +24,26 @@ export interface AgentToolResult {
 }
 
 const TOOL_DESCRIPTIONS = `
+[AGENT RULES]
+
+1. ALWAYS respond in the SAME LANGUAGE as the user's prompt.
+2. BEFORE creating or editing files, ALWAYS read the relevant files first to understand the project structure.
+3. Use project_scan() or list_workspace_files() to explore the workspace before making changes.
+4. NEVER output explanations before tool calls — just call the tool immediately.
+5. NEVER wrap tool JSON in markdown code blocks (no \`\`\`json).
+6. STOP immediately after completing the user's request. Do NOT verify, check, or read back created/edited files.
+7. Do NOT scan the project after completing the task unless explicitly asked.
+
 [TOOL FORMAT]
 
-Output tool calls as a single JSON object on its own line:
+Output tool calls as a single JSON object on its own line, with "args" key:
 {"tool": "tool_name", "args": {"param": "value"}}
+
+Examples:
+{"tool": "list_workspace_files", "args": {"directory": "src"}}
+{"tool": "read_specific_file", "args": {"filepath": "package.json"}}
+{"tool": "create_or_edit_file", "args": {"filename": "summary.md", "content": "# Project\\n\\nDescription..."}}
+{"tool": "execute_terminal_command", "args": {"command": "ls -la"}}
 
 Available tools:
 - create_or_edit_file(filename, content) — Create or overwrite a file
@@ -41,7 +57,7 @@ Available tools:
 - read_active_file() — Read the currently open file
 - project_scan() — Get a recursive tree of the entire workspace
 
-Output ONE tool call JSON per response. No prose before the JSON. Do not wrap the JSON in markdown fences.
+Output ONE tool call JSON per response. No prose before the JSON.
 `;
 
 /** Maps common hallucinated tool names to valid ones. */
@@ -51,20 +67,24 @@ const TOOL_NAME_ALIASES: Record<string, string> = {
   'edit_file': 'create_or_edit_file',
   'update_file': 'create_or_edit_file',
   'modify_file': 'replace_in_file',
+  'execute_command': 'execute_terminal_command',
   'run_command': 'execute_terminal_command',
   'run_terminal': 'execute_terminal_command',
   'shell': 'execute_terminal_command',
+  'cmd': 'execute_terminal_command',
   'open_terminal': 'launch_in_terminal',
   'read_file': 'read_specific_file',
   'get_file': 'read_specific_file',
   'view_file': 'read_specific_file',
   'list_files': 'list_workspace_files',
   'ls': 'list_workspace_files',
+  'dir': 'list_workspace_files',
   'scan_project': 'project_scan',
   'workspace_scan': 'project_scan',
   'tree': 'project_scan',
   'delete': 'delete_file',
   'remove_file': 'delete_file',
+  'rm': 'delete_file',
 };
 
 function normalizeToolName(name: string): string {
@@ -443,6 +463,7 @@ function resolveWorkspaceUri(targetPath: string, allowCreate = false): vscode.Ur
     throw new Error('Path is required.');
   }
   if (path.isAbsolute(normalized)) {
+    // Don't prepend workspace root to absolute paths
     return vscode.Uri.file(normalized);
   }
   const root = vscode.workspace.workspaceFolders?.[0]?.uri;

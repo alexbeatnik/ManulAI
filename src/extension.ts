@@ -45,6 +45,23 @@ export function activate(context: vscode.ExtensionContext): void {
       await vscode.commands.executeCommand('manulai.settings.focus');
     })
   );
+
+  // Tool approval buttons
+  context.subscriptions.push(
+    vscode.commands.registerCommand('manulai.approveTool', async () => {
+      await context.globalState.update('manulai.autoApproveState', true);
+      await context.globalState.update('manulai.pendingApproval', false);
+      vscode.window.showInformationMessage('✅ ManulAI: Auto-approve enabled. Type any message to continue.');
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('manulai.declineTool', async () => {
+      await context.globalState.update('manulai.autoApproveState', false);
+      await context.globalState.update('manulai.pendingApproval', false);
+      vscode.window.showInformationMessage('❌ ManulAI: Tool declined. Auto-approve is off.');
+    })
+  );
 }
 
 export function deactivate(): void {

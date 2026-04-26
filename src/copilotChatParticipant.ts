@@ -37,7 +37,13 @@ export class ManulAiChatParticipant {
   }
 
   private getAutoApprove(): boolean {
-    return this.globalState?.get<boolean>(ManulAiChatParticipant.AUTO_APPROVE_KEY) ?? false;
+    // Agent mode defaults to auto-approve for file modifications
+    const mode = this.getAgentMode();
+    const stored = this.globalState?.get<boolean>(ManulAiChatParticipant.AUTO_APPROVE_KEY);
+    if (stored === undefined) {
+      return mode === 'agent'; // Default: agent=true, planner/chat=false
+    }
+    return stored;
   }
 
   private async setAutoApprove(value: boolean): Promise<void> {
@@ -198,9 +204,19 @@ export class ManulAiChatParticipant {
 
       if (agentMode === 'agent') {
         effectiveSystemPrompt += '\n\nYou are in Agent mode. You may read files, edit code, and run terminal commands using the tools below.';
+        effectiveSystemPrompt += '\n\nCRITICAL RULES:';
+        effectiveSystemPrompt += '\n1. Execute ONLY what the user explicitly asked. Do NOT do extra work.';
+        effectiveSystemPrompt += '\n2. STOP immediately after completing the task. Do NOT read files to "verify" or "check" your work.';
+        effectiveSystemPrompt += '\n3. Do NOT scan the project or list files after creating/editing files unless the user asked.';
+        effectiveSystemPrompt += '\n4. If the user asked to create a file — create it and STOP. Do not read it back.';
+        effectiveSystemPrompt += '\n5. If the user asked to edit a file — edit it and STOP. Do not read it back.';
         effectiveSystemPrompt += '\n\n' + getAgentToolInstructions();
       } else if (agentMode === 'planner') {
         effectiveSystemPrompt += '\n\nYou are in Planner mode. Prefer concise, step-by-step responses. Use tools for small deliberate actions.';
+        effectiveSystemPrompt += '\n\nCRITICAL RULES:';
+        effectiveSystemPrompt += '\n1. Execute ONLY what the user explicitly asked. Do NOT do extra work.';
+        effectiveSystemPrompt += '\n2. STOP immediately after completing the task. Do NOT read files to "verify" or "check" your work.';
+        effectiveSystemPrompt += '\n3. Do NOT scan the project or list files after creating/editing files unless the user asked.';
         effectiveSystemPrompt += '\n\n' + getAgentToolInstructions();
       } else {
         effectiveSystemPrompt += '\n\nYou are in Chat mode. Answer questions and review code without suggesting file changes or tool calls.';
@@ -260,7 +276,9 @@ export class ManulAiChatParticipant {
     isAgentLike: boolean
   ): Promise<void> {
     const MAX_TURNS = 15;
+    const MAX_SAME_TOOL_REPEAT = 3;
     let turnCount = 0;
+    const recentToolSignatures: string[] = [];
 
     while (turnCount < MAX_TURNS) {
       if (abort.signal.aborted) {
@@ -298,12 +316,22 @@ export class ManulAiChatParticipant {
       // Add assistant message (with stripped tools) to history
       messages.push({ role: 'assistant', content: cleanText || '(tool call)' });
 
-      // Approval check
-      const autoApprove = this.getAutoApprove();
+      // Approval check — agent mode defaults to auto-execute
+      let autoApprove = this.getAutoApprove();
       const toolNames = toolCalls.map((tc) => tc.function.name).join(', ');
 
       if (!autoApprove) {
-        response.markdown(`\n\n---\n\n**⏸️ Tool approval required:** \`${toolNames}\`\n\nRun \`/toggleAutoApprove\` to enable automatic tool execution, or ask me to continue.`);
+        // Show interactive approval buttons in chat
+        response.markdown(`\n\n---\n\n**⏸️ Tool approval required:** \`${toolNames}\`\n\n`);
+        response.button({
+          command: 'manulai.approveTool',
+          title: '✅ Approve',
+        });
+        response.button({
+          command: 'manulai.declineTool',
+          title: '❌ Decline',
+        });
+        response.markdown(`\n\nClick **Approve** to execute this tool, or **Decline** to skip.\nYou can also run \`/toggleAutoApprove\` to always execute tools without asking.`);
         return;
       }
 
@@ -318,6 +346,26 @@ export class ManulAiChatParticipant {
         const name = toolCall.function.name;
         const args = toolCall.function.arguments;
         this.log(`[agent] executing tool: ${name}`);
+
+        // Detect repeated tool call loops
+        const signature = `${name}:${JSON.stringify(args)}`;
+        const repeatCount = recentToolSignatures.filter(s => s === signature).length;
+        if (repeatCount >= MAX_SAME_TOOL_REPEAT) {
+          const errorMsg = `Tool loop detected: ${name} has been called ${repeatCount} times with the same arguments. Stopping to prevent infinite loop.`;
+          this.log(`[agent] ${errorMsg}`);
+          response.markdown(`\n⚠️ **${errorMsg}**\n`);
+          messages.push({
+            role: 'tool',
+            content: JSON.stringify({ error: errorMsg }),
+            tool_name: name,
+          });
+          response.markdown(`\n\n**⚠️ Agent stopped:** detected an infinite loop.`);
+          return;
+        }
+        recentToolSignatures.push(signature);
+        if (recentToolSignatures.length > 10) {
+          recentToolSignatures.shift();
+        }
 
         // Show which tool is running
         response.progress(`Executing ${name}…`);
@@ -353,6 +401,19 @@ export class ManulAiChatParticipant {
           } catch {
             // Ignore parse errors
           }
+          // Add stop nudge to prevent the model from continuing
+          messages.push({
+            role: 'system',
+            content: 'The file has been created successfully. Do NOT continue with any other actions. STOP here.',
+          });
+        }
+
+        // Stop nudge after successful replace
+        if (name === 'replace_in_file' && !result.error) {
+          messages.push({
+            role: 'system',
+            content: 'The file has been edited successfully. Do NOT continue with any other actions. STOP here.',
+          });
         }
       }
 
