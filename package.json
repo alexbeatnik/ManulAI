@@ -2,7 +2,7 @@
   "name": "manulai-local-agent",
   "displayName": "ManulAI Local Agent",
   "description": "ManulAI is a local AI coding assistant for Visual Studio Code powered entirely by your own Ollama runtime.",
-  "version": "0.0.12",
+  "version": "0.0.13",
   "publisher": "manul-engine",
   "icon": "icon.png",
   "license": "Apache-2.0",
@@ -13,9 +13,11 @@
   "engines": {
     "vscode": "^1.107.0"
   },
-  "categories": [
-    "Other"
-  ],
+    "categories": [
+      "AI",
+      "Chat",
+      "Machine Learning"
+    ],
   "activationEvents": [],
   "main": "./out/extension.js",
   "contributes": {
@@ -67,6 +69,12 @@
         "title": "ManulAI: Send Prompt (Dev/Test)",
         "category": "ManulAI",
         "icon": "$(beaker)"
+      },
+      {
+        "command": "manulai.openSettings",
+        "title": "ManulAI: Open Settings",
+        "category": "ManulAI",
+        "icon": "$(gear)"
       }
     ],
     "menus": {
@@ -102,7 +110,34 @@
         }
       ]
     },
+    "chatParticipants": [
+      {
+        "id": "manulai.manulai",
+        "fullName": "ManulAI",
+        "name": "manulai",
+        "description": "Chat with ManulAI local Ollama assistant (@manulai)",
+        "isSticky": true,
+        "iconPath": "media/manulai-icon.svg",
+        "commands": [
+          {
+            "name": "selectModel",
+            "description": "Select an Ollama model"
+          },
+          {
+            "name": "model",
+            "description": "Show the active Ollama model"
+          }
+        ]
+      }
+    ],
     "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "manulaiActivityBar",
+          "title": "ManulAI",
+          "icon": "media/manulai-icon.svg"
+        }
+      ],
       "secondarySidebar": [
         {
           "id": "manulai",
@@ -112,6 +147,14 @@
       ]
     },
     "views": {
+      "manulaiActivityBar": [
+        {
+          "type": "webview",
+          "id": "manulai.settings",
+          "name": "Settings",
+          "icon": "media/manulai-icon.svg"
+        }
+      ],
       "manulai": [
         {
           "type": "webview",
