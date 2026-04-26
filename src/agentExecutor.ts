@@ -163,30 +163,30 @@ export async function executeTool(
       case 'read_active_file':
         return await toolReadActiveFile();
       case 'read_specific_file':
-        return await toolReadSpecificFile(String(args.filepath ?? ''));
+        return await toolReadSpecificFile(String(args.filepath ?? args.path ?? ''));
       case 'read_file_slice':
         return await toolReadFileSlice(
-          String(args.filepath ?? ''),
+          String(args.filepath ?? args.path ?? ''),
           args.startLine as number | undefined,
           args.endLine as number | undefined
         );
       case 'create_or_edit_file':
         return await toolCreateOrEditFile(
-          String(args.filename ?? args.filepath ?? ''),
+          String(args.filename ?? args.filepath ?? args.path ?? ''),
           String(args.content ?? '')
         );
       case 'replace_in_file':
         return await toolReplaceInFile(
-          String(args.filepath ?? ''),
-          String(args.old_text ?? ''),
-          String(args.new_text ?? '')
+          String(args.filepath ?? args.path ?? ''),
+          String(args.old_text ?? args.oldText ?? ''),
+          String(args.new_text ?? args.newText ?? '')
         );
       case 'execute_terminal_command':
         return await toolExecuteTerminal(String(args.command ?? args.cmd ?? ''));
       case 'launch_in_terminal':
         return await toolLaunchInTerminal(String(args.command ?? args.cmd ?? ''));
       case 'delete_file':
-        return await toolDeleteFile(String(args.filepath ?? ''));
+        return await toolDeleteFile(String(args.filepath ?? args.path ?? ''));
       case 'list_workspace_files':
         return await toolListWorkspaceFiles(String(args.directory ?? ''));
       case 'project_scan':
