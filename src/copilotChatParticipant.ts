@@ -360,6 +360,7 @@ export class ManulAiChatParticipant {
       response.markdown(`\n\n---\n\n`);
 
       let lastToolWasWrite = false;
+      let lastToolWasTerminal = false;
 
       for (const toolCall of toolCalls) {
         if (abort.signal.aborted) {
@@ -405,9 +406,12 @@ export class ManulAiChatParticipant {
           tool_name: name,
         });
 
-        // Track if this was a write operation
+        // Track if this was a write or terminal operation
         if ((name === 'create_or_edit_file' || name === 'replace_in_file') && !result.error) {
           lastToolWasWrite = true;
+        }
+        if (name === 'execute_terminal_command' && !result.error) {
+          lastToolWasTerminal = true;
         }
 
         // Stream brief result to user — human-friendly formatting
@@ -464,9 +468,13 @@ export class ManulAiChatParticipant {
         }
       }
 
-      // If the last tool was a successful write, stop the loop
+      // If the last tool was a successful write, or a terminal command in a multi-tool chain, stop the loop
       if (lastToolWasWrite) {
         this.log('[agent] last tool was a write operation — stopping loop');
+        return;
+      }
+      if (lastToolWasTerminal && toolCalls.length >= 2) {
+        this.log('[agent] last tool was terminal in a multi-tool chain — stopping loop');
         return;
       }
 
