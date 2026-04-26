@@ -40,6 +40,8 @@ src/
   copilotChatParticipant.ts # VS Code Chat participant (@manulai) for native Chat panel
   settingsPanel.ts          # Activity Bar settings webview (model picker with /api/tags fetch)
   ollamaStreamParser.ts     # NDJSON stream parser with <think> reasoning extraction
+  agentInstructionsReader.ts # Reads AGENTS.md, CLAUDE.md, etc. from workspace
+  skillsReader.ts           # Reads skill files from .claude/skills/ and similar directories
   types.ts                  # Shared types
 media/
   manulai-icon.svg          # Extension icon
@@ -94,6 +96,7 @@ Read the relevant skill file **before** making changes to related systems.
 | Settings panel, Activity Bar webview | `.claude/skills/settings-panel/SKILL.md` |
 | Ollama streaming, reasoning extraction | `.claude/skills/ollama-streaming/SKILL.md` |
 | Workspace agent instructions (AGENTS.md, CLAUDE.md) | `.claude/skills/agent-instructions-reader/SKILL.md` |
+| Workspace skills reader (.claude/skills/) | `.claude/skills/skills-reader/SKILL.md` |
 | Packaging, versioning, VSIX build | `.claude/skills/extension-packaging/SKILL.md` |
 | Version bump + docs sync | `.claude/skills/bump-version/SKILL.md` |
 | Pre-commit docs sanity check | `.claude/skills/verify-docs-sync/SKILL.md` |

@@ -41,6 +41,7 @@ ManulAI supports three modes, toggled via chat commands:
 | `/setAgentMode <chat\|agent\|planner>` | Switch agent mode |
 | `/toggleAutoApprove` | Toggle auto-approve |
 | `/instructions` | Show loaded workspace agent instructions |
+| `/skills` | Show loaded workspace skills |
 
 ### Workspace agent instructions
 
@@ -57,6 +58,31 @@ ManulAI automatically reads agent instruction files from your workspace and inje
 - `docs/CLAUDE.md`
 
 Place an `AGENTS.md` in your project root to give the model context about your codebase conventions, architecture, or rules.
+
+### Workspace skills
+
+ManulAI also reads **skills** from your workspace and injects them into every chat request. Skills are markdown files with YAML frontmatter (`name`, `description`) stored in skill directories:
+
+- `.claude/skills/<skill-name>/SKILL.md`
+- `skills/<skill-name>/SKILL.md`
+- `.github/skills/<skill-name>/SKILL.md`
+- `.ai/skills/<skill-name>/SKILL.md`
+
+Example skill file:
+
+```markdown
+---
+name: my-project-rules
+description: Guidelines for working with this codebase
+---
+
+# my-project-rules
+
+1. Always use TypeScript strict mode.
+2. Prefer functional components over class components.
+```
+
+Use `@manulai /skills` to see which skills are currently loaded.
 
 ### Settings panel
 

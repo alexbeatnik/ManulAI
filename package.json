@@ -63,6 +63,10 @@
           {
             "name": "instructions",
             "description": "Show loaded workspace agent instructions (AGENTS.md, CLAUDE.md, etc.)"
+          },
+          {
+            "name": "skills",
+            "description": "Show loaded workspace skills from .claude/skills/"
           }
         ]
       }

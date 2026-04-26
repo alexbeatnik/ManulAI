@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import { OllamaStreamParser } from './ollamaStreamParser';
 import type { OllamaStreamChunk } from './ollamaStreamParser';
 import { readAgentInstructions, formatInstructionsForPrompt } from './agentInstructionsReader';
+import { readWorkspaceSkills, formatSkillsForPrompt } from './skillsReader';
 
 export interface ChatMessage {
   role: 'system' | 'user' | 'assistant';
@@ -94,6 +95,18 @@ export class ManulAiChatParticipant {
         }
         return;
       }
+      if (request.command === 'skills') {
+        const skills = await readWorkspaceSkills();
+        if (skills.length > 0) {
+          const lines = skills.map(
+            (s) => `- **${s.name}** — \`${s.source}\`${s.description ? `\n  ${s.description}` : ''}`
+          );
+          response.markdown(`**Found ${skills.length} skill(s):**\n\n${lines.join('\n')}`);
+        } else {
+          response.markdown('No workspace skills found. Expected directories: `.claude/skills/`, `skills/`, `.github/skills/`, `.ai/skills/` containing `SKILL.md` files.');
+        }
+        return;
+      }
 
       const config = vscode.workspace.getConfiguration('manulai');
       const model = String(config.get('ollamaModel', '')).trim();
@@ -114,6 +127,13 @@ export class ManulAiChatParticipant {
       if (instructions) {
         effectiveSystemPrompt += '\n\n' + formatInstructionsForPrompt(instructions);
         this.log(`[instructions] loaded from ${instructions.source}`);
+      }
+
+      // Inject workspace skills if available
+      const skills = await readWorkspaceSkills();
+      if (skills.length > 0) {
+        effectiveSystemPrompt += '\n\n' + formatSkillsForPrompt(skills);
+        this.log(`[skills] loaded ${skills.length} skill(s): ${skills.map((s) => s.name).join(', ')}`);
       }
 
       if (agentMode === 'agent') {
