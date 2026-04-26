@@ -229,6 +229,7 @@ export class ManulAiChatParticipant {
         effectiveSystemPrompt += '\n3. Do NOT scan the project or list files after creating/editing files unless the user asked.';
         effectiveSystemPrompt += '\n4. If the user asked to create a file — create it and STOP. Do not read it back.';
         effectiveSystemPrompt += '\n5. If the user asked to edit a file — edit it and STOP. Do not read it back.';
+        effectiveSystemPrompt += '\n6. After outputting a tool JSON, STOP. Do not write any additional text.';
         effectiveSystemPrompt += '\n\n' + getAgentToolInstructions();
       } else if (agentMode === 'planner') {
         effectiveSystemPrompt += '\n\nYou are in Planner mode. Prefer concise, step-by-step responses. Use tools for small deliberate actions.';
@@ -236,6 +237,7 @@ export class ManulAiChatParticipant {
         effectiveSystemPrompt += '\n1. Execute ONLY what the user explicitly asked. Do NOT do extra work.';
         effectiveSystemPrompt += '\n2. STOP immediately after completing the task. Do NOT read files to "verify" or "check" your work.';
         effectiveSystemPrompt += '\n3. Do NOT scan the project or list files after creating/editing files unless the user asked.';
+        effectiveSystemPrompt += '\n4. After outputting a tool JSON, STOP. Do not write any additional text.';
         effectiveSystemPrompt += '\n\n' + getAgentToolInstructions();
       } else {
         effectiveSystemPrompt += '\n\nYou are in Chat mode. Answer questions and review code without suggesting file changes or tool calls.';
@@ -357,6 +359,8 @@ export class ManulAiChatParticipant {
       // Execute tools
       response.markdown(`\n\n---\n\n`);
 
+      let lastToolWasWrite = false;
+
       for (const toolCall of toolCalls) {
         if (abort.signal.aborted) {
           return;
@@ -400,6 +404,11 @@ export class ManulAiChatParticipant {
           content: toolContent,
           tool_name: name,
         });
+
+        // Track if this was a write operation
+        if ((name === 'create_or_edit_file' || name === 'replace_in_file') && !result.error) {
+          lastToolWasWrite = true;
+        }
 
         // Stream brief result to user — human-friendly formatting
         if (result.error) {
@@ -452,20 +461,13 @@ export class ManulAiChatParticipant {
           } catch {
             // Ignore parse errors
           }
-          // Add stop nudge to prevent the model from continuing
-          messages.push({
-            role: 'system',
-            content: 'The file has been created successfully. Do NOT continue with any other actions. STOP here.',
-          });
         }
+      }
 
-        // Stop nudge after successful replace
-        if (name === 'replace_in_file' && !result.error) {
-          messages.push({
-            role: 'system',
-            content: 'The file has been edited successfully. Do NOT continue with any other actions. STOP here.',
-          });
-        }
+      // If the last tool was a successful write, stop the loop
+      if (lastToolWasWrite) {
+        this.log('[agent] last tool was a write operation — stopping loop');
+        return;
       }
 
       response.markdown(`\n\n---\n\n`);

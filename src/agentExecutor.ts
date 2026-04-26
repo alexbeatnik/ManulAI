@@ -33,6 +33,7 @@ const TOOL_DESCRIPTIONS = `
 5. NEVER wrap tool JSON in markdown code blocks (no \`\`\`json).
 6. STOP immediately after completing the user's request. Do NOT verify, check, or read back created/edited files.
 7. Do NOT scan the project after completing the task unless explicitly asked.
+8. After outputting a tool JSON, STOP. Do not write any additional text, explanations, or thinking.
 
 [TOOL FORMAT]
 
