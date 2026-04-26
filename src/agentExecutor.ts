@@ -44,37 +44,91 @@ Available tools:
 Output ONE tool call JSON per response. No prose before the JSON. Do not wrap the JSON in markdown fences.
 `;
 
+/** Maps common hallucinated tool names to valid ones. */
+const TOOL_NAME_ALIASES: Record<string, string> = {
+  'create_file': 'create_or_edit_file',
+  'write_file': 'create_or_edit_file',
+  'edit_file': 'create_or_edit_file',
+  'update_file': 'create_or_edit_file',
+  'modify_file': 'replace_in_file',
+  'run_command': 'execute_terminal_command',
+  'run_terminal': 'execute_terminal_command',
+  'shell': 'execute_terminal_command',
+  'open_terminal': 'launch_in_terminal',
+  'read_file': 'read_specific_file',
+  'get_file': 'read_specific_file',
+  'view_file': 'read_specific_file',
+  'list_files': 'list_workspace_files',
+  'ls': 'list_workspace_files',
+  'scan_project': 'project_scan',
+  'workspace_scan': 'project_scan',
+  'tree': 'project_scan',
+  'delete': 'delete_file',
+  'remove_file': 'delete_file',
+};
+
+function normalizeToolName(name: string): string {
+  return TOOL_NAME_ALIASES[name.toLowerCase().trim()] ?? name;
+}
+
 export function getAgentToolInstructions(): string {
   return TOOL_DESCRIPTIONS;
 }
 
 /**
  * Parses tool calls from assistant text.
- * Supports two formats:
- * 1. Native Ollama tool_calls (already parsed)
- * 2. Text-based: {"tool": "name", "args": {...}}
+ * Supports multiple formats:
+ * 1. {"tool": "name", "args": {...}}
+ * 2. {"tool": "name", "parameters": {...}}
+ * 3. Flat format: {"tool": "name", "filepath": "...", ...}
  */
 export function extractToolCallsFromText(text: string): Array<{
   type: 'function';
   function: { name: string; arguments: Record<string, unknown> };
 }> {
   const results: ReturnType<typeof extractToolCallsFromText> = [];
+  const seen = new Set<string>();
 
-  // Look for {"tool": "...", "args": {...}} pattern
-  const toolRegex = /\{\s*"tool"\s*:\s*"([^"]+)"\s*,\s*"args"\s*:\s*(\{[\s\S]*?\})\s*\}/g;
+  // Pattern 1: {"tool": "...", "args": {...}}
+  const argsRegex = /\{\s*"tool"\s*:\s*"([^"]+)"\s*,\s*"args"\s*:\s*(\{[\s\S]*?\})\s*\}/g;
   let match: RegExpExecArray | null;
-
-  while ((match = toolRegex.exec(text)) !== null) {
+  while ((match = argsRegex.exec(text)) !== null) {
     try {
-      const name = match[1];
+      const name = normalizeToolName(match[1]);
       const args = JSON.parse(match[2]) as Record<string, unknown>;
-      results.push({
-        type: 'function',
-        function: { name, arguments: args },
-      });
-    } catch {
-      // Invalid JSON, skip
-    }
+      const entry = { type: 'function' as const, function: { name, arguments: args } };
+      const key = JSON.stringify(entry);
+      if (!seen.has(key)) { seen.add(key); results.push(entry); }
+    } catch { /* ignore invalid JSON */ }
+  }
+
+  // Pattern 2: {"tool": "...", "parameters": {...}}
+  const paramsRegex = /\{\s*"tool"\s*:\s*"([^"]+)"\s*,\s*"parameters"\s*:\s*(\{[\s\S]*?\})\s*\}/g;
+  while ((match = paramsRegex.exec(text)) !== null) {
+    try {
+      const name = normalizeToolName(match[1]);
+      const args = JSON.parse(match[2]) as Record<string, unknown>;
+      const entry = { type: 'function' as const, function: { name, arguments: args } };
+      const key = JSON.stringify(entry);
+      if (!seen.has(key)) { seen.add(key); results.push(entry); }
+    } catch { /* ignore invalid JSON */ }
+  }
+
+  // Pattern 3: Flat format {"tool": "name", "filepath": "...", ...}
+  const flatRegex = /\{\s*"tool"\s*:\s*"([^"]+)"(?:\s*,\s*"(args|parameters)"\s*:\s*\{|\s*,\s*"([^"]+)"\s*:)/g;
+  while ((match = flatRegex.exec(text)) !== null) {
+    if (match[2] === 'args' || match[2] === 'parameters') continue; // Already handled
+    try {
+      const fullMatch = text.slice(match.index).match(/^\{[\s\S]*?\}/);
+      if (!fullMatch) continue;
+      const parsed = JSON.parse(fullMatch[0]) as Record<string, unknown>;
+      const { tool, args, parameters, ...rest } = parsed;
+      const name = normalizeToolName(String(tool ?? ''));
+      const argObj = (args ?? parameters ?? rest) as Record<string, unknown>;
+      const entry = { type: 'function' as const, function: { name, arguments: argObj } };
+      const key = JSON.stringify(entry);
+      if (!seen.has(key)) { seen.add(key); results.push(entry); }
+    } catch { /* ignore invalid JSON */ }
   }
 
   return results;
@@ -82,10 +136,18 @@ export function extractToolCallsFromText(text: string): Array<{
 
 /**
  * Strips tool call JSON from assistant text to get clean content.
+ * Handles multiple formats and markdown-wrapped JSON.
  */
 export function stripToolCallsFromText(text: string): string {
   return text
+    // Remove markdown code blocks containing tool JSON
+    .replace(/```(?:json)?\s*\n?\s*\{\s*"tool"\s*:\s*"[^"]+"[\s\S]*?\}\s*\n?\s*```/gi, '')
+    // Remove inline JSON with args
     .replace(/\{\s*"tool"\s*:\s*"[^"]+"\s*,\s*"args"\s*:\s*\{[\s\S]*?\}\s*\}/g, '')
+    // Remove inline JSON with parameters
+    .replace(/\{\s*"tool"\s*:\s*"[^"]+"\s*,\s*"parameters"\s*:\s*\{[\s\S]*?\}\s*\}/g, '')
+    // Remove flat format JSON
+    .replace(/\{\s*"tool"\s*:\s*"[^"]+"\s*,\s*"[^"]+"\s*:\s*"[^"]*"[\s\S]*?\}\s*\}/g, '')
     .trim();
 }
 

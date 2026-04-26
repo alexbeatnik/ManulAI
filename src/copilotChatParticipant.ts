@@ -375,12 +375,12 @@ export class ManulAiChatParticipant {
     abort: AbortController
   ): Promise<string> {
     let reasoningOpen = false;
-    let answerStarted = false;
     let collectedText = '';
 
     await this.streamOllamaChat(baseUrl, model, messages, {
       onChunk: (chunk) => {
         if (abort.signal.aborted) return;
+        // Stream reasoning in real-time so the user sees the model "thinking"
         if (chunk.reasoning) {
           if (!reasoningOpen) {
             response.markdown('> _Thinking…_\n>\n> ');
@@ -388,14 +388,9 @@ export class ManulAiChatParticipant {
           }
           response.markdown(chunk.reasoning.replace(/\n/g, '\n> '));
         }
+        // Accumulate content but do NOT stream it yet — we need to strip tool JSON first
         if (chunk.content) {
-          if (reasoningOpen && !answerStarted) {
-            response.markdown('\n\n');
-            reasoningOpen = false;
-          }
-          answerStarted = true;
           collectedText += chunk.content;
-          response.markdown(chunk.content);
         }
         if (chunk.error) {
           response.markdown(`\n\n**Error:** ${chunk.error}`);
@@ -404,8 +399,19 @@ export class ManulAiChatParticipant {
       onError: (err) => {
         response.markdown(`\n\n**Error:** ${err.message}`);
       },
-      onDone: () => {},
+      onDone: () => {
+        // Close reasoning block if it was left open
+        if (reasoningOpen) {
+          response.markdown('\n\n');
+        }
+      },
     }, abort);
+
+    // Now that the full response is collected, strip any tool JSON and display the clean text
+    const cleanText = stripToolCallsFromText(collectedText);
+    if (cleanText) {
+      response.markdown(cleanText);
+    }
 
     return collectedText;
   }
