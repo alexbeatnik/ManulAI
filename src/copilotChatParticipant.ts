@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import * as path from 'path';
 import { OllamaStreamParser } from './ollamaStreamParser';
 import type { OllamaStreamChunk } from './ollamaStreamParser';
 import { readAgentInstructions, formatInstructionsForPrompt } from './agentInstructionsReader';
@@ -270,6 +271,9 @@ export class ManulAiChatParticipant {
       turnCount++;
       this.log(`[agent] turn ${turnCount}/${MAX_TURNS}`);
 
+      // Show progress indicator while the model is "thinking"
+      response.progress(isAgentLike ? 'Thinking…' : 'Typing…');
+
       const trimmedMessages = this.truncateMessagesToFit(messages, model);
       const assistantText = await this.streamAndCollect(baseUrl, model, trimmedMessages, response, abort);
 
@@ -304,7 +308,7 @@ export class ManulAiChatParticipant {
       }
 
       // Execute tools
-      response.markdown(`\n\n---\n\n**🔧 Executing:** \`${toolNames}\`\n\n`);
+      response.markdown(`\n\n---\n\n`);
 
       for (const toolCall of toolCalls) {
         if (abort.signal.aborted) {
@@ -314,6 +318,9 @@ export class ManulAiChatParticipant {
         const name = toolCall.function.name;
         const args = toolCall.function.arguments;
         this.log(`[agent] executing tool: ${name}`);
+
+        // Show which tool is running
+        response.progress(`Executing ${name}…`);
 
         const result = await executeTool(name, args);
 
@@ -332,6 +339,20 @@ export class ManulAiChatParticipant {
           response.markdown(`\n❌ \`${name}\`: ${result.error}\n`);
         } else {
           response.markdown(`\n✅ \`${name}\` completed\n`);
+        }
+
+        // If a file was created, add a reference so the user can click it
+        if (name === 'create_or_edit_file' && !result.error) {
+          try {
+            const parsed = JSON.parse(result.content);
+            const filePath = parsed.path || args.filename || args.filepath;
+            if (filePath) {
+              const uri = vscode.Uri.file(filePath.startsWith('/') ? filePath : path.join(vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? '', filePath));
+              response.reference(uri);
+            }
+          } catch {
+            // Ignore parse errors
+          }
         }
       }
 
