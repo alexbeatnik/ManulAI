@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
+import * as fs from 'fs';
 import { OllamaStreamParser } from './ollamaStreamParser';
 import type { OllamaStreamChunk } from './ollamaStreamParser';
 import { readAgentInstructions, formatInstructionsForPrompt } from './agentInstructionsReader';
@@ -30,6 +31,8 @@ export class ManulAiChatParticipant {
   private readonly globalState?: vscode.Memento;
   private static readonly AUTO_APPROVE_KEY = 'manulai.autoApproveState';
   private static readonly AGENT_MODE_KEY = 'manulai.agentModeState';
+  private debugMode = false;
+  private debugLogFilePath?: string;
 
   constructor(options?: ManulAiChatParticipantOptions) {
     this.output = options?.output;
@@ -62,6 +65,53 @@ export class ManulAiChatParticipant {
     this.output?.appendLine(msg);
   }
 
+  private initDebugLog(): void {
+    if (!this.debugMode || this.debugLogFilePath) { return; }
+    const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    if (!workspaceRoot) { return; }
+    const now = new Date();
+    const timestamp = now.toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    const logDir = path.join(workspaceRoot, '.manulai', 'logs');
+    fs.mkdirSync(logDir, { recursive: true });
+    this.debugLogFilePath = path.join(logDir, `${timestamp}.jsonl`);
+    this.debugLog('session_start', {
+      model: this.getSelectedModel(),
+      agentMode: this.getAgentMode(),
+      autoApprove: this.getAutoApprove(),
+    });
+  }
+
+  private debugLog(event: string, data: Record<string, unknown>): void {
+    if (!this.debugMode || !this.debugLogFilePath) { return; }
+    const entry = {
+      timestamp: new Date().toISOString(),
+      event,
+      ...data,
+    };
+    try {
+      fs.appendFileSync(this.debugLogFilePath, JSON.stringify(entry) + '\n', 'utf8');
+    } catch {
+      // Ignore log write failures
+    }
+  }
+
+  private getSelectedModel(): string {
+    const config = vscode.workspace.getConfiguration('manulai');
+    return String(config.get('ollamaModel', '')).trim();
+  }
+
+  private redactArgsForLog(args: Record<string, unknown>): Record<string, unknown> {
+    const redacted: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(args)) {
+      if (typeof value === 'string' && (key === 'content' || key === 'new_text' || key === 'old_text' || key === 'text')) {
+        redacted[key] = value.length > 80 ? value.substring(0, 80) + '…' : value;
+      } else {
+        redacted[key] = value;
+      }
+    }
+    return redacted;
+  }
+
   /**
    * Detects the language ID from a file path for syntax highlighting.
    */
@@ -82,14 +132,45 @@ export class ManulAiChatParticipant {
   }
 
   /**
-   * Truncates message history to fit within the model's context window.
-   * Always preserves the system prompt (index 0) and the latest user message (last index).
-   * Drops oldest history pairs first.
+   * Compacts conversation history by asking Ollama to summarize old messages.
+   * Returns a single compact message that replaces the dropped history.
    */
-  private truncateMessagesToFit(
+  private async compactMessagesWithOllama(
+    messagesToCompact: ChatMessage[],
+    baseUrl: string,
+    model: string,
+    abort: AbortController
+  ): Promise<string> {
+    if (messagesToCompact.length === 0) { return ''; }
+    const summaryPrompt = messagesToCompact
+      .map(m => `[${m.role}${m.tool_name ? `/${m.tool_name}` : ''}]: ${m.content.substring(0, 800)}`)
+      .join('\n---\n');
+
+    const summaryMessages: ChatMessage[] = [
+      { role: 'system', content: 'Summarize the following conversation history into 2-4 concise sentences. Focus on: key files modified, important decisions made, critical errors encountered, and any unfinished work. Be extremely brief.' },
+      { role: 'user', content: summaryPrompt },
+    ];
+
+    try {
+      const summary = await this.callOllamaNonStream(baseUrl, model, summaryMessages, abort);
+      return summary.trim();
+    } catch {
+      // If compaction fails, return empty so truncation falls back to dropping
+      return '';
+    }
+  }
+
+  /**
+   * Truncates message history to fit within the model's context window.
+   * First tries to compact dropped history via Ollama summarization.
+   * Always preserves the system prompt (index 0) and the latest user message (last index).
+   */
+  private async truncateMessagesToFit(
     messages: ChatMessage[],
-    model: string
-  ): ChatMessage[] {
+    model: string,
+    baseUrl: string,
+    abort: AbortController
+  ): Promise<ChatMessage[]> {
     if (messages.length <= 2) {
       return messages;
     }
@@ -102,14 +183,16 @@ export class ManulAiChatParticipant {
 
     if (totalTokens <= maxTokens) {
       this.log(`[context] ${totalTokens} tokens / ${maxTokens} max — no truncation needed`);
+      this.debugLog('context_check', { totalTokens, maxTokens, messageCount: messages.length, truncated: false });
       return messages;
     }
 
-    // Keep system (0) and last message (current user); drop from the front of history.
     const system = messages[0];
     const currentUser = messages[messages.length - 1];
     let history = messages.slice(1, -1);
 
+    // Try progressive compaction: drop oldest pairs and compact them into a summary
+    const compactedSummaries: string[] = [];
     while (history.length > 0) {
       const trimmed = [system, ...history, currentUser];
       const tokens = trimmed.reduce(
@@ -118,14 +201,48 @@ export class ManulAiChatParticipant {
       );
       if (tokens <= maxTokens) {
         const dropped = messages.length - trimmed.length;
-        this.log(`[context] truncated ${dropped} old message(s); now ${tokens} tokens / ${maxTokens} max`);
-        return trimmed;
+        const resultMessages: ChatMessage[] = [system];
+        // Add any compacted summaries as a single system message
+        if (compactedSummaries.length > 0) {
+          resultMessages.push({
+            role: 'system',
+            content: `[Previous conversation summarized]: ${compactedSummaries.join(' ')}`,
+          });
+        }
+        resultMessages.push(...history, currentUser);
+        this.log(`[context] truncated ${dropped} old message(s)${compactedSummaries.length > 0 ? ' with compaction' : ''}; now ${tokens} tokens / ${maxTokens} max`);
+        this.debugLog('context_trim', {
+          maxTokens,
+          totalTokens,
+          messageCount: messages.length,
+          trimmedTo: resultMessages.length,
+          dropped,
+          compacted: compactedSummaries.length > 0,
+          compactedSummaries: compactedSummaries.length,
+        });
+        return resultMessages;
       }
-      history.shift();
+
+      // Drop the oldest message(s) and try to compact them
+      const droppedMessages: ChatMessage[] = [];
+      // Drop in pairs (user+assistant or tool+assistant) to keep coherence
+      if (history.length >= 2) {
+        droppedMessages.push(history.shift()!);
+        droppedMessages.push(history.shift()!);
+      } else {
+        droppedMessages.push(history.shift()!);
+      }
+
+      // Try to compact the dropped messages
+      const summary = await this.compactMessagesWithOllama(droppedMessages, baseUrl, model, abort);
+      if (summary) {
+        compactedSummaries.push(summary);
+      }
     }
 
     // Even with only system + current user it's too long — keep just those two.
     this.log(`[context] history cleared; only system + current user kept`);
+    this.debugLog('context_trim', { maxTokens, totalTokens, messageCount: messages.length, trimmedTo: 2, dropped: messages.length - 2, compacted: false });
     return [system, currentUser];
   }
 
@@ -196,6 +313,13 @@ export class ManulAiChatParticipant {
       const baseUrl = String(config.get('ollamaBaseUrl', 'http://localhost:11434')).replace(/\/$/, '');
       const systemPrompt = String(config.get('systemPrompt', 'You are ManulAI, a privacy local coding assistant running inside VS Code. Work across any programming language. Prefer precise, minimal changes and explain results clearly.')).trim();
       const agentMode = this.getAgentMode();
+      const debugMode = Boolean(config.get('debugMode', false));
+      if (debugMode !== this.debugMode) {
+        this.debugMode = debugMode;
+        if (this.debugMode) {
+          this.initDebugLog();
+        }
+      }
 
       if (!model) {
         response.markdown('No Ollama model selected. Run **ManulAI: Select Ollama Model** or set `manulai.ollamaModel`.');
@@ -273,6 +397,14 @@ export class ManulAiChatParticipant {
         return;
       }
 
+      this.debugLog('user_request', {
+        prompt: userPrompt,
+        model,
+        agentMode,
+        autoApprove: this.getAutoApprove(),
+        messageCount: messages.length,
+      });
+
       const abort = new AbortController();
       token.onCancellationRequested(() => abort.abort());
 
@@ -280,6 +412,7 @@ export class ManulAiChatParticipant {
         await this.runAgentLoop(baseUrl, model, messages, response, abort, isAgentLike);
       } catch (err: any) {
         this.log(`[ManulAiChatParticipant] error: ${err?.message || String(err)}`);
+        this.debugLog('agent_error', { error: err?.message || String(err), stack: err?.stack || null });
         response.markdown(`\n\n**Error:** ${err?.message || String(err)}`);
       }
     };
@@ -313,7 +446,7 @@ export class ManulAiChatParticipant {
       // Show progress indicator while the model is "thinking"
       response.progress(isAgentLike ? 'Thinking…' : 'Typing…');
 
-      const trimmedMessages = this.truncateMessagesToFit(messages, model);
+      const trimmedMessages = await this.truncateMessagesToFit(messages, model, baseUrl, abort);
       const assistantText = await this.streamAndCollect(baseUrl, model, trimmedMessages, response, abort);
 
       if (!assistantText) {
@@ -327,12 +460,24 @@ export class ManulAiChatParticipant {
 
       // Check for text-based tool calls
       const toolCalls = extractToolCallsFromText(assistantText);
+      this.debugLog('ollama_response', {
+        turn: turnCount,
+        contentLength: assistantText.length,
+        hasToolCalls: toolCalls.length > 0,
+        contentPreview: assistantText.substring(0, 300),
+      });
       const cleanText = stripToolCallsFromText(assistantText);
 
       if (toolCalls.length === 0) {
         // No tools — assistant gave a final answer.
         return;
       }
+
+      this.debugLog('tool_calls_detected', {
+        turn: turnCount,
+        count: toolCalls.length,
+        tools: toolCalls.map((tc) => tc.function.name),
+      });
 
       // Add assistant message (with stripped tools) to history
       messages.push({ role: 'assistant', content: cleanText || '(tool call)' });
@@ -377,6 +522,7 @@ export class ManulAiChatParticipant {
         if (repeatCount >= MAX_SAME_TOOL_REPEAT) {
           const errorMsg = `Tool loop detected: ${name} has been called ${repeatCount} times with the same arguments. Stopping to prevent infinite loop.`;
           this.log(`[agent] ${errorMsg}`);
+          this.debugLog('tool_loop_detected', { turn: turnCount, tool: name, repeatCount, signature });
           response.markdown(`\n⚠️ **${errorMsg}**\n`);
           messages.push({
             role: 'tool',
@@ -394,7 +540,20 @@ export class ManulAiChatParticipant {
         // Show which tool is running
         response.progress(`Executing ${name}…`);
 
+        this.debugLog('tool_exec_start', {
+          turn: turnCount,
+          tool: name,
+          args: this.redactArgsForLog(args),
+        });
+
         const result = await executeTool(name, args);
+
+        this.debugLog('tool_exec_result', {
+          turn: turnCount,
+          tool: name,
+          error: result.error || null,
+          result: result.content ? result.content.substring(0, 500) : null,
+        });
 
         const toolContent = result.error
           ? JSON.stringify({ error: result.error })
@@ -471,12 +630,14 @@ export class ManulAiChatParticipant {
       // If the last tool was a successful write, stop the loop
       if (lastToolWasWrite) {
         this.log('[agent] last tool was a write operation — stopping loop');
+        this.debugLog('agent_stop', { turn: turnCount, reason: 'write_operation' });
         return;
       }
       // If ANY terminal command was executed successfully, stop the loop
       // Terminal commands are usually the final step in a workflow
       if (lastToolWasTerminal) {
         this.log('[agent] terminal command executed — stopping loop');
+        this.debugLog('agent_stop', { turn: turnCount, reason: 'terminal_command' });
         return;
       }
 
@@ -484,6 +645,7 @@ export class ManulAiChatParticipant {
     }
 
     // Max turns reached
+    this.debugLog('agent_stop', { turn: turnCount, reason: 'max_turns', maxTurns: MAX_TURNS });
     response.markdown(`\n\n**⚠️ Agent stopped:** maximum turn limit (${MAX_TURNS}) reached.`);
   }
 
@@ -555,6 +717,11 @@ export class ManulAiChatParticipant {
     };
 
     this.log(`[ManulAiChatParticipant] streaming to ${url}, model=${model}`);
+    this.debugLog('ollama_request', {
+      model,
+      messageCount: messages.length,
+      url,
+    });
 
     const response = await fetch(url, {
       method: 'POST',
@@ -602,5 +769,37 @@ export class ManulAiChatParticipant {
     } finally {
       reader.releaseLock();
     }
+  }
+
+  /**
+   * Non-streaming Ollama call for conversation compaction.
+   */
+  private async callOllamaNonStream(
+    baseUrl: string,
+    model: string,
+    messages: ChatMessage[],
+    abortController: AbortController
+  ): Promise<string> {
+    const url = `${baseUrl}/api/chat`;
+    const body = {
+      model,
+      messages,
+      stream: false,
+    };
+
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      signal: abortController.signal,
+    });
+
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(`Ollama HTTP ${response.status}: ${text.slice(0, 300)}`);
+    }
+
+    const data = await response.json() as { message?: { content?: string } };
+    return data.message?.content ?? '';
   }
 }
