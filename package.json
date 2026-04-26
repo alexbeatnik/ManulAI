@@ -2,7 +2,7 @@
   "name": "manulai-local-agent",
   "displayName": "ManulAI Local Agent",
   "description": "ManulAI is a local AI coding assistant for Visual Studio Code powered entirely by your own Ollama runtime.",
-  "version": "0.0.14",
+  "version": "0.0.15",
   "publisher": "manul-engine",
   "icon": "icon.png",
   "license": "Apache-2.0",

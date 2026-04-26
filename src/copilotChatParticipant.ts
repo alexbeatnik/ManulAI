@@ -405,6 +405,19 @@ export class ManulAiChatParticipant {
         messageCount: messages.length,
       });
 
+      // Verify the model exists before attempting to use it
+      const modelAvailable = await this.verifyModelAvailable(baseUrl, model);
+      if (!modelAvailable) {
+        response.markdown(
+          `**Model not found:** \`${model}\` is not available in your local Ollama.\n\n` +
+          `To fix this:\n` +
+          `1. Pull the model: \`ollama pull ${model}\`\n` +
+          `2. Or select a different model with \`@manulai /selectModel\`\n\n` +
+          `Available models: run \`ollama list\` to see what's installed.`
+        );
+        return;
+      }
+
       const abort = new AbortController();
       token.onCancellationRequested(() => abort.abort());
 
@@ -698,6 +711,92 @@ export class ManulAiChatParticipant {
     return collectedText;
   }
 
+  /**
+   * Checks whether the requested model is installed locally via Ollama /api/tags.
+   */
+  private async verifyModelAvailable(baseUrl: string, model: string): Promise<boolean> {
+    try {
+      const res = await fetch(`${baseUrl}/api/tags`, { signal: AbortSignal.timeout(10000) });
+      if (!res.ok) { return false; }
+      const data = await res.json() as { models?: Array<{ name?: string }> };
+      const names = (data.models ?? []).map((m) => m.name ?? '');
+      return names.includes(model) || names.some((n) => n.startsWith(model + ':'));
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Fetches from Ollama with retry for model-loading transient failures.
+   * Retries on HTTP 503/500 that mention "model is loading" or "model failed to load".
+   */
+  private async fetchWithModelRetry(
+    url: string,
+    body: Record<string, unknown>,
+    abortController: AbortController,
+    model: string,
+    maxRetries = 3
+  ): Promise<Response> {
+    const isModelLoadingError = (status: number, text: string): boolean => {
+      if (status !== 500 && status !== 503) { return false; }
+      const lower = text.toLowerCase();
+      return lower.includes('model failed to load') ||
+             lower.includes('model is loading') ||
+             lower.includes('loading model') ||
+             lower.includes('resource limitations');
+    };
+
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      if (abortController.signal.aborted) {
+        throw new Error('Request aborted');
+      }
+
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+        signal: abortController.signal,
+      });
+
+      if (response.ok || !isModelLoadingError(response.status, await response.clone().text())) {
+        return response;
+      }
+
+      const text = await response.text();
+      this.log(`[ollama] model loading error on attempt ${attempt + 1}/${maxRetries + 1}: HTTP ${response.status}`);
+      this.debugLog('ollama_model_loading_retry', {
+        attempt: attempt + 1,
+        maxRetries: maxRetries + 1,
+        status: response.status,
+        error: text.slice(0, 200),
+        model,
+      });
+
+      if (attempt < maxRetries) {
+        const delay = 3000 + attempt * 2000; // 3s, 5s, 7s
+        this.log(`[ollama] waiting ${delay}ms before retry…`);
+        await new Promise(resolve => setTimeout(resolve, delay));
+      } else {
+        // All retries exhausted — throw a user-friendly error
+        throw new Error(
+          `Ollama could not load model "${model}" after ${maxRetries + 1} attempts.\n\n` +
+          `This usually means:\n` +
+          `• The model is too large for your available RAM/VRAM\n` +
+          `• Ollama is still downloading or unpacking the model\n` +
+          `• Another process is using the GPU\n\n` +
+          `Try:\n` +
+          `1. Run \`ollama ps\` to check loaded models\n` +
+          `2. Run \`ollama pull ${model}\` to verify the model is available\n` +
+          `3. Try a smaller model (e.g. \`phi4-mini:3.8b\` or \`llama3.1:8b\`)\n` +
+          `4. Check Ollama server logs: \`ollama logs\` or \`journalctl -u ollama\``
+        );
+      }
+    }
+
+    // Should never reach here, but TypeScript needs it
+    throw new Error('Unexpected end of retry loop');
+  }
+
   private async streamOllamaChat(
     baseUrl: string,
     model: string,
@@ -723,12 +822,7 @@ export class ManulAiChatParticipant {
       url,
     });
 
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-      signal: abortController.signal,
-    });
+    const response = await this.fetchWithModelRetry(url, body, abortController, model);
 
     if (!response.ok) {
       const text = await response.text();
@@ -787,12 +881,7 @@ export class ManulAiChatParticipant {
       stream: false,
     };
 
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-      signal: abortController.signal,
-    });
+    const response = await this.fetchWithModelRetry(url, body, abortController, model);
 
     if (!response.ok) {
       const text = await response.text();
