@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import { OllamaStreamParser } from './ollamaStreamParser';
 import type { OllamaStreamChunk } from './ollamaStreamParser';
+import { readAgentInstructions, formatInstructionsForPrompt } from './agentInstructionsReader';
 
 export interface ChatMessage {
   role: 'system' | 'user' | 'assistant';
@@ -81,6 +82,18 @@ export class ManulAiChatParticipant {
         response.markdown(`Agent mode is now **${mode}**.`);
         return;
       }
+      if (request.command === 'instructions') {
+        const instructions = await readAgentInstructions();
+        if (instructions) {
+          const preview = instructions.content.length > 500
+            ? instructions.content.slice(0, 500) + '...'
+            : instructions.content;
+          response.markdown(`**Found instructions:** \`${instructions.source}\`\n\n\`\`\`markdown\n${preview}\n\`\`\``);
+        } else {
+          response.markdown('No agent instructions found. Expected files: `AGENTS.md`, `CLAUDE.md`, `.github/copilot-instructions.md`, `.cursorrules` in the workspace root.');
+        }
+        return;
+      }
 
       const config = vscode.workspace.getConfiguration('manulai');
       const model = String(config.get('ollamaModel', '')).trim();
@@ -95,8 +108,16 @@ export class ManulAiChatParticipant {
 
       const messages: ChatMessage[] = [];
       let effectiveSystemPrompt = systemPrompt;
+
+      // Inject workspace agent instructions if available
+      const instructions = await readAgentInstructions();
+      if (instructions) {
+        effectiveSystemPrompt += '\n\n' + formatInstructionsForPrompt(instructions);
+        this.log(`[instructions] loaded from ${instructions.source}`);
+      }
+
       if (agentMode === 'agent') {
-        effectiveSystemPrompt += '\n\nYou are in Agent mode. You may suggest file edits, terminal commands, and browser automation steps, but you cannot execute them directly in this chat panel. For full tool execution, use the ManulAI Secondary Sidebar chat.';
+        effectiveSystemPrompt += '\n\nYou are in Agent mode. You may suggest file edits, terminal commands, and browser automation steps, but you cannot execute them directly in this chat panel.';
       } else if (agentMode === 'planner') {
         effectiveSystemPrompt += '\n\nYou are in Planner mode. Prefer concise, step-by-step responses. You may suggest small actions but cannot execute tools in this chat panel.';
       } else {

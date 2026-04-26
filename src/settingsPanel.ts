@@ -211,10 +211,6 @@ export class SettingsPanel implements vscode.WebviewViewProvider {
       <button class="ghost" id="refreshBtn" title="Refresh models">&#8635;</button>
       <div class="spinner" id="spinner"></div>
     </div>
-    <div class="row">
-      <input type="text" id="customModelInput" placeholder="custom model id…" />
-      <button id="setCustomModel">Set</button>
-    </div>
   </div>
 
   <div class="field">
@@ -246,7 +242,6 @@ export class SettingsPanel implements vscode.WebviewViewProvider {
     const vscode = acquireVsCodeApi();
     const $ = (id) => document.getElementById(id);
     const modelSelect = $('modelSelect');
-    const customModelInput = $('customModelInput');
     const baseUrlInput = $('baseUrlInput');
     const systemPromptInput = $('systemPromptInput');
     const debugModeCheck = $('debugModeCheck');
@@ -285,10 +280,6 @@ export class SettingsPanel implements vscode.WebviewViewProvider {
         vscode.postMessage({ command: 'changeModel', model: modelSelect.value });
       }
     });
-    $('setCustomModel').addEventListener('click', () => {
-      const v = customModelInput.value.trim();
-      if (v) vscode.postMessage({ command: 'changeModel', model: v });
-    });
     $('setBaseUrlBtn').addEventListener('click', () => {
       const v = baseUrlInput.value.trim();
       if (v) vscode.postMessage({ command: 'changeBaseUrl', baseUrl: v });
@@ -305,7 +296,6 @@ export class SettingsPanel implements vscode.WebviewViewProvider {
     window.addEventListener('message', (event) => {
       const m = event.data;
       if (m.command === 'setState') {
-        customModelInput.value = '';
         baseUrlInput.value = m.baseUrl || '';
         systemPromptInput.value = m.systemPrompt || '';
         debugModeCheck.checked = Boolean(m.debugMode);

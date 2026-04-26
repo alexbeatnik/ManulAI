@@ -3,95 +3,71 @@
 ![Alpha](https://img.shields.io/badge/status-alpha-bf5b04)
 ![Manul Product Line](https://img.shields.io/badge/product%20line-Manul-111827)
 
-ManulAI is a **local AI coding assistant for VS Code** built on top of Ollama. It keeps chat in the right-side Secondary Sidebar, works with local files and terminal actions, and avoids cloud APIs or remote inference by default.
+ManulAI is a **local AI coding assistant for VS Code** built on top of Ollama. It runs as a native Copilot Chat participant — no separate panels, just type `@manulai` in the Chat panel.
 
-It is also designed as a **predictable local-agent building block** for teams that want the same local-first patterns in IDE plugins, CI jobs, internal tools, and documentation-assisted support flows.
-
-**Default: local models only.** ManulAI keeps model execution, file access, tool actions, and workspace state on your machine or inside your controlled environment.
-
-> **Status: Alpha.**
-> ManulAI is already useful for real work, but it is still being hardened through real-world use. The priority is local control, safe edits, predictable tool execution, and practical integration with existing engineering systems.
-
-## What This Enables For Your Product
-
-- **Embed a local agent into product workflows** without sending code or prompts to a cloud AI provider.
-- **Add workspace-aware assistance to internal tools** such as engineering dashboards, product CLIs, or support consoles.
-- **Run safe, reviewable code edits in gated flows** with approvals, diffs, and revertable changes.
-- **Power internal IDE experiences** with a right-side assistant that understands files, tools, and project structure.
-- **Generate structured reports in CI** from local scans, bounded reads, and deterministic tool output.
-- **Keep product teams in control** with local models, command restrictions, debug logs, and file-backed workspace state.
+![ManulAI Copilot Chat](media/screenshots/Chat.png)
 
 ## Quick Demo
 
 ### Hands-On In VS Code
-
-Minimal path from install to a real file write:
 
 ```bash
 ollama serve
 ollama pull qwen3-coder:30b
 ```
 
-Open VS Code, install the ManulAI extension, then run:
+Open VS Code, install the ManulAI extension, then open the Chat panel (`Ctrl+Alt+I` / `Cmd+Alt+I`) and type:
 
 ```text
-ManulAI: Open Secondary Sidebar
-ManulAI: Select Ollama Model
-Attach Active File to ManulAI Chat
+@manulai hello
 ```
 
-Prompt the agent:
-
-```text
-Create src/hello.ts with a function that returns "hello from ManulAI".
-```
-
-Expected transcript shape:
-
-```text
-User: Create src/hello.ts with a function that returns "hello from ManulAI".
-
-Assistant tool: create_or_edit_file
-Path: src/hello.ts
-
-Preview:
-export function hello(): string {
-  return 'hello from ManulAI';
-}
-
-Assistant: Created src/hello.ts with a small exported helper.
-```
-
-Outcome: **a local model creates a real file through a visible, approval-aware tool action instead of only suggesting code in chat.**
+Streaming response appears token-by-token, including live **reasoning** blocks for thinking models.
 
 ### Chat, Agent, Planner
 
-- **Chat**: plain text only. Use it for explanation, review, and discussion when no file changes should happen.
-- **Agent**: tool-enabled execution. Use it for reads, edits, scans, terminal commands, and automation.
-- **Planner**: constrained stepwise execution. Use it when you want smaller, more deliberate actions with less prompt overhead.
+ManulAI supports three modes, toggled via chat commands:
 
-### Copilot Chat Integration
+- **Chat**: plain text only. Use it for explanation, review, and discussion.
+- **Agent**: the model may suggest file edits, terminal commands, and browser automation steps.
+- **Planner**: concise, step-by-step responses with smaller deliberate actions.
 
-ManulAI now registers as a native VS Code Chat participant (`@manulai`). You can invoke it directly in the Copilot Chat panel alongside other participants:
-
-1. Open the Chat panel: `Ctrl+Alt+I` (Windows/Linux) or `Cmd+Alt+I` (macOS)
-2. Type `@manulai` followed by your question
-3. Streaming responses appear token-by-token, including a live **reasoning** block for thinking models
-
-#### Slash commands in chat
+### Slash commands
 
 | Command | Description |
 |---------|-------------|
-| `/selectModel` | Open the Ollama model picker |
-| `/model` | Show the currently selected model |
+| `/selectModel` | Open the model picker |
+| `/model` | Show active model, agent mode and auto-approve status |
+| `/setAgentMode <chat\|agent\|planner>` | Switch agent mode |
+| `/toggleAutoApprove` | Toggle auto-approve |
+| `/instructions` | Show loaded workspace agent instructions |
 
-#### Settings panel
+### Workspace agent instructions
 
-A dedicated **ManulAI Settings** view lives in the Secondary Sidebar next to the chat view. It automatically fetches the list of installed Ollama models from `/api/tags` so you can pick from a dropdown instead of typing the model name manually. You can also:
+ManulAI automatically reads agent instruction files from your workspace and injects them into every chat request. Supported file names (searched in this order):
+
+- `AGENTS.md`
+- `CLAUDE.md`
+- `.claude/AGENTS.md`
+- `.claude/CLAUDE.md`
+- `.github/copilot-instructions.md`
+- `.cursorrules`
+- `.ai/agents.md`
+- `docs/AGENTS.md`
+- `docs/CLAUDE.md`
+
+Place an `AGENTS.md` in your project root to give the model context about your codebase conventions, architecture, or rules.
+
+### Settings panel
+
+Click the **ManulAI** icon in the Activity Bar to open Settings:
+
+![ManulAI Settings](media/screenshots/Settings.png)
+
+The panel automatically fetches installed Ollama models from `/api/tags`. You can also:
 - Update the Ollama base URL
-- Switch agent mode (Chat / Agent / Planner)
 - Edit the system prompt
-- Toggle auto-approve and debug mode
+- Toggle debug mode
 
 The Settings view is also reachable via the **ManulAI: Open Settings** command.
 
@@ -304,13 +280,12 @@ Outcome: **your CI job gets a local JSON artifact that other tools can parse wit
 
 ### VS Code Extension
 
-ManulAI is a compact right-side assistant for VS Code with:
+ManulAI is a native VS Code Copilot Chat participant (`@manulai`) powered by local Ollama models:
 
 - Chat, Agent, and Planner modes
-- workspace file attachments
-- visible tool transcript output
-- local Ollama model selection
-- file-backed workspace state
+- Streaming responses with live reasoning blocks
+- Local Ollama model selection via Settings panel
+- Activity Bar settings for quick configuration
 
 ### MCP And Programmatic Control Patterns
 

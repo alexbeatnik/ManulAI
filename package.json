@@ -59,6 +59,10 @@
           {
             "name": "toggleAutoApprove",
             "description": "Toggle auto-approve for tool calls"
+          },
+          {
+            "name": "instructions",
+            "description": "Show loaded workspace agent instructions (AGENTS.md, CLAUDE.md, etc.)"
           }
         ]
       }

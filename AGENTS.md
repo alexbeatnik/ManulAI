@@ -50,16 +50,16 @@ media/
 ManulAI exposes a **single chat surface**: the **Copilot Chat Participant** (`@manulai`).
 
 - It streams Ollama responses into the native VS Code Chat panel.
-- Supports slash commands: `/selectModel`, `/model`, `/toggleAutoApprove`.
-- Reads global VS Code settings: `ollamaModel`, `ollamaBaseUrl`, `systemPrompt`, `agentMode`.
-- Auto-approve state is stored in `ExtensionContext.globalState` (not settings), toggled via `/toggleAutoApprove`.
+- Supports slash commands: `/selectModel`, `/model`, `/setAgentMode`, `/toggleAutoApprove`.
+- Reads global VS Code settings: `ollamaModel`, `ollamaBaseUrl`, `systemPrompt`.
+- `agentMode` and `autoApprove` are stored in `ExtensionContext.globalState`, toggled via `/setAgentMode` and `/toggleAutoApprove`.
 - Implemented by `copilotChatParticipant.ts`.
 
 ### Settings Panel
 
 - Activity Bar `WebviewViewProvider` (`manulai.settings`).
 - Fetches model list from Ollama `/api/tags` on load and refresh.
-- Controls: model dropdown, base URL, agent mode, system prompt, debug mode.
+- Controls: model dropdown, base URL, system prompt, debug mode.
 - Writes to global VS Code settings (`ConfigurationTarget.Global`).
 
 ### Streaming & Reasoning
@@ -93,6 +93,7 @@ Read the relevant skill file **before** making changes to related systems.
 | Copilot Chat participant, `@manulai`, streaming | `.claude/skills/copilot-chat-participant/SKILL.md` |
 | Settings panel, Activity Bar webview | `.claude/skills/settings-panel/SKILL.md` |
 | Ollama streaming, reasoning extraction | `.claude/skills/ollama-streaming/SKILL.md` |
+| Workspace agent instructions (AGENTS.md, CLAUDE.md) | `.claude/skills/agent-instructions-reader/SKILL.md` |
 | Packaging, versioning, VSIX build | `.claude/skills/extension-packaging/SKILL.md` |
 | Version bump + docs sync | `.claude/skills/bump-version/SKILL.md` |
 | Pre-commit docs sanity check | `.claude/skills/verify-docs-sync/SKILL.md` |

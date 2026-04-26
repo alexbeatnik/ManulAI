@@ -69,29 +69,23 @@ Make sure you have Ollama running locally (`http://localhost:11434` by default) 
 
 ## Commands and Views
 
-- **Views:** Contributes the `manulai.chatView` webview to the Secondary Sidebar. The separate Activity Bar launcher container was removed so the extension stays focused on the right-side chat view.
-- **Copilot Chat Participant:** ManulAI registers a VS Code Chat participant (`@manulai`) via `src/copilotChatParticipant.ts`. It streams Ollama responses into the native Chat panel, including live reasoning blocks extracted from `<think>` tags. The participant reads global VS Code settings (`manulai.ollamaModel`, `manulai.ollamaBaseUrl`, `manulai.systemPrompt`) and does not use the agent loop or tool calling — it is a pure chat streaming surface.
-- **Settings Panel:** A `WebviewViewProvider` (`src/settingsPanel.ts`) is registered as `manulai.settings` inside an Activity Bar container (`manulaiActivityBar`). It lets users view and update model, base URL, agent mode, system prompt, auto-approve, and debug mode without opening `settings.json`.
-- **File Context:** Supports dropping files into the UI, or using commands like `manulai.attachActiveFile` and `manulai.attachExplorerSelection` via context menus.
-- **Dev/Test Prompt Entry:** Also contributes `manulai.devSendPrompt`, which can inject a prompt directly into the installed provider flow without typing into the webview. This is intended for local debugging and repeatable extension-level smoke tests.
-- **Configuration:** `package.json` still contributes `manulai.ollamaModel`, `manulai.ollamaBaseUrl`, `manulai.agentMode`, `manulai.autoApprove`, `manulai.debugMode`, and `manulai.systemPrompt`, but file-backed workspaces now persist the effective workspace state in `.manulai/settings.json`.
+- **Copilot Chat Participant:** ManulAI registers a VS Code Chat participant (`@manulai`) via `src/copilotChatParticipant.ts`. It streams Ollama responses into the native Chat panel, including live reasoning blocks extracted from `<think>` tags. The participant reads global VS Code settings (`manulai.ollamaModel`, `manulai.ollamaBaseUrl`, `manulai.systemPrompt`) and stores `agentMode` and `autoApprove` in `ExtensionContext.globalState`.
+- **Agent Instructions Reader:** `src/agentInstructionsReader.ts` discovers and reads `AGENTS.md`, `CLAUDE.md`, `.github/copilot-instructions.md`, `.cursorrules`, and other instruction files from the workspace root. The content is automatically appended to the system prompt on every chat request so the model follows project-specific conventions.
+- **Settings Panel:** A `WebviewViewProvider` (`src/settingsPanel.ts`) is registered as `manulai.settings` inside an Activity Bar container (`manulaiActivityBar`). It lets users view and update model, base URL, system prompt, and debug mode without opening `settings.json`.
+- **Configuration:** `package.json` contributes `manulai.ollamaModel`, `manulai.ollamaBaseUrl`, `manulai.debugMode`, and `manulai.systemPrompt`.
 
-## Workspace Settings Storage
+## Global State Storage
 
-- **Workspace Source Of Truth:** For a file-backed workspace, ManulAI reads and writes workspace-owned settings only from `.manulai/settings.json`.
-- **No `.vscode/settings.json` Runtime Dependency:** The provider no longer uses workspace `manulai.*` entries from `.vscode/settings.json` as its runtime fallback. Missing values fall back to built-in defaults.
-- **Migration Path:** On initialization, existing workspace-level `manulai.*` values are migrated from `.vscode/settings.json` into `.manulai/settings.json`, then the old workspace entries are cleared.
-- **No-Workspace Case:** When no file-backed workspace exists, global VS Code settings still act as the fallback store because there is no `.manulai/` folder to write into.
-- **Chat Storage:** Chat session state is stored separately from settings in `.manulai/chats.json` for file-backed workspaces, or under extension storage when there is no file-backed workspace.
+- **`agentMode`** and **`autoApprove`** are stored in `ExtensionContext.globalState`, not VS Code settings. They are toggled via chat slash commands (`/setAgentMode`, `/toggleAutoApprove`) and persist across VS Code restarts.
+- **Settings Panel** writes model, base URL, system prompt, and debug mode to global VS Code settings (`ConfigurationTarget.Global`).
+- No workspace-level `.manulai/settings.json` is used in the current architecture.
 
-Reference shape:
+Reference shape (global settings):
 
 ```json
 {
   "ollamaModel": "",
   "ollamaBaseUrl": "http://localhost:11434",
-  "agentMode": "agent",
-  "autoApprove": false,
   "debugMode": false,
   "systemPrompt": "You are ManulAI, a privacy local coding assistant running inside VS Code. Work across any programming language. Prefer precise, minimal changes and explain results clearly."
 }
