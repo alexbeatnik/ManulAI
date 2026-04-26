@@ -1,5 +1,10 @@
 import * as vscode from 'vscode';
 
+interface OllamaTagModel {
+  name?: string;
+  model?: string;
+}
+
 export class SettingsPanel implements vscode.WebviewViewProvider {
   public static readonly viewType = 'manulai.settings';
   private view?: vscode.WebviewView;
@@ -27,6 +32,9 @@ export class SettingsPanel implements vscode.WebviewViewProvider {
           case 'ready':
             await this.refreshAll();
             break;
+          case 'refreshModels':
+            await this.sendModels();
+            break;
           case 'changeModel':
             await this.changeModel(msg.model);
             break;
@@ -35,12 +43,6 @@ export class SettingsPanel implements vscode.WebviewViewProvider {
             break;
           case 'changeSystemPrompt':
             await this.changeSystemPrompt(msg.systemPrompt);
-            break;
-          case 'setAgentMode':
-            await this.setAgentMode(msg.value);
-            break;
-          case 'setAutoApprove':
-            await this.setAutoApprove(msg.value);
             break;
           case 'setDebugMode':
             await this.setDebugMode(msg.value);
@@ -63,10 +65,32 @@ export class SettingsPanel implements vscode.WebviewViewProvider {
       model: String(config.get('ollamaModel', '')),
       baseUrl: String(config.get('ollamaBaseUrl', 'http://localhost:11434')),
       systemPrompt: String(config.get('systemPrompt', '')),
-      agentMode: config.get('agentMode', true),
-      autoApprove: Boolean(config.get('autoApprove', false)),
       debugMode: Boolean(config.get('debugMode', false)),
     });
+    await this.sendModels();
+  }
+
+  private async sendModels(): Promise<void> {
+    this.post({ command: 'setModelsLoading', value: true });
+    try {
+      const config = vscode.workspace.getConfiguration('manulai');
+      const baseUrl = String(config.get('ollamaBaseUrl', 'http://localhost:11434')).replace(/\/$/, '');
+      const res = await fetch(`${baseUrl}/api/tags`, { signal: AbortSignal.timeout(15000) });
+      if (!res.ok) {
+        throw new Error(`Ollama HTTP ${res.status}`);
+      }
+      const json = await res.json() as { models?: OllamaTagModel[] };
+      const models = (json.models || [])
+        .map((m) => String(m.name || m.model || '').trim())
+        .filter(Boolean)
+        .sort((a, b) => a.localeCompare(b));
+      this.post({ command: 'setModels', models });
+    } catch (err: any) {
+      this.log(`[SettingsPanel] fetchModels failed: ${err?.message || err}`);
+      this.post({ command: 'setModels', models: [] });
+    } finally {
+      this.post({ command: 'setModelsLoading', value: false });
+    }
   }
 
   private async changeModel(model: string): Promise<void> {
@@ -89,20 +113,6 @@ export class SettingsPanel implements vscode.WebviewViewProvider {
     const config = vscode.workspace.getConfiguration('manulai');
     await config.update('systemPrompt', systemPrompt, vscode.ConfigurationTarget.Global);
     this.post({ command: 'toast', text: 'System prompt updated', kind: 'ok' });
-  }
-
-  private async setAgentMode(value: string): Promise<void> {
-    const config = vscode.workspace.getConfiguration('manulai');
-    await config.update('agentMode', value, vscode.ConfigurationTarget.Global);
-    this.post({ command: 'toast', text: `Agent mode: ${value}`, kind: 'ok' });
-    await this.refreshAll();
-  }
-
-  private async setAutoApprove(value: boolean): Promise<void> {
-    const config = vscode.workspace.getConfiguration('manulai');
-    await config.update('autoApprove', value, vscode.ConfigurationTarget.Global);
-    this.post({ command: 'toast', text: `Auto-approve: ${value ? 'on' : 'off'}`, kind: 'ok' });
-    await this.refreshAll();
   }
 
   private async setDebugMode(value: boolean): Promise<void> {
@@ -177,6 +187,13 @@ export class SettingsPanel implements vscode.WebviewViewProvider {
   .status { font-size: 11px; color: var(--muted); }
   .open-chat { margin-top: 4px; padding: 8px; text-align: center; }
   hr { border: 0; border-top: 1px solid var(--border); margin: 0; }
+  .spinner {
+    display: none; width: 12px; height: 12px;
+    border: 2px solid var(--border); border-top-color: var(--accent);
+    border-radius: 50%; animation: spin 0.8s linear infinite;
+  }
+  .spinner.active { display: inline-block; }
+  @keyframes spin { to { transform: rotate(360deg); } }
 </style>
 </head>
 <body>
@@ -188,9 +205,16 @@ export class SettingsPanel implements vscode.WebviewViewProvider {
   <hr/>
 
   <div class="field">
-    <label for="modelInput">Ollama Model</label>
-    <input type="text" id="modelInput" placeholder="e.g. qwen3-coder:30b" />
-    <button id="setModelBtn">Set Model</button>
+    <label for="modelSelect">Ollama Model</label>
+    <div class="row">
+      <select id="modelSelect"></select>
+      <button class="ghost" id="refreshBtn" title="Refresh models">&#8635;</button>
+      <div class="spinner" id="spinner"></div>
+    </div>
+    <div class="row">
+      <input type="text" id="customModelInput" placeholder="custom model id…" />
+      <button id="setCustomModel">Set</button>
+    </div>
   </div>
 
   <div class="field">
@@ -200,26 +224,12 @@ export class SettingsPanel implements vscode.WebviewViewProvider {
   </div>
 
   <div class="field">
-    <label for="agentModeSelect">Agent Mode</label>
-    <select id="agentModeSelect">
-      <option value="chat">Chat</option>
-      <option value="agent">Agent</option>
-      <option value="planner">Planner</option>
-    </select>
-  </div>
-
-  <div class="field">
     <label for="systemPromptInput">System Prompt</label>
     <textarea id="systemPromptInput" placeholder="Enter system prompt..."></textarea>
     <button id="setSystemPromptBtn">Set System Prompt</button>
   </div>
 
   <hr/>
-
-  <div class="checkbox-row">
-    <input type="checkbox" id="autoApproveCheck" />
-    <label for="autoApproveCheck">Auto-approve tool calls</label>
-  </div>
 
   <div class="checkbox-row">
     <input type="checkbox" id="debugModeCheck" />
@@ -235,14 +245,16 @@ export class SettingsPanel implements vscode.WebviewViewProvider {
   <script nonce="${nonce}">
     const vscode = acquireVsCodeApi();
     const $ = (id) => document.getElementById(id);
-    const modelInput = $('modelInput');
+    const modelSelect = $('modelSelect');
+    const customModelInput = $('customModelInput');
     const baseUrlInput = $('baseUrlInput');
     const systemPromptInput = $('systemPromptInput');
-    const agentModeSelect = $('agentModeSelect');
-    const autoApproveCheck = $('autoApproveCheck');
     const debugModeCheck = $('debugModeCheck');
     const toast = $('toast');
+    const spinner = $('spinner');
+    const refreshBtn = $('refreshBtn');
     const activeLabel = $('activeLabel');
+    let allModels = [];
 
     function showToast(text, kind) {
       toast.textContent = text;
@@ -250,8 +262,31 @@ export class SettingsPanel implements vscode.WebviewViewProvider {
       setTimeout(() => toast.classList.remove('show'), 1800);
     }
 
-    $('setModelBtn').addEventListener('click', () => {
-      const v = modelInput.value.trim();
+    function rebuildModelOptions() {
+      const current = modelSelect.value;
+      modelSelect.innerHTML = '';
+      const placeholder = document.createElement('option');
+      placeholder.value = ''; placeholder.textContent = '-- model --';
+      modelSelect.appendChild(placeholder);
+      for (const m of allModels) {
+        const opt = document.createElement('option');
+        opt.value = m; opt.textContent = m;
+        modelSelect.appendChild(opt);
+      }
+      if (current) {
+        for (const opt of modelSelect.options) {
+          if (opt.value === current) { modelSelect.value = current; break; }
+        }
+      }
+    }
+
+    modelSelect.addEventListener('change', () => {
+      if (modelSelect.value) {
+        vscode.postMessage({ command: 'changeModel', model: modelSelect.value });
+      }
+    });
+    $('setCustomModel').addEventListener('click', () => {
+      const v = customModelInput.value.trim();
       if (v) vscode.postMessage({ command: 'changeModel', model: v });
     });
     $('setBaseUrlBtn').addEventListener('click', () => {
@@ -261,31 +296,34 @@ export class SettingsPanel implements vscode.WebviewViewProvider {
     $('setSystemPromptBtn').addEventListener('click', () => {
       vscode.postMessage({ command: 'changeSystemPrompt', systemPrompt: systemPromptInput.value });
     });
-    agentModeSelect.addEventListener('change', () => {
-      vscode.postMessage({ command: 'setAgentMode', value: agentModeSelect.value });
-    });
-    autoApproveCheck.addEventListener('change', () => {
-      vscode.postMessage({ command: 'setAutoApprove', value: autoApproveCheck.checked });
-    });
     debugModeCheck.addEventListener('change', () => {
       vscode.postMessage({ command: 'setDebugMode', value: debugModeCheck.checked });
     });
+    refreshBtn.addEventListener('click', () => vscode.postMessage({ command: 'refreshModels' }));
     $('openChatBtn').addEventListener('click', () => vscode.postMessage({ command: 'openChat' }));
 
     window.addEventListener('message', (event) => {
       const m = event.data;
       if (m.command === 'setState') {
-        modelInput.value = m.model || '';
+        customModelInput.value = '';
         baseUrlInput.value = m.baseUrl || '';
         systemPromptInput.value = m.systemPrompt || '';
-        if (m.agentMode) {
-          for (const opt of agentModeSelect.options) {
-            if (opt.value === m.agentMode) { agentModeSelect.value = m.agentMode; break; }
-          }
-        }
-        autoApproveCheck.checked = Boolean(m.autoApprove);
         debugModeCheck.checked = Boolean(m.debugMode);
         activeLabel.textContent = (m.model || 'No model') + ' @ ' + (m.baseUrl || '—');
+        if (m.model) {
+          modelSelect.value = m.model;
+          for (const opt of modelSelect.options) {
+            if (opt.value === m.model) { modelSelect.value = m.model; break; }
+          }
+        }
+      }
+      if (m.command === 'setModels') {
+        allModels = m.models || [];
+        rebuildModelOptions();
+      }
+      if (m.command === 'setModelsLoading') {
+        if (m.value) { refreshBtn.disabled = true; spinner.classList.add('active'); }
+        else { refreshBtn.disabled = false; spinner.classList.remove('active'); }
       }
       if (m.command === 'toast') {
         showToast(m.text, m.kind);

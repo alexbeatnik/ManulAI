@@ -87,12 +87,13 @@ ManulAI now registers as a native VS Code Chat participant (`@manulai`). You can
 
 #### Settings panel
 
-A dedicated **ManulAI Settings** view is available in the Activity Bar. Click the ManulAI icon on the left sidebar to:
-- View and change the active Ollama model
+A dedicated **ManulAI Settings** view lives in the Secondary Sidebar next to the chat view. It automatically fetches the list of installed Ollama models from `/api/tags` so you can pick from a dropdown instead of typing the model name manually. You can also:
 - Update the Ollama base URL
 - Switch agent mode (Chat / Agent / Planner)
 - Edit the system prompt
 - Toggle auto-approve and debug mode
+
+The Settings view is also reachable via the **ManulAI: Open Settings** command.
 
 ### Integration Patterns
 

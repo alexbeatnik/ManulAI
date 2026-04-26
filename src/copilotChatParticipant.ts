@@ -9,14 +9,35 @@ export interface ChatMessage {
 
 export interface ManulAiChatParticipantOptions {
   output?: vscode.OutputChannel;
+  extensionContext?: vscode.ExtensionContext;
 }
 
 export class ManulAiChatParticipant {
   private parser = new OllamaStreamParser();
   private output?: vscode.OutputChannel;
+  private readonly globalState?: vscode.Memento;
+  private static readonly AUTO_APPROVE_KEY = 'manulai.autoApproveState';
+  private static readonly AGENT_MODE_KEY = 'manulai.agentModeState';
 
   constructor(options?: ManulAiChatParticipantOptions) {
     this.output = options?.output;
+    this.globalState = options?.extensionContext?.globalState;
+  }
+
+  private getAutoApprove(): boolean {
+    return this.globalState?.get<boolean>(ManulAiChatParticipant.AUTO_APPROVE_KEY) ?? false;
+  }
+
+  private async setAutoApprove(value: boolean): Promise<void> {
+    await this.globalState?.update(ManulAiChatParticipant.AUTO_APPROVE_KEY, value);
+  }
+
+  private getAgentMode(): string {
+    return this.globalState?.get<string>(ManulAiChatParticipant.AGENT_MODE_KEY) ?? 'agent';
+  }
+
+  private async setAgentMode(value: string): Promise<void> {
+    await this.globalState?.update(ManulAiChatParticipant.AGENT_MODE_KEY, value);
   }
 
   private log(msg: string): void {
@@ -35,14 +56,37 @@ export class ManulAiChatParticipant {
       if (request.command === 'model') {
         const config = vscode.workspace.getConfiguration('manulai');
         const model = String(config.get('ollamaModel', ''));
-        response.markdown(model ? `Active model: \`${model}\`` : 'No model selected. Run `@manulai /selectModel`.');
+        const autoApprove = this.getAutoApprove();
+        const agentMode = this.getAgentMode();
+        const lines = [
+          model ? `Active model: \`${model}\`` : 'No model selected. Run `@manulai /selectModel`.',
+          `Agent mode: \`${agentMode}\``,
+          `Auto-approve: ${autoApprove ? 'on' : 'off'}`,
+        ];
+        response.markdown(lines.join('\n'));
+        return;
+      }
+      if (request.command === 'toggleAutoApprove') {
+        const current = this.getAutoApprove();
+        const next = !current;
+        await this.setAutoApprove(next);
+        response.markdown(`Auto-approve is now **${next ? 'ON' : 'OFF'}**.`);
+        return;
+      }
+      if (request.command === 'setAgentMode') {
+        const arg = request.prompt?.trim().toLowerCase() || '';
+        const validModes = ['chat', 'agent', 'planner'];
+        const mode = validModes.includes(arg) ? arg : 'agent';
+        await this.setAgentMode(mode);
+        response.markdown(`Agent mode is now **${mode}**.`);
         return;
       }
 
       const config = vscode.workspace.getConfiguration('manulai');
       const model = String(config.get('ollamaModel', '')).trim();
       const baseUrl = String(config.get('ollamaBaseUrl', 'http://localhost:11434')).replace(/\/$/, '');
-      const systemPrompt = String(config.get('systemPrompt', 'You are ManulAI, a privacy-first local coding assistant running inside VS Code. Work across any programming language. Prefer precise, minimal changes and explain results clearly.')).trim();
+      const systemPrompt = String(config.get('systemPrompt', 'You are ManulAI, a privacy local coding assistant running inside VS Code. Work across any programming language. Prefer precise, minimal changes and explain results clearly.')).trim();
+      const agentMode = this.getAgentMode();
 
       if (!model) {
         response.markdown('No Ollama model selected. Run **ManulAI: Select Ollama Model** or set `manulai.ollamaModel`.');
@@ -50,8 +94,16 @@ export class ManulAiChatParticipant {
       }
 
       const messages: ChatMessage[] = [];
-      if (systemPrompt) {
-        messages.push({ role: 'system', content: systemPrompt });
+      let effectiveSystemPrompt = systemPrompt;
+      if (agentMode === 'agent') {
+        effectiveSystemPrompt += '\n\nYou are in Agent mode. You may suggest file edits, terminal commands, and browser automation steps, but you cannot execute them directly in this chat panel. For full tool execution, use the ManulAI Secondary Sidebar chat.';
+      } else if (agentMode === 'planner') {
+        effectiveSystemPrompt += '\n\nYou are in Planner mode. Prefer concise, step-by-step responses. You may suggest small actions but cannot execute tools in this chat panel.';
+      } else {
+        effectiveSystemPrompt += '\n\nYou are in Chat mode. Answer questions and review code without suggesting file changes or tool calls.';
+      }
+      if (effectiveSystemPrompt) {
+        messages.push({ role: 'system', content: effectiveSystemPrompt });
       }
 
       for (const turn of context.history) {

@@ -93,7 +93,7 @@ Reference shape:
   "agentMode": "agent",
   "autoApprove": false,
   "debugMode": false,
-  "systemPrompt": "You are ManulAI, a privacy-first local coding assistant running inside VS Code. Work across any programming language. Prefer precise, minimal changes and explain results clearly."
+  "systemPrompt": "You are ManulAI, a privacy local coding assistant running inside VS Code. Work across any programming language. Prefer precise, minimal changes and explain results clearly."
 }
 ```
 
@@ -220,7 +220,12 @@ The practical difference between the working and non-working groups is not just 
 
 ## Release Notes
 
-- **0.0.13:** Copilot Chat participant and settings panel. Added `src/copilotChatParticipant.ts`, which registers a VS Code Chat participant (`@manulai`) that streams Ollama responses into the native Chat panel. The participant reads global VS Code settings (`manulai.ollamaModel`, `manulai.ollamaBaseUrl`, `manulai.systemPrompt`) and supports slash commands `/selectModel` and `/model`. Streaming includes live reasoning extraction from `<think>` tags via `src/ollamaStreamParser.ts`. Added `src/settingsPanel.ts` as an Activity Bar `WebviewViewProvider` (`manulai.settings`) for quick model/base-url/agent-mode/system-prompt/auto-approve/debug toggles. Updated `src/extension.ts` and `package.json` to wire the participant, settings view, and new commands. The original Secondary Sidebar chat view (`manulai.chatView`) and agent loop remain unchanged. Packaging version updated to `0.0.13`.
+- **0.0.13:** Copilot Chat participant and settings panel.
+  - **Chat participant (`src/copilotChatParticipant.ts`):** Registers `@manulai` in the native VS Code Chat panel. Streams Ollama `/api/chat` with `stream: true` via `src/ollamaStreamParser.ts`, including live `<think>` reasoning extraction. Reads global VS Code settings (`ollamaModel`, `ollamaBaseUrl`, `systemPrompt`, `agentMode`) and supports slash commands `/selectModel` and `/model`. Injects a mode-specific system-prompt suffix based on `agentMode` (chat/agent/planner) so the participant's tone matches the active mode even though it does not execute tools.
+  - **Settings panel (`src/settingsPanel.ts`):** Moved from Activity Bar to Secondary Sidebar (`manulai` container). Fetches the installed model list from Ollama `/api/tags` on load and on manual refresh, presenting a dropdown instead of a raw text input. Custom model IDs are still supported via a text fallback. Exposes model, base URL, agent mode, system prompt, auto-approve, and debug toggles. Writes only to global VS Code settings (`ConfigurationTarget.Global`).
+  - **Removed Activity Bar container:** `manulaiActivityBar` and its `manulai.settings` view were removed from `package.json`. The Settings view now lives alongside `manulai.chatView` in the Secondary Sidebar. `manulai.openSettings` opens the Secondary Sidebar and focuses the Settings view.
+  - **New files:** `src/ollamaStreamParser.ts` (NDJSON + `<think>` parsing), `src/copilotChatParticipant.ts`, `src/settingsPanel.ts`.
+  - Packaging version updated to `0.0.13`.
 - **0.0.12:** Architectural hardening and docs sync.
   - **Webview IPC safety:** `resolveWebviewView` `onDidReceiveMessage` async callback now wraps `handleWebviewMessage` in `try/catch` and checks `this.disposed` before executing, preventing unhandled Promise rejections from wedging the chat UI.
   - **Disposal completeness:** `dispose()` now resolves `pendingApprovalResolver(false)` and clears `pendingApproval`/`pendingApprovalResolver`, so awaiting callers do not hang if an approval dialog was open during teardown. It also explicitly calls `_manulBridge?.dispose()` and nulls the reference, rather than relying solely on the constructor subscription.

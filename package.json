@@ -23,52 +23,10 @@
   "contributes": {
     "commands": [
       {
-        "command": "manulai.openChat",
-        "title": "ManulAI: Open Chat",
-        "category": "ManulAI",
-        "icon": "$(comment-discussion)"
-      },
-      {
-        "command": "manulai.openSecondarySidebar",
-        "title": "ManulAI: Open Secondary Sidebar",
-        "category": "ManulAI",
-        "icon": "$(layout-sidebar-right)"
-      },
-      {
         "command": "manulai.selectModel",
         "title": "ManulAI: Select Ollama Model",
         "category": "ManulAI",
         "icon": "$(hubot)"
-      },
-      {
-        "command": "manulai.attachFile",
-        "title": "Attach to ManulAI Chat",
-        "category": "ManulAI",
-        "icon": "$(add)"
-      },
-      {
-        "command": "manulai.attachActiveFile",
-        "title": "Attach Active File to ManulAI Chat",
-        "category": "ManulAI",
-        "icon": "$(file-code)"
-      },
-      {
-        "command": "manulai.attachExplorerSelection",
-        "title": "Attach Explorer Selection to ManulAI Chat",
-        "category": "ManulAI",
-        "icon": "$(files)"
-      },
-      {
-        "command": "manulai.attachFolder",
-        "title": "Attach Folder to ManulAI Chat",
-        "category": "ManulAI",
-        "icon": "$(file-directory)"
-      },
-      {
-        "command": "manulai.devSendPrompt",
-        "title": "ManulAI: Send Prompt (Dev/Test)",
-        "category": "ManulAI",
-        "icon": "$(beaker)"
       },
       {
         "command": "manulai.openSettings",
@@ -77,39 +35,6 @@
         "icon": "$(gear)"
       }
     ],
-    "menus": {
-      "explorer/context": [
-        {
-          "command": "manulai.attachFile",
-          "group": "manulai@1",
-          "when": "!explorerResourceIsFolder"
-        },
-        {
-          "command": "manulai.attachFolder",
-          "group": "manulai@2",
-          "when": "explorerResourceIsFolder"
-        }
-      ],
-      "view/title": [
-        {
-          "command": "manulai.attachExplorerSelection",
-          "group": "navigation@45",
-          "when": "view == workbench.explorer.fileView || view == workbench.view.extension.test || view == workbench.view.scm"
-        }
-      ],
-      "editor/title": [
-        {
-          "command": "manulai.attachActiveFile",
-          "group": "navigation@10"
-        }
-      ],
-      "editor/context": [
-        {
-          "command": "manulai.attachActiveFile",
-          "group": "navigation@10"
-        }
-      ]
-    },
     "chatParticipants": [
       {
         "id": "manulai.manulai",
@@ -125,7 +50,15 @@
           },
           {
             "name": "model",
-            "description": "Show the active Ollama model"
+            "description": "Show the active Ollama model, agent mode and auto-approve status"
+          },
+          {
+            "name": "setAgentMode",
+            "description": "Set agent mode: chat, agent, or planner"
+          },
+          {
+            "name": "toggleAutoApprove",
+            "description": "Toggle auto-approve for tool calls"
           }
         ]
       }
@@ -137,13 +70,6 @@
           "title": "ManulAI",
           "icon": "media/manulai-icon.svg"
         }
-      ],
-      "secondarySidebar": [
-        {
-          "id": "manulai",
-          "title": "ManulAI",
-          "icon": "media/manulai-icon.svg"
-        }
       ]
     },
     "views": {
@@ -152,16 +78,6 @@
           "type": "webview",
           "id": "manulai.settings",
           "name": "Settings",
-          "icon": "media/manulai-icon.svg"
-        }
-      ],
-      "manulai": [
-        {
-          "type": "webview",
-          "id": "manulai.chatView",
-          "name": "ManulAI Chat",
-          "contextualTitle": "ManulAI Chat",
-          "visibility": "visible",
           "icon": "media/manulai-icon.svg"
         }
       ]
@@ -179,16 +95,6 @@
           "default": "http://localhost:11434",
           "description": "Base URL for the local Ollama server."
         },
-        "manulai.agentMode": {
-          "type": "boolean",
-          "default": true,
-          "description": "When enabled, ManulAI exposes local tools to Ollama and runs the native agent loop automatically. When disabled, requests run as plain chat without tool calling."
-        },
-        "manulai.autoApprove": {
-          "type": "boolean",
-          "default": false,
-          "description": "When enabled, tool calls are executed automatically without asking for user confirmation. When disabled, each tool call requires explicit approval."
-        },
         "manulai.debugMode": {
           "type": "boolean",
           "default": false,
@@ -196,7 +102,7 @@
         },
         "manulai.systemPrompt": {
           "type": "string",
-          "default": "You are ManulAI, a privacy-first local coding assistant running inside VS Code. Work across any programming language. Prefer precise, minimal changes and explain results clearly.",
+          "default": "You are ManulAI, a privacy local coding assistant running inside VS Code. Work across any programming language. Prefer precise, minimal changes and explain results clearly.",
           "description": "System prompt prepended to every Ollama chat request.",
           "editPresentation": "multilineText"
         }
