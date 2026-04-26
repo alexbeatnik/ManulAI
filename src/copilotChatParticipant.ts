@@ -468,13 +468,15 @@ export class ManulAiChatParticipant {
         }
       }
 
-      // If the last tool was a successful write, or a terminal command in a multi-tool chain, stop the loop
+      // If the last tool was a successful write, stop the loop
       if (lastToolWasWrite) {
         this.log('[agent] last tool was a write operation — stopping loop');
         return;
       }
-      if (lastToolWasTerminal && toolCalls.length >= 2) {
-        this.log('[agent] last tool was terminal in a multi-tool chain — stopping loop');
+      // If ANY terminal command was executed successfully, stop the loop
+      // Terminal commands are usually the final step in a workflow
+      if (lastToolWasTerminal) {
+        this.log('[agent] terminal command executed — stopping loop');
         return;
       }
 

@@ -349,6 +349,26 @@ async function toolExecuteTerminal(command: string): Promise<AgentToolResult> {
     cp.exec(trimmed, { cwd: getWorkspaceRoot() }, (error: Error | null, stdout: string, stderr: string) => {
       const output = stdout + (stderr ? `\nSTDERR:\n${stderr}` : '');
       if (error) {
+        // Smart retry: if git push failed due to no upstream branch, auto-retry with --set-upstream
+        if (/git push/.test(trimmed) && /no upstream branch/i.test(stderr)) {
+          cp.exec('git branch --show-current', { cwd: getWorkspaceRoot() }, (branchErr: Error | null, branch: string) => {
+            if (branchErr || !branch.trim()) {
+              resolve({ content: '', error: `Exit code ${error.message}\n${output}` });
+              return;
+            }
+            const currentBranch = branch.trim();
+            const retryCmd = `git push --set-upstream origin ${currentBranch}`;
+            cp.exec(retryCmd, { cwd: getWorkspaceRoot() }, (retryErr: Error | null, retryStdout: string, retryStderr: string) => {
+              const retryOutput = retryStdout + (retryStderr ? `\nSTDERR:\n${retryStderr}` : '');
+              if (retryErr) {
+                resolve({ content: '', error: `Auto-retry failed: ${retryErr.message}\n${retryOutput}` });
+              } else {
+                resolve({ content: JSON.stringify({ command: retryCmd, output: retryOutput, note: 'Auto-retried with --set-upstream' }), });
+              }
+            });
+          });
+          return;
+        }
         resolve({ content: '', error: `Exit code ${error.message}\n${output}` });
       } else {
         resolve({ content: JSON.stringify({ command: trimmed, output }), });
