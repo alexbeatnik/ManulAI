@@ -19,22 +19,36 @@ This document covers development guidelines, constraints, and architecture for t
 
 ManulAI is a local-first, privacy-focused coding agent for VS Code. All intelligent operations are powered by a local Ollama process. It connects to the `/api/chat` native tooling flow for agentic execution.
 
-- **UI Provider:** Built using `WebviewViewProvider` for the chat interface in the Secondary Sidebar.
+- **Chat Surface:** Single Copilot Chat Participant (`@manulai`) registered in `src/copilotChatParticipant.ts`. Streams Ollama responses into VS Code's native Chat panel.
 - **Agent Loop:** All context forwarding and tool results are handled by returning tool outputs directly to Ollama.
-- **Provider Split:** `src/ManulAiChatProvider.ts` remains the stateful orchestration layer, while `src/providerRefactorUtils.ts` contains pure large-refactor/bootstrap inference and generated-module validation helpers, `src/providerSafetyUtils.ts` contains build-verify classification, structured-write guards, preview generation, and placeholder/path heuristics, `src/providerPersistenceUtils.ts` contains workspace settings/chat persistence helpers, `src/providerWebviewUtils.ts` contains attachment rendering plus transcript/webview formatting helpers, `src/providerToolParsingUtils.ts` contains tool-call parsing plus malformed JSON recovery helpers, and `src/providerFileFallbackUtils.ts` contains fallback file-write extraction heuristics.
-- **Modes:** The extension supports three working modes: tool-enabled Agent Mode, condensed step-by-step Planner Mode (same tools, shorter mandate, can answer text questions directly), and plain Chat Mode with no tool calls. Agent and Planner behavior are also model-size-aware: very small models get shorter mandates, less injected context, lower retry budgets, and a reduced tool surface.
+- **Modes:** The extension supports three working modes: tool-enabled Agent Mode, condensed step-by-step Planner Mode, and plain Chat Mode with no tool calls.
 - **File System:** Uses `vscode.workspace.fs` for file inspection and edits.
-- **State:** Conversation history and file context remain available in memory during the VS Code session. They are not sent to any cloud provider.
-- **Chat Sessions:** The provider maintains multiple chat sessions; each chat owns its own transcript and attached file context while sharing the same workspace settings and tool/runtime layer. File-backed workspaces persist this state under `.manulai/chats.json`, with extension-storage fallback when no file-backed workspace exists.
+- **State:** Conversation history is managed by the VS Code Chat API (`context.history`) and lives only in memory during the session. It is not persisted to disk.
 
-## Context And Scan Behavior
+## Context Window Management
 
-- **Attached Files:** Explicitly attached files are serialized into hidden attachment context messages and should not be re-read unless the user asks for fresh disk state.
-- **Workspace Snapshot:** Project scan requests can attach a folder snapshot containing the workspace tree and a capped subset of file contents. This gives weaker local models broader context without trying to inline the entire repository.
-- **Folder Isolation:** Attached folders are marked separately from regular files and must not be treated as editable file targets.
-- **Auto File Discovery:** Edit requests can auto-resolve likely targets such as `README.md`, `LICENSE`, `package.json`, `tsconfig.json`, and explicit file paths before the model starts editing.
-- **Scan Nudges:** Full-project scan requests inject hidden guidance to keep reading relevant files and not stop after the first directory or first detected issue.
-- **Workspace Listing:** `list_workspace_files` must accept both workspace-relative directories and absolute paths without incorrectly re-rooting absolute paths under the workspace.
+`src/modelContextConfig.ts` maintains a mapping of known Ollama models to their context-window sizes (in tokens). Before each request, `copilotChatParticipant.ts` estimates the prompt size and automatically truncates the oldest history messages if the total would exceed a safe threshold (75 % of the model's window).
+
+### Known context windows
+
+| Model family | Context window |
+|-------------|----------------|
+| `gemma4` | 256K |
+| `llama3.1`, `llama3.2`, `llama3.3` | 128K |
+| `qwen3`, `qwen2.5` | 128K |
+| `deepseek` | 128K |
+| `phi4`, `phi3` | 128K |
+| `mistral`, `mixtral` | 32K |
+| `codellama` | 16K |
+| `gemma2`, `gemma:` | 8K |
+| unknown / default | 128K |
+
+### Truncation rules
+
+1. **System prompt is never dropped.** It contains instructions, skills, and mode configuration.
+2. **Current user message is never dropped.** It is the actual query.
+3. **Oldest history pairs are dropped first.** The loop removes the earliest `user` + `assistant` turns until the estimated token count fits.
+4. **Conservative estimate.** Token count is estimated as `ceil(characters / 3.5)` — intentionally over-counts to avoid overflow.
 
 ## Product Constraints and Rules
 
@@ -53,6 +67,14 @@ ManulAI is a local-first, privacy-focused coding agent for VS Code. All intellig
 - **File Editing Safety:** Prefer `replace_in_file` for surgical edits. Read the file before editing, preserve all unrelated content, and never remove content that the user did not explicitly ask to remove.
 - **Project Structure:**
   - `src/` — Extension backend and core logic.
+    - `extension.ts` — Activation and wiring.
+    - `copilotChatParticipant.ts` — VS Code Chat participant with streaming and context truncation.
+    - `settingsPanel.ts` — Activity Bar settings webview.
+    - `ollamaStreamParser.ts` — NDJSON stream parser with `<think>` reasoning extraction.
+    - `agentInstructionsReader.ts` — Reads workspace instruction files (AGENTS.md, CLAUDE.md, etc.).
+    - `skillsReader.ts` — Reads workspace skill files from `.claude/skills/` and similar directories.
+    - `modelContextConfig.ts` — Model context-window mapping and token estimation.
+    - `types.ts` — Shared types.
   - `media/` — Assets, icons, and webview HTML definitions.
 
 ## Setup for Development
@@ -69,9 +91,10 @@ Make sure you have Ollama running locally (`http://localhost:11434` by default) 
 
 ## Commands and Views
 
-- **Copilot Chat Participant:** ManulAI registers a VS Code Chat participant (`@manulai`) via `src/copilotChatParticipant.ts`. It streams Ollama responses into the native Chat panel, including live reasoning blocks extracted from `<think>` tags. The participant reads global VS Code settings (`manulai.ollamaModel`, `manulai.ollamaBaseUrl`, `manulai.systemPrompt`) and stores `agentMode` and `autoApprove` in `ExtensionContext.globalState`.
+- **Copilot Chat Participant:** ManulAI registers a VS Code Chat participant (`@manulai`) via `src/copilotChatParticipant.ts`. It streams Ollama responses into the native Chat panel, including live reasoning blocks extracted from `<think>` tags. The participant reads global VS Code settings (`manulai.ollamaModel`, `manulai.ollamaBaseUrl`, `manulai.systemPrompt`) and stores `agentMode` and `autoApprove` in `ExtensionContext.globalState`. Before each request it automatically truncates history to fit the model's context window.
 - **Agent Instructions Reader:** `src/agentInstructionsReader.ts` discovers and reads `AGENTS.md`, `CLAUDE.md`, `.github/copilot-instructions.md`, `.cursorrules`, and other instruction files from the workspace root. The content is automatically appended to the system prompt on every chat request so the model follows project-specific conventions.
 - **Skills Reader:** `src/skillsReader.ts` discovers and reads skill files from `.claude/skills/`, `skills/`, `.github/skills/`, and `.ai/skills/` directories. Each skill is a markdown file with YAML frontmatter (`name`, `description`) containing project-specific rules and guidelines. Skills are automatically injected into the system prompt alongside agent instructions.
+- **Model Context Config:** `src/modelContextConfig.ts` maps Ollama model names to their context-window sizes and provides token-estimation utilities used by the participant for automatic history truncation.
 - **Settings Panel:** A `WebviewViewProvider` (`src/settingsPanel.ts`) is registered as `manulai.settings` inside an Activity Bar container (`manulaiActivityBar`). It lets users view and update model, base URL, system prompt, and debug mode without opening `settings.json`.
 - **Configuration:** `package.json` contributes `manulai.ollamaModel`, `manulai.ollamaBaseUrl`, `manulai.debugMode`, and `manulai.systemPrompt`.
 

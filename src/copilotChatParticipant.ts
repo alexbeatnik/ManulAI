@@ -3,10 +3,19 @@ import { OllamaStreamParser } from './ollamaStreamParser';
 import type { OllamaStreamChunk } from './ollamaStreamParser';
 import { readAgentInstructions, formatInstructionsForPrompt } from './agentInstructionsReader';
 import { readWorkspaceSkills, formatSkillsForPrompt } from './skillsReader';
+import { getMaxPromptTokens, estimateTokens } from './modelContextConfig';
+import {
+  getAgentToolInstructions,
+  extractToolCallsFromText,
+  stripToolCallsFromText,
+  executeTool,
+} from './agentExecutor';
+import type { AgentMessage } from './agentExecutor';
 
 export interface ChatMessage {
-  role: 'system' | 'user' | 'assistant';
+  role: 'system' | 'user' | 'assistant' | 'tool';
   content: string;
+  tool_name?: string;
 }
 
 export interface ManulAiChatParticipantOptions {
@@ -44,6 +53,54 @@ export class ManulAiChatParticipant {
 
   private log(msg: string): void {
     this.output?.appendLine(msg);
+  }
+
+  /**
+   * Truncates message history to fit within the model's context window.
+   * Always preserves the system prompt (index 0) and the latest user message (last index).
+   * Drops oldest history pairs first.
+   */
+  private truncateMessagesToFit(
+    messages: ChatMessage[],
+    model: string
+  ): ChatMessage[] {
+    if (messages.length <= 2) {
+      return messages;
+    }
+
+    const maxTokens = getMaxPromptTokens(model);
+    const totalTokens = messages.reduce(
+      (sum, m) => sum + estimateTokens(m.content),
+      0
+    );
+
+    if (totalTokens <= maxTokens) {
+      this.log(`[context] ${totalTokens} tokens / ${maxTokens} max — no truncation needed`);
+      return messages;
+    }
+
+    // Keep system (0) and last message (current user); drop from the front of history.
+    const system = messages[0];
+    const currentUser = messages[messages.length - 1];
+    let history = messages.slice(1, -1);
+
+    while (history.length > 0) {
+      const trimmed = [system, ...history, currentUser];
+      const tokens = trimmed.reduce(
+        (sum, m) => sum + estimateTokens(m.content),
+        0
+      );
+      if (tokens <= maxTokens) {
+        const dropped = messages.length - trimmed.length;
+        this.log(`[context] truncated ${dropped} old message(s); now ${tokens} tokens / ${maxTokens} max`);
+        return trimmed;
+      }
+      history.shift();
+    }
+
+    // Even with only system + current user it's too long — keep just those two.
+    this.log(`[context] history cleared; only system + current user kept`);
+    return [system, currentUser];
   }
 
   buildHandler(): vscode.ChatRequestHandler {
@@ -136,10 +193,14 @@ export class ManulAiChatParticipant {
         this.log(`[skills] loaded ${skills.length} skill(s): ${skills.map((s) => s.name).join(', ')}`);
       }
 
+      const isAgentLike = agentMode === 'agent' || agentMode === 'planner';
+
       if (agentMode === 'agent') {
-        effectiveSystemPrompt += '\n\nYou are in Agent mode. You may suggest file edits, terminal commands, and browser automation steps, but you cannot execute them directly in this chat panel.';
+        effectiveSystemPrompt += '\n\nYou are in Agent mode. You may read files, edit code, and run terminal commands using the tools below.';
+        effectiveSystemPrompt += '\n\n' + getAgentToolInstructions();
       } else if (agentMode === 'planner') {
-        effectiveSystemPrompt += '\n\nYou are in Planner mode. Prefer concise, step-by-step responses. You may suggest small actions but cannot execute tools in this chat panel.';
+        effectiveSystemPrompt += '\n\nYou are in Planner mode. Prefer concise, step-by-step responses. Use tools for small deliberate actions.';
+        effectiveSystemPrompt += '\n\n' + getAgentToolInstructions();
       } else {
         effectiveSystemPrompt += '\n\nYou are in Chat mode. Answer questions and review code without suggesting file changes or tool calls.';
       }
@@ -177,42 +238,155 @@ export class ManulAiChatParticipant {
       const abort = new AbortController();
       token.onCancellationRequested(() => abort.abort());
 
-      let reasoningOpen = false;
-      let answerStarted = false;
-
       try {
-        await this.streamOllamaChat(baseUrl, model, messages, {
-          onChunk: (chunk) => {
-            if (abort.signal.aborted) return;
-            if (chunk.reasoning) {
-              if (!reasoningOpen) {
-                response.markdown('> _Thinking…_\n>\n> ');
-                reasoningOpen = true;
-              }
-              response.markdown(chunk.reasoning.replace(/\n/g, '\n> '));
-            }
-            if (chunk.content) {
-              if (reasoningOpen && !answerStarted) {
-                response.markdown('\n\n');
-                reasoningOpen = false;
-              }
-              answerStarted = true;
-              response.markdown(chunk.content);
-            }
-            if (chunk.error) {
-              response.markdown(`\n\n**Error:** ${chunk.error}`);
-            }
-          },
-          onError: (err) => {
-            response.markdown(`\n\n**Error:** ${err.message}`);
-          },
-          onDone: () => {},
-        }, abort);
+        await this.runAgentLoop(baseUrl, model, messages, response, abort, isAgentLike);
       } catch (err: any) {
         this.log(`[ManulAiChatParticipant] error: ${err?.message || String(err)}`);
         response.markdown(`\n\n**Error:** ${err?.message || String(err)}`);
       }
     };
+  }
+
+  /**
+   * Runs the agent loop: stream response → check for tool calls → execute → repeat.
+   */
+  private async runAgentLoop(
+    baseUrl: string,
+    model: string,
+    messages: ChatMessage[],
+    response: vscode.ChatResponseStream,
+    abort: AbortController,
+    isAgentLike: boolean
+  ): Promise<void> {
+    const MAX_TURNS = 15;
+    let turnCount = 0;
+
+    while (turnCount < MAX_TURNS) {
+      if (abort.signal.aborted) {
+        this.log('[agent] loop aborted');
+        return;
+      }
+
+      turnCount++;
+      this.log(`[agent] turn ${turnCount}/${MAX_TURNS}`);
+
+      const trimmedMessages = this.truncateMessagesToFit(messages, model);
+      const assistantText = await this.streamAndCollect(baseUrl, model, trimmedMessages, response, abort);
+
+      if (!assistantText) {
+        return;
+      }
+
+      // In chat mode, just stream and stop — no tool execution.
+      if (!isAgentLike) {
+        return;
+      }
+
+      // Check for text-based tool calls
+      const toolCalls = extractToolCallsFromText(assistantText);
+      const cleanText = stripToolCallsFromText(assistantText);
+
+      if (toolCalls.length === 0) {
+        // No tools — assistant gave a final answer.
+        return;
+      }
+
+      // Add assistant message (with stripped tools) to history
+      messages.push({ role: 'assistant', content: cleanText || '(tool call)' });
+
+      // Approval check
+      const autoApprove = this.getAutoApprove();
+      const toolNames = toolCalls.map((tc) => tc.function.name).join(', ');
+
+      if (!autoApprove) {
+        response.markdown(`\n\n---\n\n**⏸️ Tool approval required:** \`${toolNames}\`\n\nRun \`/toggleAutoApprove\` to enable automatic tool execution, or ask me to continue.`);
+        return;
+      }
+
+      // Execute tools
+      response.markdown(`\n\n---\n\n**🔧 Executing:** \`${toolNames}\`\n\n`);
+
+      for (const toolCall of toolCalls) {
+        if (abort.signal.aborted) {
+          return;
+        }
+
+        const name = toolCall.function.name;
+        const args = toolCall.function.arguments;
+        this.log(`[agent] executing tool: ${name}`);
+
+        const result = await executeTool(name, args);
+
+        const toolContent = result.error
+          ? JSON.stringify({ error: result.error })
+          : result.content;
+
+        messages.push({
+          role: 'tool',
+          content: toolContent,
+          tool_name: name,
+        });
+
+        // Stream brief result to user
+        if (result.error) {
+          response.markdown(`\n❌ \`${name}\`: ${result.error}\n`);
+        } else {
+          response.markdown(`\n✅ \`${name}\` completed\n`);
+        }
+      }
+
+      response.markdown(`\n\n---\n\n`);
+    }
+
+    // Max turns reached
+    response.markdown(`\n\n**⚠️ Agent stopped:** maximum turn limit (${MAX_TURNS}) reached.`);
+  }
+
+  /**
+   * Streams Ollama response to the chat UI while collecting the full text.
+   * Returns the collected assistant text (excluding reasoning).
+   */
+  private async streamAndCollect(
+    baseUrl: string,
+    model: string,
+    messages: ChatMessage[],
+    response: vscode.ChatResponseStream,
+    abort: AbortController
+  ): Promise<string> {
+    let reasoningOpen = false;
+    let answerStarted = false;
+    let collectedText = '';
+
+    await this.streamOllamaChat(baseUrl, model, messages, {
+      onChunk: (chunk) => {
+        if (abort.signal.aborted) return;
+        if (chunk.reasoning) {
+          if (!reasoningOpen) {
+            response.markdown('> _Thinking…_\n>\n> ');
+            reasoningOpen = true;
+          }
+          response.markdown(chunk.reasoning.replace(/\n/g, '\n> '));
+        }
+        if (chunk.content) {
+          if (reasoningOpen && !answerStarted) {
+            response.markdown('\n\n');
+            reasoningOpen = false;
+          }
+          answerStarted = true;
+          collectedText += chunk.content;
+          response.markdown(chunk.content);
+        }
+        if (chunk.error) {
+          response.markdown(`\n\n**Error:** ${chunk.error}`);
+        }
+      },
+      onError: (err) => {
+        response.markdown(`\n\n**Error:** ${err.message}`);
+      },
+      onDone: () => {},
+    }, abort);
+
+    return collectedText;
   }
 
   private async streamOllamaChat(

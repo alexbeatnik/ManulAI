@@ -42,6 +42,7 @@ src/
   ollamaStreamParser.ts     # NDJSON stream parser with <think> reasoning extraction
   agentInstructionsReader.ts # Reads AGENTS.md, CLAUDE.md, etc. from workspace
   skillsReader.ts           # Reads skill files from .claude/skills/ and similar directories
+  modelContextConfig.ts     # Model context-window mapping and automatic history truncation
   types.ts                  # Shared types
 media/
   manulai-icon.svg          # Extension icon
