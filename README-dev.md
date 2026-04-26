@@ -238,6 +238,17 @@ The practical difference between the working and non-working groups is not just 
 
 ## Release Notes
 
+- **0.0.14:** Agent tool execution, context management, and UX improvements.
+  - **Agent tool execution (`src/agentExecutor.ts`):** Added full agent loop with text-based tool calls (JSON in assistant response). Supports `create_or_edit_file`, `replace_in_file`, `read_specific_file`, `read_file_slice`, `list_workspace_files`, `project_scan`, `execute_terminal_command`, `launch_in_terminal`, `delete_file`, and `read_active_file`. Includes tool name aliasing (`create_file` → `create_or_edit_file`, etc.) to handle model hallucinations.
+  - **Context window management (`src/modelContextConfig.ts`):** Automatic history truncation based on known Ollama model context windows (Gemma 4: 256K, Llama 3.x: 128K, etc.). Keeps system prompt + current user message, drops oldest history pairs first.
+  - **Workspace skills (`src/skillsReader.ts`):** Reads skill files from `.claude/skills/`, `skills/`, `.github/skills/`, and `.ai/skills/` directories. Skills are markdown files with YAML frontmatter (`name`, `description`) injected into the system prompt.
+  - **Human-friendly tool output:** Tool results are now formatted nicely in chat — created files show content with syntax highlighting, modifications show diff, reads show filename, terminal commands show the command run.
+  - **Loop detection:** Detects when the same tool is called repeatedly with identical arguments (3+ times) and stops the agent to prevent infinite loops.
+  - **Stop nudges:** After successful `create_or_edit_file` or `replace_in_file`, a system message tells the model to stop — preventing unnecessary file reads after task completion.
+  - **Approval buttons:** Interactive ✅ Approve / ❌ Decline buttons in chat when `autoApprove` is off.
+  - **Agent mode defaults to auto-approve:** In Agent mode, tools execute without asking by default. Planner and Chat modes require approval.
+  - **Debug harness (`scripts/debug-agent.mjs`):** Complete rewrite matching the new Copilot Chat Participant architecture. Supports text-based tool calls, streaming, context truncation, and degenerate output detection.
+  - Packaging version updated to `0.0.14`.
 - **0.0.13:** Copilot Chat participant and settings panel.
   - **Chat participant (`src/copilotChatParticipant.ts`):** Registers `@manulai` in the native VS Code Chat panel. Streams Ollama `/api/chat` with `stream: true` via `src/ollamaStreamParser.ts`, including live `<think>` reasoning extraction. Reads global VS Code settings (`ollamaModel`, `ollamaBaseUrl`, `systemPrompt`, `agentMode`) and supports slash commands `/selectModel` and `/model`. Injects a mode-specific system-prompt suffix based on `agentMode` (chat/agent/planner) so the participant's tone matches the active mode even though it does not execute tools.
   - **Settings panel (`src/settingsPanel.ts`):** Moved from Activity Bar to Secondary Sidebar (`manulai` container). Fetches the installed model list from Ollama `/api/tags` on load and on manual refresh, presenting a dropdown instead of a raw text input. Custom model IDs are still supported via a text fallback. Exposes model, base URL, agent mode, system prompt, auto-approve, and debug toggles. Writes only to global VS Code settings (`ConfigurationTarget.Global`).

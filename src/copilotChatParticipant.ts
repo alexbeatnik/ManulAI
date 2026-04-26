@@ -63,6 +63,25 @@ export class ManulAiChatParticipant {
   }
 
   /**
+   * Detects the language ID from a file path for syntax highlighting.
+   */
+  private detectLanguage(filePath: string): string {
+    const ext = filePath.split('.').pop()?.toLowerCase() ?? '';
+    const map: Record<string, string> = {
+      'ts': 'typescript', 'tsx': 'typescript',
+      'js': 'javascript', 'jsx': 'javascript',
+      'py': 'python', 'go': 'go', 'rs': 'rust',
+      'java': 'java', 'kt': 'kotlin', 'cs': 'csharp',
+      'cpp': 'cpp', 'c': 'c', 'h': 'c',
+      'html': 'html', 'css': 'css', 'scss': 'scss',
+      'json': 'json', 'md': 'markdown', 'yml': 'yaml',
+      'yaml': 'yaml', 'sh': 'bash', 'bash': 'bash',
+      'sql': 'sql', 'xml': 'xml',
+    };
+    return map[ext] ?? '';
+  }
+
+  /**
    * Truncates message history to fit within the model's context window.
    * Always preserves the system prompt (index 0) and the latest user message (last index).
    * Drops oldest history pairs first.
@@ -382,11 +401,43 @@ export class ManulAiChatParticipant {
           tool_name: name,
         });
 
-        // Stream brief result to user
+        // Stream brief result to user — human-friendly formatting
         if (result.error) {
-          response.markdown(`\n❌ \`${name}\`: ${result.error}\n`);
+          response.markdown(`\n❌ **Error** — \`${name}\`\n\n${result.error}\n`);
         } else {
-          response.markdown(`\n✅ \`${name}\` completed\n`);
+          switch (name) {
+            case 'create_or_edit_file': {
+              const filePath = String(args.filename ?? args.filepath ?? 'unknown');
+              const content = String(args.content ?? '');
+              response.markdown(`\n📝 **Created** \`${filePath}\`\n\n\`\`\`${this.detectLanguage(filePath)}\n${content}\n\`\`\`\n`);
+              break;
+            }
+            case 'replace_in_file': {
+              const filePath = String(args.filepath ?? 'unknown');
+              const oldText = String(args.old_text ?? args.oldText ?? '');
+              const newText = String(args.new_text ?? args.newText ?? '');
+              response.markdown(`\n✏️ **Modified** \`${filePath}\`\n\n\`\`\`diff\n- ${oldText.replace(/\n/g, '\n- ')}\n+ ${newText.replace(/\n/g, '\n+ ')}\n\`\`\`\n`);
+              break;
+            }
+            case 'read_specific_file':
+            case 'read_file_slice': {
+              const filePath = String(args.filepath ?? args.path ?? 'unknown');
+              response.markdown(`\n📖 **Read** \`${filePath}\`\n`);
+              break;
+            }
+            case 'execute_terminal_command': {
+              const cmd = String(args.command ?? args.cmd ?? '');
+              response.markdown(`\n💻 **Ran** \`\`${cmd}\`\`\n`);
+              break;
+            }
+            case 'delete_file': {
+              const filePath = String(args.filepath ?? args.path ?? 'unknown');
+              response.markdown(`\n🗑️ **Deleted** \`${filePath}\`\n`);
+              break;
+            }
+            default:
+              response.markdown(`\n✅ \`${name}\` completed\n`);
+          }
         }
 
         // If a file was created, add a reference so the user can click it
