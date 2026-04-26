@@ -1,225 +1,50 @@
 import * as vscode from 'vscode';
-import { ManulAiChatProvider } from './ManulAiChatProvider';
+import { ManulAiChatParticipant } from './copilotChatParticipant';
+import { SettingsPanel } from './settingsPanel';
+
+let output: vscode.OutputChannel | undefined;
 
 export function activate(context: vscode.ExtensionContext): void {
-  const provider = new ManulAiChatProvider(context);
+  output = vscode.window.createOutputChannel('ManulAI Copilot');
+  context.subscriptions.push(output);
 
-  context.subscriptions.push(provider);
+  // Register Copilot Chat participant (@manulai)
+  try {
+    const participant = vscode.chat.createChatParticipant(
+      'manulai.manulai',
+      new ManulAiChatParticipant({ output, extensionContext: context }).buildHandler()
+    );
+    participant.iconPath = vscode.Uri.joinPath(context.extensionUri, 'media', 'manulai-icon.svg');
+    participant.followupProvider = {
+      provideFollowups: () => [
+        { prompt: 'Continue.', label: '$(arrow-right) Continue', command: undefined },
+      ],
+    };
+    context.subscriptions.push(participant);
+    output.appendLine('[activate] chat participant registered: manulai.manulai');
+  } catch (err: any) {
+    output.appendLine(`[activate] chat participant registration failed: ${err?.message || err}`);
+  }
 
-  const openSecondarySidebar = async (): Promise<void> => {
-    const commandsToTry = [
-      'workbench.action.focusAuxiliaryBar',
-      'workbench.view.extension.manulai'
-    ];
-
-    for (const command of commandsToTry) {
-      try {
-        await vscode.commands.executeCommand(command);
-      } catch {
-        // Ignore unavailable commands and keep trying the next way to reveal the sidebar.
-      }
-    }
-  };
-
-  const openChat = async (): Promise<void> => {
-    await openSecondarySidebar();
-
-    try {
-      await vscode.commands.executeCommand('manulai.chatView.focus');
-    } catch {
-      // Ignore and fall back to the provider reveal.
-    }
-
-    provider.reveal(false);
-  };
-
+  // Register Settings webview view in Activity Bar
+  const settingsPanel = new SettingsPanel(context.extensionUri, output);
   context.subscriptions.push(
-    vscode.window.registerWebviewViewProvider(ManulAiChatProvider.viewType, provider, {
-      webviewOptions: {
-        retainContextWhenHidden: true
-      }
-    })
-  );
-
-  context.subscriptions.push(
-    vscode.commands.registerCommand('manulai.openChat', async () => {
-      await openChat();
-    })
-  );
-
-  context.subscriptions.push(
-    vscode.commands.registerCommand('manulai.openSecondarySidebar', async () => {
-      await openSecondarySidebar();
-      provider.reveal(true);
-    })
-  );
-
-  context.subscriptions.push(
-    vscode.commands.registerCommand('manulai.attachFile', async (...args: unknown[]) => {
-      let uris: vscode.Uri[] = [];
-
-      // When invoked from Explorer context menu, VS Code passes the clicked URI as the first arg
-      // and all selected URIs as the second arg.
-      if (args.length >= 2 && Array.isArray(args[1])) {
-        uris = (args[1] as vscode.Uri[]).filter(u => u instanceof vscode.Uri);
-      } else if (args.length >= 1 && args[0] instanceof vscode.Uri) {
-        uris = [args[0]];
-      }
-
-      if (uris.length === 0) {
-        // Fallback: attach active editor file
-        const activeUri = vscode.window.activeTextEditor?.document.uri;
-        if (activeUri) {
-          uris = [activeUri];
-        }
-      }
-
-      if (uris.length === 0) {
-        void vscode.window.showWarningMessage('No file selected to attach.');
-        return;
-      }
-
-      await provider.attachFilesByUri(uris);
-      await openChat();
-    })
-  );
-
-  context.subscriptions.push(
-    vscode.commands.registerCommand('manulai.attachActiveFile', async () => {
-      await provider.attachActiveEditorFile();
-      await openChat();
-    })
-  );
-
-  context.subscriptions.push(
-    vscode.commands.registerCommand('manulai.attachExplorerSelection', async () => {
-      await provider.attachExplorerSelectionFromClipboard();
-      await openChat();
-    })
-  );
-
-  context.subscriptions.push(
-    vscode.commands.registerCommand('manulai.attachFolder', async (...args: unknown[]) => {
-      let uri: vscode.Uri | undefined;
-      if (args.length >= 1 && args[0] instanceof vscode.Uri) {
-        uri = args[0];
-      }
-      if (!uri) {
-        const selection = await vscode.window.showOpenDialog({
-          canSelectMany: false,
-          canSelectFiles: false,
-          canSelectFolders: true,
-          openLabel: 'Attach folder',
-          title: 'Attach folder to ManulAI context'
-        });
-        uri = selection?.[0];
-      }
-      if (uri) {
-        await provider.attachFolderByUri(uri);
-      }
-      await openChat();
+    vscode.window.registerWebviewViewProvider(SettingsPanel.viewType, settingsPanel, {
+      webviewOptions: { retainContextWhenHidden: true },
     })
   );
 
   context.subscriptions.push(
     vscode.commands.registerCommand('manulai.selectModel', async () => {
-      await provider.refreshModelCatalog(true);
-
-      const currentModel = provider.getSelectedModel();
-      const availableModelNames = provider.getAvailableModels();
-      const validatedModels = availableModelNames.filter(model => provider.isValidatedModel(model));
-      const otherModels = availableModelNames.filter(model => !provider.isValidatedModel(model));
-      const availableModels: vscode.QuickPickItem[] = [];
-
-      if (validatedModels.length > 0) {
-        availableModels.push({
-          label: 'Validated Baseline',
-          kind: vscode.QuickPickItemKind.Separator
-        });
-        availableModels.push(...validatedModels.map(model => ({
-          label: model,
-          description: model === currentModel ? 'Current model' : 'Recommended'
-        })));
-      }
-
-      if (otherModels.length > 0) {
-        availableModels.push({
-          label: 'Other Installed Models',
-          kind: vscode.QuickPickItemKind.Separator
-        });
-        availableModels.push(...otherModels.map(model => ({
-          label: model,
-          description: model === currentModel ? 'Current model' : 'Installed locally',
-          detail: 'Available for manual testing, but not part of the validated default baseline yet.'
-        })));
-      }
-
-      if (availableModels.length === 0) {
-        void vscode.window.showWarningMessage('No Ollama models were found. Make sure `ollama list` shows installed local models and that `/api/tags` is reachable.');
-        return;
-      }
-
-      const selected = await vscode.window.showQuickPick(availableModels, {
-        title: 'Select Ollama model for ManulAI',
-        placeHolder: 'Choose a local Ollama model. Validated models are shown first.'
-      });
-
-      if (!selected || selected.kind === vscode.QuickPickItemKind.Separator) {
-        return;
-      }
-
-      await provider.setSelectedModel(selected.label);
-      await openChat();
+      await vscode.commands.executeCommand('manulai.settings.focus');
     })
   );
 
   context.subscriptions.push(
-    vscode.commands.registerCommand('manulai.devSendPrompt', async (promptArg?: unknown, optionsArg?: unknown) => {
-      let prompt = typeof promptArg === 'string' ? promptArg.trim() : '';
-      const options = typeof optionsArg === 'object' && optionsArg !== null
-        ? optionsArg as { autoApprove?: boolean }
-        : undefined;
-
-      if (!prompt) {
-        const entered = await vscode.window.showInputBox({
-          title: 'ManulAI Dev/Test Prompt',
-          prompt: 'Send a prompt directly into the installed ManulAI provider flow',
-          placeHolder: 'Enter a prompt to run through the extension',
-          ignoreFocusOut: true
-        });
-        prompt = entered?.trim() ?? '';
-      }
-
-      if (!prompt) {
-        return;
-      }
-
-      await openChat();
-      await provider.submitPromptForTesting(prompt, options?.autoApprove);
+    vscode.commands.registerCommand('manulai.openSettings', async () => {
+      await vscode.commands.executeCommand('manulai.settings.focus');
     })
   );
-
-  context.subscriptions.push(
-    vscode.workspace.onDidChangeConfiguration(async event => {
-      if (event.affectsConfiguration('manulai')) {
-        await provider.handleConfigurationChange();
-      }
-    })
-  );
-
-  context.subscriptions.push(
-    vscode.window.onDidChangeActiveTextEditor(() => {
-      provider.handleActiveEditorChange();
-    })
-  );
-
-  context.subscriptions.push(
-    vscode.workspace.onDidSaveTextDocument(() => {
-      provider.handleActiveEditorChange();
-    })
-  );
-
-  void openChat();
 }
 
 export function deactivate(): void {

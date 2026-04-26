@@ -19,22 +19,36 @@ This document covers development guidelines, constraints, and architecture for t
 
 ManulAI is a local-first, privacy-focused coding agent for VS Code. All intelligent operations are powered by a local Ollama process. It connects to the `/api/chat` native tooling flow for agentic execution.
 
-- **UI Provider:** Built using `WebviewViewProvider` for the chat interface in the Secondary Sidebar.
+- **Chat Surface:** Single Copilot Chat Participant (`@manulai`) registered in `src/copilotChatParticipant.ts`. Streams Ollama responses into VS Code's native Chat panel.
 - **Agent Loop:** All context forwarding and tool results are handled by returning tool outputs directly to Ollama.
-- **Provider Split:** `src/ManulAiChatProvider.ts` remains the stateful orchestration layer, while `src/providerRefactorUtils.ts` contains pure large-refactor/bootstrap inference and generated-module validation helpers, `src/providerSafetyUtils.ts` contains build-verify classification, structured-write guards, preview generation, and placeholder/path heuristics, `src/providerPersistenceUtils.ts` contains workspace settings/chat persistence helpers, `src/providerWebviewUtils.ts` contains attachment rendering plus transcript/webview formatting helpers, `src/providerToolParsingUtils.ts` contains tool-call parsing plus malformed JSON recovery helpers, and `src/providerFileFallbackUtils.ts` contains fallback file-write extraction heuristics.
-- **Modes:** The extension supports three working modes: tool-enabled Agent Mode, condensed step-by-step Planner Mode (same tools, shorter mandate, can answer text questions directly), and plain Chat Mode with no tool calls. Agent and Planner behavior are also model-size-aware: very small models get shorter mandates, less injected context, lower retry budgets, and a reduced tool surface.
+- **Modes:** The extension supports three working modes: tool-enabled Agent Mode, condensed step-by-step Planner Mode, and plain Chat Mode with no tool calls.
 - **File System:** Uses `vscode.workspace.fs` for file inspection and edits.
-- **State:** Conversation history and file context remain available in memory during the VS Code session. They are not sent to any cloud provider.
-- **Chat Sessions:** The provider maintains multiple chat sessions; each chat owns its own transcript and attached file context while sharing the same workspace settings and tool/runtime layer. File-backed workspaces persist this state under `.manulai/chats.json`, with extension-storage fallback when no file-backed workspace exists.
+- **State:** Conversation history is managed by the VS Code Chat API (`context.history`) and lives only in memory during the session. It is not persisted to disk.
 
-## Context And Scan Behavior
+## Context Window Management
 
-- **Attached Files:** Explicitly attached files are serialized into hidden attachment context messages and should not be re-read unless the user asks for fresh disk state.
-- **Workspace Snapshot:** Project scan requests can attach a folder snapshot containing the workspace tree and a capped subset of file contents. This gives weaker local models broader context without trying to inline the entire repository.
-- **Folder Isolation:** Attached folders are marked separately from regular files and must not be treated as editable file targets.
-- **Auto File Discovery:** Edit requests can auto-resolve likely targets such as `README.md`, `LICENSE`, `package.json`, `tsconfig.json`, and explicit file paths before the model starts editing.
-- **Scan Nudges:** Full-project scan requests inject hidden guidance to keep reading relevant files and not stop after the first directory or first detected issue.
-- **Workspace Listing:** `list_workspace_files` must accept both workspace-relative directories and absolute paths without incorrectly re-rooting absolute paths under the workspace.
+`src/modelContextConfig.ts` maintains a mapping of known Ollama models to their context-window sizes (in tokens). Before each request, `copilotChatParticipant.ts` estimates the prompt size and automatically truncates the oldest history messages if the total would exceed a safe threshold (75 % of the model's window).
+
+### Known context windows
+
+| Model family | Context window |
+|-------------|----------------|
+| `gemma4` | 256K |
+| `llama3.1`, `llama3.2`, `llama3.3` | 128K |
+| `qwen3`, `qwen2.5` | 128K |
+| `deepseek` | 128K |
+| `phi4`, `phi3` | 128K |
+| `mistral`, `mixtral` | 32K |
+| `codellama` | 16K |
+| `gemma2`, `gemma:` | 8K |
+| unknown / default | 128K |
+
+### Truncation rules
+
+1. **System prompt is never dropped.** It contains instructions, skills, and mode configuration.
+2. **Current user message is never dropped.** It is the actual query.
+3. **Oldest history pairs are dropped first.** The loop removes the earliest `user` + `assistant` turns until the estimated token count fits.
+4. **Conservative estimate.** Token count is estimated as `ceil(characters / 3.5)` — intentionally over-counts to avoid overflow.
 
 ## Product Constraints and Rules
 
@@ -53,6 +67,14 @@ ManulAI is a local-first, privacy-focused coding agent for VS Code. All intellig
 - **File Editing Safety:** Prefer `replace_in_file` for surgical edits. Read the file before editing, preserve all unrelated content, and never remove content that the user did not explicitly ask to remove.
 - **Project Structure:**
   - `src/` — Extension backend and core logic.
+    - `extension.ts` — Activation and wiring.
+    - `copilotChatParticipant.ts` — VS Code Chat participant with streaming and context truncation.
+    - `settingsPanel.ts` — Activity Bar settings webview.
+    - `ollamaStreamParser.ts` — NDJSON stream parser with `<think>` reasoning extraction.
+    - `agentInstructionsReader.ts` — Reads workspace instruction files (AGENTS.md, CLAUDE.md, etc.).
+    - `skillsReader.ts` — Reads workspace skill files from `.claude/skills/` and similar directories.
+    - `modelContextConfig.ts` — Model context-window mapping and token estimation.
+    - `types.ts` — Shared types.
   - `media/` — Assets, icons, and webview HTML definitions.
 
 ## Setup for Development
@@ -69,29 +91,27 @@ Make sure you have Ollama running locally (`http://localhost:11434` by default) 
 
 ## Commands and Views
 
-- **Views:** Contributes the `manulai.chatView` webview to the Secondary Sidebar. The separate Activity Bar launcher container was removed so the extension stays focused on the right-side chat view.
-- **File Context:** Supports dropping files into the UI, or using commands like `manulai.attachActiveFile` and `manulai.attachExplorerSelection` via context menus.
-- **Dev/Test Prompt Entry:** Also contributes `manulai.devSendPrompt`, which can inject a prompt directly into the installed provider flow without typing into the webview. This is intended for local debugging and repeatable extension-level smoke tests.
-- **Configuration:** `package.json` still contributes `manulai.ollamaModel`, `manulai.ollamaBaseUrl`, `manulai.agentMode`, `manulai.autoApprove`, `manulai.debugMode`, and `manulai.systemPrompt`, but file-backed workspaces now persist the effective workspace state in `.manulai/settings.json`.
+- **Copilot Chat Participant:** ManulAI registers a VS Code Chat participant (`@manulai`) via `src/copilotChatParticipant.ts`. It streams Ollama responses into the native Chat panel, including live reasoning blocks extracted from `<think>` tags. The participant reads global VS Code settings (`manulai.ollamaModel`, `manulai.ollamaBaseUrl`, `manulai.systemPrompt`) and stores `agentMode` and `autoApprove` in `ExtensionContext.globalState`. Before each request it automatically truncates history to fit the model's context window.
+- **Agent Instructions Reader:** `src/agentInstructionsReader.ts` discovers and reads `AGENTS.md`, `CLAUDE.md`, `.github/copilot-instructions.md`, `.cursorrules`, and other instruction files from the workspace root. The content is automatically appended to the system prompt on every chat request so the model follows project-specific conventions.
+- **Skills Reader:** `src/skillsReader.ts` discovers and reads skill files from `.claude/skills/`, `skills/`, `.github/skills/`, and `.ai/skills/` directories. Each skill is a markdown file with YAML frontmatter (`name`, `description`) containing project-specific rules and guidelines. Skills are automatically injected into the system prompt alongside agent instructions.
+- **Model Context Config:** `src/modelContextConfig.ts` maps Ollama model names to their context-window sizes and provides token-estimation utilities used by the participant for automatic history truncation.
+- **Settings Panel:** A `WebviewViewProvider` (`src/settingsPanel.ts`) is registered as `manulai.settings` inside an Activity Bar container (`manulaiActivityBar`). It lets users view and update model, base URL, system prompt, and debug mode without opening `settings.json`.
+- **Configuration:** `package.json` contributes `manulai.ollamaModel`, `manulai.ollamaBaseUrl`, `manulai.debugMode`, and `manulai.systemPrompt`.
 
-## Workspace Settings Storage
+## Global State Storage
 
-- **Workspace Source Of Truth:** For a file-backed workspace, ManulAI reads and writes workspace-owned settings only from `.manulai/settings.json`.
-- **No `.vscode/settings.json` Runtime Dependency:** The provider no longer uses workspace `manulai.*` entries from `.vscode/settings.json` as its runtime fallback. Missing values fall back to built-in defaults.
-- **Migration Path:** On initialization, existing workspace-level `manulai.*` values are migrated from `.vscode/settings.json` into `.manulai/settings.json`, then the old workspace entries are cleared.
-- **No-Workspace Case:** When no file-backed workspace exists, global VS Code settings still act as the fallback store because there is no `.manulai/` folder to write into.
-- **Chat Storage:** Chat session state is stored separately from settings in `.manulai/chats.json` for file-backed workspaces, or under extension storage when there is no file-backed workspace.
+- **`agentMode`** and **`autoApprove`** are stored in `ExtensionContext.globalState`, not VS Code settings. They are toggled via chat slash commands (`/setAgentMode`, `/toggleAutoApprove`) and persist across VS Code restarts.
+- **Settings Panel** writes model, base URL, system prompt, and debug mode to global VS Code settings (`ConfigurationTarget.Global`).
+- No workspace-level `.manulai/settings.json` is used in the current architecture.
 
-Reference shape:
+Reference shape (global settings):
 
 ```json
 {
   "ollamaModel": "",
   "ollamaBaseUrl": "http://localhost:11434",
-  "agentMode": "agent",
-  "autoApprove": false,
   "debugMode": false,
-  "systemPrompt": "You are ManulAI, a privacy-first local coding assistant running inside VS Code. Work across any programming language. Prefer precise, minimal changes and explain results clearly."
+  "systemPrompt": "You are ManulAI, a privacy local coding assistant running inside VS Code. Work across any programming language. Prefer precise, minimal changes and explain results clearly."
 }
 ```
 
@@ -218,6 +238,12 @@ The practical difference between the working and non-working groups is not just 
 
 ## Release Notes
 
+- **0.0.13:** Copilot Chat participant and settings panel.
+  - **Chat participant (`src/copilotChatParticipant.ts`):** Registers `@manulai` in the native VS Code Chat panel. Streams Ollama `/api/chat` with `stream: true` via `src/ollamaStreamParser.ts`, including live `<think>` reasoning extraction. Reads global VS Code settings (`ollamaModel`, `ollamaBaseUrl`, `systemPrompt`, `agentMode`) and supports slash commands `/selectModel` and `/model`. Injects a mode-specific system-prompt suffix based on `agentMode` (chat/agent/planner) so the participant's tone matches the active mode even though it does not execute tools.
+  - **Settings panel (`src/settingsPanel.ts`):** Moved from Activity Bar to Secondary Sidebar (`manulai` container). Fetches the installed model list from Ollama `/api/tags` on load and on manual refresh, presenting a dropdown instead of a raw text input. Custom model IDs are still supported via a text fallback. Exposes model, base URL, agent mode, system prompt, auto-approve, and debug toggles. Writes only to global VS Code settings (`ConfigurationTarget.Global`).
+  - **Removed Activity Bar container:** `manulaiActivityBar` and its `manulai.settings` view were removed from `package.json`. The Settings view now lives alongside `manulai.chatView` in the Secondary Sidebar. `manulai.openSettings` opens the Secondary Sidebar and focuses the Settings view.
+  - **New files:** `src/ollamaStreamParser.ts` (NDJSON + `<think>` parsing), `src/copilotChatParticipant.ts`, `src/settingsPanel.ts`.
+  - Packaging version updated to `0.0.13`.
 - **0.0.12:** Architectural hardening and docs sync.
   - **Webview IPC safety:** `resolveWebviewView` `onDidReceiveMessage` async callback now wraps `handleWebviewMessage` in `try/catch` and checks `this.disposed` before executing, preventing unhandled Promise rejections from wedging the chat UI.
   - **Disposal completeness:** `dispose()` now resolves `pendingApprovalResolver(false)` and clears `pendingApproval`/`pendingApprovalResolver`, so awaiting callers do not hang if an approval dialog was open during teardown. It also explicitly calls `_manulBridge?.dispose()` and nulls the reference, rather than relying solely on the constructor subscription.
@@ -228,6 +254,7 @@ The practical difference between the working and non-working groups is not just 
   - **Recovery scoping:** `recoverRequestScopedCreateTargetPath` in `src/ManulAiChatProvider.ts` now short-circuits unless the current request is `currentRequestIsExplicitCreateOnly`, `currentRequestIsPreferredGreenfield`, or `isLargeRefactorScenario()`. Previously the recovery would match an extensionless write target (e.g. `.gitignore`) against a single explicit request target and silently redirect the write, overwriting the existing edit target with the model's unrelated content. Matching gate added in `scripts/debug-agent.mjs:recoverRequestScopedCreatePath`.
   - **Read-loop nudge accuracy:** Added `successfulReadOps` counter alongside `totalReadOps` in `ManulAiChatProvider`. The "you have enough context, stop reading" nudge now requires `successfulReadOps > 0`, so a model that keeps hitting `ENOENT` on a hallucinated path is not told to answer from nonexistent context. `scripts/debug-agent.mjs` gained the equivalent guard via `recentReads.length > 0`.
   - **Debug harness parity:** `scripts/debug-agent.mjs` received the same recovery gate. Two harness-only fixes also landed: the `replace_in_file` "Single-line rename without an import replacement is not a valid extraction step" rejection is now gated on `IS_SPLIT_TASK` so ordinary surgical one-line edits (`"change 'hello world' to 'hi there'"`) are no longer rejected when the task is not a split/extract flow; and the bare-mention fallback in `parseToolCallsFromText` that pushed a `read_specific_file` with `filepath: TARGET_FILE` when only the tool name appeared in text is now also gated on `IS_SPLIT_TASK`, preventing the harness from injecting an unrelated read of `src/ManulAiChatProvider.ts` into non-split sessions.
+  - **Cross-variation root-command failure detector:** Existing `failedCommandCounts` in `ManulAiChatProvider` keyed by exact normalized command string, so a model rotating flags (observed live on `qwen3-coder:30b` trying `npx tailwindcss init -p` → `npx tailwindcss init` → `npm install -g tailwindcss` against Tailwind v4 which removed the `init` CLI) bypassed the repeat guard. Added `extractCommandRootSignature()` which collapses a command to its first token or runner+subject pair — `npx <pkg>`, `npm <subcommand>`, `pnpm <subcommand>`, `yarn <subcommand>`, `bun <subcommand>`, `bunx <pkg>`, `deno <subcommand>`, `pipx <pkg>`, `pip install`, `cargo <subcommand>`, `go <subcommand>`, `docker <subcommand>`, `git <subcommand>`, `make`, `mvn <goal>`, `gradle <task>`, `dotnet <verb>`, and `brew`/`apt`/`apt-get`/`dnf`/`yum` subcommands. New `failedCommandRootCounts: Map<rootSig, { count, variations: Set, lastStderr }>` and `nudgedRootFailures: Set<rootSig>` track cross-argument failure clustering. When the same root has failed ≥2 times across ≥2 distinct command variations, a single nudge is injected telling the model to stop varying arguments and switch approach — read the package's `README.md`/`package.json` `bin` field, write the config file manually with `create_or_edit_file`, or use a different integration. Nudge fires once per root per request and is cleared on any successful execution of the same root. Both maps are also cleared at the start of every user request alongside `failedCommandCounts`. Matching implementation added to `scripts/debug-agent.mjs` with a mirrored `extractCommandRootSignature()` helper and `logEvent('repeated_command_root_failure', …)` for the debug JSONL.
   - **Documentation:** Created `CLAUDE.md` at repository root and updated `.github/copilot-instructions.md` to version `0.0.12`, adding the **Air-Gap**, **Fetch**, and **Memory** extension laws. Packaging version updated to `0.0.12`.
 - **0.0.11:** LLM interaction layer hardening in `src/ManulAiChatProvider.ts`. `fetchOllamaChatResponse` now wraps the `fetch` call in a watchdog `AbortController` with a 600-second hard cap (`OLLAMA_CHAT_TIMEOUT_MS`), linked to the caller's abort signal so a user stop still propagates. Retry budget raised from 1 to 2 with exponential backoff and jitter (`computeOllamaRetryDelay`), preserving the existing transient-error heuristics but adding three new cases: timeout-originated `AbortError` (distinguished from user-triggered stops via the caller controller), `undici` fetch-error `cause` chains (`ECONNRESET`/`ECONNREFUSED`/`EAI_AGAIN`), and HTTP 503 responses with "model is loading" style bodies. `computeOllamaRetryDelay` now takes an optional `reason` argument (`'fetch' | 'model_loading'`); the 503 branch in `fetchOllamaChatResponse` passes `'model_loading'`, switching to a longer 5s/10s/20s + jitter curve (cap 20s) instead of the short 0.5s/1s/2s curve — cold starts on 30B+ models no longer exhaust retries while Ollama is still warming weights from disk. `callOllama` gained a dedicated context-overflow branch: on HTTP 500/413 whose body matches `/context|token.{0,12}(limit|exceed)|exceed|too\s+(long|large|many)|prompt\s+is\s+too/i`, it performs an in-place emergency trim (keep leading `system` messages, halve the non-system tail, skip any leading `tool`-role boundary, strip `tool_calls` off the boundary assistant, prepend a continue-don't-restate nudge) and retries once under a fresh `AbortController` before bubbling the error. The pre-call sliding-window trim in `processOllamaResponse` was also hardened: tail-start walks forward past leading `tool` messages (unchanged) and now strips `tool_calls` off the boundary assistant when its paired `tool` responses were discarded, preventing phantom call IDs from sending the next turn into a "tool was called but never answered" state. Response bodies go through `parseOllamaChatResponse` and `parseOllamaTagsResponse` — dependency-free runtime guards that validate the shape returned by Ollama and throw a user-readable error instead of the unchecked `as OllamaResponse` casts used previously. `refreshModelCatalog` also gets a 20-second timeout (`OLLAMA_TAGS_TIMEOUT_MS`) so the model picker cannot hang the webview on a dead daemon. No runtime dependencies added — the air-gap mandate is preserved. Packaging version updated to `0.0.11`.
 - **0.0.10:** ManulEngine browser automation integration. Added `src/manulBridge.ts` as the TypeScript bridge for a bundled Python runner (`media/manul_bridge_api.py`) that launches and talks to the [ManulEngine](https://github.com/alexbeatnik/ManulEngine) runtime over newline-delimited JSON on stdin/stdout. ManulEngine (`pip install manul-engine`) is a separate Python runtime and is not the same as ManulMcpServer (the Copilot MCP bridge extension). Eight browser automation tools wired into the agent and planner tool loops: `manul_run_step`, `manul_run_goal`, `manul_scan_page`, `manul_read_page_text`, `manul_get_state`, `manul_save_hunt`, `manul_run_hunt`, `manul_run_hunt_file`. The agent and planner mandates include a full Hunt DSL reference (commands, contextual qualifiers, VERIFY-after-every-action table) and a `[MANUL SESSION COMPLETION]` rule that instructs the model to reconstruct a `.hunt` preview and propose saving after every automation session. `manul_save_hunt` is hard-gated by the latest visible user message so the model cannot write a `.hunt` file before the user explicitly asks to save it; when a save is attempted too early, the runtime returns the preview flow back to the model instead. When ManulEngine does not return a sufficiently complete proposal, the provider now reconstructs a local `.hunt` preview from successful tool results and infers VERIFY lines for navigation/click/fill/select/check actions from the recorded `page_scan` data and executed step text. `manul_get_state` and successful terminal VERIFY steps now also return `hunt_proposal` / `_nextAction` hints when executed steps already exist so the model can stop after success instead of replaying earlier steps. `manul_save_hunt` still falls back to VS Code FS write when the bridge cannot complete the save request, and that fallback is kept inside the workspace root. `scripts/debug-agent.mjs` updated in parity: all 8 tool stubs in `executeTool()`, the same confirmation-gated save rule is documented and enforced there, both mandate builders carry the DSL reference and session completion rule, Manul tools added to the text-tool section. Packaging version updated to `0.0.10`.

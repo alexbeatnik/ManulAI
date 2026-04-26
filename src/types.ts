@@ -97,7 +97,7 @@ export const DEFAULT_STORED_SETTINGS: Required<ManulAiStoredSettings> = {
   agentMode: 'agent',
   autoApprove: false,
   debugMode: false,
-  systemPrompt: 'You are ManulAI, a privacy-first local coding assistant running inside VS Code. Work across any programming language. Prefer precise, minimal changes and explain results clearly.',
+  systemPrompt: 'You are ManulAI, a privacy local coding assistant running inside VS Code. Work across any programming language. Prefer precise, minimal changes and explain results clearly.',
 };
 
 export interface ToolDefinition {
