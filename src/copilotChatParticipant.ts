@@ -40,13 +40,9 @@ export class ManulAiChatParticipant {
   }
 
   private getAutoApprove(): boolean {
-    // Agent mode defaults to auto-approve for file modifications
-    const mode = this.getAgentMode();
+    // Safety: default to false unless user explicitly enabled it
     const stored = this.globalState?.get<boolean>(ManulAiChatParticipant.AUTO_APPROVE_KEY);
-    if (stored === undefined) {
-      return mode === 'agent'; // Default: agent=true, planner/chat=false
-    }
-    return stored;
+    return stored === true;
   }
 
   private async setAutoApprove(value: boolean): Promise<void> {
@@ -71,9 +67,10 @@ export class ManulAiChatParticipant {
     if (!workspaceRoot) { return; }
     const now = new Date();
     const timestamp = now.toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    const ms = String(now.getMilliseconds()).padStart(3, '0');
     const logDir = path.join(workspaceRoot, '.manulai', 'logs');
     fs.mkdirSync(logDir, { recursive: true });
-    this.debugLogFilePath = path.join(logDir, `${timestamp}.jsonl`);
+    this.debugLogFilePath = path.join(logDir, `${timestamp}-${ms}.jsonl`);
     this.debugLog('session_start', {
       model: this.getSelectedModel(),
       agentMode: this.getAgentMode(),
@@ -345,6 +342,16 @@ export class ManulAiChatParticipant {
 
       const isAgentLike = agentMode === 'agent' || agentMode === 'planner';
 
+      // Detect description/explanation intent. For these prompts we steer the model toward
+      // doc-reading (README.md, AGENTS.md, CLAUDE.md, package.json) and forbid terminal execution
+      // — observed bug: qwen3.6:35b on "Tell me about this project" ran `node scripts/debug-agent.mjs`
+      // (a script with no purpose-fit-to-the-prompt), then read its source, then described THE SCRIPT
+      // instead of THE PROJECT, never opening README.md.
+      const userPromptForIntent = (request.prompt || '').trim();
+      const explainPattern = /\b(tell me about|describe|explain|what (?:is|are|does)|summarize|how does|what(?:'s|s)\s+this|про що|що це|опиши|розкажи|поясни)\b/i;
+      const actionPattern = /\b(create|write|add|edit|modify|change|rename|fix|delete|remove|replace|update|implement|generate|build|set up|move|extract|split|refactor|run|execute|install)\b/i;
+      const promptIsExplainOnly = explainPattern.test(userPromptForIntent) && !actionPattern.test(userPromptForIntent);
+
       if (agentMode === 'agent') {
         effectiveSystemPrompt += '\n\nYou are in Agent mode. You may read files, edit code, and run terminal commands using the tools below.';
         effectiveSystemPrompt += '\n\nCRITICAL RULES:';
@@ -353,7 +360,21 @@ export class ManulAiChatParticipant {
         effectiveSystemPrompt += '\n3. Do NOT scan the project or list files after creating/editing files unless the user asked.';
         effectiveSystemPrompt += '\n4. If the user asked to create a file — create it and STOP. Do not read it back.';
         effectiveSystemPrompt += '\n5. If the user asked to edit a file — edit it and STOP. Do not read it back.';
-        effectiveSystemPrompt += '\n6. After outputting a tool JSON, STOP. Do not write any additional text.';
+        effectiveSystemPrompt += '\n6. NEVER read the same file more than once. If you already read a file, use the information from that read.';
+        effectiveSystemPrompt += '\n7. After outputting a tool JSON, STOP. Do not write any additional text.';
+        effectiveSystemPrompt += '\n\nPLANNING PHASE (required for multi-step tasks):';
+        effectiveSystemPrompt += '\n- When the user asks for something that requires multiple tools (e.g. "scan and create", "read and edit"), FIRST output a brief 1-sentence plan, THEN execute step by step.';
+        effectiveSystemPrompt += '\n- Example: "Plan: I will scan the project structure, read the key files, then create description.md." Then call project_scan.';
+        effectiveSystemPrompt += '\n- NEVER call more than 3 tools in a single turn. If you need more, do them in the next turn.';
+        effectiveSystemPrompt += '\n- After receiving a tool result, ALWAYS state your next step in 1 sentence BEFORE calling the next tool.';
+        if (promptIsExplainOnly) {
+          effectiveSystemPrompt += '\n\nDESCRIPTION INTENT DETECTED:';
+          effectiveSystemPrompt += '\n- The user asked for a description / explanation, not for changes.';
+          effectiveSystemPrompt += '\n- Read documentation files first: README.md, AGENTS.md, CLAUDE.md, package.json. project_scan is fine. read_specific_file on those docs is fine.';
+          effectiveSystemPrompt += '\n- Do NOT call execute_terminal_command or launch_in_terminal — running scripts is not how you describe a project. They will be rejected.';
+          effectiveSystemPrompt += '\n- Do NOT read random source files unless docs are missing or insufficient. Describe THE PROJECT, not the first script you find.';
+          effectiveSystemPrompt += '\n- Once you have read the docs, produce the answer in plain text. Do not call any more tools.';
+        }
         effectiveSystemPrompt += '\n\n' + getAgentToolInstructions();
       } else if (agentMode === 'planner') {
         effectiveSystemPrompt += '\n\nYou are in Planner mode. Prefer concise, step-by-step responses. Use tools for small deliberate actions.';
@@ -405,15 +426,37 @@ export class ManulAiChatParticipant {
         messageCount: messages.length,
       });
 
+      // Verify the model exists before attempting to use it
+      const modelAvailable = await this.verifyModelAvailable(baseUrl, model);
+      if (!modelAvailable) {
+        response.markdown(
+          `**Model not found:** \`${model}\` is not available in your local Ollama.\n\n` +
+          `To fix this:\n` +
+          `1. Pull the model: \`ollama pull ${model}\`\n` +
+          `2. Or select a different model with \`@manulai /selectModel\`\n\n` +
+          `Available models: run \`ollama list\` to see what's installed.`
+        );
+        return;
+      }
+
       const abort = new AbortController();
       token.onCancellationRequested(() => abort.abort());
 
       try {
-        await this.runAgentLoop(baseUrl, model, messages, response, abort, isAgentLike);
+        await this.runAgentLoop(baseUrl, model, messages, response, abort, isAgentLike, userPrompt, promptIsExplainOnly);
       } catch (err: any) {
         this.log(`[ManulAiChatParticipant] error: ${err?.message || String(err)}`);
         this.debugLog('agent_error', { error: err?.message || String(err), stack: err?.stack || null });
-        response.markdown(`\n\n**Error:** ${err?.message || String(err)}`);
+        let errorMsg = err?.message || String(err);
+        // If it looks like an OOM, append fallback model suggestions
+        const isOom = /model failed to load|resource limitations|exit status 2/i.test(errorMsg);
+        if (isOom) {
+          const fallback = await this.getFallbackModelSuggestion(baseUrl, model);
+          if (fallback) {
+            errorMsg += fallback;
+          }
+        }
+        response.markdown(`\n\n**Error:** ${errorMsg}`);
       }
     };
   }
@@ -427,12 +470,38 @@ export class ManulAiChatParticipant {
     messages: ChatMessage[],
     response: vscode.ChatResponseStream,
     abort: AbortController,
-    isAgentLike: boolean
+    isAgentLike: boolean,
+    originalUserPrompt: string,
+    promptIsExplainOnly = false
   ): Promise<void> {
     const MAX_TURNS = 15;
     const MAX_SAME_TOOL_REPEAT = 3;
     let turnCount = 0;
     const recentToolSignatures: string[] = [];
+    const readFilesThisSession = new Set<string>();
+    let hasProjectScanned = false;
+    let consecutiveReadOrListTurns = 0;
+    let toolsExecutedAny = false;
+    let refusalNudgeFired = false;
+    // Heuristic: user prompts that expect file/tool actions. Conservative trigger words at word
+    // boundaries — should not misfire on pure questions like "explain this code".
+    const promptExpectsAction = /\b(create|write|add|edit|modify|change|rename|fix|delete|remove|replace|update|implement|generate|build|set up|move|extract|split|refactor|run)\b/i.test(originalUserPrompt);
+
+    // Extract likely target filename from user prompt
+    const extractTargetFilename = (prompt: string): string | undefined => {
+      // Match patterns like "create file.md", "write description.md", "edit config.ts"
+      const patterns = [
+        /\b(?:create|write|make|generate|build)\s+(?:a\s+|the\s+)?(?:file\s+)?[`"']?(\S+\.(?:md|txt|ts|js|py|json|yml|yaml|html|css|scss|go|rs|java|kt|cs|cpp|c|h|sh|bash|sql|xml))[`"']?/i,
+        /\b(?:edit|modify|update|fix|change)\s+(?:file\s+)?[`"']?(\S+\.(?:md|txt|ts|js|py|json|yml|yaml|html|css|scss|go|rs|java|kt|cs|cpp|c|h|sh|bash|sql|xml))[`"']?/i,
+        /[`"'](\S+\.(?:md|txt|ts|js|py|json|yml|yaml|html|css|scss|go|rs|java|kt|cs|cpp|c|h|sh|bash|sql|xml))[`"']/i,
+      ];
+      for (const p of patterns) {
+        const m = prompt.match(p);
+        if (m) { return m[1]; }
+      }
+      return undefined;
+    };
+    const targetFilename = extractTargetFilename(originalUserPrompt);
 
     while (turnCount < MAX_TURNS) {
       if (abort.signal.aborted) {
@@ -447,7 +516,7 @@ export class ManulAiChatParticipant {
       response.progress(isAgentLike ? 'Thinking…' : 'Typing…');
 
       const trimmedMessages = await this.truncateMessagesToFit(messages, model, baseUrl, abort);
-      const assistantText = await this.streamAndCollect(baseUrl, model, trimmedMessages, response, abort);
+      const assistantText = await this.streamAndCollect(baseUrl, model, trimmedMessages, response, abort, isAgentLike);
 
       if (!assistantText) {
         return;
@@ -470,6 +539,10 @@ export class ManulAiChatParticipant {
 
       if (toolCalls.length === 0) {
         // No tools — assistant gave a final answer.
+        // In agent mode the raw content was suppressed during streaming, so display it now.
+        if (cleanText && cleanText.trim()) {
+          response.markdown(`\n\n${cleanText.trim()}\n\n`);
+        }
         return;
       }
 
@@ -478,6 +551,32 @@ export class ManulAiChatParticipant {
         count: toolCalls.length,
         tools: toolCalls.map((tc) => tc.function.name),
       });
+
+      // Show the assistant's plan/thinking before executing tools
+      if (cleanText && cleanText.trim()) {
+        response.markdown(`\n\n${cleanText.trim()}\n\n`);
+      } else if (isAgentLike && toolCalls.length > 0) {
+        // Auto-generate a plan description from the tool calls
+        const planDesc = toolCalls.map((tc) => {
+          const name = tc.function.name;
+          const args = tc.function.arguments;
+          switch (name) {
+            case 'project_scan': return '🔍 Scanning project structure';
+            case 'read_specific_file':
+            case 'read_file_slice': return `📖 Reading \`${args.filepath || args.path}\``;
+            case 'list_workspace_files': return `📂 Listing files in \`${args.directory || '.'}\``;
+            case 'create_or_edit_file': return `📝 Creating \`${args.filename || args.filepath}\``;
+            case 'replace_in_file': return `✏️ Editing \`${args.filepath}\``;
+            case 'execute_terminal_command': {
+              const cmd = String(args.command ?? args.cmd ?? '');
+              return `💻 Running \`${cmd.substring(0, 60)}\``;
+            }
+            case 'delete_file': return `🗑️ Deleting \`${args.filepath || args.path}\``;
+            default: return `⚙️ ${name}`;
+          }
+        }).join('\n');
+        response.markdown(`\n\n**Next step:**\n${planDesc}\n\n`);
+      }
 
       // Add assistant message (with stripped tools) to history
       messages.push({ role: 'assistant', content: cleanText || '(tool call)' });
@@ -506,8 +605,41 @@ export class ManulAiChatParticipant {
 
       let lastToolWasWrite = false;
       let lastToolWasTerminal = false;
+      const MAX_TOOLS_PER_TURN = 3;
 
-      for (const toolCall of toolCalls) {
+      // Limit tools per turn to prevent context explosion
+      let toolsToExecute = toolCalls;
+      const droppedTools: typeof toolCalls = [];
+      if (toolCalls.length > MAX_TOOLS_PER_TURN) {
+        // Prioritize write operations; if none, just take the first N
+        const writeOps = toolCalls.filter((tc) => tc.function.name === 'create_or_edit_file' || tc.function.name === 'replace_in_file');
+        const terminalOps = toolCalls.filter((tc) => tc.function.name === 'execute_terminal_command');
+        const readOps = toolCalls.filter((tc) => tc.function.name === 'read_specific_file' || tc.function.name === 'read_file_slice' || tc.function.name === 'list_workspace_files' || tc.function.name === 'project_scan');
+        if (writeOps.length > 0) {
+          toolsToExecute = writeOps.slice(0, MAX_TOOLS_PER_TURN);
+        } else if (terminalOps.length > 0) {
+          toolsToExecute = terminalOps.slice(0, MAX_TOOLS_PER_TURN);
+        } else {
+          toolsToExecute = readOps.slice(0, MAX_TOOLS_PER_TURN);
+        }
+        droppedTools.push(...toolCalls.filter((tc) => !toolsToExecute.includes(tc)));
+        this.log(`[agent] limiting ${toolCalls.length} tools to ${toolsToExecute.length} (max ${MAX_TOOLS_PER_TURN})`);
+        this.debugLog('tools_limited', { originalCount: toolCalls.length, limitedTo: toolsToExecute.length, kept: toolsToExecute.map((tc) => tc.function.name), dropped: droppedTools.map((tc) => tc.function.name) });
+      }
+
+      // Feed back dropped tools as errors so the model knows they were skipped
+      for (const dropped of droppedTools) {
+        const dName = dropped.function.name;
+        const dArgs = dropped.function.arguments;
+        const errorMsg = `Tool "${dName}" was NOT executed because you output too many tools at once. Maximum is ${MAX_TOOLS_PER_TURN} per turn. Call it in the next turn if still needed.`;
+        messages.push({
+          role: 'tool',
+          content: JSON.stringify({ error: errorMsg, args: dArgs }),
+          tool_name: dName,
+        });
+      }
+
+      for (const toolCall of toolsToExecute) {
         if (abort.signal.aborted) {
           return;
         }
@@ -532,9 +664,49 @@ export class ManulAiChatParticipant {
           response.markdown(`\n\n**⚠️ Agent stopped:** detected an infinite loop.`);
           return;
         }
+
+        // Early nudge for repeated reads of the same file (before hitting MAX_SAME_TOOL_REPEAT)
+        if (repeatCount >= 1 && (name === 'read_specific_file' || name === 'read_file_slice')) {
+          const filePath = String(args.filepath ?? args.path ?? '');
+          const nudge = `You have already read \`${filePath}\`. Do NOT read it again. Use the information you already have to complete the user's request.`;
+          messages.push({ role: 'system', content: nudge });
+          this.log(`[agent] nudge: repeated read of ${filePath}`);
+          this.debugLog('repeated_read_nudge', { turn: turnCount, tool: name, filepath: filePath, repeatCount });
+        }
+
+        // Block redundant list_workspace_files after project_scan
+        if (name === 'list_workspace_files' && hasProjectScanned) {
+          const nudge = `You already scanned the entire project with project_scan. You do NOT need to list files again. Use the information from project_scan to complete the task.`;
+          messages.push({ role: 'system', content: nudge });
+          this.log(`[agent] blocked redundant list_workspace_files after project_scan`);
+          this.debugLog('redundant_list_blocked', { turn: turnCount, tool: name, args });
+          // Skip executing the tool, but still add a fake result so the model sees it was "done"
+          messages.push({
+            role: 'tool',
+            content: JSON.stringify({ note: 'Skipped — project_scan already provided full directory listing.' }),
+            tool_name: name,
+          });
+          continue;
+        }
+
         recentToolSignatures.push(signature);
         if (recentToolSignatures.length > 10) {
           recentToolSignatures.shift();
+        }
+
+        // Block terminal commands when the prompt is purely description/explanation. Observed:
+        // qwen3.6:35b on "Tell me about this project" ran a random script, then described THE SCRIPT
+        // instead of THE PROJECT. Reject the call so the model is forced back to doc-reading.
+        if (promptIsExplainOnly && (name === 'execute_terminal_command' || name === 'launch_in_terminal')) {
+          const blockMsg = 'Terminal commands are blocked for description/explain prompts. Read README.md, AGENTS.md, CLAUDE.md, or package.json to describe the project, then answer in plain text. Do not run scripts to introspect the project.';
+          response.markdown(`\n🚫 **Blocked** — \`${name}\`\n\n${blockMsg}\n`);
+          messages.push({
+            role: 'tool',
+            content: JSON.stringify({ error: blockMsg }),
+            tool_name: name,
+          });
+          this.debugLog('terminal_blocked_explain_intent', { turn: turnCount, tool: name, args: this.redactArgsForLog(args) });
+          continue;
         }
 
         // Show which tool is running
@@ -547,6 +719,9 @@ export class ManulAiChatParticipant {
         });
 
         const result = await executeTool(name, args);
+        if (!result.error) {
+          toolsExecutedAny = true;
+        }
 
         this.debugLog('tool_exec_result', {
           turn: turnCount,
@@ -565,12 +740,19 @@ export class ManulAiChatParticipant {
           tool_name: name,
         });
 
-        // Track if this was a write or terminal operation
+        // Track session state for smarter nudges
         if ((name === 'create_or_edit_file' || name === 'replace_in_file') && !result.error) {
           lastToolWasWrite = true;
         }
         if (name === 'execute_terminal_command' && !result.error) {
           lastToolWasTerminal = true;
+        }
+        if (name === 'read_specific_file' || name === 'read_file_slice') {
+          const fp = String(args.filepath ?? args.path ?? '');
+          if (fp) { readFilesThisSession.add(fp); }
+        }
+        if (name === 'project_scan') {
+          hasProjectScanned = true;
         }
 
         // Stream brief result to user — human-friendly formatting
@@ -607,6 +789,15 @@ export class ManulAiChatParticipant {
               response.markdown(`\n🗑️ **Deleted** \`${filePath}\`\n`);
               break;
             }
+            case 'list_workspace_files': {
+              const dir = String(args.directory ?? '.');
+              response.markdown(`\n📂 **Listed files** in \`${dir}\`\n`);
+              break;
+            }
+            case 'project_scan': {
+              response.markdown(`\n🔍 **Scanned project**\n`);
+              break;
+            }
             default:
               response.markdown(`\n✅ \`${name}\` completed\n`);
           }
@@ -625,6 +816,52 @@ export class ManulAiChatParticipant {
             // Ignore parse errors
           }
         }
+      }
+
+      // Track consecutive read/list turns for auto-bootstrap
+      const allReadsOrLists = toolCalls.every((tc) =>
+        tc.function.name === 'read_specific_file' ||
+        tc.function.name === 'read_file_slice' ||
+        tc.function.name === 'list_workspace_files' ||
+        tc.function.name === 'project_scan'
+      );
+      if (allReadsOrLists) {
+        consecutiveReadOrListTurns++;
+      } else {
+        consecutiveReadOrListTurns = 0;
+      }
+
+      // General exploration limit: after 3 consecutive read-only turns with no progress,
+      // force the model to stop exploring and just answer based on what it already knows.
+      if (consecutiveReadOrListTurns >= 3) {
+        const readFilesList = Array.from(readFilesThisSession).map(f => `- ${f}`).join('\n');
+        const answerNudge =
+          `STOP. You have been exploring the workspace for ${consecutiveReadOrListTurns} turns without making progress.` +
+          `\n\nYou have already seen:\n${readFilesList || '- project structure via project_scan'}` +
+          `\n\nDO NOT read any more files. DO NOT list files. You already have enough information.` +
+          `\n\nThe user did NOT ask you to create or edit files. They asked a QUESTION.` +
+          `\n\nAnswer the user's question in plain text NOW, using only the information you already have. No tool calls.`;
+        messages.push({ role: 'user', content: answerNudge });
+        this.log('[agent] forcing answer after excessive exploration');
+        this.debugLog('force_answer', { turn: turnCount, consecutiveReadOrListTurns, readFiles: Array.from(readFilesThisSession) });
+      }
+
+      // Auto-bootstrap: if stuck in read-only loop for 2+ turns, force a create instruction.
+      // ONLY fire when we know the target filename from the user's prompt — otherwise we
+      // have no idea what file to create and the model may hallucinate and overwrite existing code.
+      else if (consecutiveReadOrListTurns >= 2 && targetFilename) {
+        const readFilesList = Array.from(readFilesThisSession).map(f => `- ${f}`).join('\n');
+        const bootstrapNudge =
+          `STOP. You are stuck in a read loop. You have already read these files:\n${readFilesList || '- (project scanned)'}` +
+          `\n\nDO NOT read any more files. DO NOT list files. You already have all the information you need.` +
+          `\n\nThe user asked you to CREATE a file. The target file is \`${targetFilename}\`.` +
+          `\n\nOutput ONLY a create_or_edit_file tool call NOW with filename "${targetFilename}".` +
+          `\nNo text, no explanation — just the tool JSON.` +
+          `\n\nCRITICAL: You MUST use filename "${targetFilename}". Any other filename is wrong. Do NOT create any other file.`;
+        // Use user role — models pay more attention to user instructions than system nudges
+        messages.push({ role: 'user', content: bootstrapNudge });
+        this.log('[agent] auto-bootstrap: forcing create after read-only loop');
+        this.debugLog('auto_bootstrap_read_loop', { turn: turnCount, consecutiveReadOrListTurns, readFiles: Array.from(readFilesThisSession) });
       }
 
       // If the last tool was a successful write, stop the loop
@@ -658,7 +895,8 @@ export class ManulAiChatParticipant {
     model: string,
     messages: ChatMessage[],
     response: vscode.ChatResponseStream,
-    abort: AbortController
+    abort: AbortController,
+    suppressRawContent = false
   ): Promise<string> {
     let reasoningOpen = false;
     let answerStarted = false;
@@ -675,7 +913,7 @@ export class ManulAiChatParticipant {
           }
           response.markdown(chunk.reasoning.replace(/\n/g, '\n> '));
         }
-        // Stream content in real-time (for debugging / transparency)
+        // Stream content in real-time (only in chat mode; hide raw tool JSON in agent/planner)
         if (chunk.content) {
           if (reasoningOpen && !answerStarted) {
             response.markdown('\n\n');
@@ -683,7 +921,9 @@ export class ManulAiChatParticipant {
           }
           answerStarted = true;
           collectedText += chunk.content;
-          response.markdown(chunk.content);
+          if (!suppressRawContent) {
+            response.markdown(chunk.content);
+          }
         }
         if (chunk.error) {
           response.markdown(`\n\n**Error:** ${chunk.error}`);
@@ -698,6 +938,135 @@ export class ManulAiChatParticipant {
     return collectedText;
   }
 
+  /**
+   * Checks whether the requested model is installed locally via Ollama /api/tags.
+   */
+  private async verifyModelAvailable(baseUrl: string, model: string): Promise<boolean> {
+    try {
+      const res = await fetch(`${baseUrl}/api/tags`, { signal: AbortSignal.timeout(10000) });
+      if (!res.ok) { return false; }
+      const data = await res.json() as { models?: Array<{ name?: string }> };
+      const names = (data.models ?? []).map((m) => m.name ?? '');
+      return names.includes(model) || names.some((n) => n.startsWith(model + ':'));
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Suggests fallback models when the current model fails to load (usually OOM).
+   * Checks /api/tags and recommends installed smaller models.
+   */
+  private async getFallbackModelSuggestion(baseUrl: string, failedModel: string): Promise<string> {
+    const sizeMatch = failedModel.match(/:(\d+)[bm]$/i);
+    const sizeB = sizeMatch ? parseInt(sizeMatch[1], 10) : 0;
+    if (sizeB < 15) {
+      return '';
+    }
+
+    const fallbackCandidates = [
+      'qwen3-coder:8b', 'qwen3-coder:4b', 'qwen3-coder:1.7b',
+      'llama3.1:8b', 'llama3.2:3b', 'llama3.2:1b',
+      'phi4-mini:3.8b', 'gemma4:9b', 'gemma4:4b',
+    ];
+
+    try {
+      const res = await fetch(`${baseUrl}/api/tags`, { signal: AbortSignal.timeout(5000) });
+      if (!res.ok) { return ''; }
+      const data = await res.json() as { models?: Array<{ name?: string }> };
+      const installed = (data.models ?? []).map((m) => m.name ?? '');
+      const available = fallbackCandidates.filter((c) => installed.includes(c));
+
+      if (available.length > 0) {
+        return `\n\n**💡 You already have smaller models installed:**\n` +
+               available.map((m) => `- \`${m}\``).join('\n') +
+               `\n\nSwitch with: \`@manulai /selectModel\``;
+      }
+    } catch {
+      // ignore
+    }
+
+    return `\n\n**💡 Recommended smaller models:**\n` +
+           `- \`qwen3-coder:8b\` (~5 GB) — great for coding\n` +
+           `- \`llama3.1:8b\` (~5 GB) — general purpose\n` +
+           `- \`phi4-mini:3.8b\` (~2.5 GB) — lightweight\n` +
+           `\nInstall one with \`ollama pull <model>\`, then switch with \`@manulai /selectModel\`.`;
+  }
+
+  /**
+   * Fetches from Ollama with retry for model-loading transient failures.
+   * Retries on HTTP 503/500 that mention "model is loading" or "model failed to load".
+   */
+  private async fetchWithModelRetry(
+    baseUrl: string,
+    url: string,
+    body: Record<string, unknown>,
+    abortController: AbortController,
+    model: string,
+    maxRetries = 3
+  ): Promise<Response> {
+    const isModelLoadingError = (status: number, text: string): boolean => {
+      if (status !== 500 && status !== 503) { return false; }
+      const lower = text.toLowerCase();
+      return lower.includes('model failed to load') ||
+             lower.includes('model is loading') ||
+             lower.includes('loading model') ||
+             lower.includes('resource limitations');
+    };
+
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      if (abortController.signal.aborted) {
+        throw new Error('Request aborted');
+      }
+
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+        signal: abortController.signal,
+      });
+
+      if (response.ok || !isModelLoadingError(response.status, await response.clone().text())) {
+        return response;
+      }
+
+      const text = await response.text();
+      this.log(`[ollama] model loading error on attempt ${attempt + 1}/${maxRetries + 1}: HTTP ${response.status}`);
+      this.debugLog('ollama_model_loading_retry', {
+        attempt: attempt + 1,
+        maxRetries: maxRetries + 1,
+        status: response.status,
+        error: text.slice(0, 200),
+        model,
+      });
+
+      if (attempt < maxRetries) {
+        const delay = 3000 + attempt * 2000; // 3s, 5s, 7s
+        this.log(`[ollama] waiting ${delay}ms before retry…`);
+        await new Promise(resolve => setTimeout(resolve, delay));
+      } else {
+        // All retries exhausted — build a user-friendly error with fallback suggestions
+        const fallback = await this.getFallbackModelSuggestion(baseUrl, model);
+        throw new Error(
+          `Ollama could not load model "${model}" after ${maxRetries + 1} attempts.\n\n` +
+          `This usually means:\n` +
+          `• The model is too large for your available RAM/VRAM\n` +
+          `• Ollama is still downloading or unpacking the model\n` +
+          `• Another process is using the GPU\n\n` +
+          `Try:\n` +
+          `1. Run \`ollama ps\` to check loaded models\n` +
+          `2. Run \`ollama pull ${model}\` to verify the model is available\n` +
+          `3. Try a smaller model (e.g. \`phi4-mini:3.8b\` or \`llama3.1:8b\`)\n` +
+          `4. Check Ollama server logs: \`journalctl -u ollama\`` +
+          fallback
+        );
+      }
+    }
+
+    // Should never reach here, but TypeScript needs it
+    throw new Error('Unexpected end of retry loop');
+  }
+
   private async streamOllamaChat(
     baseUrl: string,
     model: string,
@@ -710,10 +1079,14 @@ export class ManulAiChatParticipant {
     abortController: AbortController
   ): Promise<void> {
     const url = `${baseUrl}/api/chat`;
-    const body = {
+    const maxTokens = getMaxPromptTokens(model);
+    const body: Record<string, unknown> = {
       model,
       messages,
       stream: true,
+      options: {
+        num_ctx: Math.min(maxTokens, 128_000),
+      },
     };
 
     this.log(`[ManulAiChatParticipant] streaming to ${url}, model=${model}`);
@@ -723,12 +1096,7 @@ export class ManulAiChatParticipant {
       url,
     });
 
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-      signal: abortController.signal,
-    });
+    const response = await this.fetchWithModelRetry(baseUrl, url, body, abortController, model);
 
     if (!response.ok) {
       const text = await response.text();
@@ -781,18 +1149,17 @@ export class ManulAiChatParticipant {
     abortController: AbortController
   ): Promise<string> {
     const url = `${baseUrl}/api/chat`;
-    const body = {
+    const maxTokens = getMaxPromptTokens(model);
+    const body: Record<string, unknown> = {
       model,
       messages,
       stream: false,
+      options: {
+        num_ctx: Math.min(maxTokens, 128_000),
+      },
     };
 
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-      signal: abortController.signal,
-    });
+    const response = await this.fetchWithModelRetry(baseUrl, url, body, abortController, model);
 
     if (!response.ok) {
       const text = await response.text();

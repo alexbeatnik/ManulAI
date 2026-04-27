@@ -15,7 +15,6 @@ export interface OllamaStreamChunk {
 export class OllamaStreamParser {
   private buffer = '';
   private isThinking = false;
-  private thinkBuffer = '';
 
   /**
    * Feed a raw chunk string (may contain partial NDJSON lines).
@@ -45,12 +44,7 @@ export class OllamaStreamParser {
 
   private parseLine(line: string): OllamaStreamChunk | null {
     if (line === '[DONE]') {
-      if (this.isThinking && this.thinkBuffer.length > 0) {
-        const flush: OllamaStreamChunk = { reasoning: this.thinkBuffer };
-        this.thinkBuffer = '';
-        this.isThinking = false;
-        return flush;
-      }
+      this.isThinking = false;
       return { done: true };
     }
 
@@ -66,12 +60,7 @@ export class OllamaStreamParser {
     }
 
     if (json.done) {
-      if (this.isThinking && this.thinkBuffer.length > 0) {
-        const flush: OllamaStreamChunk = { reasoning: this.thinkBuffer };
-        this.thinkBuffer = '';
-        this.isThinking = false;
-        return flush;
-      }
+      this.isThinking = false;
       return { done: true };
     }
 
@@ -84,6 +73,9 @@ export class OllamaStreamParser {
   }
 
   private handleRawText(text: string): OllamaStreamChunk | null {
+    // Stream reasoning AND content live — never buffer reasoning until </think>, otherwise
+    // long thinking passages leave the user staring at a static "Thinking…" placeholder until
+    // the model finally closes the tag (often 30+ s for thinking models like gemma4 / phi4).
     let output: OllamaStreamChunk | null = null;
     let i = 0;
 
@@ -109,15 +101,19 @@ export class OllamaStreamParser {
       } else {
         const endIdx = text.indexOf('</think>', i);
         if (endIdx === -1) {
-          this.thinkBuffer += text.substring(i);
+          // Emit the partial reasoning slice immediately instead of buffering until </think>.
+          const slice = text.substring(i);
+          if (slice.length > 0) {
+            output = output || {};
+            output.reasoning = (output.reasoning || '') + slice;
+          }
           break;
         } else {
-          this.thinkBuffer += text.substring(i, endIdx);
-          if (this.thinkBuffer.length > 0) {
+          const slice = text.substring(i, endIdx);
+          if (slice.length > 0) {
             output = output || {};
-            output.reasoning = (output.reasoning || '') + this.thinkBuffer;
+            output.reasoning = (output.reasoning || '') + slice;
           }
-          this.thinkBuffer = '';
           this.isThinking = false;
           i = endIdx + '</think>'.length;
         }

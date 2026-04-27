@@ -27,13 +27,15 @@ const TOOL_DESCRIPTIONS = `
 [AGENT RULES]
 
 1. ALWAYS respond in the SAME LANGUAGE as the user's prompt.
-2. BEFORE creating or editing files, ALWAYS read the relevant files first to understand the project structure.
+2. NEVER read files unless you genuinely need information to complete the task. Do NOT read package.json "just in case".
 3. Use project_scan() or list_workspace_files() to explore the workspace before making changes.
 4. NEVER output explanations before tool calls — just call the tool immediately.
 5. NEVER wrap tool JSON in markdown code blocks (no \`\`\`json).
 6. STOP immediately after completing the user's request. Do NOT verify, check, or read back created/edited files.
 7. Do NOT scan the project after completing the task unless explicitly asked.
 8. After outputting a tool JSON, STOP. Do not write any additional text, explanations, or thinking.
+9. NEVER read the same file more than once. If you already read a file, use the information you already have.
+10. NEVER call more than 3 tools in a single turn. If you need more, do them in the next turn.
 
 [TOOL FORMAT]
 
@@ -89,7 +91,8 @@ const TOOL_NAME_ALIASES: Record<string, string> = {
 };
 
 function normalizeToolName(name: string): string {
-  return TOOL_NAME_ALIASES[name.toLowerCase().trim()] ?? name;
+  const cleaned = name.toLowerCase().trim().replace(/\(\)\s*$/, ''); // strip trailing ()
+  return TOOL_NAME_ALIASES[cleaned] ?? cleaned;
 }
 
 export function getAgentToolInstructions(): string {
@@ -169,6 +172,9 @@ export function stripToolCallsFromText(text: string): string {
     .replace(/\{\s*"tool"\s*:\s*"[^"]+"\s*,\s*"parameters"\s*:\s*\{[\s\S]*?\}\s*\}/g, '')
     // Remove flat format JSON
     .replace(/\{\s*"tool"\s*:\s*"[^"]+"\s*,\s*"[^"]+"\s*:\s*"[^"]*"[\s\S]*?\}\s*\}/g, '')
+    // Remove stray ChatML tokens and reasoning tags
+    .replace(/<\/?think>/gi, '')
+    .replace(/<\|im_(?:start|end)\|>[a-zA-Z]*\n?/g, '')
     .trim();
 }
 
@@ -191,11 +197,21 @@ export async function executeTool(
           args.startLine as number | undefined,
           args.endLine as number | undefined
         );
-      case 'create_or_edit_file':
+      case 'create_or_edit_file': {
+        // Reject if the model omitted the content key entirely. Coercing missing content to ""
+        // silently truncates the target file and lets the model claim success on a destroyed target.
+        // Empty files are still allowed when the model passes content: "" explicitly.
+        if (!('content' in args)) {
+          return { content: '', error: `create_or_edit_file requires a 'content' field. To create an empty file pass content: "" explicitly. Re-issue the call with the file's full content.` };
+        }
+        if (typeof args.content !== 'string') {
+          return { content: '', error: `create_or_edit_file 'content' must be a string, got ${typeof args.content}.` };
+        }
         return await toolCreateOrEditFile(
           String(args.filename ?? args.filepath ?? args.path ?? ''),
-          String(args.content ?? '')
+          args.content
         );
+      }
       case 'replace_in_file':
         return await toolReplaceInFile(
           String(args.filepath ?? args.path ?? ''),
@@ -292,13 +308,21 @@ async function toolCreateOrEditFile(filename: string, content: string): Promise<
     return { content: '', error: `Write blocked for safety: ${blocked.reason}` };
   }
   const uri = resolveWorkspaceUri(filename, true);
+  let existed = false;
+  try {
+    await vscode.workspace.fs.stat(uri);
+    existed = true;
+  } catch {
+    existed = false;
+  }
   try {
     await vscode.workspace.fs.writeFile(uri, Buffer.from(content, 'utf8'));
     return {
       content: JSON.stringify({
         path: uri.fsPath,
-        action: 'created_or_overwritten',
+        action: existed ? 'overwritten' : 'created',
         length: content.length,
+        existed,
       }),
     };
   } catch (err) {
@@ -321,12 +345,23 @@ async function toolReplaceInFile(
   if (!oldText) {
     return { content: '', error: 'old_text is required.' };
   }
+  // Block no-op replaces — identical old/new makes no change and is almost always a model mistake.
+  if (oldText === newText) {
+    return { content: '', error: 'old_text and new_text are identical — this would make no change to the file.' };
+  }
   const uri = resolveWorkspaceUri(filepath);
   try {
     const bytes = await vscode.workspace.fs.readFile(uri);
     const content = Buffer.from(bytes).toString('utf8');
-    if (!content.includes(oldText)) {
-      return { content: '', error: `old_text not found in file: ${filepath}` };
+    const occurrences = content.split(oldText).length - 1;
+    if (occurrences === 0) {
+      return { content: '', error: `old_text not found in file: ${filepath}. Make sure it matches exactly, including whitespace and indentation.` };
+    }
+    // Refuse multi-match unless the model is explicitly using the entire file — otherwise a
+    // wrong choice of old_text (e.g. matching `return 1` in both branches of an if/else) silently
+    // corrupts unrelated code on the assumption that the first occurrence was the intended one.
+    if (occurrences > 1) {
+      return { content: '', error: `old_text matched ${occurrences} times in ${filepath}. Add more surrounding context so it matches exactly once.` };
     }
     const updated = content.replace(oldText, newText);
     await vscode.workspace.fs.writeFile(uri, Buffer.from(updated, 'utf8'));
