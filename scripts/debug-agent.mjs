@@ -730,15 +730,17 @@ async function runAgent() {
       consecutiveReadOrListTurns = 0;
     }
 
-    // Auto-bootstrap: if stuck in read-only loop for 2+ turns, force a create instruction
-    if (consecutiveReadOrListTurns >= 2) {
+    // Auto-bootstrap: if stuck in read-only loop for 2+ turns, force a create instruction.
+    // ONLY fire when we know the target filename from the user's prompt.
+    if (consecutiveReadOrListTurns >= 2 && targetFilename) {
       const readFilesList = Array.from(readFilesThisSession).map(f => `- ${f}`).join('\n');
-      const fileHint = targetFilename ? ` The target file is \`${targetFilename}\`.` : '';
       const bootstrapNudge =
         `STOP. You are stuck in a read loop. You have already read these files:\n${readFilesList || '- (project scanned)'}` +
         `\n\nDO NOT read any more files. DO NOT list files. You already have all the information you need.` +
-        `\n\nThe user asked you to CREATE a file.${fileHint} Output ONLY a create_or_edit_file tool call NOW with the correct filename. No text, no explanation — just the tool JSON.` +
-        (targetFilename ? `\n\nCRITICAL: You MUST use filename "${targetFilename}". Any other filename is wrong. Do NOT create any other file.` : '');
+        `\n\nThe user asked you to CREATE a file. The target file is \`${targetFilename}\`.` +
+        `\n\nOutput ONLY a create_or_edit_file tool call NOW with filename "${targetFilename}".` +
+        `\nNo text, no explanation — just the tool JSON.` +
+        `\n\nCRITICAL: You MUST use filename "${targetFilename}". Any other filename is wrong. Do NOT create any other file.`;
       messages.push({ role: 'user', content: bootstrapNudge });
       label(Y, 'BOOTSTRAP', 'forcing create after read-only loop');
       logEvent('auto_bootstrap_read_loop', { turn, consecutiveReadOrListTurns, readFiles: Array.from(readFilesThisSession) });

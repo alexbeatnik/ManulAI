@@ -522,20 +522,11 @@ export class ManulAiChatParticipant {
       const cleanText = stripToolCallsFromText(assistantText);
 
       if (toolCalls.length === 0) {
-        // Refusal-style response: the user asked for an action but the model produced narrative
-        // without executing a single tool. Nudge once before accepting it as a final answer.
-        if (promptExpectsAction && !toolsExecutedAny && !refusalNudgeFired) {
-          refusalNudgeFired = true;
-          this.debugLog('refusal_nudge', { turn: turnCount, contentPreview: assistantText.slice(0, 400) });
-          messages.push({ role: 'assistant', content: cleanText || '(no tool call)' });
-          messages.push({
-            role: 'user',
-            content:
-              'You answered with prose, but this task requires you to actually call tools to read or modify files in this workspace. The files exist and the tools work — you have access. Do not describe hypothetical changes. Call the appropriate tool now (e.g. read_specific_file, replace_in_file, create_or_edit_file).',
-          });
-          continue;
-        }
         // No tools — assistant gave a final answer.
+        // In agent mode the raw content was suppressed during streaming, so display it now.
+        if (cleanText && cleanText.trim()) {
+          response.markdown(`\n\n${cleanText.trim()}\n\n`);
+        }
         return;
       }
 
@@ -809,15 +800,18 @@ export class ManulAiChatParticipant {
         consecutiveReadOrListTurns = 0;
       }
 
-      // Auto-bootstrap: if stuck in read-only loop for 2+ turns, force a create instruction
-      if (consecutiveReadOrListTurns >= 2) {
+      // Auto-bootstrap: if stuck in read-only loop for 2+ turns, force a create instruction.
+      // ONLY fire when we know the target filename from the user's prompt — otherwise we
+      // have no idea what file to create and the model may hallucinate and overwrite existing code.
+      if (consecutiveReadOrListTurns >= 2 && targetFilename) {
         const readFilesList = Array.from(readFilesThisSession).map(f => `- ${f}`).join('\n');
-        const fileHint = targetFilename ? ` The target file is \`${targetFilename}\`.` : '';
         const bootstrapNudge =
           `STOP. You are stuck in a read loop. You have already read these files:\n${readFilesList || '- (project scanned)'}` +
           `\n\nDO NOT read any more files. DO NOT list files. You already have all the information you need.` +
-          `\n\nThe user asked you to CREATE a file.${fileHint} Output ONLY a create_or_edit_file tool call NOW with the correct filename. No text, no explanation — just the tool JSON.` +
-          (targetFilename ? `\n\nCRITICAL: You MUST use filename "${targetFilename}". Any other filename is wrong. Do NOT create any other file.` : '');
+          `\n\nThe user asked you to CREATE a file. The target file is \`${targetFilename}\`.` +
+          `\n\nOutput ONLY a create_or_edit_file tool call NOW with filename "${targetFilename}".` +
+          `\nNo text, no explanation — just the tool JSON.` +
+          `\n\nCRITICAL: You MUST use filename "${targetFilename}". Any other filename is wrong. Do NOT create any other file.`;
         // Use user role — models pay more attention to user instructions than system nudges
         messages.push({ role: 'user', content: bootstrapNudge });
         this.log('[agent] auto-bootstrap: forcing create after read-only loop');
