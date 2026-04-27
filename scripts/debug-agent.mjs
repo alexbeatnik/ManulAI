@@ -730,9 +730,22 @@ async function runAgent() {
       consecutiveReadOrListTurns = 0;
     }
 
+    // General exploration limit: after 3 consecutive read-only turns, force an answer
+    if (consecutiveReadOrListTurns >= 3) {
+      const readFilesList = Array.from(readFilesThisSession).map(f => `- ${f}`).join('\n');
+      const answerNudge =
+        `STOP. You have been exploring the workspace for ${consecutiveReadOrListTurns} turns without making progress.` +
+        `\n\nYou have already seen:\n${readFilesList || '- project structure via project_scan'}` +
+        `\n\nDO NOT read any more files. DO NOT list files. You already have enough information.` +
+        `\n\nThe user did NOT ask you to create or edit files. They asked a QUESTION.` +
+        `\n\nAnswer the user's question in plain text NOW, using only the information you already have. No tool calls.`;
+      messages.push({ role: 'user', content: answerNudge });
+      label(Y, 'FORCE ANSWER', 'stopping exploration after 3+ read-only turns');
+      logEvent('force_answer', { turn, consecutiveReadOrListTurns, readFiles: Array.from(readFilesThisSession) });
+    }
     // Auto-bootstrap: if stuck in read-only loop for 2+ turns, force a create instruction.
     // ONLY fire when we know the target filename from the user's prompt.
-    if (consecutiveReadOrListTurns >= 2 && targetFilename) {
+    else if (consecutiveReadOrListTurns >= 2 && targetFilename) {
       const readFilesList = Array.from(readFilesThisSession).map(f => `- ${f}`).join('\n');
       const bootstrapNudge =
         `STOP. You are stuck in a read loop. You have already read these files:\n${readFilesList || '- (project scanned)'}` +
