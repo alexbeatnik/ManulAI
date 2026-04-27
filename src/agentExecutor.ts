@@ -191,11 +191,21 @@ export async function executeTool(
           args.startLine as number | undefined,
           args.endLine as number | undefined
         );
-      case 'create_or_edit_file':
+      case 'create_or_edit_file': {
+        // Reject if the model omitted the content key entirely. Coercing missing content to ""
+        // silently truncates the target file and lets the model claim success on a destroyed target.
+        // Empty files are still allowed when the model passes content: "" explicitly.
+        if (!('content' in args)) {
+          return { content: '', error: `create_or_edit_file requires a 'content' field. To create an empty file pass content: "" explicitly. Re-issue the call with the file's full content.` };
+        }
+        if (typeof args.content !== 'string') {
+          return { content: '', error: `create_or_edit_file 'content' must be a string, got ${typeof args.content}.` };
+        }
         return await toolCreateOrEditFile(
           String(args.filename ?? args.filepath ?? args.path ?? ''),
-          String(args.content ?? '')
+          args.content
         );
+      }
       case 'replace_in_file':
         return await toolReplaceInFile(
           String(args.filepath ?? args.path ?? ''),

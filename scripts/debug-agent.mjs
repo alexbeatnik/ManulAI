@@ -227,44 +227,100 @@ async function streamOllamaResponse(messages) {
 }
 
 // ─── Tool Call Parsing (robust — handles malformed model output) ─────────
+// Brace-balanced JSON extractor (mirrors providerToolParsingUtils.extractBalancedJson).
+// Tracks string state so braces inside string values do not affect depth.
+function extractBalancedJson(text, startIndex) {
+  let depth = 0;
+  let inString = false;
+  let stringChar = '';
+  let escape = false;
+  for (let index = startIndex; index < text.length; index += 1) {
+    const char = text[index];
+    if (escape) { escape = false; continue; }
+    if (char === '\\' && inString) { escape = true; continue; }
+    if ((char === '"' || char === "'") && (!inString || char === stringChar)) {
+      if (inString) { inString = false; stringChar = ''; }
+      else { inString = true; stringChar = char; }
+      continue;
+    }
+    if (inString) continue;
+    if (char === '{') depth += 1;
+    else if (char === '}') {
+      depth -= 1;
+      if (depth === 0) return { json: text.slice(startIndex, index + 1), endIndex: index + 1 };
+    }
+  }
+  return undefined;
+}
+
+const KNOWN_TOOL_NAMES = new Set([
+  'create_or_edit_file', 'replace_in_file', 'read_specific_file', 'read_file_slice',
+  'read_active_file', 'list_workspace_files', 'execute_terminal_command', 'launch_in_terminal',
+]);
+
+function findToolStarts(text) {
+  const starts = [];
+  // Canonical {"tool": "name", ...}
+  const reCanonical = /\{\s*"tool"\s*:/g;
+  let m;
+  while ((m = reCanonical.exec(text)) !== null) starts.push(m.index);
+  // Alt shape used by weak models: {"tool_name": { ... }} where the key is the tool itself.
+  const reAlt = /\{\s*"([a-z_]+)"\s*:\s*\{/g;
+  while ((m = reAlt.exec(text)) !== null) {
+    if (KNOWN_TOOL_NAMES.has(m[1])) starts.push(m.index);
+  }
+  return [...new Set(starts)].sort((a, b) => a - b);
+}
+
 function extractToolCalls(text) {
   const results = [];
+  const seen = new Set();
+  for (const start of findToolStarts(text)) {
+    const balanced = extractBalancedJson(text, start);
+    if (!balanced) continue;
+    let parsed;
+    try { parsed = JSON.parse(balanced.json); } catch { continue; }
+    if (!parsed || typeof parsed !== 'object') continue;
 
-  // Pattern 1: Correct format {"tool": "name", "args": {...}}
-  const correctRegex = /\{\s*"tool"\s*:\s*"([^"]+)"\s*,\s*"args"\s*:\s*(\{[\s\S]*?\})\s*\}/g;
-  let match;
-  while ((match = correctRegex.exec(text)) !== null) {
-    try {
-      results.push({ name: match[1], args: JSON.parse(match[2]) });
-    } catch { /* ignore invalid JSON */ }
-  }
-
-  // Pattern 2: Malformed flat format {"tool": "name", "filepath": "...", ...}
-  // (models like gemma4 sometimes put args directly in the object)
-  const flatRegex = /\{\s*"tool"\s*:\s*"([^"]+)"\s*,\s*"([^"]+)"\s*:/g;
-  let flatMatch;
-  const seen = new Set(results.map(r => JSON.stringify(r)));
-  while ((flatMatch = flatRegex.exec(text)) !== null) {
-    if (flatMatch[2] === 'args') continue; // Already handled by pattern 1
-    try {
-      const fullMatch = text.slice(flatMatch.index).match(/^\{[\s\S]*?\}/);
-      if (!fullMatch) continue;
-      const parsed = JSON.parse(fullMatch[0]);
-      const { tool, ...args } = parsed;
-      const entry = { name: tool, args };
-      const key = JSON.stringify(entry);
-      if (!seen.has(key)) {
-        seen.add(key);
-        results.push(entry);
+    let entry;
+    if (typeof parsed.tool === 'string') {
+      if (parsed.args && typeof parsed.args === 'object') {
+        entry = { name: parsed.tool, args: parsed.args };
+      } else {
+        const { tool, ...rest } = parsed;
+        entry = { name: tool, args: rest };
       }
-    } catch { /* ignore invalid JSON */ }
-  }
+    } else {
+      // Alt shape: {"<tool_name>": {<args>}}
+      const keys = Object.keys(parsed);
+      const toolKey = keys.find(k => KNOWN_TOOL_NAMES.has(k));
+      if (!toolKey) continue;
+      const inner = parsed[toolKey];
+      if (!inner || typeof inner !== 'object') continue;
+      entry = { name: toolKey, args: inner };
+    }
 
+    const key = JSON.stringify(entry);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    results.push(entry);
+  }
   return results;
 }
 
 function stripToolCalls(text) {
-  return text.replace(/\{\s*"tool"\s*:\s*"[^"]+"\s*,\s*"args"\s*:\s*\{[\s\S]*?\}\s*\}/g, '').trim();
+  let result = '';
+  let cursor = 0;
+  for (const start of findToolStarts(text)) {
+    if (start < cursor) continue;
+    const balanced = extractBalancedJson(text, start);
+    if (!balanced) continue;
+    result += text.slice(cursor, start);
+    cursor = balanced.endIndex;
+  }
+  result += text.slice(cursor);
+  // Strip surrounding markdown fences left over after removing the JSON inside them.
+  return result.replace(/```(?:json|tool|tool_call)?\s*```/gi, '').trim();
 }
 
 // ─── Tool Execution (mirrors agentExecutor.ts) ──────────────────────────
@@ -312,20 +368,47 @@ async function executeTool(name, args) {
       }
       case 'create_or_edit_file': {
         const fp = resolveUri(String(args.filename ?? args.filepath ?? ''));
-        if (!isBlockedCommand(fp)) {
-          writeFileSync(fp, String(args.content ?? ''), 'utf8');
+        // Reject if content key is missing entirely — silently writing an empty file
+        // when the model just forgot to include content corrupts the file and lets the
+        // model claim success on a destroyed target.
+        if (!('content' in args)) {
+          return { content: '', error: `create_or_edit_file requires a 'content' field. To create an empty file pass content: "" explicitly. Re-issue the call with the file's full content.` };
         }
-        return { content: JSON.stringify({ path: fp, action: 'created_or_overwritten' }) };
+        if (typeof args.content !== 'string') {
+          return { content: '', error: `create_or_edit_file 'content' must be a string, got ${typeof args.content}.` };
+        }
+        if (!isBlockedCommand(fp)) {
+          writeFileSync(fp, args.content, 'utf8');
+        }
+        return { content: JSON.stringify({ path: fp, action: 'created_or_overwritten', bytes: args.content.length }) };
       }
       case 'replace_in_file': {
         const fp = resolveUri(String(args.filepath ?? ''));
         const content = readFileSync(fp, 'utf8');
         const oldText = String(args.old_text ?? '');
-        if (!content.includes(oldText)) {
-          return { content: '', error: `old_text not found in ${fp}` };
-        }
-        writeFileSync(fp, content.replace(oldText, String(args.new_text ?? '')), 'utf8');
-        return { content: JSON.stringify({ path: fp, action: 'replaced' }) };
+        const newText = String(args.new_text ?? '');
+        if (!oldText) return { content: '', error: 'old_text is required' };
+        // Count occurrences without regex (avoids escaping headaches).
+        let occurrences = 0;
+        let cursor = 0;
+        while ((cursor = content.indexOf(oldText, cursor)) !== -1) { occurrences += 1; cursor += oldText.length; }
+        if (occurrences === 0) return { content: '', error: `old_text not found in ${fp}` };
+        const replaceAll = args.all === true || args.replace_all === true;
+        const updated = replaceAll ? content.split(oldText).join(newText) : content.replace(oldText, newText);
+        writeFileSync(fp, updated, 'utf8');
+        const replaced = replaceAll ? occurrences : 1;
+        const remaining = occurrences - replaced;
+        return {
+          content: JSON.stringify({
+            path: fp,
+            action: 'replaced',
+            replaced,
+            remaining,
+            note: remaining > 0
+              ? `old_text appears ${occurrences} time(s) in this file. Replaced ${replaced}; ${remaining} occurrence(s) remain. Call replace_in_file again with the same old_text (or pass "all": true) to replace more.`
+              : undefined,
+          }),
+        };
       }
       case 'execute_terminal_command': {
         const cmd = String(args.command ?? args.cmd ?? '').trim();
@@ -404,8 +487,21 @@ async function runAgent() {
   ];
 
   const isAgentLike = MODE === 'agent' || MODE === 'planner';
+  let consecutiveMalformed = 0;
+  const MAX_CONSECUTIVE_MALFORMED = 3;
+  const toolCallCounts = new Map(); // signature -> count
+  const MAX_DUPLICATE_TOOL_CALLS = 2; // bail when the same call repeats this many times after the first
+  let lastTurnFullyCompleted = false;
+  let completedTurns = 0;
+  let refusalNudgeFired = false;
+
+  // Heuristic: does the user prompt expect file/tool actions?
+  // Trigger words at word boundaries — keep this conservative to avoid misfiring on questions.
+  const promptExpectsAction = /\b(create|write|add|edit|modify|change|rename|fix|delete|remove|replace|update|implement|generate|build|set up|move|extract|split|refactor|run)\b/i.test(userPrompt);
 
   for (let turn = 1; turn <= MAX_TURNS; turn++) {
+    completedTurns = turn;
+    lastTurnFullyCompleted = false;
     label(C, `TURN ${turn}/${MAX_TURNS}`, 'Calling Ollama...');
     logEvent('turn_start', { turn, messageCount: messages.length });
 
@@ -440,7 +536,64 @@ async function runAgent() {
     const cleanText = stripToolCalls(assistantText);
 
     if (toolCalls.length === 0) {
+      // Detect malformed tool-call JSON (model tried to call a tool but the JSON is invalid).
+      // Per CLAUDE.md: reject leaked/malformed tool-call payloads and nudge instead of treating them as a final answer.
+      const toolStarts = findToolStarts(assistantText);
+      const looksLikeMalformedTool =
+        toolStarts.length > 0 ||
+        /```\s*(json|tool|tool_call)/i.test(assistantText) ||
+        /"tool"\s*:\s*"/.test(assistantText);
+      if (looksLikeMalformedTool) {
+        consecutiveMalformed += 1;
+        label(R, 'MALFORMED', `Model emitted tool-shaped text that did not parse (${toolStarts.length} starts, ${assistantText.length} chars, streak=${consecutiveMalformed})`);
+        logEvent('malformed_tool_call', { turn, streak: consecutiveMalformed, content: assistantText.slice(0, 400) });
+        if (consecutiveMalformed >= MAX_CONSECUTIVE_MALFORMED) {
+          label(R, 'BAIL', `Aborting: ${consecutiveMalformed} consecutive malformed tool calls — model cannot recover`);
+          logEvent('bail_malformed', { turn });
+          break;
+        }
+        messages.push({ role: 'assistant', content: cleanText || '(malformed tool call)' });
+        messages.push({
+          role: 'user',
+          content:
+            'Your last response contained tool-call-shaped text but the JSON was invalid (bad escapes, mismatched quotes, or missing colons). Emit exactly ONE valid tool call now. Do NOT wrap it in markdown fences. Do NOT include extra prose. Use the format {"tool": "name", "args": {"key": "value"}}. Strings inside "content" must use \\n for newlines, escape every " inside the string as \\", and never embed an unescaped { or } that breaks JSON.'
+        });
+        continue;
+      }
+
+      // Refusal-style response: the user asked for an action and the model produced narrative
+      // without a single tool call. Nudge once before accepting the response as a final answer.
+      const noToolsExecutedYet = toolCallCounts.size === 0;
+      if (promptExpectsAction && noToolsExecutedYet && !refusalNudgeFired) {
+        refusalNudgeFired = true;
+        label(R, 'REFUSAL', `Model returned narrative for an action-required prompt without calling any tool (turn ${turn}). Nudging once.`);
+        logEvent('refusal_nudge', { turn, content: assistantText.slice(0, 400) });
+        messages.push({ role: 'assistant', content: cleanText || '(no tool call)' });
+        messages.push({
+          role: 'user',
+          content:
+            'You answered with prose, but this task requires you to actually call tools to read or modify files in this workspace. The files exist and the tools work — you have access. Do not describe hypothetical changes. Call the appropriate tool now (e.g. read_specific_file, replace_in_file, create_or_edit_file). Output only the tool call JSON.'
+        });
+        continue;
+      }
       label(G, 'DONE', 'No tool calls — task complete');
+      break;
+    }
+    consecutiveMalformed = 0;
+
+    // Detect duplicate-write loops: same tool + identical args called repeatedly.
+    // Common with mid/large models that "redo" a successful write instead of producing a final answer.
+    const duplicateSignatures = [];
+    for (const tool of toolCalls) {
+      const sig = `${tool.name}::${JSON.stringify(tool.args)}`;
+      const count = (toolCallCounts.get(sig) ?? 0) + 1;
+      toolCallCounts.set(sig, count);
+      if (count > MAX_DUPLICATE_TOOL_CALLS) duplicateSignatures.push({ sig, count });
+    }
+    if (duplicateSignatures.length > 0) {
+      const { sig, count } = duplicateSignatures[0];
+      label(R, 'BAIL', `Aborting: identical tool call repeated ${count}× — duplicate-write loop (${sig.slice(0, 60)}...)`);
+      logEvent('bail_duplicate_tool_call', { turn, signature: sig, count });
       break;
     }
 
@@ -468,14 +621,15 @@ async function runAgent() {
         content: result.error ? JSON.stringify({ error: result.error }) : result.content,
       });
     }
+    lastTurnFullyCompleted = true;
   }
 
-  if (messages.length > MAX_TURNS) {
+  if (lastTurnFullyCompleted && completedTurns === MAX_TURNS) {
     label(R, 'STOP', `Max turns (${MAX_TURNS}) reached`);
   }
 
-  logEvent('session_end', { totalMessages: messages.length });
-  label(B, 'SUMMARY', `Turns: ${Math.min(MAX_TURNS, messages.length)} | Log: ${LOG_FILE}`);
+  logEvent('session_end', { totalMessages: messages.length, completedTurns });
+  label(B, 'SUMMARY', `Turns: ${completedTurns} | Log: ${LOG_FILE}`);
 }
 
 runAgent().catch(err => {
