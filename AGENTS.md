@@ -36,16 +36,16 @@ code --install-extension manulai-local-agent-*.vsix
 
 ```
 src/
-  extension.ts              # Activation, command registration, participant + settings wiring
-  copilotChatParticipant.ts # VS Code Chat participant (@manulai) for native Chat panel
-  settingsPanel.ts          # Activity Bar settings webview (model picker with /api/tags fetch)
-  ollamaStreamParser.ts     # NDJSON stream parser with <think> reasoning extraction
+  extension.ts               # Activation, command registration, participant + settings wiring
+  copilotChatParticipant.ts  # VS Code Chat participant (@manulai), agent loop, refusal/tool-cap/read-loop guards
+  agentExecutor.ts           # Tool dispatch table (read/edit/terminal/list/scan), safety guards
+  settingsPanel.ts           # Activity Bar settings webview (model picker with /api/tags fetch)
+  ollamaStreamParser.ts      # NDJSON stream parser with <think> reasoning extraction
   agentInstructionsReader.ts # Reads AGENTS.md, CLAUDE.md, etc. from workspace
-  skillsReader.ts           # Reads skill files from .claude/skills/ and similar directories
-  modelContextConfig.ts     # Model context-window mapping and automatic history truncation
-  types.ts                  # Shared types
+  skillsReader.ts            # Reads skill files from .claude/skills/ and similar directories
+  modelContextConfig.ts      # Model context-window mapping and automatic history truncation
 media/
-  manulai-icon.svg          # Extension icon
+  manulai-icon.svg           # Extension icon
 ```
 
 ### Chat Surface
@@ -53,10 +53,10 @@ media/
 ManulAI exposes a **single chat surface**: the **Copilot Chat Participant** (`@manulai`).
 
 - It streams Ollama responses into the native VS Code Chat panel.
-- Supports slash commands: `/selectModel`, `/model`, `/setAgentMode`, `/toggleAutoApprove`.
-- Reads global VS Code settings: `ollamaModel`, `ollamaBaseUrl`, `systemPrompt`.
-- `agentMode` and `autoApprove` are stored in `ExtensionContext.globalState`, toggled via `/setAgentMode` and `/toggleAutoApprove`.
-- Implemented by `copilotChatParticipant.ts`.
+- Slash commands: `/selectModel`, `/model`, `/setAgentMode`, `/toggleAutoApprove`, `/instructions`, `/skills`.
+- Reads global VS Code settings: `ollamaModel`, `ollamaBaseUrl`, `systemPrompt`, `debugMode`.
+- `agentMode` and `autoApprove` are stored in `ExtensionContext.globalState` (NOT in VS Code settings), toggled via `/setAgentMode` and `/toggleAutoApprove`. Storage keys: `manulai.agentModeState`, `manulai.autoApproveState`.
+- Implemented by `copilotChatParticipant.ts`. Tool execution lives in `agentExecutor.ts`.
 
 ### Settings Panel
 

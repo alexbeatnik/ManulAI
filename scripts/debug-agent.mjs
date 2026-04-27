@@ -587,10 +587,37 @@ async function runAgent() {
     }
     consecutiveMalformed = 0;
 
-    // Detect duplicate-write loops: same tool + identical args called repeatedly.
+    // De-duplicate tool calls WITHIN this turn — some models emit the same call twice
+    // back-to-back when they enter a "list everything" mode. We only need to run it once
+    // before the duplicate-loop guard counts it across turns.
+    const seenInTurn = new Set();
+    const dedupedToolCalls = [];
+    for (const tool of toolCalls) {
+      const sig = `${tool.name}::${JSON.stringify(tool.args)}`;
+      if (seenInTurn.has(sig)) continue;
+      seenInTurn.add(sig);
+      dedupedToolCalls.push(tool);
+    }
+
+    // Cap tools per turn so a single response that emits 20+ read calls (observed with
+    // qwen3-coder:30b on broad "scan and explain" prompts) does not blow up context. Mirrors the
+    // live agent loop's MAX_TOOLS_PER_TURN guard. Prioritise writes/terminal over reads.
+    const MAX_TOOLS_PER_TURN = 3;
+    let prioritisedToolCalls = dedupedToolCalls;
+    if (dedupedToolCalls.length > MAX_TOOLS_PER_TURN) {
+      const writes = dedupedToolCalls.filter(t => /create_or_edit_file|write_to_file|replace_in_file|delete_file/.test(t.name));
+      const terminal = dedupedToolCalls.filter(t => /execute_terminal_command|launch_in_terminal/.test(t.name));
+      const reads = dedupedToolCalls.filter(t => !writes.includes(t) && !terminal.includes(t));
+      prioritisedToolCalls = [...writes, ...terminal, ...reads].slice(0, MAX_TOOLS_PER_TURN);
+      const dropped = dedupedToolCalls.length - prioritisedToolCalls.length;
+      label(Y, 'CAP', `Capping ${dedupedToolCalls.length} tool calls to ${MAX_TOOLS_PER_TURN}; dropped ${dropped} (writes prioritised, then terminal, then reads).`);
+      logEvent('tool_cap_applied', { turn, requested: dedupedToolCalls.length, executed: prioritisedToolCalls.length });
+    }
+
+    // Detect duplicate-write loops: same tool + identical args called repeatedly across turns.
     // Common with mid/large models that "redo" a successful write instead of producing a final answer.
     const duplicateSignatures = [];
-    for (const tool of toolCalls) {
+    for (const tool of prioritisedToolCalls) {
       const sig = `${tool.name}::${JSON.stringify(tool.args)}`;
       const count = (toolCallCounts.get(sig) ?? 0) + 1;
       toolCallCounts.set(sig, count);
@@ -606,10 +633,11 @@ async function runAgent() {
     // Add assistant message to history
     messages.push({ role: 'assistant', content: cleanText || '(tool call)' });
 
-    label(Y, 'TOOLS', toolCalls.map(t => t.name).join(', '));
+    const toolCallsToRun = prioritisedToolCalls;
+    label(Y, 'TOOLS', toolCallsToRun.map(t => t.name).join(', '));
 
-    // Execute tools
-    for (const tool of toolCalls) {
+    // Execute tools (post-cap, post-dedup)
+    for (const tool of toolCallsToRun) {
       label(B, 'EXECUTE', `${tool.name}(${JSON.stringify(tool.args).slice(0, 80)}...)`);
       logEvent('tool_start', { tool: tool.name, args: tool.args });
 
