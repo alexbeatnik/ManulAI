@@ -40,13 +40,9 @@ export class ManulAiChatParticipant {
   }
 
   private getAutoApprove(): boolean {
-    // Agent mode defaults to auto-approve for file modifications
-    const mode = this.getAgentMode();
+    // Safety: default to false unless user explicitly enabled it
     const stored = this.globalState?.get<boolean>(ManulAiChatParticipant.AUTO_APPROVE_KEY);
-    if (stored === undefined) {
-      return mode === 'agent'; // Default: agent=true, planner/chat=false
-    }
-    return stored;
+    return stored === true;
   }
 
   private async setAutoApprove(value: boolean): Promise<void> {
@@ -71,9 +67,10 @@ export class ManulAiChatParticipant {
     if (!workspaceRoot) { return; }
     const now = new Date();
     const timestamp = now.toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    const ms = String(now.getMilliseconds()).padStart(3, '0');
     const logDir = path.join(workspaceRoot, '.manulai', 'logs');
     fs.mkdirSync(logDir, { recursive: true });
-    this.debugLogFilePath = path.join(logDir, `${timestamp}.jsonl`);
+    this.debugLogFilePath = path.join(logDir, `${timestamp}-${ms}.jsonl`);
     this.debugLog('session_start', {
       model: this.getSelectedModel(),
       agentMode: this.getAgentMode(),
@@ -345,6 +342,16 @@ export class ManulAiChatParticipant {
 
       const isAgentLike = agentMode === 'agent' || agentMode === 'planner';
 
+      // Detect description/explanation intent. For these prompts we steer the model toward
+      // doc-reading (README.md, AGENTS.md, CLAUDE.md, package.json) and forbid terminal execution
+      // — observed bug: qwen3.6:35b on "Tell me about this project" ran `node scripts/debug-agent.mjs`
+      // (a script with no purpose-fit-to-the-prompt), then read its source, then described THE SCRIPT
+      // instead of THE PROJECT, never opening README.md.
+      const userPromptForIntent = (request.prompt || '').trim();
+      const explainPattern = /\b(tell me about|describe|explain|what (?:is|are|does)|summarize|how does|what(?:'s|s)\s+this|про що|що це|опиши|розкажи|поясни)\b/i;
+      const actionPattern = /\b(create|write|add|edit|modify|change|rename|fix|delete|remove|replace|update|implement|generate|build|set up|move|extract|split|refactor|run|execute|install)\b/i;
+      const promptIsExplainOnly = explainPattern.test(userPromptForIntent) && !actionPattern.test(userPromptForIntent);
+
       if (agentMode === 'agent') {
         effectiveSystemPrompt += '\n\nYou are in Agent mode. You may read files, edit code, and run terminal commands using the tools below.';
         effectiveSystemPrompt += '\n\nCRITICAL RULES:';
@@ -360,6 +367,14 @@ export class ManulAiChatParticipant {
         effectiveSystemPrompt += '\n- Example: "Plan: I will scan the project structure, read the key files, then create description.md." Then call project_scan.';
         effectiveSystemPrompt += '\n- NEVER call more than 3 tools in a single turn. If you need more, do them in the next turn.';
         effectiveSystemPrompt += '\n- After receiving a tool result, ALWAYS state your next step in 1 sentence BEFORE calling the next tool.';
+        if (promptIsExplainOnly) {
+          effectiveSystemPrompt += '\n\nDESCRIPTION INTENT DETECTED:';
+          effectiveSystemPrompt += '\n- The user asked for a description / explanation, not for changes.';
+          effectiveSystemPrompt += '\n- Read documentation files first: README.md, AGENTS.md, CLAUDE.md, package.json. project_scan is fine. read_specific_file on those docs is fine.';
+          effectiveSystemPrompt += '\n- Do NOT call execute_terminal_command or launch_in_terminal — running scripts is not how you describe a project. They will be rejected.';
+          effectiveSystemPrompt += '\n- Do NOT read random source files unless docs are missing or insufficient. Describe THE PROJECT, not the first script you find.';
+          effectiveSystemPrompt += '\n- Once you have read the docs, produce the answer in plain text. Do not call any more tools.';
+        }
         effectiveSystemPrompt += '\n\n' + getAgentToolInstructions();
       } else if (agentMode === 'planner') {
         effectiveSystemPrompt += '\n\nYou are in Planner mode. Prefer concise, step-by-step responses. Use tools for small deliberate actions.';
@@ -428,7 +443,7 @@ export class ManulAiChatParticipant {
       token.onCancellationRequested(() => abort.abort());
 
       try {
-        await this.runAgentLoop(baseUrl, model, messages, response, abort, isAgentLike, userPrompt);
+        await this.runAgentLoop(baseUrl, model, messages, response, abort, isAgentLike, userPrompt, promptIsExplainOnly);
       } catch (err: any) {
         this.log(`[ManulAiChatParticipant] error: ${err?.message || String(err)}`);
         this.debugLog('agent_error', { error: err?.message || String(err), stack: err?.stack || null });
@@ -456,7 +471,8 @@ export class ManulAiChatParticipant {
     response: vscode.ChatResponseStream,
     abort: AbortController,
     isAgentLike: boolean,
-    originalUserPrompt: string
+    originalUserPrompt: string,
+    promptIsExplainOnly = false
   ): Promise<void> {
     const MAX_TURNS = 15;
     const MAX_SAME_TOOL_REPEAT = 3;
@@ -676,6 +692,21 @@ export class ManulAiChatParticipant {
         recentToolSignatures.push(signature);
         if (recentToolSignatures.length > 10) {
           recentToolSignatures.shift();
+        }
+
+        // Block terminal commands when the prompt is purely description/explanation. Observed:
+        // qwen3.6:35b on "Tell me about this project" ran a random script, then described THE SCRIPT
+        // instead of THE PROJECT. Reject the call so the model is forced back to doc-reading.
+        if (promptIsExplainOnly && (name === 'execute_terminal_command' || name === 'launch_in_terminal')) {
+          const blockMsg = 'Terminal commands are blocked for description/explain prompts. Read README.md, AGENTS.md, CLAUDE.md, or package.json to describe the project, then answer in plain text. Do not run scripts to introspect the project.';
+          response.markdown(`\n🚫 **Blocked** — \`${name}\`\n\n${blockMsg}\n`);
+          messages.push({
+            role: 'tool',
+            content: JSON.stringify({ error: blockMsg }),
+            tool_name: name,
+          });
+          this.debugLog('terminal_blocked_explain_intent', { turn: turnCount, tool: name, args: this.redactArgsForLog(args) });
+          continue;
         }
 
         // Show which tool is running
@@ -1048,10 +1079,14 @@ export class ManulAiChatParticipant {
     abortController: AbortController
   ): Promise<void> {
     const url = `${baseUrl}/api/chat`;
-    const body = {
+    const maxTokens = getMaxPromptTokens(model);
+    const body: Record<string, unknown> = {
       model,
       messages,
       stream: true,
+      options: {
+        num_ctx: Math.min(maxTokens, 128_000),
+      },
     };
 
     this.log(`[ManulAiChatParticipant] streaming to ${url}, model=${model}`);
@@ -1114,10 +1149,14 @@ export class ManulAiChatParticipant {
     abortController: AbortController
   ): Promise<string> {
     const url = `${baseUrl}/api/chat`;
-    const body = {
+    const maxTokens = getMaxPromptTokens(model);
+    const body: Record<string, unknown> = {
       model,
       messages,
       stream: false,
+      options: {
+        num_ctx: Math.min(maxTokens, 128_000),
+      },
     };
 
     const response = await this.fetchWithModelRetry(baseUrl, url, body, abortController, model);
