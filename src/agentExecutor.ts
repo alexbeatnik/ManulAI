@@ -172,6 +172,9 @@ export function stripToolCallsFromText(text: string): string {
     .replace(/\{\s*"tool"\s*:\s*"[^"]+"\s*,\s*"parameters"\s*:\s*\{[\s\S]*?\}\s*\}/g, '')
     // Remove flat format JSON
     .replace(/\{\s*"tool"\s*:\s*"[^"]+"\s*,\s*"[^"]+"\s*:\s*"[^"]*"[\s\S]*?\}\s*\}/g, '')
+    // Remove stray ChatML tokens and reasoning tags
+    .replace(/<\/?think>/gi, '')
+    .replace(/<\|im_(?:start|end)\|>[a-zA-Z]*\n?/g, '')
     .trim();
 }
 
