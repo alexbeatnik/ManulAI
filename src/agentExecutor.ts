@@ -303,6 +303,10 @@ async function toolCreateOrEditFile(filename: string, content: string): Promise<
   }
   const uri = resolveWorkspaceUri(filename, true);
   try {
+    // Auto-create parent directories so the model can write nested greenfield paths
+    // (e.g. `src/index.ts` in a fresh project) without first calling a separate "mkdir" step.
+    const parent = vscode.Uri.file(path.dirname(uri.fsPath));
+    await vscode.workspace.fs.createDirectory(parent);
     await vscode.workspace.fs.writeFile(uri, Buffer.from(content, 'utf8'));
     return {
       content: JSON.stringify({
@@ -331,12 +335,23 @@ async function toolReplaceInFile(
   if (!oldText) {
     return { content: '', error: 'old_text is required.' };
   }
+  // Block no-op replaces — identical old/new makes no change and is almost always a model mistake.
+  if (oldText === newText) {
+    return { content: '', error: 'old_text and new_text are identical — this would make no change to the file.' };
+  }
   const uri = resolveWorkspaceUri(filepath);
   try {
     const bytes = await vscode.workspace.fs.readFile(uri);
     const content = Buffer.from(bytes).toString('utf8');
-    if (!content.includes(oldText)) {
-      return { content: '', error: `old_text not found in file: ${filepath}` };
+    const occurrences = content.split(oldText).length - 1;
+    if (occurrences === 0) {
+      return { content: '', error: `old_text not found in file: ${filepath}. Make sure it matches exactly, including whitespace and indentation.` };
+    }
+    // Refuse multi-match unless the model is explicitly using the entire file — otherwise a
+    // wrong choice of old_text (e.g. matching `return 1` in both branches of an if/else) silently
+    // corrupts unrelated code on the assumption that the first occurrence was the intended one.
+    if (occurrences > 1) {
+      return { content: '', error: `old_text matched ${occurrences} times in ${filepath}. Add more surrounding context so it matches exactly once.` };
     }
     const updated = content.replace(oldText, newText);
     await vscode.workspace.fs.writeFile(uri, Buffer.from(updated, 'utf8'));

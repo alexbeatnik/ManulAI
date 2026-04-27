@@ -465,6 +465,11 @@ export class ManulAiChatParticipant {
     const readFilesThisSession = new Set<string>();
     let hasProjectScanned = false;
     let consecutiveReadOrListTurns = 0;
+    let toolsExecutedAny = false;
+    let refusalNudgeFired = false;
+    // Heuristic: user prompts that expect file/tool actions. Conservative trigger words at word
+    // boundaries — should not misfire on pure questions like "explain this code".
+    const promptExpectsAction = /\b(create|write|add|edit|modify|change|rename|fix|delete|remove|replace|update|implement|generate|build|set up|move|extract|split|refactor|run)\b/i.test(originalUserPrompt);
 
     // Extract likely target filename from user prompt
     const extractTargetFilename = (prompt: string): string | undefined => {
@@ -517,6 +522,19 @@ export class ManulAiChatParticipant {
       const cleanText = stripToolCallsFromText(assistantText);
 
       if (toolCalls.length === 0) {
+        // Refusal-style response: the user asked for an action but the model produced narrative
+        // without executing a single tool. Nudge once before accepting it as a final answer.
+        if (promptExpectsAction && !toolsExecutedAny && !refusalNudgeFired) {
+          refusalNudgeFired = true;
+          this.debugLog('refusal_nudge', { turn: turnCount, contentPreview: assistantText.slice(0, 400) });
+          messages.push({ role: 'assistant', content: cleanText || '(no tool call)' });
+          messages.push({
+            role: 'user',
+            content:
+              'You answered with prose, but this task requires you to actually call tools to read or modify files in this workspace. The files exist and the tools work — you have access. Do not describe hypothetical changes. Call the appropriate tool now (e.g. read_specific_file, replace_in_file, create_or_edit_file).',
+          });
+          continue;
+        }
         // No tools — assistant gave a final answer.
         return;
       }
@@ -665,6 +683,9 @@ export class ManulAiChatParticipant {
         });
 
         const result = await executeTool(name, args);
+        if (!result.error) {
+          toolsExecutedAny = true;
+        }
 
         this.debugLog('tool_exec_result', {
           turn: turnCount,

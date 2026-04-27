@@ -378,6 +378,9 @@ async function executeTool(name, args) {
           return { content: '', error: `create_or_edit_file 'content' must be a string, got ${typeof args.content}.` };
         }
         if (!isBlockedCommand(fp)) {
+          // Auto-create parent directories so the model can write nested greenfield paths
+          // (e.g. `src/index.ts` in a fresh project) without first calling a separate "mkdir" step.
+          mkdirSync(path.dirname(fp), { recursive: true });
           writeFileSync(fp, args.content, 'utf8');
         }
         return { content: JSON.stringify({ path: fp, action: 'created_or_overwritten', bytes: args.content.length }) };
@@ -388,26 +391,29 @@ async function executeTool(name, args) {
         const oldText = String(args.old_text ?? '');
         const newText = String(args.new_text ?? '');
         if (!oldText) return { content: '', error: 'old_text is required' };
+        if (oldText === newText) {
+          return { content: '', error: 'old_text and new_text are identical — this would make no change to the file.' };
+        }
         // Count occurrences without regex (avoids escaping headaches).
         let occurrences = 0;
         let cursor = 0;
         while ((cursor = content.indexOf(oldText, cursor)) !== -1) { occurrences += 1; cursor += oldText.length; }
-        if (occurrences === 0) return { content: '', error: `old_text not found in ${fp}` };
+        if (occurrences === 0) return { content: '', error: `old_text not found in ${fp}. Make sure it matches exactly, including whitespace and indentation.` };
         const replaceAll = args.all === true || args.replace_all === true;
+        // Match production semantics: refuse multi-match unless replace_all is explicit.
+        // Multiple matches with a non-explicit replace lets a wrong choice of old_text
+        // silently corrupt unrelated code (e.g. matching `return 1` in both branches of an if/else).
+        if (occurrences > 1 && !replaceAll) {
+          return {
+            content: '',
+            error: `old_text matched ${occurrences} times in ${fp}. Add more surrounding context so it matches exactly once, or pass "all": true if you genuinely want to replace every occurrence.`,
+          };
+        }
         const updated = replaceAll ? content.split(oldText).join(newText) : content.replace(oldText, newText);
         writeFileSync(fp, updated, 'utf8');
         const replaced = replaceAll ? occurrences : 1;
-        const remaining = occurrences - replaced;
         return {
-          content: JSON.stringify({
-            path: fp,
-            action: 'replaced',
-            replaced,
-            remaining,
-            note: remaining > 0
-              ? `old_text appears ${occurrences} time(s) in this file. Replaced ${replaced}; ${remaining} occurrence(s) remain. Call replace_in_file again with the same old_text (or pass "all": true) to replace more.`
-              : undefined,
-          }),
+          content: JSON.stringify({ path: fp, action: 'replaced', replaced }),
         };
       }
       case 'execute_terminal_command': {
