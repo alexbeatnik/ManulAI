@@ -27,13 +27,15 @@ const TOOL_DESCRIPTIONS = `
 [AGENT RULES]
 
 1. ALWAYS respond in the SAME LANGUAGE as the user's prompt.
-2. BEFORE creating or editing files, ALWAYS read the relevant files first to understand the project structure.
+2. NEVER read files unless you genuinely need information to complete the task. Do NOT read package.json "just in case".
 3. Use project_scan() or list_workspace_files() to explore the workspace before making changes.
 4. NEVER output explanations before tool calls — just call the tool immediately.
 5. NEVER wrap tool JSON in markdown code blocks (no \`\`\`json).
 6. STOP immediately after completing the user's request. Do NOT verify, check, or read back created/edited files.
 7. Do NOT scan the project after completing the task unless explicitly asked.
 8. After outputting a tool JSON, STOP. Do not write any additional text, explanations, or thinking.
+9. NEVER read the same file more than once. If you already read a file, use the information you already have.
+10. NEVER call more than 3 tools in a single turn. If you need more, do them in the next turn.
 
 [TOOL FORMAT]
 
@@ -89,7 +91,8 @@ const TOOL_NAME_ALIASES: Record<string, string> = {
 };
 
 function normalizeToolName(name: string): string {
-  return TOOL_NAME_ALIASES[name.toLowerCase().trim()] ?? name;
+  const cleaned = name.toLowerCase().trim().replace(/\(\)\s*$/, ''); // strip trailing ()
+  return TOOL_NAME_ALIASES[cleaned] ?? cleaned;
 }
 
 export function getAgentToolInstructions(): string {
@@ -302,17 +305,21 @@ async function toolCreateOrEditFile(filename: string, content: string): Promise<
     return { content: '', error: `Write blocked for safety: ${blocked.reason}` };
   }
   const uri = resolveWorkspaceUri(filename, true);
+  let existed = false;
   try {
-    // Auto-create parent directories so the model can write nested greenfield paths
-    // (e.g. `src/index.ts` in a fresh project) without first calling a separate "mkdir" step.
-    const parent = vscode.Uri.file(path.dirname(uri.fsPath));
-    await vscode.workspace.fs.createDirectory(parent);
+    await vscode.workspace.fs.stat(uri);
+    existed = true;
+  } catch {
+    existed = false;
+  }
+  try {
     await vscode.workspace.fs.writeFile(uri, Buffer.from(content, 'utf8'));
     return {
       content: JSON.stringify({
         path: uri.fsPath,
-        action: 'created_or_overwritten',
+        action: existed ? 'overwritten' : 'created',
         length: content.length,
+        existed,
       }),
     };
   } catch (err) {

@@ -111,6 +111,19 @@ function estimateTokens(text) {
 
 // ─── Tool Instructions (mirrors agentExecutor.ts) ───────────────────────
 const TOOL_INSTRUCTIONS = `
+[AGENT RULES]
+
+1. ALWAYS respond in the SAME LANGUAGE as the user's prompt.
+2. NEVER read files unless you genuinely need information to complete the task. Do NOT read package.json "just in case".
+3. Use project_scan() or list_workspace_files() to explore the workspace before making changes.
+4. NEVER output explanations before tool calls — just call the tool immediately.
+5. NEVER wrap tool JSON in markdown code blocks (no \`\`\`json).
+6. STOP immediately after completing the user's request. Do NOT verify, check, or read back created/edited files.
+7. Do NOT scan the project after completing the task unless explicitly asked.
+8. After outputting a tool JSON, STOP. Do not write any additional text, explanations, or thinking.
+9. NEVER read the same file more than once. If you already read a file, use the information you already have.
+10. NEVER call more than 3 tools in a single turn. If you need more, do them in the next turn.
+
 [TOOL FORMAT]
 
 Output tool calls as a single JSON object on its own line:
@@ -284,11 +297,12 @@ function extractToolCalls(text) {
 
     let entry;
     if (typeof parsed.tool === 'string') {
+      const toolName = parsed.tool.replace(/\(\)\s*$/, ''); // strip trailing ()
       if (parsed.args && typeof parsed.args === 'object') {
-        entry = { name: parsed.tool, args: parsed.args };
+        entry = { name: toolName, args: parsed.args };
       } else {
         const { tool, ...rest } = parsed;
-        entry = { name: tool, args: rest };
+        entry = { name: toolName, args: rest };
       }
     } else {
       // Alt shape: {"<tool_name>": {<args>}}
@@ -377,13 +391,14 @@ async function executeTool(name, args) {
         if (typeof args.content !== 'string') {
           return { content: '', error: `create_or_edit_file 'content' must be a string, got ${typeof args.content}.` };
         }
+        const existed = existsSync(fp);
         if (!isBlockedCommand(fp)) {
           // Auto-create parent directories so the model can write nested greenfield paths
           // (e.g. `src/index.ts` in a fresh project) without first calling a separate "mkdir" step.
           mkdirSync(path.dirname(fp), { recursive: true });
           writeFileSync(fp, args.content, 'utf8');
         }
-        return { content: JSON.stringify({ path: fp, action: 'created_or_overwritten', bytes: args.content.length }) };
+        return { content: JSON.stringify({ path: fp, action: existed ? 'overwritten' : 'created', bytes: args.content.length, existed }) };
       }
       case 'replace_in_file': {
         const fp = resolveUri(String(args.filepath ?? ''));
@@ -500,6 +515,24 @@ async function runAgent() {
   let lastTurnFullyCompleted = false;
   let completedTurns = 0;
   let refusalNudgeFired = false;
+  const readFilesThisSession = new Set();
+  let hasProjectScanned = false;
+  let consecutiveReadOrListTurns = 0;
+
+  // Extract likely target filename from user prompt
+  const extractTargetFilename = (prompt) => {
+    const patterns = [
+      /\b(?:create|write|make|generate|build)\s+(?:a\s+|the\s+)?(?:file\s+)?[`"']?(\S+\.(?:md|txt|ts|js|py|json|yml|yaml|html|css|scss|go|rs|java|kt|cs|cpp|c|h|sh|bash|sql|xml))[`"']?/i,
+      /\b(?:edit|modify|update|fix|change)\s+(?:file\s+)?[`"']?(\S+\.(?:md|txt|ts|js|py|json|yml|yaml|html|css|scss|go|rs|java|kt|cs|cpp|c|h|sh|bash|sql|xml))[`"']?/i,
+      /[`"'](\S+\.(?:md|txt|ts|js|py|json|yml|yaml|html|css|scss|go|rs|java|kt|cs|cpp|c|h|sh|bash|sql|xml))[`"']/i,
+    ];
+    for (const p of patterns) {
+      const m = prompt.match(p);
+      if (m) return m[1];
+    }
+    return undefined;
+  };
+  const targetFilename = extractTargetFilename(userPrompt);
 
   // Heuristic: does the user prompt expect file/tool actions?
   // Trigger words at word boundaries — keep this conservative to avoid misfiring on questions.
@@ -637,6 +670,8 @@ async function runAgent() {
     label(Y, 'TOOLS', toolCallsToRun.map(t => t.name).join(', '));
 
     // Execute tools (post-cap, post-dedup)
+    let lastToolWasWrite = false;
+    let lastToolWasTerminal = false;
     for (const tool of toolCallsToRun) {
       label(B, 'EXECUTE', `${tool.name}(${JSON.stringify(tool.args).slice(0, 80)}...)`);
       logEvent('tool_start', { tool: tool.name, args: tool.args });
@@ -654,7 +689,73 @@ async function runAgent() {
         role: 'tool',
         content: result.error ? JSON.stringify({ error: result.error }) : result.content,
       });
+
+      if ((tool.name === 'create_or_edit_file' || tool.name === 'replace_in_file') && !result.error) {
+        lastToolWasWrite = true;
+      }
+      if (tool.name === 'execute_terminal_command' && !result.error) {
+        lastToolWasTerminal = true;
+      }
+      if (tool.name === 'read_specific_file' || tool.name === 'read_file_slice') {
+        const fp = String(tool.args.filepath ?? tool.args.path ?? '');
+        if (fp) readFilesThisSession.add(fp);
+      }
+      if (tool.name === 'project_scan') {
+        hasProjectScanned = true;
+      }
     }
+
+    // Feed back dropped tools as errors so the model knows they were skipped
+    if (dedupedToolCalls.length > MAX_TOOLS_PER_TURN) {
+      const dropped = dedupedToolCalls.slice(MAX_TOOLS_PER_TURN);
+      for (const tool of dropped) {
+        const errorMsg = `Tool "${tool.name}" was NOT executed because you output too many tools at once. Maximum is ${MAX_TOOLS_PER_TURN} per turn. Call it in the next turn if still needed.`;
+        messages.push({
+          role: 'tool',
+          content: JSON.stringify({ error: errorMsg, args: tool.args }),
+        });
+      }
+    }
+
+    // Track consecutive read/list turns for auto-bootstrap
+    const allReadsOrLists = toolCalls.every((tc) =>
+      tc.name === 'read_specific_file' ||
+      tc.name === 'read_file_slice' ||
+      tc.name === 'list_workspace_files' ||
+      tc.name === 'project_scan'
+    );
+    if (allReadsOrLists) {
+      consecutiveReadOrListTurns++;
+    } else {
+      consecutiveReadOrListTurns = 0;
+    }
+
+    // Auto-bootstrap: if stuck in read-only loop for 2+ turns, force a create instruction
+    if (consecutiveReadOrListTurns >= 2) {
+      const readFilesList = Array.from(readFilesThisSession).map(f => `- ${f}`).join('\n');
+      const fileHint = targetFilename ? ` The target file is \`${targetFilename}\`.` : '';
+      const bootstrapNudge =
+        `STOP. You are stuck in a read loop. You have already read these files:\n${readFilesList || '- (project scanned)'}` +
+        `\n\nDO NOT read any more files. DO NOT list files. You already have all the information you need.` +
+        `\n\nThe user asked you to CREATE a file.${fileHint} Output ONLY a create_or_edit_file tool call NOW with the correct filename. No text, no explanation — just the tool JSON.` +
+        (targetFilename ? `\n\nCRITICAL: You MUST use filename "${targetFilename}". Any other filename is wrong. Do NOT create any other file.` : '');
+      messages.push({ role: 'user', content: bootstrapNudge });
+      label(Y, 'BOOTSTRAP', 'forcing create after read-only loop');
+      logEvent('auto_bootstrap_read_loop', { turn, consecutiveReadOrListTurns, readFiles: Array.from(readFilesThisSession) });
+    }
+
+    // Stop after writes or terminal commands
+    if (lastToolWasWrite) {
+      label(G, 'DONE', 'Write operation completed — stopping');
+      logEvent('agent_stop', { turn, reason: 'write_operation' });
+      break;
+    }
+    if (lastToolWasTerminal) {
+      label(G, 'DONE', 'Terminal command executed — stopping');
+      logEvent('agent_stop', { turn, reason: 'terminal_command' });
+      break;
+    }
+
     lastTurnFullyCompleted = true;
   }
 

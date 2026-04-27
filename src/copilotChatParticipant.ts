@@ -602,6 +602,7 @@ export class ManulAiChatParticipant {
 
       // Limit tools per turn to prevent context explosion
       let toolsToExecute = toolCalls;
+      const droppedTools: typeof toolCalls = [];
       if (toolCalls.length > MAX_TOOLS_PER_TURN) {
         // Prioritize write operations; if none, just take the first N
         const writeOps = toolCalls.filter((tc) => tc.function.name === 'create_or_edit_file' || tc.function.name === 'replace_in_file');
@@ -614,8 +615,21 @@ export class ManulAiChatParticipant {
         } else {
           toolsToExecute = readOps.slice(0, MAX_TOOLS_PER_TURN);
         }
+        droppedTools.push(...toolCalls.filter((tc) => !toolsToExecute.includes(tc)));
         this.log(`[agent] limiting ${toolCalls.length} tools to ${toolsToExecute.length} (max ${MAX_TOOLS_PER_TURN})`);
-        this.debugLog('tools_limited', { originalCount: toolCalls.length, limitedTo: toolsToExecute.length, kept: toolsToExecute.map((tc) => tc.function.name) });
+        this.debugLog('tools_limited', { originalCount: toolCalls.length, limitedTo: toolsToExecute.length, kept: toolsToExecute.map((tc) => tc.function.name), dropped: droppedTools.map((tc) => tc.function.name) });
+      }
+
+      // Feed back dropped tools as errors so the model knows they were skipped
+      for (const dropped of droppedTools) {
+        const dName = dropped.function.name;
+        const dArgs = dropped.function.arguments;
+        const errorMsg = `Tool "${dName}" was NOT executed because you output too many tools at once. Maximum is ${MAX_TOOLS_PER_TURN} per turn. Call it in the next turn if still needed.`;
+        messages.push({
+          role: 'tool',
+          content: JSON.stringify({ error: errorMsg, args: dArgs }),
+          tool_name: dName,
+        });
       }
 
       for (const toolCall of toolsToExecute) {
@@ -803,8 +817,9 @@ export class ManulAiChatParticipant {
           `STOP. You are stuck in a read loop. You have already read these files:\n${readFilesList || '- (project scanned)'}` +
           `\n\nDO NOT read any more files. DO NOT list files. You already have all the information you need.` +
           `\n\nThe user asked you to CREATE a file.${fileHint} Output ONLY a create_or_edit_file tool call NOW with the correct filename. No text, no explanation — just the tool JSON.` +
-          (targetFilename ? `\n\nIMPORTANT: You MUST use filename "${targetFilename}". Any other filename is wrong.` : '');
-        messages.push({ role: 'system', content: bootstrapNudge });
+          (targetFilename ? `\n\nCRITICAL: You MUST use filename "${targetFilename}". Any other filename is wrong. Do NOT create any other file.` : '');
+        // Use user role — models pay more attention to user instructions than system nudges
+        messages.push({ role: 'user', content: bootstrapNudge });
         this.log('[agent] auto-bootstrap: forcing create after read-only loop');
         this.debugLog('auto_bootstrap_read_loop', { turn: turnCount, consecutiveReadOrListTurns, readFiles: Array.from(readFilesThisSession) });
       }
